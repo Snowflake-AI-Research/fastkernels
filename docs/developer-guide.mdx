@@ -1,0 +1,42 @@
+---
+title: Developer Guide
+description: Testing against vLLM and adding new model architectures.
+---
+
+## vLLM Alignment Test
+
+`tests/bench_vllm.py` runs kb-nano and vLLM side-by-side across three workload scenarios (prefill-heavy, balanced, decode-heavy) plus latency benchmarks, comparing throughput and per-token alignment:
+
+```bash
+python tests/bench_vllm.py --model meta-llama/Llama-3.1-8B-Instruct
+python tests/bench_vllm.py --model meta-llama/Llama-3.1-70B-Instruct --tp 4
+
+# Latency only (skip throughput)
+python tests/bench_vllm.py --model meta-llama/Llama-3.1-8B-Instruct --skip-throughput
+
+# Parse and plot results
+python tests/utils/parse_vllm_bench_results.py
+```
+
+Results are saved to `tests/results/<GPU>/<model>_tp<N>/results.json`. The parser auto-discovers these files and generates tables and plots in `tests/plots/<GPU>/`.
+
+For a quick correctness check (no throughput measurement), use the `--skip-throughput` flag:
+
+```bash
+python tests/bench_vllm.py \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --skip-throughput --skip-latency
+```
+
+---
+
+## Adding a New Model
+
+Follow the L1 → L4 pattern (see [Architecture](/architecture) for details on the hierarchy):
+
+1. **L1**: Identify which single-kernel ops are needed. Reuse existing L1 ops where possible (e.g. `RMSNorm`, `SiluAndMul`). Write new L1 modules only for ops that don't exist yet.
+2. **L2**: Compose L1 ops into multi-op blocks (attention, MLP). Mirror the corresponding vLLM module's `__init__` and `forward` signatures.
+3. **L3**: Write a decoder layer that combines L2 attention + L2 MLP + L1 normalization.
+4. **L4**: Write the full model class (`NewModelForCausalLM`) with embedding, decoder stack, and LM head.
+
+Each module should be a drop-in match for its vLLM counterpart. The bench suite auto-discovers new operators from the import graph.

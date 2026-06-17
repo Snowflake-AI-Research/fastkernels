@@ -1,0 +1,208 @@
+# Additional KernelAgent evaluation scenarios for selected kb_nano workloads.
+#
+# These are workload-shaped synthetic scenarios for operators whose generated
+# KernelAgent candidates were staged under tasks/candidate/. Data-dependent MoE
+# paths need a specialized runtime builder because mxfp4_moe consumes prepared
+# Triton weight wrappers and a quant_config object, which are not plain YAML
+# tensors.
+
+relu:
+  scenarios:
+    - name: "openfold3/act/residue128"
+      init_args: {}
+      inputs:
+        x: {shape: [128, 384], dtype: bfloat16}
+    - name: "rtdetrv2/feature-map"
+      init_args: {}
+      inputs:
+        x: {shape: [1, 256, 80, 80], dtype: float16}
+
+sigmoid:
+  scenarios:
+    - name: "rtdetrv2/logits"
+      init_args: {}
+      inputs:
+        x: {shape: [1, 300, 80], dtype: float16}
+    - name: "openfold3/gating"
+      init_args: {}
+      inputs:
+        x: {shape: [128, 384], dtype: bfloat16}
+
+silu:
+  scenarios:
+    - name: "gla/mlp/decode-bs1"
+      init_args: {}
+      inputs:
+        x: {shape: [1, 8192], dtype: bfloat16}
+    - name: "gla/mlp/prefill-512"
+      init_args: {}
+      inputs:
+        x: {shape: [512, 8192], dtype: bfloat16}
+    - name: "rtdetrv2/activation"
+      init_args: {}
+      inputs:
+        x: {shape: [1, 256, 80, 80], dtype: float16}
+
+gelu:
+  scenarios:
+    - name: "openfold3/transition"
+      init_args: {approximate: "none"}
+      inputs:
+        x: {shape: [128, 384], dtype: bfloat16}
+    - name: "rtdetrv2/encoder-mlp"
+      init_args: {approximate: "none"}
+      inputs:
+        x: {shape: [1, 300, 1024], dtype: float16}
+
+layer_norm:
+  scenarios:
+    - name: "openfold3/residue128"
+      init_args: {normalized_shape: 384, eps: 1.0e-5}
+      inputs:
+        x: {shape: [128, 384], dtype: bfloat16}
+    - name: "openfold3/pair128"
+      init_args: {normalized_shape: 128, eps: 1.0e-5}
+      inputs:
+        x: {shape: [128, 128, 128], dtype: bfloat16}
+    - name: "gpt_oss/decode-bs32/tp2"
+      init_args: {normalized_shape: 1440, eps: 1.0e-5}
+      inputs:
+        x: {shape: [32, 1440], dtype: bfloat16}
+
+fp8_linear:
+  scenarios:
+    - name: "kernelagent/fp8/decode-bs1"
+      init_args: {}
+      inputs:
+        input_bf16: {shape: [1, 1024], dtype: bfloat16}
+        weight_fp8:
+          shape: [1024, 1024]
+          dtype: float8_e4m3fn
+          quantize: fp8
+          source_dtype: bfloat16
+          scale_arg: weight_scale_inv
+          scale_layout: per_block
+          block_shape: [128, 128]
+        bias: null
+    - name: "kernelagent/fp8/prefill-128"
+      init_args: {}
+      inputs:
+        input_bf16: {shape: [128, 1024], dtype: bfloat16}
+        weight_fp8:
+          shape: [1024, 1024]
+          dtype: float8_e4m3fn
+          quantize: fp8
+          source_dtype: bfloat16
+          scale_arg: weight_scale_inv
+          scale_layout: per_block
+          block_shape: [128, 128]
+        bias: null
+
+rotary_emb:
+  scenarios:
+    - name: "kernelagent/llama31-8b/decode-bs1/tp1"
+      init_args:
+        head_dim: 128
+        max_position_embeddings: 131072
+        rope_theta: 500000
+      inputs:
+        positions: {shape: [1], dtype: int64}
+        query: {shape: [1, 32, 128], dtype: bfloat16}
+        key: {shape: [1, 8, 128], dtype: bfloat16}
+    - name: "kernelagent/llama31-8b/prefill-512/tp1"
+      init_args:
+        head_dim: 128
+        max_position_embeddings: 131072
+        rope_theta: 500000
+      inputs:
+        positions: {shape: [512], dtype: int64}
+        query: {shape: [512, 32, 128], dtype: bfloat16}
+        key: {shape: [512, 8, 128], dtype: bfloat16}
+
+yarn_rotary_emb:
+  scenarios:
+    - name: "gpt_oss/decode-bs1/tp2"
+      init_args:
+        head_dim: 64
+        max_position_embeddings: 131072
+        rope_theta: 150000
+        scaling_factor: 32.0
+      inputs:
+        positions: {shape: [1], dtype: int64}
+        query: {shape: [1, 32, 64], dtype: bfloat16}
+        key: {shape: [1, 8, 64], dtype: bfloat16}
+    - name: "gpt_oss/prefill-512/tp2"
+      init_args:
+        head_dim: 64
+        max_position_embeddings: 131072
+        rope_theta: 150000
+        scaling_factor: 32.0
+      inputs:
+        positions: {shape: [512], dtype: int64}
+        query: {shape: [512, 32, 64], dtype: bfloat16}
+        key: {shape: [512, 8, 64], dtype: bfloat16}
+
+store_kvcache:
+  scenarios:
+    - name: "llama31/decode-bs32"
+      init_args: {page_size: 16}
+      inputs:
+        key: {shape: [32, 8, 128], dtype: bfloat16}
+        value: {shape: [32, 8, 128], dtype: bfloat16}
+        k_cache: {shape: [64, 8, 16, 128], dtype: bfloat16}
+        v_cache: {shape: [64, 8, 16, 128], dtype: bfloat16}
+        slot_mapping: {shape: [32], dtype: int64}
+
+chunk_gla:
+  scenarios:
+    - name: "gla/prefill-128"
+      init_args: {}
+      inputs:
+        q: {shape: [1, 128, 8, 64], dtype: bfloat16}
+        k: {shape: [1, 128, 8, 64], dtype: bfloat16}
+        v: {shape: [1, 128, 8, 128], dtype: bfloat16}
+        g: {shape: [1, 128, 8, 64], dtype: bfloat16}
+        scale: null
+        initial_state: null
+        output_final_state: false
+        cu_seqlens: null
+
+chunk_retention:
+  scenarios:
+    - name: "gla-retention/prefill-128"
+      init_args: {}
+      inputs:
+        q: {shape: [1, 128, 8, 64], dtype: bfloat16}
+        k: {shape: [1, 128, 8, 64], dtype: bfloat16}
+        v: {shape: [1, 128, 8, 128], dtype: bfloat16}
+        scale: null
+        initial_state: null
+        output_final_state: false
+        cu_seqlens: null
+
+fused_recurrent_gla:
+  scenarios:
+    - name: "gla/decode-bs1"
+      init_args: {}
+      inputs:
+        q: {shape: [1, 1, 8, 64], dtype: bfloat16}
+        k: {shape: [1, 1, 8, 64], dtype: bfloat16}
+        v: {shape: [1, 1, 8, 128], dtype: bfloat16}
+        gk: {shape: [1, 1, 8, 64], dtype: bfloat16}
+        scale: null
+        initial_state: {shape: [1, 8, 64, 128], dtype: bfloat16}
+        output_final_state: true
+        cu_seqlens: null
+
+fused_recurrent_retention:
+  scenarios:
+    - name: "gla-retention/decode-bs1"
+      init_args: {}
+      inputs:
+        q: {shape: [1, 1, 8, 64], dtype: bfloat16}
+        k: {shape: [1, 1, 8, 64], dtype: bfloat16}
+        v: {shape: [1, 1, 8, 128], dtype: bfloat16}
+        scale: null
+        initial_state: {shape: [1, 8, 64, 128], dtype: bfloat16}
+        output_final_state: true
+        cu_seqlens: null

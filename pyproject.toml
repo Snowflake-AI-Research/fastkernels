@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=64", "wheel", "torch>=2.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kb_nano"
+version = "0.1.0"
+description = "A CUDA kernel benchmarking library for LLM inference"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "numpy",
+    "pyyaml",
+    "transformers",
+    "huggingface_hub",
+    "safetensors",
+    "tqdm",
+    "flash-attn",
+    "vllm==0.18.0",
+    "deep-gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@v2.1.1.post3",
+    "decord",
+    "mlflow>=2.10",
+    "datasets",
+    "diffusers>=0.37",
+    "peft>=0.17.0",
+    "sam3 @ git+https://github.com/sfc-gh-goliaro/sam3.git",
+    "openfold3 @ git+https://github.com/sfc-gh-goliaro/openfold-3.git",
+    "pycocotools",
+    "timm",
+    "einops",
+    "torchvision",
+    "av",
+    "rotary-embedding-torch",
+    "fastsafetensors",
+    "ultralytics",
+    "flash-linear-attention>=0.4.2",
+    # TTT-E2E benchmark (tests/bench_ttt_e2e.py): the official reference at
+    # github.com/test-time-training/e2e is JAX/Equinox/Optax. We import its
+    # MetaModel from a subprocess worker for cross-framework correctness +
+    # throughput comparison.
+    "jax[cuda12]",
+    "equinox>=0.11.12",
+    "optax>=0.2.4",
+    "jaxtyping>=0.2.36",
+    "hydra-core>=1.3",
+    # DP3 bench (tests/bench_dp3.py): omegaconf is required by the
+    # reference 3D-Diffusion-Policy repo for its OmegaConf-based configs;
+    # pyarrow reads the xarm-pointcloud parquet shards; dill loads the
+    # reference's dill-pickled checkpoints. ``datasets`` already pulls in
+    # pyarrow and dill transitively, but we pin them here for clarity.
+    "omegaconf",
+    "pyarrow",
+    "dill",
+]
+
+[project.scripts]
+kb_nano = "kb_nano.__main__:main"
+
+[tool.uv]
+find-links = [
+    "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/expanded_assets/v0.9.0",
+]
+no-build-isolation-package = ["flash-attn", "deep-gemm"]
+
+[tool.setuptools.package-dir]
+"kb_nano" = "."

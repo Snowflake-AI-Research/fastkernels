@@ -1,0 +1,90 @@
+---
+title: Building an Agent
+description: Use an LLM to automatically generate and benchmark replacement kernels.
+---
+
+kb-nano includes an agent that uses an LLM to generate replacement kernels, validate them, and benchmark them end-to-end — all in a single run. You can use it as-is or as a starting point for building your own agent.
+
+## How the Agent Works
+
+The agent follows a four-stage pipeline:
+
+1. **Discover** — Given a model and an operator level (L1–L4), the agent queries the benchmark registry to find all target operators.
+2. **Generate** — For each operator, the agent sends the baseline source code to an LLM with a prompt requesting a faster replacement. All operators are generated in parallel.
+3. **Validate** — Each generated kernel is compiled and checked: does the class name match? Does `__init__` succeed? If validation fails, the error is fed back to the LLM for retry (up to `--max-retries` attempts).
+4. **Benchmark** — All successful kernels are patched into the model and benchmarked end-to-end, measuring token match rate and wall-clock speedup. If a kernel causes a runtime failure, the agent identifies it, re-generates it, and re-runs the benchmark.
+
+## Running the Agent
+
+```bash
+# Generate all L1 kernels for Llama
+kb_nano agent \
+    --model meta-llama/Llama-3.1-8B-Instruct --level 1
+
+# CUDA-only kernels (no Triton/PyTorch builtins)
+kb_nano agent \
+    --model meta-llama/Llama-3.1-8B-Instruct --level 1 --cuda-only
+
+# Mixtral L2 operators with TP
+kb_nano agent \
+    --model mistralai/Mixtral-8x7B-Instruct-v0.1 --level 2 --tp 4
+```
+
+Key flags:
+
+| Flag | Description |
+|---|---|
+| `--model` | HuggingFace model name |
+| `--level` | Operator level: 1 (kernels), 2 (blocks), 3 (decoders), 4 (models) |
+| `--cuda-only` | Force raw CUDA only — no Triton or PyTorch builtins |
+| `--max-retries` | Max retries per kernel on compilation failure (default: 5) |
+| `--tp` | Tensor parallelism degree (default: 1) |
+| `--llm-model` | LLM model for generation (default: `claude-opus-4-6`) |
+| `--skip-unit-tests` | Skip per-operator unit tests, go straight to E2E benchmark |
+
+Generated kernels are saved to `tasks/candidate/L{level}/{op_name}.py`.
+
+---
+
+## Building Your Own Agent
+
+The agent in `agent/agent.py` is structured around a few composable pieces you can reuse or replace:
+
+### Operator Discovery
+
+```python
+from kb_nano.agent.agent import discover_operators
+
+ops = discover_operators("meta-llama/Llama-3.1-8B-Instruct", level=1)
+for op in ops:
+    print(f"L{op.level} {op.name}: {op.class_name}")
+    print(op.source_code[:200])
+```
+
+`discover_operators` returns a list of `OperatorSpec` objects, each containing the operator's name, level, class name, source code, and which models use it. This is all the context your agent needs to generate a replacement.
+
+### Prompt Construction
+
+`build_generation_prompt(op, cuda_only)` constructs a detailed prompt that includes the baseline source code, the exact class and signature requirements, and performance guidance. `build_retry_prompt(...)` takes a failed attempt and its error message to produce a corrective prompt.
+
+### Validation
+
+`validate_kernel(code, expected_class_name)` writes code to a temp file, imports it, and checks that the expected class exists and can be instantiated. Use this to gate submissions before running expensive benchmarks.
+
+### Benchmarking
+
+Once your agent has produced kernels, place them at `tasks/candidate/L{level}/{op_name}.py` and use the [benchmarking tools](/benchmarking) to evaluate them — either programmatically via `run_benchmark(...)` or from the CLI.
+
+### Experiment Tracking
+
+All `kb_nano agent` runs are automatically logged to MLflow. You can also use the [tracking API](/experiment-tracking#tracking-api) in your own agent to log kernel generations, benchmark results, and custom metrics:
+
+```python
+from kb_nano.bench.tracking import tracker
+
+with tracker.start_run("my-agent-run", params={"model": "llama", "level": 1}):
+    tracker.log_kernel("rms_norm", level=1, code=kernel_source)
+    tracker.log_metrics({"compile_time_s": 12.3, "my_score": 0.95})
+```
+
+Use `kb_nano history` to query past runs from the CLI, or `kb_nano mlflow-ui` to launch the web UI. See [Experiment Tracking](/experiment-tracking) for full details.

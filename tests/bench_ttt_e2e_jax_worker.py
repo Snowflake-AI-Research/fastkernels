@@ -1,0 +1,368 @@
+"""JAX subprocess worker for TTT-E2E benchmarking.
+
+Runs the OFFICIAL JAX/Equinox/Optax reference at github.com/test-time-training/e2e
+in an isolated process. Two modes:
+
+  --mode init_and_save
+    Build a MetaModel from the given config json, initialize all weights from
+    a deterministic seed, save the flat state dict as numpy ``.npz``. The
+    resulting file is portable: kb-nano loads from the same file via the name
+    map in ``infra/ttt_e2e_engine.py``.
+
+  --mode run_forward
+    Load weights from the npz, run ``loss_for_sequence`` on the input ids
+    (numpy file), save per-token NLL + final hidden states + per-chunk loss
+    as a numpy ``.npz`` for the parent bench harness to read back.
+
+Why a subprocess: JAX initializes its own CUDA context and global state on
+import; running it in-process with PyTorch fights for the same GPU memory and
+makes timings unreliable. Same pattern used by tests/bench_dp3.py.
+
+Run directly with the path to the cloned/vendored ttt-e2e repo on sys.path:
+
+    python -m kb_nano.tests.bench_ttt_e2e_jax_worker --help
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+
+
+def _add_ttt_e2e_to_path() -> str:
+    """Locate the ttt-e2e reference repo and add it to sys.path.
+
+    Search order:
+      1. $TTT_E2E_REPO env var (explicit override)
+      2. /tmp/ttt_e2e_ref (where this branch's bench harness clones it)
+      3. ~/ttt_e2e_ref
+    """
+    candidates = []
+    env = os.environ.get("TTT_E2E_REPO", "").strip()
+    if env:
+        candidates.append(env)
+    candidates += ["/tmp/ttt_e2e_ref", str(Path.home() / "ttt_e2e_ref")]
+    for c in candidates:
+        if c and Path(c, "ttt", "model", "transformer.py").is_file():
+            sys.path.insert(0, c)
+            return c
+    raise FileNotFoundError(
+        "Could not find the ttt-e2e reference repo. Set $TTT_E2E_REPO or "
+        "clone https://github.com/test-time-training/e2e to /tmp/ttt_e2e_ref."
+    )
+
+
+def _build_jax_config(cfg_dict: dict):
+    """Translate the portable config dict to the reference's nested dataclasses."""
+    from ttt.config import Config, SGDOptimizerConfig
+
+    cfg = Config()
+    m = cfg_dict["model"]
+    cfg.model.vocab_size = int(m["vocab_size"])
+    cfg.model.hidden_size = int(m["hidden_size"])
+    cfg.model.intermediate_size = int(m["intermediate_size"])
+    cfg.model.num_hidden_layers = int(m["num_hidden_layers"])
+    cfg.model.num_attention_heads = int(m["num_attention_heads"])
+    cfg.model.mini_batch_size = int(m["mini_batch_size"])
+    cfg.model.sliding_window_size = int(m["sliding_window_size"])
+    cfg.model.seq_len = int(m["seq_len"])
+    cfg.model.rms_norm_eps = float(m["rms_norm_eps"])
+    cfg.model.initializer_range = float(m["initializer_range"])
+    cfg.model.tie_word_embeddings = bool(m["tie_word_embeddings"])
+    cfg.model.rope_theta = float(m["rope_theta"])
+    cfg.model.suffix_len = int(m["suffix_len"])
+    cfg.model.prime = bool(m["prime"])
+    cfg.model.qk_norm = bool(m.get("qk_norm", True))
+    cfg.model.pre_norm = bool(m.get("pre_norm", True))
+    cfg.model.post_norm = bool(m.get("post_norm", True))
+    cfg.model.seq_modeling_block = "SWA"
+    cfg.model.compute_dtype = m.get("compute_dtype", "bf16")
+    cfg.model.param_dtype = m.get("param_dtype", "fp32")
+    cfg.model.state_dtype = m.get("state_dtype", "fp32")
+    cfg.model.unroll_block_scan = True
+    cfg.model.unroll_inner_scan = True
+    cfg.model.feed_forward_prime = "swiglu"
+
+    t = cfg_dict["training"]
+    cfg.training.train_mode = t["train_mode"]  # "pretrain" or "meta"
+    cfg.training.seq_length = int(t["seq_length"])
+    cfg.training.spec_inner = ["language_model.**.suffix_blocks.feed_forward_prime.**"]
+    cfg.training.ilr_init = float(t.get("ilr_init", 1.0))
+    cfg.training.ilr_warmup_steps = int(t.get("ilr_warmup_steps", 0))
+    cfg.training.optimizer_inner = SGDOptimizerConfig(
+        optimizer_type="sgd",
+        lr=float(t.get("inner_lr", 1.0)),
+        clip_gradient=float(t.get("inner_clip", 1.0)),
+    )
+    cfg.training.inner_remat_freq = 1
+    return cfg
+
+
+def _path_to_str(path) -> str:
+    parts = []
+    for k in path:
+        n = getattr(k, "name", None)
+        if n is not None:
+            parts.append(str(n))
+        elif hasattr(k, "idx"):
+            parts.append(str(k.idx))
+        elif hasattr(k, "key"):
+            parts.append(str(k.key))
+        else:
+            parts.append(str(k))
+    return ".".join(parts)
+
+
+def _is_param_array(arr) -> bool:
+    """Return True if leaf is a (real-valued) array."""
+    import jax.numpy as jnp
+    if not hasattr(arr, "dtype"):
+        return False
+    return jnp.issubdtype(arr.dtype, jnp.floating)
+
+
+_STATE_PATH_TOKENS = ("kv_cache_index", "chunk_index", "step_index")
+
+
+def _is_state_path(path_str: str) -> bool:
+    """Return True if the dotted path points inside an nn.StateIndex.
+
+    StateIndex initializers are not trainable; they're regenerated by
+    ``nn.State(model)`` and they include bf16 buffers that don't round-trip
+    cleanly through numpy savez.
+    """
+    return any(tok in path_str for tok in _STATE_PATH_TOKENS)
+
+
+def _flatten_pytree(tree, key_filter=None):
+    """Yield (str_path, np.ndarray) pairs for trainable float leaves only.
+
+    Path components joined with dots; non-float leaves (state indices, bf16
+    cache initializers) are skipped.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    flat, _ = jax.tree_util.tree_flatten_with_path(
+        tree, is_leaf=lambda x: isinstance(x, jnp.ndarray) or x is None,
+    )
+    for path, leaf in flat:
+        if leaf is None:
+            continue
+        if not _is_param_array(leaf):
+            continue
+        s = _path_to_str(path)
+        if _is_state_path(s):
+            continue
+        if key_filter is not None and not key_filter(s):
+            continue
+        yield s, np.asarray(leaf)
+
+
+def cmd_init_and_save(args) -> None:
+    repo_path = _add_ttt_e2e_to_path()
+    print(f"[jax_worker] using ttt-e2e repo at {repo_path}", flush=True)
+
+    import jax
+    import jax.random as jrandom
+    from ttt.model.transformer import MetaModel
+
+    with open(args.config) as f:
+        cfg_dict = json.load(f)
+    cfg = _build_jax_config(cfg_dict)
+
+    print(
+        f"[jax_worker] building MetaModel: hidden={cfg.model.hidden_size}, "
+        f"layers={cfg.model.num_hidden_layers}, suffix_len={cfg.model.suffix_len}, "
+        f"prime={cfg.model.prime}",
+        flush=True,
+    )
+    t0 = time.time()
+    key = jrandom.PRNGKey(int(args.seed))
+    model = MetaModel(cfg, key=key)
+    elapsed = time.time() - t0
+    print(f"[jax_worker] built in {elapsed:.2f}s", flush=True)
+
+    arrays: dict[str, np.ndarray] = {}
+    n_params = 0
+    for path, arr in _flatten_pytree(model):
+        arrays[path] = arr
+        n_params += int(np.prod(arr.shape))
+    print(
+        f"[jax_worker] flattened {len(arrays)} arrays, total params ~{n_params/1e6:.2f}M",
+        flush=True,
+    )
+
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    np.savez(args.out, **arrays)
+    print(f"[jax_worker] wrote {args.out}", flush=True)
+
+
+def cmd_run_forward(args) -> None:
+    repo_path = _add_ttt_e2e_to_path()
+    print(f"[jax_worker] using ttt-e2e repo at {repo_path}", flush=True)
+
+    import jax
+    import jax.numpy as jnp
+    import jax.random as jrandom
+    import equinox as eqx
+    from equinox import nn
+    from ttt.model.transformer import MetaModel
+    from ttt.model.data import Batch
+
+    with open(args.config) as f:
+        cfg_dict = json.load(f)
+    cfg = _build_jax_config(cfg_dict)
+
+    # Re-build model template with the same seed used for init, then overwrite
+    # leaves with values loaded from npz. We can't fully bypass the seed-based
+    # init because the model has hundreds of arrays and we need a structured
+    # template; loading just overwrites the dynamic leaves.
+    key = jrandom.PRNGKey(int(cfg_dict.get("init_seed", 0)))
+    model = MetaModel(cfg, key=key)
+
+    z = np.load(args.weights)
+    npz_keys = set(z.keys())
+
+    # Walk the same path order as flatten and replace inexact-float leaves from
+    # the npz. State buffers (StateIndex tag values, KV-cache initializers) are
+    # left at their template values from the just-built MetaModel.
+    flat, treedef = jax.tree_util.tree_flatten_with_path(
+        model, is_leaf=lambda x: isinstance(x, jnp.ndarray) or x is None,
+    )
+    new_leaves = []
+    n_loaded = 0
+    for path, leaf in flat:
+        if leaf is None:
+            new_leaves.append(None)
+            continue
+        s = _path_to_str(path)
+        if _is_state_path(s):
+            new_leaves.append(leaf)
+            continue
+        if _is_param_array(leaf) and s in npz_keys:
+            new_leaves.append(jnp.asarray(z[s]))
+            n_loaded += 1
+        else:
+            new_leaves.append(leaf)
+    model = jax.tree_util.tree_unflatten(treedef, new_leaves)
+    print(
+        f"[jax_worker] loaded {n_loaded}/{len(npz_keys)} param arrays from {args.weights}",
+        flush=True,
+    )
+
+    # Mesh required for sharding constraints in the prefix path.
+    devices = np.array(jax.devices()).reshape(1, 1)
+    mesh = jax.sharding.Mesh(devices, ("data", "state"))
+
+    state = nn.State(model)
+
+    # Read input ids
+    input_ids = np.load(args.input_ids).astype(np.int32)
+    seqlen = input_ids.shape[-1]
+    if seqlen != cfg.training.seq_length:
+        raise ValueError(
+            f"seq_length in config ({cfg.training.seq_length}) != input_ids len ({seqlen})"
+        )
+
+    target_tokens = np.concatenate([input_ids[..., 1:], input_ids[..., :1]], axis=-1)
+    loss_masks = np.ones_like(input_ids, dtype=np.float32)
+    seq = Batch(
+        input_ids=jnp.asarray(input_ids),
+        target_tokens=jnp.asarray(target_tokens),
+        loss_masks=jnp.asarray(loss_masks),
+        position_ids=None,
+    )
+
+    print(
+        f"[jax_worker] running loss_for_sequence: train_mode={cfg.training.train_mode}, "
+        f"seqlen={seqlen}, chunk={cfg.model.mini_batch_size}",
+        flush=True,
+    )
+
+    # Wrap loss_for_sequence in eqx.filter_jit so subsequent calls hit the
+    # XLA cache. Without this, every call retraces the Python code (~10-30s
+    # per 8K call for the 125m config) and the perf number is dominated by
+    # tracing, not actual GPU work — a misleading comparison vs an eager
+    # PyTorch baseline.
+    @eqx.filter_jit
+    def _jitted(model, seq, state):
+        return model.loss_for_sequence(seq, state)
+
+    # First call: traces + compiles. We measure compile separately.
+    t0 = time.time()
+    with mesh:
+        loss, metrics = _jitted(model, seq, state)
+        loss.block_until_ready()
+    compile_s = time.time() - t0
+    print(f"[jax_worker] first call (compile+run): {compile_s:.2f}s", flush=True)
+
+    runs = int(args.runs)
+    times = []
+    for i in range(runs):
+        t0 = time.time()
+        with mesh:
+            loss, metrics = _jitted(model, seq, state)
+            loss.block_until_ready()
+        times.append(time.time() - t0)
+    print(f"[jax_worker] timed runs (s): {[f'{t:.4f}' for t in times]}", flush=True)
+
+    nll = np.asarray(metrics["token_nll_loss"]).astype(np.float32)
+    out = {
+        "loss": np.asarray(loss).astype(np.float32),
+        "token_nll_loss": nll,
+        "compile_s": np.float32(compile_s),
+        "run_times_s": np.asarray(times, dtype=np.float32),
+    }
+    # For correctness debugging, also dump the final logits when explicitly
+    # requested (a separate forward; we don't need to time it).
+    if args.dump_logits:
+        with mesh:
+            # Re-run a CausalLM forward (no inner loop) to get logits.
+            from equinox import nn as _eqx_nn
+            lm_state = _eqx_nn.State(model)
+            lm_out = model.language_model(state=lm_state, seq=seq)
+            logits = np.asarray(lm_out.logits).astype(np.float32)
+        out["logits"] = logits
+        print(f"[jax_worker] dumped logits shape={logits.shape}", flush=True)
+    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    np.savez(args.out, **out)
+    print(
+        f"[jax_worker] wrote {args.out}; loss={float(loss):.4f}, "
+        f"nll mean={float(nll.mean()):.4f}, shape={nll.shape}",
+        flush=True,
+    )
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    p1 = sub.add_parser("init_and_save", help="Build MetaModel and save weights as npz.")
+    p1.add_argument("--config", required=True)
+    p1.add_argument("--seed", type=int, default=0)
+    p1.add_argument("--out", required=True)
+
+    p2 = sub.add_parser("run_forward", help="Load weights and run loss_for_sequence.")
+    p2.add_argument("--config", required=True)
+    p2.add_argument("--weights", required=True)
+    p2.add_argument("--input-ids", dest="input_ids", required=True)
+    p2.add_argument("--out", required=True)
+    p2.add_argument("--runs", type=int, default=3)
+    p2.add_argument("--dump-logits", action="store_true", help="Also dump per-token logits (CausalLM forward, no inner loop) for debugging.")
+
+    args = p.parse_args()
+    if args.cmd == "init_and_save":
+        cmd_init_and_save(args)
+    elif args.cmd == "run_forward":
+        cmd_run_forward(args)
+
+
+if __name__ == "__main__":
+    main()

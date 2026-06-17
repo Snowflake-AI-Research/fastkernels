@@ -1,0 +1,40 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "maple",
+  "name": "kb-nano",
+  "colors": {
+    "primary": "#171717",
+    "light": "#525252",
+    "dark": "#E5E5E5"
+  },
+  "background": {
+    "style": "gradient"
+  },
+  "font": {
+    "headings": { "family": "Inter", "weight": 600 },
+    "body": { "family": "Inter" }
+  },
+  "rounded": "default",
+  "navigation": {
+    "groups": [
+      {
+        "group": "Start Here",
+        "pages": ["intro", "architecture"]
+      },
+      {
+        "group": "User Guide",
+        "pages": ["benchmarking", "building-an-agent", "experiment-tracking"]
+      },
+      {
+        "group": "Developer Guide",
+        "pages": ["developer-guide"]
+      }
+    ]
+  },
+  "topbarLinks": [
+    {
+      "name": "GitHub",
+      "url": "https://github.com/sfc-gh-goliaro/kb-nano"
+    }
+  ]
+}

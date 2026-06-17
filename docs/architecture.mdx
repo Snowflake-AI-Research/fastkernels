@@ -1,0 +1,54 @@
+---
+title: Architecture
+description: The L1–L4 operator hierarchy, interface mirroring, and how to extend kb-nano.
+---
+
+kb-nano takes a **top-down, model-driven** approach: rather than collecting synthetic operators in isolation, benchmark tasks are dynamically instantiated from the configuration files of real production models. This ensures every operator is tested with realistic shapes, dtypes, and data flows. The layered hierarchy below makes it possible to benchmark a single kernel replacement while measuring its impact all the way up to full-model inference.
+
+## The L1-L4 Hierarchy
+
+All model operators live under [`tasks/baseline/`](https://github.com/sfc-gh-goliaro/kb-nano/tree/main/tasks/baseline) at four abstraction levels:
+
+- **L1** — Single-kernel ops (e.g. `rms_norm`, `silu_and_mul`, `rotary_emb`, `linear`)
+- **L2** — Multi-op blocks (e.g. `LlamaAttention`, `LlamaMLP`, `MixtralMoE`, `QKVParallelLinear`)
+- **L3** — Decoder layers (e.g. `LlamaDecoderLayer`, `MixtralDecoderLayer`)
+- **L4** — Full models (e.g. `LlamaForCausalLM`, `MixtralForCausalLM`)
+
+Higher levels compose lower ones via standard Python imports:
+
+```
+L4/llama.py (LlamaForCausalLM)
+  L3/llama_decoder.py (LlamaDecoderLayer)
+    L2/attention.py (LlamaAttention)
+      L1/store_kvcache.py, L1/flash_attn_*.py
+      L2/parallel_linear.py (QKVParallelLinear, RowParallelLinear)
+        L1/linear.py, L1/allreduce.py
+    L2/llama_mlp.py (LlamaMLP)
+      L1/silu_and_mul.py
+      L2/parallel_linear.py
+    L1/rms_norm.py
+```
+
+When you replace an L1 operator, the change propagates upward through every level that uses it. The bench suite traces these dependencies automatically via import graph analysis.
+
+---
+
+## Interface Mirroring
+
+Every module's `__init__` and `forward` signatures are designed to mirror the corresponding vLLM module. This makes it easy to port optimizations between the two codebases and ensures candidate kernels can be validated against a well-known reference.
+
+| kb-nano module | vLLM equivalent | `forward` signature |
+|---|---|---|
+| `LlamaAttention` | `LlamaAttention` | `(positions, hidden_states) -> Tensor` |
+| `LlamaDecoderLayer` | `LlamaDecoderLayer` | `(positions, hidden_states, residual) -> (Tensor, Tensor)` |
+| `QKVParallelLinear` | `QKVParallelLinear` | `(x) -> (output, bias)` |
+| `RowParallelLinear` | `RowParallelLinear` | `(x) -> (output, bias)` |
+| `MergedColumnParallelLinear` | `MergedColumnParallelLinear` | `(x) -> (output, bias)` |
+| `VocabParallelEmbedding` | `VocabParallelEmbedding` | `(input_ids) -> Tensor` |
+| `ParallelLMHead` | `ParallelLMHead` | `(hidden_states) -> Tensor` |
+| `SiluAndMul` | `SiluAndMul` | `(x) -> Tensor` |
+| `RMSNorm` | `RMSNorm` | `(x, residual=None) -> Tensor or (Tensor, Tensor)` |
+
+All parallel linear layers return `(output, bias)` tuples to match vLLM. `LlamaAttention` stores `rotary_emb` as an `__init__` parameter (not a `forward` argument), matching vLLM's design where each `LlamaAttention` owns its rotary embedding.
+
+

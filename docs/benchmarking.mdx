@@ -1,0 +1,166 @@
+---
+title: Benchmarking
+description: Three-tier benchmarking infrastructure for kernel development.
+---
+
+kb-nano uses a three-tier benchmarking system. Each tier adds scope: isolated kernels → full-model inference → multi-model evaluation sweeps.
+
+| Tier | Scope | CLI |
+|------|-------|-----|
+| 1 — Kernel | Single operator `forward()` in isolation | `kb_nano kernels` |
+| 2 — E2E | Full-model throughput, latency, serving | `kb_nano e2e` |
+| 3 — Eval | Standardized multi-model sweep | `kb_nano eval` |
+
+---
+
+## Tier 1: Kernel Benchmark
+
+Tests a single operator replacement by instantiating baseline and candidate `nn.Module`s side-by-side, copying weights, and comparing `forward()` outputs and timing across a registry of input shapes.
+
+```bash
+# Run all operators that have candidates in tasks/candidate/
+kb_nano kernels
+
+# Single operator
+kb_nano kernels --target rms_norm
+
+# Filter by model / TP / category
+kb_nano kernels --target rms_norm --model llama31 --tp 1
+
+# List available targets
+kb_nano kernels --list
+kb_nano kernels --list --level 1
+
+# Show model-to-operator mapping
+kb_nano kernels --map
+```
+
+**Key flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--target` | all | Operator name (e.g. `rms_norm`, `attention`) |
+| `--model` | all | Filter scenarios by model prefix |
+| `--tp` | all | Filter by TP degree(s) |
+| `--category` | all | Filter by category (e.g. `llm`) |
+| `--num-warmup` | 10 | Warmup iterations |
+| `--num-runs` | 100 | Timed iterations for median |
+| `--output-json` | `bench/results/kernels_<timestamp>.json` | Results path |
+
+A scenario **passes** if its max error ratio is <= 1.0, where each element's error is normalized by `atol + rtol * abs(baseline)`. FP8 outputs that return `(fp8_tensor, scale)` pairs are compared after dequantization with scale-derived tolerances. Speedup > 1.0 means faster than baseline.
+
+---
+
+## Tier 2: E2E Benchmark
+
+Full-model inference benchmarks. The CLI mirrors vLLM's interface, so the same flags work in both.
+
+```bash
+# Throughput
+kb_nano e2e throughput \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --dataset-name random --random-input-len 512 --random-output-len 128 \
+    --num-prompts 200 --tp 4
+
+# Latency
+kb_nano e2e latency \
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --input-len 128 --output-len 128
+
+# Online serving
+kb_nano e2e serve [args...]
+```
+
+---
+
+## Tier 3: Eval Sweep
+
+Runs a standardized evaluation across all candidate kernels using fixed workloads. Each job pair (baseline vs candidate) runs in an isolated subprocess to prevent contamination.
+
+```bash
+# Full sweep (auto-detects models from candidates)
+kb_nano eval
+
+# Specific model and TP
+kb_nano eval \
+    --model meta-llama/Llama-3.1-8B-Instruct --tp 1 4
+
+# Filter by category
+kb_nano eval --category llm
+
+# Control scale
+kb_nano eval --num-prompts 500 --gpu-pool 4
+```
+
+**Key flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--model` | auto | HuggingFace model name(s) |
+| `--tp` | `1 4` | TP degree(s) to evaluate |
+| `--category` | all | Filter by category |
+| `--num-prompts` | 1000 | Prompts per throughput workload |
+| `--gpu-pool` | 8 | GPUs available for scheduling |
+| `--seed` | 42 | Random seed |
+| `--output-json` | `bench/results/eval_<timestamp>.json` | Results path |
+
+### Standardized workloads
+
+Eval uses fixed, non-configurable workloads for reproducibility:
+
+**Throughput** (per model/TP pair):
+- `prefill-heavy` — 1024 input, 512 output tokens
+- `balanced` — 512 input, 512 output tokens
+- `decode-heavy` — 512 input, 1024 output tokens
+
+**Latency** (per model/TP pair):
+- `single-request` — batch 1, 128 in/out tokens
+- `fixed-batch-32` — batch 32, 128 in/out tokens
+
+### MacroEval metrics
+
+Tier 3 reports MacroEval leaderboard metrics in addition to the legacy averages:
+
+- `macro_speedup` — macro-geometric speedup across architecture families. Each valid item blends throughput and latency speedups with `lambda=0.5`, then families and the overall report use geometric means.
+- `macro_correctness` — macro-averaged calibrated correctness across families. LLM eval currently uses deterministic token alignment as the calibrated correctness signal.
+- `macro_coverage` — macro-averaged fraction of valid items per family. Invalid or failed items receive no speedup credit.
+- `macro_score` — default product score: `macro_speedup * macro_correctness * macro_coverage`.
+
+---
+
+## Input Registry
+
+Kernel benchmarks (Tier 1) draw input shapes from the small shape registry at `bench/kernels/benchmark_scenarios/small/shape_registry.yaml`. Each entry specifies tensor shapes, dtypes, and init args for a given operator input scenario. FP8 inputs should be declared as coherent FP8+scale pairs with `quantize: fp8` and `scale_arg`; the registry generates the FP8 tensor by quantizing a random source tensor and stores the matching scale tensor under `scale_arg`. Use captured inputs under `bench/kernels/benchmark_scenarios/small/captured_inputs/` for data-dependent FP8 paths such as MoE routing or packed cache layouts.
+
+The preferred registry path is workload-derived. The checked-in workload scenario
+definitions live in `bench/kernels/benchmark_scenarios/small/config.yaml`, raw traces under
+`bench/kernels/benchmark_scenarios/small/traces/`, the generated shape registry at
+`bench/kernels/benchmark_scenarios/small/shape_registry.yaml`, and the captured-input manifest under
+`bench/kernels/benchmark_scenarios/small/captured_inputs/captured_inputs_manifest.yaml`.
+
+1. `trace-inputs` runs real workloads and records raw operator-call JSONL traces with shapes, dtypes, strides, module path, occurrence order, TP degree, model key, and workload provenance.
+2. First-seen inputs for data/control-flow dependent operators are saved as `safetensors` golden data plus a JSON scalar sidecar.
+3. `build-input-registry` deduplicates by input/init structure, selects a small representative subset per operator and dtype group, writes backward-compatible YAML, and also exports representative workload-only trace JSONL.
+4. `validate-input-registry` checks loadability and golden coverage.
+
+```bash
+# Legacy config-derived manifest generator
+kb_nano generate-inputs
+
+# Workload-derived registry pipeline
+kb_nano trace-inputs --config bench/kernels/benchmark_scenarios/small/config.yaml
+kb_nano build-input-registry
+kb_nano validate-input-registry
+```
+
+---
+
+## Experiment Tracking
+
+All three benchmark tiers automatically log their results to MLflow. After any `kb_nano kernels`, `kb_nano e2e`, or `kb_nano eval` run, you can query the results with `kb_nano history` or browse them in the MLflow web UI via `kb_nano mlflow-ui`. See [Experiment Tracking](/experiment-tracking) for details.
+
+---
+
+## Conflict Resolution
+
+When multiple candidate kernels overlap (e.g. an L2 `attention` kernel internally replaces an L1 `rms_norm`), the kernel swapper detects subsumption automatically and warns. Candidates are always applied bottom-up (L1 → L4).
