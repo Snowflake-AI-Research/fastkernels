@@ -1,9 +1,9 @@
-"""CLI dispatcher for kb-nano e2e benchmarks.
+"""CLI dispatcher for fastkernels e2e benchmarks.
 
 Usage:
-    python -m kb_nano.bench.e2e throughput [args...]
-    python -m kb_nano.bench.e2e latency [args...]
-    python -m kb_nano.bench.e2e serve [args...]
+    python -m fastkernels.bench.e2e throughput [args...]
+    python -m fastkernels.bench.e2e latency [args...]
+    python -m fastkernels.bench.e2e serve [args...]
 """
 
 from __future__ import annotations
@@ -14,12 +14,12 @@ import sys
 
 def main():
     parser = argparse.ArgumentParser(
-        prog="python -m kb_nano.bench.e2e",
-        description="kb-nano end-to-end benchmarks",
+        prog="python -m fastkernels.bench.e2e",
+        description="fastkernels end-to-end benchmarks",
     )
     subparsers = parser.add_subparsers(dest="command", help="Benchmark type")
 
-    from kb_nano.bench.e2e import latency, serve, throughput
+    from fastkernels.bench.e2e import latency, serve, throughput
 
     tp = subparsers.add_parser("throughput", help="Offline throughput benchmark")
     throughput.add_cli_args(tp)
@@ -35,7 +35,7 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-    from kb_nano.bench.tracking import tracker
+    from fastkernels.bench.tracking import tracker
 
     model = getattr(args, "model", "unknown")
     tp = getattr(args, "tp", 1)

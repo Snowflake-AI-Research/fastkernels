@@ -164,7 +164,7 @@ class DeepSeekMoE(nn.Module):
         # Custom-op dispatch scaffolding (matches the other MoE L2 modules).
         # ``_use_custom_op`` is flipped to True by ``enable_custom_ops`` so
         # ``torch.compile`` sees the MoE block as an opaque
-        # ``kb_nano::moe_forward`` op (avoids tracing into CUDA stream and
+        # ``fastkernels::moe_forward`` op (avoids tracing into CUDA stream and
         # DeepGEMM pybind boundaries).
         self._use_custom_op = False
         self._layer_name = ""
@@ -198,7 +198,7 @@ class DeepSeekMoE(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self._use_custom_op:
-            return torch.ops.kb_nano.moe_forward(hidden_states, self._layer_name)
+            return torch.ops.fastkernels.moe_forward(hidden_states, self._layer_name)
         return self.forward_impl(hidden_states)
 
     def forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -262,7 +262,7 @@ class DeepSeekMoE(nn.Module):
         # ``vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py:165``
         # — and ``invoke_fused_moe_triton_kernel`` consumes them directly).
         # Cast to activation dtype only for the BF16 / "unquantized" path,
-        # which still uses kb_nano's local FusedExperts wrapper.
+        # which still uses fastkernels's local FusedExperts wrapper.
         if self.use_fp8:
             # FP8 W8A8 block-quant on Hopper + TP: vLLM's oracle
             # (``select_fp8_moe_backend`` -> ``_get_priority_backends``

@@ -80,7 +80,7 @@ def test_section_1():
     print("  SECTION 1: Input Registry")
     print(f"{'=' * 60}")
 
-    from kb_nano.bench.kernels.scenario_registry import InputRegistry
+    from fastkernels.bench.kernels.scenario_registry import InputRegistry
 
     # 1a. YAML parsing
     with _Timeout(30):
@@ -308,7 +308,7 @@ moe_grouped_gemm:
 
     # 1j. Data-dependent capture policy is input-specific
     with _Timeout(30):
-        from kb_nano.bench.kernels.scenario_schema import (
+        from fastkernels.bench.kernels.scenario_schema import (
             DATA_DEPENDENT_INPUTS,
             DATA_DEPENDENT_OPS,
         )
@@ -456,13 +456,13 @@ def test_section_2():
     print("  SECTION 2: KernelRunner")
     print(f"{'=' * 60}")
 
-    from kb_nano.bench.kernels.runner import (
+    from fastkernels.bench.kernels.runner import (
         _compare_outputs,
         _merge_correctness,
         _run_forward_once,
         _time_forward,
     )
-    from kb_nano.bench.kernels.result import OperatorResult, ScenarioResult
+    from fastkernels.bench.kernels.result import OperatorResult, ScenarioResult
 
     # 2a. Identical modules
     with _Timeout(30):
@@ -554,7 +554,7 @@ def test_section_2():
             def forward(self, x):
                 return x
 
-        from kb_nano.bench.kernels.runner import _instantiate_module
+        from fastkernels.bench.kernels.runner import _instantiate_module
         mod = _instantiate_module(ConfigModule, {"hidden_size": 32, "eps": 1e-5}, device="cpu")
         check(mod.hidden_size == 32, "2e. hidden_size=32 propagated")
         check(mod.eps == 1e-5, "2e. eps=1e-5 propagated")
@@ -570,7 +570,7 @@ def test_section_2():
 
     # 2f. Scenario filtering
     with _Timeout(30):
-        from kb_nano.bench.kernels.scenario_registry import InputRegistry
+        from fastkernels.bench.kernels.scenario_registry import InputRegistry
 
         filter_yaml = """
 rms_norm:
@@ -665,7 +665,7 @@ def test_section_3():
     print("  SECTION 3: Result dataclasses and JSON output")
     print(f"{'=' * 60}")
 
-    from kb_nano.bench.kernels.result import (
+    from fastkernels.bench.kernels.result import (
         KernelBenchResult,
         OperatorResult,
         ScenarioResult,
@@ -765,8 +765,8 @@ def test_section_3():
 
     # 3f. MacroEval aggregation
     with _Timeout(30):
-        from kb_nano.bench.eval.aggregator import Aggregator
-        from kb_nano.bench.eval.runner import JobResult
+        from fastkernels.bench.eval.aggregator import Aggregator
+        from fastkernels.bench.eval.runner import JobResult
 
         llm_valid = JobResult(
             model="model-a",
@@ -828,8 +828,8 @@ def test_section_3():
 
     # 3g. MacroEval excludes invalid/failed items from speedup credit
     with _Timeout(30):
-        from kb_nano.bench.eval.aggregator import Aggregator
-        from kb_nano.bench.eval.runner import JobResult
+        from fastkernels.bench.eval.aggregator import Aggregator
+        from fastkernels.bench.eval.runner import JobResult
 
         llm_valid = JobResult(
             model="llm-valid",
@@ -902,8 +902,8 @@ def test_section_3():
 
     # 3h. MacroEval JSON schema and terminal output
     with _Timeout(30):
-        from kb_nano.bench.eval.aggregator import Aggregator
-        from kb_nano.bench.eval.runner import JobResult
+        from fastkernels.bench.eval.aggregator import Aggregator
+        from fastkernels.bench.eval.runner import JobResult
 
         report = Aggregator.aggregate([
             JobResult(
@@ -969,7 +969,7 @@ def test_section_4():
     print("  SECTION 4: Standardized workloads")
     print(f"{'=' * 60}")
 
-    from kb_nano.bench.utils.workloads import (
+    from fastkernels.bench.utils.workloads import (
         LATENCY_WORKLOADS,
         THROUGHPUT_WORKLOADS,
         get_max_seq_len,
@@ -1043,7 +1043,7 @@ def test_section_4():
 def _can_discover_targets() -> bool:
     """Check if target discovery works (requires sgl_kernel and other CUDA deps)."""
     try:
-        from kb_nano.infra.kernel_swapper import discover_targets
+        from fastkernels.infra.kernel_swapper import discover_targets
         discover_targets()
         return True
     except Exception as exc:
@@ -1056,7 +1056,7 @@ def test_section_5():
     print("  SECTION 5: Multi-level conflict resolution")
     print(f"{'=' * 60}")
 
-    from kb_nano.infra.kernel_swapper import (
+    from fastkernels.infra.kernel_swapper import (
         BenchTarget,
         _detect_subsumption,
         _sort_by_level,
@@ -1083,7 +1083,7 @@ def test_section_5():
         if not has_targets:
             print("    SKIP  5b. sgl_kernel not available, cannot discover targets")
         else:
-            from kb_nano.infra.kernel_swapper import get
+            from fastkernels.infra.kernel_swapper import get
 
             rms_target = get("rms_norm")
             llama_decoder_target = get("llama_decoder")
@@ -1131,7 +1131,7 @@ def test_section_5():
         if not has_targets:
             print("    SKIP  5d. sgl_kernel not available, cannot discover targets")
         else:
-            from kb_nano.infra.kernel_swapper import get, patch_class, restore
+            from fastkernels.infra.kernel_swapper import get, patch_class, restore
             rms_target = get("rms_norm")
             rms_module = importlib.import_module(f"{PACKAGE_NAME}.{rms_target.module_path}")
             original_cls = rms_target.target_cls
@@ -1164,7 +1164,7 @@ def test_section_5():
         if not has_targets:
             print("    SKIP  5e. sgl_kernel not available, cannot discover targets")
         else:
-            from kb_nano.infra.kernel_swapper import (
+            from fastkernels.infra.kernel_swapper import (
                 list_targets, models_for_target, targets_for_model,
             )
 
@@ -1229,7 +1229,7 @@ def test_section_6():
     # 6b. bench.e2e CLI
     with _Timeout(30):
         result = subprocess.run(
-            [sys.executable, "-m", "kb_nano.bench.e2e", "--help"],
+            [sys.executable, "-m", "fastkernels.bench.e2e", "--help"],
             capture_output=True, text=True, timeout=30,
             cwd=PROJECT_ROOT,
             env={**os.environ, "PYTHONPATH": PROJECT_ROOT},
@@ -1260,7 +1260,7 @@ def test_section_6():
     # 6c. bench.eval CLI
     with _Timeout(30):
         result = subprocess.run(
-            [sys.executable, "-m", "kb_nano.bench.eval", "--help"],
+            [sys.executable, "-m", "fastkernels.bench.eval", "--help"],
             capture_output=True, text=True, timeout=30,
             cwd=PROJECT_ROOT,
             env={**os.environ, "PYTHONPATH": PROJECT_ROOT},
@@ -1280,7 +1280,7 @@ def test_section_6():
 
     # 6d. Default JSON output path
     with _Timeout(30):
-        from kb_nano import RESULTS_DIR, run_output_path
+        from fastkernels import RESULTS_DIR, run_output_path
 
         kernels_default = run_output_path("kernels")
         check(
@@ -1424,7 +1424,7 @@ print(json.dumps({{
             with tempfile.TemporaryDirectory() as tmpdir:
                 json_path = os.path.join(tmpdir, "kernels.json")
                 result = subprocess.run(
-                    [sys.executable, "-m", "kb_nano.bench.kernels",
+                    [sys.executable, "-m", "fastkernels.bench.kernels",
                      "--target", "rms_norm",
                      "--output-json", json_path,
                      "--num-warmup", "2", "--num-runs", "5"],
@@ -1455,7 +1455,7 @@ print(json.dumps({{
 
     # 7d. All-candidates default (skip if no candidates exist)
     with _Timeout(360):
-        from kb_nano.infra.kernel_swapper import discover_candidates
+        from fastkernels.infra.kernel_swapper import discover_candidates
         candidates = discover_candidates()
         if not candidates:
             print("    SKIP  7d. no candidate kernels found, skipping all-candidates test")
@@ -1464,7 +1464,7 @@ print(json.dumps({{
                 json_path = os.path.join(tmpdir, "all.json")
                 try:
                     result = subprocess.run(
-                        [sys.executable, "-m", "kb_nano.bench.kernels",
+                        [sys.executable, "-m", "fastkernels.bench.kernels",
                          "--output-json", json_path,
                          "--num-warmup", "2", "--num-runs", "5"],
                         timeout=300, cwd=PROJECT_ROOT,
@@ -1499,7 +1499,7 @@ def test_section_8():
             json_path = os.path.join(tmpdir, "throughput.json")
             try:
                 result = subprocess.run(
-                    [sys.executable, "-m", "kb_nano.bench.e2e", "throughput",
+                    [sys.executable, "-m", "fastkernels.bench.e2e", "throughput",
                      "--model", "meta-llama/Llama-3.1-8B-Instruct",
                      "--tp", "1",
                      "--dataset-name", "random",
@@ -1532,7 +1532,7 @@ def test_section_8():
             json_path = os.path.join(tmpdir, "latency.json")
             try:
                 result = subprocess.run(
-                    [sys.executable, "-m", "kb_nano.bench.e2e", "latency",
+                    [sys.executable, "-m", "fastkernels.bench.e2e", "latency",
                      "--model", "meta-llama/Llama-3.1-8B-Instruct",
                      "--batch-size", "1",
                      "--input-len", "128",
@@ -1574,7 +1574,7 @@ def test_section_9():
 
     # 9a. Single-model eval (requires at least one candidate)
     with _Timeout(660):
-        from kb_nano.infra.kernel_swapper import discover_candidates
+        from fastkernels.infra.kernel_swapper import discover_candidates
         candidates = discover_candidates()
         if not candidates:
             print("    SKIP  9a. no candidate kernels, skipping eval test")
@@ -1583,7 +1583,7 @@ def test_section_9():
                 json_path = os.path.join(tmpdir, "eval.json")
                 try:
                     result = subprocess.run(
-                        [sys.executable, "-m", "kb_nano.bench.eval",
+                        [sys.executable, "-m", "fastkernels.bench.eval",
                          "--model", "meta-llama/Llama-3.1-8B-Instruct",
                          "--tp", "1",
                          "--num-prompts", "10",
@@ -1656,7 +1656,7 @@ finally:
 
     # 9c. JSON default save path
     with _Timeout(30):
-        from kb_nano import RESULTS_DIR, run_output_path
+        from fastkernels import RESULTS_DIR, run_output_path
 
         default_output = run_output_path("eval")
         check(
@@ -1668,8 +1668,8 @@ finally:
 
     # 9d. MacroEval report integration schema
     with _Timeout(30):
-        from kb_nano.bench.eval.aggregator import Aggregator
-        from kb_nano.bench.eval.runner import JobResult
+        from fastkernels.bench.eval.aggregator import Aggregator
+        from fastkernels.bench.eval.runner import JobResult
 
         report = Aggregator.aggregate([
             JobResult(
@@ -1717,7 +1717,7 @@ finally:
 # ===========================================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="Test the kb-nano benchmarking infrastructure",
+        description="Test the fastkernels benchmarking infrastructure",
     )
     parser.add_argument(
         "--section", type=int, default=None,
@@ -1726,7 +1726,7 @@ def main():
     args = parser.parse_args()
 
     print("=" * 60)
-    print("  kb-nano benchmarking infrastructure tests")
+    print("  fastkernels benchmarking infrastructure tests")
     print("=" * 60)
 
     sections = {

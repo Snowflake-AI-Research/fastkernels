@@ -164,7 +164,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     repo_root, _ = _repo_paths()
-    from kb_nano.bench.utils.real_prompts import (
+    from fastkernels.bench.utils.real_prompts import (
         DEFAULT_WORKLOAD_DATASETS,
         load_real_prompt_workload,
     )
@@ -222,7 +222,7 @@ def main() -> None:
             (result_dir / name / "vllm_outputs.json").read_text()
         )["outputs"]
         kb_out = json.loads(
-            (result_dir / name / "kb_nano_outputs.json").read_text()
+            (result_dir / name / "fastkernels_outputs.json").read_text()
         )["outputs"]
         v_tokens = [vllm_out[i]["token_ids"] for i in indices]
         kb_tokens = [kb_out[i]["token_ids"] for i in indices]
@@ -237,12 +237,12 @@ def main() -> None:
         kb_stats = _rank_stats(kb_ranks)
         summary["scenarios"][name] = {
             "vllm_self": v_stats,
-            "kb_nano": kb_stats,
+            "fastkernels": kb_stats,
             "vllm_per_request": v_per,
             "kb_per_request": kb_per,
         }
         print(f"  vLLM self: {_fmt(v_stats)}", flush=True)
-        print(f"  kb-nano  : {_fmt(kb_stats)}", flush=True)
+        print(f"  fastkernels  : {_fmt(kb_stats)}", flush=True)
 
     summary_path = repo_root / args.summary
     summary_path.parent.mkdir(parents=True, exist_ok=True)

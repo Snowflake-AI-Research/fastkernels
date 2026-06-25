@@ -3,7 +3,7 @@
 Mirrors vLLM's ``CustomOp`` dispatch pattern:
   - ``forward_cuda``: calls vLLM's ``torch.ops._C.rms_norm`` /
     ``torch.ops._C.fused_add_rms_norm`` CUDA kernels for bitwise-identical
-    numerics with vLLM.  Falls back to ``kb_nano_norm.*`` if vLLM ops
+    numerics with vLLM.  Falls back to ``fastkernels_norm.*`` if vLLM ops
     are not available.
   - ``forward_native``: pure PyTorch implementation (f32 promotion, variance,
     rsqrt, weight multiply).  Used when torch.compile is active so Inductor
@@ -45,7 +45,7 @@ except ImportError:
 # These are used in eager mode and as CUDA graph replay targets.
 # ---------------------------------------------------------------------------
 
-_lib = torch.library.Library("kb_nano_norm", "DEF")
+_lib = torch.library.Library("fastkernels_norm", "DEF")
 
 _lib.define("rmsnorm(Tensor! result, Tensor input, Tensor weight, float eps) -> ()")
 
@@ -123,7 +123,7 @@ class RMSNorm(nn.Module):
 
     # -- CUDA kernel path (used in eager mode / CUDA graph replay) --
     # Prefers vLLM's CUDA kernels for bitwise-identical numerics;
-    # falls back to kb-nano's own kernels when vLLM is unavailable.
+    # falls back to fastkernels's own kernels when vLLM is unavailable.
 
     @staticmethod
     def forward_cuda(
@@ -144,10 +144,10 @@ class RMSNorm(nn.Module):
             else:
                 if residual is None:
                     out = torch.empty_like(x)
-                    torch.ops.kb_nano_norm.rmsnorm(out, x, weight, eps)
+                    torch.ops.fastkernels_norm.rmsnorm(out, x, weight, eps)
                     return out
                 else:
-                    torch.ops.kb_nano_norm.fused_add_rmsnorm(
+                    torch.ops.fastkernels_norm.fused_add_rmsnorm(
                         x, residual, weight, eps,
                     )
                     return x, residual

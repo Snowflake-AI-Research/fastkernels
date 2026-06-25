@@ -203,7 +203,7 @@ class DINOv3Model(nn.Module):
 
 
 def _remap_timm_to_kb(timm_sd: dict) -> dict:
-    """Remap timm Eva state dict keys to kb-nano DINOv3Model keys.
+    """Remap timm Eva state dict keys to fastkernels DINOv3Model keys.
 
     timm keys:
         patch_embed.proj.weight/bias -> patch_embed.weight/bias

@@ -210,7 +210,7 @@ def _activation_quant_int8_kernel(
     tl.store(S_ptr + pid, scale.to(tl.bfloat16))
 
 
-_bn_lib_q = torch.library.Library("kb_nano_bitnet_q", "DEF")
+_bn_lib_q = torch.library.Library("fastkernels_bitnet_q", "DEF")
 _bn_lib_q.define(
     "act_quant_int8(Tensor x, Tensor! q_out, Tensor! s_out) -> ()"
 )
@@ -249,7 +249,7 @@ def _activation_quant_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]
     M, K = x.shape
     q_out = torch.empty_like(x, dtype=torch.int8)
     s_out = torch.empty(M, dtype=torch.bfloat16, device=x.device)
-    torch.ops.kb_nano_bitnet_q.act_quant_int8(x, q_out, s_out)
+    torch.ops.fastkernels_bitnet_q.act_quant_int8(x, q_out, s_out)
     return q_out, s_out
 
 
@@ -310,7 +310,7 @@ def _official_shape_supported(m: int, n: int, k: int) -> bool:
     }
 
 
-_bn_official_lib = torch.library.Library("kb_nano_bitnet_official", "DEF")
+_bn_official_lib = torch.library.Library("fastkernels_bitnet_official", "DEF")
 _bn_official_lib.define(
     "int8xint2_gemm(Tensor input_int8, Tensor act_scale, Tensor weight, "
     "Tensor weight_scale, Tensor! output) -> ()"
@@ -379,7 +379,7 @@ def bitnet_int8xint2_linear_official(
         )
     q_int8, act_scale = _activation_quant_int8(x_2d)
     out = torch.empty(x_2d.shape[0], n, dtype=torch.bfloat16, device=x.device)
-    torch.ops.kb_nano_bitnet_official.int8xint2_gemm(
+    torch.ops.fastkernels_bitnet_official.int8xint2_gemm(
         q_int8, act_scale, weight, weight_scale, out,
     )
     return out.reshape(*in_shape[:-1], n)
@@ -387,10 +387,10 @@ def bitnet_int8xint2_linear_official(
 
 # ---------------------------------------------------------------------------
 # torch.library custom op — opaque to torch.compile (mirrors fp8_linear's
-# ``kb_nano_fp8::fp8_gemm_nt`` pattern).
+# ``fastkernels_fp8::fp8_gemm_nt`` pattern).
 # ---------------------------------------------------------------------------
 
-_bn_lib = torch.library.Library("kb_nano_bitnet", "DEF")
+_bn_lib = torch.library.Library("fastkernels_bitnet", "DEF")
 
 _bn_lib.define(
     "int8xint2_gemm(Tensor input_int8, Tensor act_scale, "
@@ -493,7 +493,7 @@ def bitnet_int8xint2_linear(
     q_int8, act_scale = _activation_quant_int8(x_2d)
 
     out = torch.empty(M, N, dtype=torch.bfloat16, device=x.device)
-    torch.ops.kb_nano_bitnet.int8xint2_gemm(
+    torch.ops.fastkernels_bitnet.int8xint2_gemm(
         q_int8, act_scale, weight, weight_scale, bias, out,
     )
 

@@ -9,7 +9,7 @@ Compilation flow:
    ``torch.compile`` call.
 2. Dynamo traces the model **once** (guards dropped via
    ``skip_all_guards_unsafe``).
-3. ``KBNanoBackend`` receives the FX graph, splits it at attention
+3. ``FastKernelsBackend`` receives the FX graph, splits it at attention
    custom-op boundaries.
 4. Each non-splitting subgraph is compiled **once** with ``compile_fx``
    using fake/symbolic args extracted from graph placeholder metadata.
@@ -63,10 +63,10 @@ logger = logging.getLogger(__name__)
 # by default.
 
 SPLITTING_OPS: list[str] = [
-    "kb_nano::unified_attention",
-    "kb_nano::mamba2_conv_ssm_forward",
-    "kb_nano::unified_mla_attention",
-    "kb_nano::sparse_attn_indexer",
+    "fastkernels::unified_attention",
+    "fastkernels::mamba2_conv_ssm_forward",
+    "fastkernels::unified_mla_attention",
+    "fastkernels::sparse_attn_indexer",
 ]
 
 
@@ -196,7 +196,7 @@ def ensure_custom_ops_registered() -> None:
         return
     _registered = True
 
-    lib = torch.library.Library("kb_nano", "DEF")
+    lib = torch.library.Library("fastkernels", "DEF")
 
     lib.define(
         "moe_forward(Tensor hidden_states, str layer_name) -> Tensor"
@@ -204,7 +204,7 @@ def ensure_custom_ops_registered() -> None:
     lib.impl("moe_forward", _moe_forward_impl, "CUDA")
     lib.impl("moe_forward", _moe_forward_impl, "CPU")
 
-    abstract_lib = torch.library.Library("kb_nano", "IMPL", "Meta")
+    abstract_lib = torch.library.Library("fastkernels", "IMPL", "Meta")
     abstract_lib.impl("moe_forward", _moe_forward_fake)
 
     lib.define(
@@ -449,7 +449,7 @@ class PostGradPassManager(torch._inductor.custom_graph_pass.CustomGraphPass):
 
 
 def configure_post_grad_passes() -> None:
-    """Install the kb_nano post-grad pass manager into Inductor config."""
+    """Install the fastkernels post-grad pass manager into Inductor config."""
     pm = PostGradPassManager()
     torch._inductor.config.post_grad_custom_post_pass = pm
     logger.info("Installed PostGradPassManager with passes: %s",
@@ -457,7 +457,7 @@ def configure_post_grad_passes() -> None:
 
 
 def remove_post_grad_passes() -> None:
-    """Remove kb_nano post-grad passes from Inductor config."""
+    """Remove fastkernels post-grad passes from Inductor config."""
     torch._inductor.config.post_grad_custom_post_pass = None
 
 
@@ -876,10 +876,10 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
 
 
 # ===================================================================
-# KBNano Dynamo backend (mirrors vLLM's VllmBackend)
+# FastKernels Dynamo backend (mirrors vLLM's VllmBackend)
 # ===================================================================
 
-class KBNanoBackend:
+class FastKernelsBackend:
     """Custom Dynamo backend that mirrors vLLM's VllmBackend.
 
     Called **exactly once** by Dynamo (guards are dropped). It:
@@ -904,10 +904,10 @@ class KBNanoBackend:
         graph: fx.GraphModule,
         example_inputs: list[torch.Tensor],
     ) -> Any:
-        assert not self._called, "KBNanoBackend should only be called once"
+        assert not self._called, "FastKernelsBackend should only be called once"
         self._called = True
 
-        logger.info("KBNanoBackend: splitting graph at %s", self.splitting_ops)
+        logger.info("FastKernelsBackend: splitting graph at %s", self.splitting_ops)
 
         split_gm, piecewise_graphs = split_graph(graph, self.splitting_ops)
 
@@ -918,7 +918,7 @@ class KBNanoBackend:
         ]
 
         logger.info(
-            "KBNanoBackend: %d subgraphs (%d compilable, %d splitting ops)",
+            "FastKernelsBackend: %d subgraphs (%d compilable, %d splitting ops)",
             len(piecewise_graphs),
             len(compile_submod_names),
             len(piecewise_graphs) - len(compile_submod_names),
@@ -941,7 +941,7 @@ class KBNanoBackend:
             cudagraph_enabled=self.cudagraph_enabled,
         ).run(*fake_args)
 
-        logger.info("KBNanoBackend: compilation complete")
+        logger.info("FastKernelsBackend: compilation complete")
 
         return split_gm
 
@@ -954,7 +954,7 @@ def compile_model(
     model: torch.nn.Module,
     cudagraph_enabled: bool = True,
 ) -> torch.nn.Module:
-    """Apply torch.compile with the KBNano backend.
+    """Apply torch.compile with the FastKernels backend.
 
     Mirrors vLLM's compilation flow:
     1. Register and enable custom ops for attention/MoE
@@ -962,7 +962,7 @@ def compile_model(
        shapes
     3. ``fullgraph=True`` — single graph, no graph breaks
     4. ``skip_all_guards_unsafe`` — Dynamo never re-traces
-    5. ``KBNanoBackend`` — splits, compiles with symbolic shapes, deduplicates
+    5. ``FastKernelsBackend`` — splits, compiles with symbolic shapes, deduplicates
 
     The model is compiled once, then reused for all batch sizes.
     """
@@ -971,7 +971,7 @@ def compile_model(
 
     PiecewiseBackend._loaded_artifacts.clear()
 
-    backend = KBNanoBackend(
+    backend = FastKernelsBackend(
         cudagraph_enabled=cudagraph_enabled,
     )
 
@@ -994,14 +994,14 @@ def compile_model(
     torch._dynamo.config.cache_size_limit = 2048
     torch._dynamo.config.accumulated_cache_size_limit = 8192
 
-    model._kb_nano_compiled = compiled  # type: ignore[attr-defined]
-    model._kb_nano_cache_restore = (  # type: ignore[attr-defined]
+    model._fastkernels_compiled = compiled  # type: ignore[attr-defined]
+    model._fastkernels_cache_restore = (  # type: ignore[attr-defined]
         original_cache_size, original_accumulated
     )
-    model._kb_nano_first_call = True  # type: ignore[attr-defined]
+    model._fastkernels_first_call = True  # type: ignore[attr-defined]
 
     logger.info(
-        "Model wrapped with KBNanoBackend (piecewise compile, "
+        "Model wrapped with FastKernelsBackend (piecewise compile, "
         "symbolic shapes, autograd_cache_key dedup)"
     )
     return compiled

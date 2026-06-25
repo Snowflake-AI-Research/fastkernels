@@ -9,7 +9,7 @@ continuation tokens. This avoids treating the generated continuation as a
 standalone prompt.
 
 Examples:
-    # Score both vLLM and kb-nano outputs from a bench_vllm.py run.
+    # Score both vLLM and fastkernels outputs from a bench_vllm.py run.
     python tests/analyze_prefill_token_ranks.py \
         --model moonshotai/Kimi-Linear-48B-A3B-Instruct \
         --bench-output-dir tmp/readme_kimi_linear_full_vs_vllm_rerun \
@@ -20,7 +20,7 @@ Examples:
     # Generic mode: score saved token IDs as one standalone prompt.
     python tests/analyze_prefill_token_ranks.py \
         --model moonshotai/Kimi-Linear-48B-A3B-Instruct \
-        --input-json tmp/run/balanced/kb_nano_outputs.json \
+        --input-json tmp/run/balanced/fastkernels_outputs.json \
         --input-mode token_ids \
         --tp 2
 """
@@ -44,7 +44,7 @@ def _needs_trust_remote_code(model_name: str) -> bool:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Analyze saved vLLM/kb-nano outputs with vLLM prompt prefill.",
+        description="Analyze saved vLLM/fastkernels outputs with vLLM prompt prefill.",
     )
     parser.add_argument("--model", required=True, help="Model name or path for vLLM.")
 
@@ -67,7 +67,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--engine",
-        choices=("both", "vllm", "kb_nano"),
+        choices=("both", "vllm", "fastkernels"),
         default="both",
         help="Which engine outputs to score in --bench-output-dir mode.",
     )
@@ -169,7 +169,7 @@ def _load_bench_records(
     if not isinstance(scenarios, list) or not scenarios:
         raise ValueError(f"{results_path} has no throughput scenarios")
 
-    engines = ("vllm", "kb_nano") if engine_filter == "both" else (engine_filter,)
+    engines = ("vllm", "fastkernels") if engine_filter == "both" else (engine_filter,)
     records: list[dict[str, Any]] = []
     for scenario_idx, scenario in enumerate(scenarios):
         name = scenario.get("scenario")

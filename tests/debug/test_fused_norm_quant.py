@@ -25,9 +25,9 @@ torch.set_grad_enabled(False)
 
 def test_fused_norm_quant():
     import math
-    from kb_nano.tasks.baseline.L1.csrc import _C
-    from kb_nano.tasks.baseline.L1.fp8_linear import PerTokenGroupQuantFp8
-    from kb_nano.tasks.baseline.L1.rmsnorm_quant import RMSNormFP8Quant
+    from fastkernels.tasks.baseline.L1.csrc import _C
+    from fastkernels.tasks.baseline.L1.fp8_linear import PerTokenGroupQuantFp8
+    from fastkernels.tasks.baseline.L1.rmsnorm_quant import RMSNormFP8Quant
 
     per_token_group_quant_fp8 = PerTokenGroupQuantFp8()
     rmsnorm_fp8_quant = RMSNormFP8Quant()

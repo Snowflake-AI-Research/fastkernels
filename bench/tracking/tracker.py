@@ -1,6 +1,6 @@
-"""MLflow tracking facade for kb_nano.
+"""MLflow tracking facade for fastkernels.
 
-All MLflow interaction is isolated in this module.  Other kb_nano code
+All MLflow interaction is isolated in this module.  Other fastkernels code
 imports ``tracker`` and calls its functions; no other module should
 import ``mlflow`` directly.
 
@@ -17,8 +17,8 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from kb_nano.bench.eval.aggregator import EvalReport
-    from kb_nano.bench.kernels.result import KernelBenchResult
+    from fastkernels.bench.eval.aggregator import EvalReport
+    from fastkernels.bench.kernels.result import KernelBenchResult
 
 # ---------------------------------------------------------------------------
 # Lazy mlflow handle
@@ -47,12 +47,12 @@ def _ensure_init() -> bool:
             _warned = True
             warnings.warn(
                 "mlflow is not installed — experiment tracking is disabled. "
-                "Install with: pip install 'kb_nano[tracking]'",
+                "Install with: pip install 'fastkernels[tracking]'",
                 stacklevel=3,
             )
         return False
 
-    from kb_nano import MLFLOW_TRACKING_DIR
+    from fastkernels import MLFLOW_TRACKING_DIR
 
     tracking_uri = f"file://{MLFLOW_TRACKING_DIR}"
     _mlflow.set_tracking_uri(tracking_uri)
@@ -83,7 +83,7 @@ def _safe(fn):
 def start_run(
     name: str,
     params: dict[str, Any] | None = None,
-    experiment: str = "kb_nano",
+    experiment: str = "fastkernels",
     tags: dict[str, str] | None = None,
 ):
     """Open an MLflow run.  Use as a context manager.
@@ -95,7 +95,7 @@ def start_run(
     params : dict, optional
         Run parameters to log (model, level, tp, …).
     experiment : str
-        MLflow experiment name (default ``"kb_nano"``).
+        MLflow experiment name (default ``"fastkernels"``).
     tags : dict, optional
         Extra MLflow tags.
 
@@ -153,12 +153,12 @@ def log_kernel(
 # ---------------------------------------------------------------------------
 @_safe
 def log_kernel_bench(result: KernelBenchResult) -> None:
-    """Log a ``KernelBenchResult`` (from ``kb_nano kernels``).
+    """Log a ``KernelBenchResult`` (from ``fastkernels kernels``).
 
     Logs per-operator and per-scenario metrics, plus aggregate totals.
     Candidate kernel source files are stored as artifacts.
     """
-    from kb_nano import CANDIDATE_DIR
+    from fastkernels import CANDIDATE_DIR
 
     for op in result.operators:
         _mlflow.log_metric(f"{op.target}_avg_speedup", op.avg_speedup)
@@ -199,7 +199,7 @@ def log_kernel_bench(result: KernelBenchResult) -> None:
 # ---------------------------------------------------------------------------
 @_safe
 def log_eval(report: EvalReport) -> None:
-    """Log an ``EvalReport`` (from ``kb_nano eval``)."""
+    """Log an ``EvalReport`` (from ``fastkernels eval``)."""
     for cat in report.categories:
         for m in cat.models:
             if m.status == "FAILED":
@@ -297,10 +297,10 @@ def log_metrics(metrics: dict[str, float]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Query helpers (for ``kb_nano history``)
+# Query helpers (for ``fastkernels history``)
 # ---------------------------------------------------------------------------
 def query_runs(
-    experiment: str = "kb_nano",
+    experiment: str = "fastkernels",
     filter_string: str | None = None,
     max_results: int = 50,
 ) -> list[dict]:

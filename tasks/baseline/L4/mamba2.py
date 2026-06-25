@@ -1,6 +1,6 @@
 """Standalone Mamba2 model implementation (Codestral / SSD architecture).
 
-Follows kb_nano's ``LlamaForCausalLM`` interface:
+Follows fastkernels's ``LlamaForCausalLM`` interface:
 ``forward(input_ids, positions)`` returning hidden states; ``compute_logits``
 performs the LM-head projection separately.
 

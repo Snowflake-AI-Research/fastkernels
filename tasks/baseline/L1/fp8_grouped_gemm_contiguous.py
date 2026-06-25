@@ -105,7 +105,7 @@ def _resolve_alignment() -> int:
 # in ``fp8_linear.py``.
 # ---------------------------------------------------------------------------
 
-_gemm_lib = torch.library.Library("kb_nano_fp8_moe", "DEF")
+_gemm_lib = torch.library.Library("fastkernels_fp8_moe", "DEF")
 
 _gemm_lib.define(
     "m_grouped_gemm_nt_contiguous(Tensor a_fp8, Tensor a_scale, "
@@ -172,7 +172,7 @@ class Fp8GroupedGemmContiguous(nn.Module):
         c_bf16: torch.Tensor,
         expert_ids: torch.Tensor,
     ) -> None:
-        torch.ops.kb_nano_fp8_moe.m_grouped_gemm_nt_contiguous(
+        torch.ops.fastkernels_fp8_moe.m_grouped_gemm_nt_contiguous(
             a_fp8, a_scale, b_fp8, b_scale, c_bf16, expert_ids,
             self._disable_ue8m0_cast,
         )

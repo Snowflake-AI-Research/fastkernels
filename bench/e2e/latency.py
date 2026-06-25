@@ -1,10 +1,10 @@
-"""Single-batch latency benchmark for kb-nano.
+"""Single-batch latency benchmark for fastkernels.
 
 Modeled after ``vllm bench latency``. Runs a fixed batch of requests repeatedly
 and measures per-iteration latency with percentile reporting.
 
 Usage:
-    python -m kb_nano.bench.e2e latency \\
+    python -m fastkernels.bench.e2e latency \\
         --model meta-llama/Llama-3.1-8B-Instruct \\
         --batch-size 8 --input-len 512 --output-len 128 \\
         --num-iters 30
@@ -24,7 +24,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from kb_nano.infra.kernel_swapper import (
+from fastkernels.infra.kernel_swapper import (
     apply_candidates,
     discover_candidates,
     print_candidate_summary,
@@ -122,10 +122,10 @@ def main(args: argparse.Namespace):
             print_candidate_summary(candidates)
             undo_info = apply_candidates(candidates)
 
-    from kb_nano.infra.engine import LlamaEngine, SamplingParams
+    from fastkernels.infra.engine import LlamaEngine, SamplingParams
 
     print("=" * 70)
-    print("  kb-nano Latency Benchmark")
+    print("  fastkernels Latency Benchmark")
     print("=" * 70)
     print(f"  Model          : {args.model}")
     print(f"  TP             : {args.tp}")
@@ -210,14 +210,14 @@ def main(args: argparse.Namespace):
     }
 
     # Log to MLflow
-    from kb_nano.bench.tracking import tracker
+    from fastkernels.bench.tracking import tracker
 
     tracker.log_e2e(results, bench_type="latency")
 
     if args.output_json:
         output_json = args.output_json
     else:
-        from kb_nano import run_output_path
+        from fastkernels import run_output_path
         output_json = str(run_output_path("latency"))
 
     os.makedirs(os.path.dirname(output_json) or ".", exist_ok=True)
@@ -245,5 +245,5 @@ def main(args: argparse.Namespace):
     del engine
 
     if undo_info is not None:
-        from kb_nano.infra.kernel_swapper import restore
+        from fastkernels.infra.kernel_swapper import restore
         restore(undo_info)

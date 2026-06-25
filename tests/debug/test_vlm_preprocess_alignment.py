@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-VLM preprocessing alignment test: kb-nano vs vLLM.
+VLM preprocessing alignment test: fastkernels vs vLLM.
 
 Loads a small set of images (VisionArena) and videos (MMVU), runs the
 HuggingFace processor through both engines, and compares:
   - token_ids (should be identical)
   - image_grid_thw / video_grid_thw (should be identical)
   - pixel_values (should be within floating-point tolerance)
-  - preprocessing wall-clock time (kb-nano should not be slower)
+  - preprocessing wall-clock time (fastkernels should not be slower)
 
 Both workers use the same shared _preload_mm_data / _load_video_opencv
 functions (no vLLM imports in data loading).
@@ -261,9 +261,9 @@ if __name__ == "__main__":
 
 
 # ---------------------------------------------------------------------------
-# kb-nano preprocessing worker (no vLLM imports)
+# fastkernels preprocessing worker (no vLLM imports)
 # ---------------------------------------------------------------------------
-KB_NANO_PREPROCESS_WORKER = _MM_PRELOAD_FN + r'''
+FASTKERNELS_PREPROCESS_WORKER = _MM_PRELOAD_FN + r'''
 import json, os, sys, time
 import numpy as np
 
@@ -329,7 +329,7 @@ def main():
             }
 
             npz_idx = len(results)
-            npz_path = os.path.join(cfg["npz_dir"], f"kbnano_{npz_idx}.npz")
+            npz_path = os.path.join(cfg["npz_dir"], f"fastkernels_{npz_idx}.npz")
             save_dict = {}
             if pv is not None:
                 save_dict["pixel_values"] = pv.numpy()
@@ -341,7 +341,7 @@ def main():
 
             results.append(entry)
         elapsed = time.perf_counter() - t0
-        print(f"  kb-nano preprocess {ds_cfg['name']}: {len(mm_data)} items in {elapsed:.2f}s")
+        print(f"  fastkernels preprocess {ds_cfg['name']}: {len(mm_data)} items in {elapsed:.2f}s")
 
     with open(cfg["output_file"], "w") as f:
         json.dump({"results": results}, f)
@@ -398,7 +398,7 @@ def run_worker(script: str, config: dict, label: str, timeout: int = 3600):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="VLM preprocessing alignment test: kb-nano vs vLLM",
+        description="VLM preprocessing alignment test: fastkernels vs vLLM",
     )
     parser.add_argument("--model", type=str, default="Qwen/Qwen2-VL-7B-Instruct")
     parser.add_argument("--num-images", type=int, default=5)
@@ -452,11 +452,11 @@ def main():
         sys.exit(1)
 
     kb_data = run_worker(
-        KB_NANO_PREPROCESS_WORKER, dict(config),
-        f"kb-nano preprocessing [{args.model}]",
+        FASTKERNELS_PREPROCESS_WORKER, dict(config),
+        f"fastkernels preprocessing [{args.model}]",
     )
     if kb_data is None:
-        print("\n  FAIL: kb-nano preprocessing worker failed.")
+        print("\n  FAIL: fastkernels preprocessing worker failed.")
         sys.exit(1)
 
     vllm_results = vllm_data["results"]
@@ -464,7 +464,7 @@ def main():
 
     total = len(vllm_results)
     assert total == len(kb_results), (
-        f"Result count mismatch: vllm={total}, kb-nano={len(kb_results)}"
+        f"Result count mismatch: vllm={total}, fastkernels={len(kb_results)}"
     )
 
     print(f"\n{'=' * 70}")
@@ -525,7 +525,7 @@ def main():
             for key in v_data.files:
                 if key not in k_data.files:
                     pv_ok = False
-                    print(f"  [{i}] pixel_values key '{key}' missing in kb-nano")
+                    print(f"  [{i}] pixel_values key '{key}' missing in fastkernels")
                     continue
                 v_arr = v_data[key]
                 k_arr = k_data[key]
@@ -567,7 +567,7 @@ def main():
     shutil.rmtree(npz_dir, ignore_errors=True)
 
     if all_pass:
-        print(f"\n  PASS: All {total} items match between vLLM and kb-nano.")
+        print(f"\n  PASS: All {total} items match between vLLM and fastkernels.")
     else:
         print(f"\n  FAIL: Some items did not match.")
         sys.exit(1)

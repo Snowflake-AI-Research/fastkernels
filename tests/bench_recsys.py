@@ -7,7 +7,7 @@ Real-data defaults:
 
 Checkpoint defaults:
 - missing checkpoints are trained on the real dataset and cached locally
-- both kb-nano and the reference backend load the same trained checkpoint
+- both fastkernels and the reference backend load the same trained checkpoint
 
 Current reference backends:
 - `lightgcn`: `torch_geometric.nn.models.LightGCN`
@@ -67,20 +67,20 @@ ADULT_LABEL_COLUMN = "income"
 def _bootstrap_local_package() -> None:
     root = Path(__file__).resolve().parent.parent
     spec = importlib.util.spec_from_file_location(
-        "kb_nano",
+        "fastkernels",
         root / "__init__.py",
         submodule_search_locations=[str(root)],
     )
     module = importlib.util.module_from_spec(spec)
-    sys.modules["kb_nano"] = module
+    sys.modules["fastkernels"] = module
     assert spec.loader is not None
     spec.loader.exec_module(module)
 
 
 _bootstrap_local_package()
 
-from kb_nano.tasks.baseline.L4.dlrmv2 import DLRMv2, DLRMv2Config
-from kb_nano.tasks.baseline.L4.lightgcn import LightGCN, LightGCNConfig
+from fastkernels.tasks.baseline.L4.dlrmv2 import DLRMv2, DLRMv2Config
+from fastkernels.tasks.baseline.L4.lightgcn import LightGCN, LightGCNConfig
 
 
 def _load_torchrec_dlrm():

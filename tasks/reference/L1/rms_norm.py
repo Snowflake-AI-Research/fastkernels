@@ -4,7 +4,7 @@ This file is used for specification/prompting and optional validation only.
 It is not the production baseline and should not be used for reported speed.
 
 The CUDA kernels below are copied from ``tasks/baseline/L1/csrc/rmsnorm.cu``
-and ``utils.h`` so this reference does not import vLLM or kb-nano's external
+and ``utils.h`` so this reference does not import vLLM or fastkernels's external
 compiled csrc package. The Python dispatch mirrors the baseline RMSNorm module,
 except eager CUDA calls route to the inline extension compiled from this file.
 """
@@ -33,7 +33,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
 
 _CUDA_SRC = r"""
-// Standalone RMSNorm and fused-add-RMSNorm CUDA kernels for kb_nano.
+// Standalone RMSNorm and fused-add-RMSNorm CUDA kernels for fastkernels.
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cub/cub.cuh>
@@ -464,16 +464,16 @@ def _load_inline_ext():
         ]
         build_directory = os.path.join(
             os.environ.get("TORCH_EXTENSIONS_DIR", "/tmp/torch_extensions"),
-            "kb_nano_reference_rmsnorm_inline",
+            "fastkernels_reference_rmsnorm_inline",
         )
         os.makedirs(build_directory, exist_ok=True)
         _INLINE_EXT = load_inline(
-            name="kb_nano_reference_rmsnorm_inline",
+            name="fastkernels_reference_rmsnorm_inline",
             cpp_sources=[_CPP_SRC],
             cuda_sources=[_CUDA_SRC],
             extra_cuda_cflags=extra_cuda_cflags,
             build_directory=build_directory,
-            verbose=bool(int(os.environ.get("KB_NANO_VERBOSE_EXT", "0"))),
+            verbose=bool(int(os.environ.get("FASTKERNELS_VERBOSE_EXT", "0"))),
         )
     return _INLINE_EXT
 

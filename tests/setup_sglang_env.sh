@@ -3,7 +3,7 @@
 #
 # We keep sglang in its own conda env (`sglang-bench`) so that its preferred
 # torch / CUDA versions (currently torch 2.9.1 + cu128) do not conflict with
-# the main `dev` env (torch 2.10 + cu130) that kb_nano runs in.
+# the main `dev` env (torch 2.10 + cu130) that fastkernels runs in.
 #
 # Usage:
 #   bash tests/setup_sglang_env.sh

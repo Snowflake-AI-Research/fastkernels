@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
-Throughput, latency, and correctness benchmark: kb-nano detection models
+Throughput, latency, and correctness benchmark: fastkernels detection models
 against official baselines (ultralytics YOLOv10, transformers RTDetrV2).
 
 Uses real images from COCO val2017 (5000 images) loaded via HuggingFace
-datasets, matching the methodology of other kb-nano benchmarks.
+datasets, matching the methodology of other fastkernels benchmarks.
 
 Correctness is checked over ALL throughput images by collecting outputs
 during the final measurement pass, not on a separate subset.
 
-Each engine (kb-nano, reference) runs in a subprocess to avoid import
+Each engine (fastkernels, reference) runs in a subprocess to avoid import
 contamination.
 
 Usage:
     python tests/bench_detection.py --model jameslahm/yolov10n
     python tests/bench_detection.py --model PekingU/rtdetr_v2_r18vd
-    python tests/bench_detection.py --skip-reference  # kb-nano only
+    python tests/bench_detection.py --skip-reference  # fastkernels only
 """
 
 from __future__ import annotations
@@ -146,14 +146,14 @@ def main():
 
     pkg_root = Path(cfg["project_root"])
     spec = importlib.util.spec_from_file_location(
-        "kb_nano", pkg_root / "__init__.py",
+        "fastkernels", pkg_root / "__init__.py",
         submodule_search_locations=[str(pkg_root)],
     )
-    kb_nano = importlib.util.module_from_spec(spec)
-    sys.modules["kb_nano"] = kb_nano
-    spec.loader.exec_module(kb_nano)
+    fastkernels = importlib.util.module_from_spec(spec)
+    sys.modules["fastkernels"] = fastkernels
+    spec.loader.exec_module(fastkernels)
 
-    from kb_nano.infra.detection_loader import (
+    from fastkernels.infra.detection_loader import (
         load_ours_detector,
         load_reference_detector,
         run_ours_detector,
@@ -161,7 +161,7 @@ def main():
     )
 
     if cfg.get("pytorch_reference", False) and cfg.get("backend") == "ours":
-        from kb_nano.infra.kernel_swapper import (
+        from fastkernels.infra.kernel_swapper import (
             apply_candidates,
             discover_references,
             print_reference_summary,
@@ -195,7 +195,7 @@ def main():
 
     if backend == "ours":
         model = load_ours_detector(model_name, device=device, dtype=dtype)
-        baseline_name = "kb-nano"
+        baseline_name = "fastkernels"
     else:
         model, baseline_name = load_reference_detector(model_name, device=device, dtype=dtype)
 
@@ -374,7 +374,7 @@ def _print_throughput_comparison(kb_results, ref_results):
     print("\n" + "=" * 90)
     print("  THROUGHPUT COMPARISON (images/sec)")
     print("=" * 90)
-    header = f"  {'Scenario':<20} {'Images':>7} {'BS':>4} {'kb-nano':>12}"
+    header = f"  {'Scenario':<20} {'Images':>7} {'BS':>4} {'fastkernels':>12}"
     if ref_results:
         header += f" {'reference':>12} {'Ratio':>10}"
     print(header)
@@ -398,7 +398,7 @@ def _print_latency_comparison(kb_results, ref_results):
     print("=" * 90)
     print("  LATENCY COMPARISON (milliseconds)")
     print("=" * 90)
-    header = f"  {'Scenario':<20} {'BS':>4} {'Iters':>6} {'kb-nano p50':>14}"
+    header = f"  {'Scenario':<20} {'BS':>4} {'Iters':>6} {'fastkernels p50':>14}"
     if ref_results:
         header += f" {'reference p50':>14} {'Ratio':>10}"
     print(header)
@@ -422,7 +422,7 @@ def _print_latency_comparison(kb_results, ref_results):
 
 def _print_correctness(correctness: dict):
     print("=" * 90)
-    print("  CORRECTNESS COMPARISON (kb-nano vs reference, all throughput images)")
+    print("  CORRECTNESS COMPARISON (fastkernels vs reference, all throughput images)")
     print("=" * 90)
     n = correctness["num_images"]
     print(f"  Images compared  : {n}")
@@ -452,7 +452,7 @@ def _print_correctness(correctness: dict):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Detection benchmark: kb-nano vs official baselines (COCO val2017)",
+        description="Detection benchmark: fastkernels vs official baselines (COCO val2017)",
     )
     ap.add_argument("--model", type=str, required=True)
     ap.add_argument("--image-size", type=int, default=0,
@@ -464,7 +464,7 @@ def main():
     ap.add_argument("--skip-reference", action="store_true")
     ap.add_argument(
         "--pytorch-reference", action="store_true", default=False,
-        help="Patch semantic PyTorch references from tasks/reference/L*/ into kb-nano.",
+        help="Patch semantic PyTorch references from tasks/reference/L*/ into fastkernels.",
     )
     ap.add_argument("--skip-throughput", action="store_true")
     ap.add_argument("--skip-latency", action="store_true")
@@ -517,7 +517,7 @@ def main():
             })
 
     print("\n" + "=" * 70)
-    print("  Detection Benchmark: kb-nano vs Reference")
+    print("  Detection Benchmark: fastkernels vs Reference")
     print("=" * 70)
     print(f"  Model          : {args.model}")
     print(f"  GPU            : {gpu}")
@@ -556,15 +556,15 @@ def main():
         if ref_raw is None:
             print("  WARNING: Reference subprocess failed.")
 
-    # -- Run kb-nano --
+    # -- Run fastkernels --
     kb_raw = run_worker(
         DETECTION_WORKER,
         {**common, "backend": "ours", "pytorch_reference": args.pytorch_reference},
-        f"kb-nano [{args.model.split('/')[-1]}]",
+        f"fastkernels [{args.model.split('/')[-1]}]",
         timeout=3600,
     )
     if kb_raw is None:
-        print("  ERROR: kb-nano subprocess failed.")
+        print("  ERROR: fastkernels subprocess failed.")
         sys.exit(1)
 
     # -- Print results --
@@ -595,7 +595,7 @@ def main():
         "dataset": "COCO val2017",
         "num_images": args.num_images,
         "seed": args.seed,
-        "kb_nano": {
+        "fastkernels": {
             "baseline_name": kb_raw["baseline_name"],
             "throughput": kb_tp,
             "latency": kb_lat,

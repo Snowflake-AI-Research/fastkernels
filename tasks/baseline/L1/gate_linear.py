@@ -16,7 +16,7 @@ which has a three-tier dispatch:
    back to FP32 at the end.
 
 Matching vLLM exactly here matters for **correctness** of the grouped-topk
-router: kb_nano's previous "promote both to FP32 then matmul" path was
+router: fastkernels's previous "promote both to FP32 then matmul" path was
 strictly more precise but used a different accumulation order than vLLM's
 specialized kernels, which flipped near-tie expert / group selections in
 the noaux_tc path (see audit notes).

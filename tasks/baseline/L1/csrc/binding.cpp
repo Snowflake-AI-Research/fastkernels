@@ -1,4 +1,4 @@
-// kb_nano custom CUDA ops – PyTorch extension binding.
+// fastkernels custom CUDA ops – PyTorch extension binding.
 #include <torch/extension.h>
 
 // Forward declarations

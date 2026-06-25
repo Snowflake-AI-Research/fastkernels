@@ -134,7 +134,7 @@ class MobileNetV4Model(nn.Module):
     def from_timm(model_name: str = "mobilenetv4_conv_medium.e500_r256_in1k") -> MobileNetV4Model:
         """Load weights from a timm pretrained checkpoint.
 
-        The kb-nano module hierarchy mirrors timm's attribute names so
+        The fastkernels module hierarchy mirrors timm's attribute names so
         state dict keys match directly. The only remapping needed is
         skipping timm-internal buffers that don't exist in our modules.
         """
@@ -159,10 +159,10 @@ class MobileNetV4Model(nn.Module):
 
 
 def _remap_timm_to_kb(timm_sd: dict) -> dict:
-    """Remap timm MobileNetV3 (V4 variant) state dict to kb-nano MobileNetV4Model.
+    """Remap timm MobileNetV3 (V4 variant) state dict to fastkernels MobileNetV4Model.
 
     Most keys map 1:1 because submodule names match. Keys that don't
-    exist in kb-nano (e.g. timm's act2 Identity) are dropped.
+    exist in fastkernels (e.g. timm's act2 Identity) are dropped.
     """
     out = {}
     for k, v in timm_sd.items():

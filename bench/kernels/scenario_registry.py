@@ -15,7 +15,7 @@ import torch
 import yaml
 from safetensors.torch import load_file as load_safetensors
 
-from kb_nano import GOLDEN_DIR, INPUTS_DIR
+from fastkernels import GOLDEN_DIR, INPUTS_DIR
 
 _INPUTS_DIR = INPUTS_DIR
 _GOLDEN_DIR = GOLDEN_DIR
@@ -356,7 +356,7 @@ class InputRegistry:
             if not golden_file.is_file():
                 raise FileNotFoundError(
                     f"Golden data file not found: {golden_file}\n"
-                    f"Run kb_nano capture-golden to generate it, "
+                    f"Run fastkernels capture-golden to generate it, "
                     f"or download from HuggingFace Hub."
                 )
             if golden_file.suffix == ".safetensors":

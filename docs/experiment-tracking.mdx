@@ -3,7 +3,7 @@ title: Experiment Tracking
 description: Track kernel generations, benchmark results, and agent runs with MLflow.
 ---
 
-Every `kb_nano agent`, `kb_nano kernels`, `kb_nano eval`, and `kb_nano e2e` run is automatically logged to [MLflow](https://mlflow.org). This gives you:
+Every `fastkernels agent`, `fastkernels kernels`, `fastkernels eval`, and `fastkernels e2e` run is automatically logged to [MLflow](https://mlflow.org). This gives you:
 
 - **Kernel lineage** — every generated kernel is stored as an MLflow artifact, linked to the run parameters that produced it
 - **Benchmark history** — speedup, correctness, and max error ratio for every operator across every run
@@ -17,19 +17,19 @@ Tracking data is stored locally in `mlruns/` (gitignored). If `mlflow` is not in
 
 | Command | Logged data |
 |---------|-------------|
-| `kb_nano agent` | Run params, per-op generation success/failure, unit test results, e2e speedup, kernel source code |
-| `kb_nano kernels` | Bench params, per-operator per-scenario speedup/correctness, kernel source code |
-| `kb_nano eval` | Per-model throughput/latency speedup, alignment rate, MacroEval speedup/correctness/coverage/score, wall-clock time |
-| `kb_nano e2e` | Throughput (tokens/s), latency (percentiles), serve metrics (TTFT, TPOT, ITL) |
+| `fastkernels agent` | Run params, per-op generation success/failure, unit test results, e2e speedup, kernel source code |
+| `fastkernels kernels` | Bench params, per-operator per-scenario speedup/correctness, kernel source code |
+| `fastkernels eval` | Per-model throughput/latency speedup, alignment rate, MacroEval speedup/correctness/coverage/score, wall-clock time |
+| `fastkernels e2e` | Throughput (tokens/s), latency (percentiles), serve metrics (TTFT, TPOT, ITL) |
 
 Each run is tagged with a `tier` to distinguish its source:
 
 | Tier tag | Source | Key metrics |
 |----------|--------|-------------|
-| `agent` | `kb_nano agent` | `gen_{op}_success`, `utest_{op}_success`, `e2e_speedup`, `e2e_token_match_rate` |
-| `kernel` | `kb_nano kernels` | `{op}_avg_speedup`, `{op}_passed`, `{op}_failed`, `avg_speedup` |
-| `eval` | `kb_nano eval` | `avg_throughput_speedup`, `avg_latency_speedup`, `alignment_rate`, `macro_speedup`, `macro_correctness`, `macro_coverage`, `macro_score` |
-| `e2e` | `kb_nano e2e` | `tokens_per_second`, `avg_latency`, `mean_ttft_ms` (varies by bench type) |
+| `agent` | `fastkernels agent` | `gen_{op}_success`, `utest_{op}_success`, `e2e_speedup`, `e2e_token_match_rate` |
+| `kernel` | `fastkernels kernels` | `{op}_avg_speedup`, `{op}_passed`, `{op}_failed`, `avg_speedup` |
+| `eval` | `fastkernels eval` | `avg_throughput_speedup`, `avg_latency_speedup`, `alignment_rate`, `macro_speedup`, `macro_correctness`, `macro_coverage`, `macro_score` |
+| `e2e` | `fastkernels e2e` | `tokens_per_second`, `avg_latency`, `mean_ttft_ms` (varies by bench type) |
 
 ---
 
@@ -37,19 +37,19 @@ Each run is tagged with a `tier` to distinguish its source:
 
 ```bash
 # Recent runs across all tiers
-kb_nano history
+fastkernels history
 
 # History for a specific operator
-kb_nano history --op rms_norm
+fastkernels history --op rms_norm
 
 # Best-ever speedup per operator
-kb_nano history --best
+fastkernels history --best
 
 # Show more results
-kb_nano history --limit 50
+fastkernels history --limit 50
 ```
 
-<Expandable title="Sample output: kb_nano history">
+<Expandable title="Sample output: fastkernels history">
 ```
 ======================================================================
   RECENT TRACKED RUNS
@@ -63,7 +63,7 @@ kb_nano history --limit 50
 ```
 </Expandable>
 
-<Expandable title="Sample output: kb_nano history --op rms_norm">
+<Expandable title="Sample output: fastkernels history --op rms_norm">
 ```
 ======================================================================
   TRACKING HISTORY: rms_norm
@@ -77,7 +77,7 @@ kb_nano history --limit 50
 ```
 </Expandable>
 
-<Expandable title="Sample output: kb_nano history --best">
+<Expandable title="Sample output: fastkernels history --best">
 ```
 ======================================================================
   BEST SPEEDUP PER OPERATOR (from kernel benchmarks)
@@ -96,16 +96,16 @@ kb_nano history --limit 50
 ## MLflow Web UI
 
 ```bash
-kb_nano mlflow-ui
+fastkernels mlflow-ui
 # Open http://localhost:5000
 # Press Ctrl+C to stop
 ```
 
-The UI launches a local MLflow server backed by the `mlruns/` directory. All runs appear under the `kb_nano` experiment.
+The UI launches a local MLflow server backed by the `mlruns/` directory. All runs appear under the `fastkernels` experiment.
 
 ### Navigating the UI
 
-1. **Experiment list** (left sidebar) — select the `kb_nano` experiment to see all tracked runs.
+1. **Experiment list** (left sidebar) — select the `fastkernels` experiment to see all tracked runs.
 2. **Runs table** — each row is a tracked run. Columns show run name, start time, duration, and logged metrics. Click column headers to sort (e.g., sort by `e2e_speedup` to find your fastest runs).
 3. **Search and filter** — use the search bar above the runs table with MLflow filter syntax:
 
@@ -141,7 +141,7 @@ You can also download artifacts programmatically:
 ```python
 import mlflow
 
-mlflow.set_tracking_uri("file://path/to/kb_nano/mlruns")
+mlflow.set_tracking_uri("file://path/to/fastkernels/mlruns")
 client = mlflow.tracking.MlflowClient()
 
 # Download a specific kernel from a run
@@ -156,10 +156,10 @@ for artifact in client.list_artifacts("<run_id>", "kernels"):
 
 ## Tracking API
 
-Any kernel optimization script or custom agent can use the tracking API directly. This is the same API that `kb_nano agent`, `kb_nano kernels`, `kb_nano eval`, and `kb_nano e2e` use internally.
+Any kernel optimization script or custom agent can use the tracking API directly. This is the same API that `fastkernels agent`, `fastkernels kernels`, `fastkernels eval`, and `fastkernels e2e` use internally.
 
 ```python
-from kb_nano.bench.tracking import tracker
+from fastkernels.bench.tracking import tracker
 
 with tracker.start_run("my-optimization-v3", params={
     "model": "meta-llama/Llama-3.1-8B-Instruct",
@@ -192,7 +192,7 @@ with tracker.start_run("my-optimization-v3", params={
 | `tracker.log_eval(report)` | Log `EvalReport` metrics |
 | `tracker.log_e2e(results, bench_type)` | Log E2E benchmark metrics |
 | `tracker.log_metrics(dict)` | Log arbitrary key-value metrics |
-| `tracker.query_runs(experiment, filter_string, max_results)` | Query tracked runs (used by `kb_nano history`) |
+| `tracker.query_runs(experiment, filter_string, max_results)` | Query tracked runs (used by `fastkernels history`) |
 
 ### Design Principles
 

@@ -43,14 +43,14 @@ sys.path.insert(0, cfg["project_root"])
 
 pkg_root = Path(cfg["project_root"])
 spec = importlib.util.spec_from_file_location(
-    "kb_nano", pkg_root / "__init__.py",
+    "fastkernels", pkg_root / "__init__.py",
     submodule_search_locations=[str(pkg_root)],
 )
-kb_nano = importlib.util.module_from_spec(spec)
-sys.modules["kb_nano"] = kb_nano
-spec.loader.exec_module(kb_nano)
+fastkernels = importlib.util.module_from_spec(spec)
+sys.modules["fastkernels"] = fastkernels
+spec.loader.exec_module(fastkernels)
 
-from kb_nano.infra.image_cls_loader import load_ours_model, load_reference_model
+from fastkernels.infra.image_cls_loader import load_ours_model, load_reference_model
 
 
 def _extract_logits(output):
@@ -149,7 +149,7 @@ def main():
 
     if backend == "ours":
         model = load_ours_model(model_name, device=device, dtype=dtype)
-        baseline_name = "kb-nano"
+        baseline_name = "fastkernels"
     else:
         model, baseline_name = load_reference_model(model_name, device=device, dtype=dtype)
 
@@ -318,7 +318,7 @@ def main():
         "seed": 1234,
     }
 
-    ours = run_worker(IMAGE_CLS_WORKER, {**common, "backend": "ours"}, "kb-nano image classification")
+    ours = run_worker(IMAGE_CLS_WORKER, {**common, "backend": "ours"}, "fastkernels image classification")
     references = {}
     comparisons = {}
     if not args.skip_reference:

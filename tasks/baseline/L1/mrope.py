@@ -18,7 +18,7 @@ import triton
 import triton.language as tl
 
 from .csrc import _C  # noqa: F401
-from . import rotary_emb as _rotary_emb_reg  # noqa: F401 — registers kb_nano_rope ops
+from . import rotary_emb as _rotary_emb_reg  # noqa: F401 — registers fastkernels_rope ops
 
 
 @triton.jit
@@ -144,7 +144,7 @@ class MRotaryEmbedding(nn.Module):
                 key.view(key.shape[0], -1),
                 self.head_dim, cache,
             )
-        torch.ops.kb_nano_rope.rotary_embedding(
+        torch.ops.fastkernels_rope.rotary_embedding(
             positions_1d,
             query.view(query.shape[0], -1),
             key.view(key.shape[0], -1),

@@ -7,7 +7,7 @@ Operators are organized into four levels of abstraction (L1 single-kernel, L2 fu
 ## Layout
 
 ```
-kb_nano/
+fastkernels/
 ├── tasks/
 │   ├── baseline/                # Reference implementations
 │   │   ├── L1/                  # Single-kernel ops
@@ -30,27 +30,27 @@ Requires Python 3.10+, CUDA 12.x, and a recent NVIDIA GPU (Hopper / Blackwell te
 
 ```bash
 git clone <repo-url> fastkernels
-cd fastkernels/kb_nano
+cd fastkernels/fastkernels
 pip install .
 ```
 
-This installs the `kb_nano` CLI plus all benchmark dependencies (PyTorch, Triton, FlashAttention, DeepGEMM, fastsafetensors, plus the per-architecture reference packages — diffusers, timm, transformers, flash-linear-attention, ultralytics, sam3, openfold3, etc.). Some optional comparisons (vLLM, vllm-omni, JAX/Equinox for TTT-E2E, OpenPI for Pi0) are best installed in separate environments and pointed at via `--<framework>-python` flags on the relevant `bench_*.py` scripts.
+This installs the `fastkernels` CLI plus all benchmark dependencies (PyTorch, Triton, FlashAttention, DeepGEMM, fastsafetensors, plus the per-architecture reference packages — diffusers, timm, transformers, flash-linear-attention, ultralytics, sam3, openfold3, etc.). Some optional comparisons (vLLM, vllm-omni, JAX/Equinox for TTT-E2E, OpenPI for Pi0) are best installed in separate environments and pointed at via `--<framework>-python` flags on the relevant `bench_*.py` scripts.
 
 ## Run
 
 ```bash
 # List all available kernel-level benchmark targets
-kb_nano kernels --list
+fastkernels kernels --list
 
 # Run a single L1/L2/L3 operator microbench
-kb_nano kernels run --target rms_norm
+fastkernels kernels run --target rms_norm
 
 # Run the multi-architecture L4 evaluation sweep
-kb_nano eval --help
+fastkernels eval --help
 
 # Run end-to-end throughput / latency
-kb_nano e2e throughput --help
-kb_nano e2e latency    --help
+fastkernels e2e throughput --help
+fastkernels e2e latency    --help
 ```
 
 Per-architecture comparison benchmarks live under `tests/`:
@@ -74,7 +74,7 @@ python tests/test_sam.py                              # SAM3.1
 ## Adding a candidate kernel
 
 1. Drop a replacement implementation in `tasks/candidate/L<level>/<op_name>.py` exposing the same class name as the baseline.
-2. Run `kb_nano kernels run --target <op_name>` (or any L4 benchmark) — the swapper auto-discovers the candidate, validates numerical agreement against the baseline, and reports speedup.
+2. Run `fastkernels kernels run --target <op_name>` (or any L4 benchmark) — the swapper auto-discovers the candidate, validates numerical agreement against the baseline, and reports speedup.
 
 ## Citation
 

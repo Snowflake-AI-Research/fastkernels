@@ -1,4 +1,4 @@
-// Standalone RMSNorm and fused-add-RMSNorm CUDA kernels for kb_nano.
+// Standalone RMSNorm and fused-add-RMSNorm CUDA kernels for fastkernels.
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cub/cub.cuh>

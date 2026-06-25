@@ -24,13 +24,13 @@ torch.set_grad_enabled(False)
 
 
 def test_custom_ops(model_name: str, tp: int = 1):
-    from kb_nano.infra.engine import LlamaEngine, SamplingParams
-    from kb_nano.infra.context import (
+    from fastkernels.infra.engine import LlamaEngine, SamplingParams
+    from fastkernels.infra.context import (
         get_no_compile_layers,
         enable_custom_ops,
         disable_custom_ops,
     )
-    from kb_nano.infra.compilation import ensure_custom_ops_registered
+    from fastkernels.infra.compilation import ensure_custom_ops_registered
 
     print(f"Loading {model_name} (TP={tp}, enforce_eager=True)...")
     engine = LlamaEngine(

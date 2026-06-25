@@ -1,1 +1,1 @@
-"""Semantic PyTorch references for kb-nano tasks."""
+"""Semantic PyTorch references for fastkernels tasks."""

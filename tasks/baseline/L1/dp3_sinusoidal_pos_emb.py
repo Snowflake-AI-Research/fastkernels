@@ -1,7 +1,7 @@
 """Sinusoidal position embedding for DP3 diffusion timestep encoding.
 
 Mirrors ``diffusion_policy_3d.model.diffusion.positional_embedding.SinusoidalPosEmb``.
-Distinct from kb-nano's existing ``sinusoidal_embed.SinusoidalEmbed`` which
+Distinct from fastkernels's existing ``sinusoidal_embed.SinusoidalEmbed`` which
 exposes configurable ``min_period`` / ``max_period`` for Pi0 flow-matching;
 DP3 uses the standard ``log(10000)`` schedule.
 """

@@ -18,7 +18,7 @@ import torch.nn as nn
 _KB_ROOT = Path(__file__).resolve().parents[1]
 _INSTANT_NGP_ROOT = _KB_ROOT / "third_party" / "instant-ngp"
 _INSTANT_NGP_BUILD = _INSTANT_NGP_ROOT / "build"
-_SNAPSHOT_CACHE = Path.home() / ".cache" / "kb_nano" / "instantngp"
+_SNAPSHOT_CACHE = Path.home() / ".cache" / "fastkernels" / "instantngp"
 
 
 @dataclass

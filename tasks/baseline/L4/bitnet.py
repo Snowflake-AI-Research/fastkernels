@@ -115,7 +115,7 @@ class BitNetModel(nn.Module):
 
 class BitNetForCausalLM(nn.Module):
     # BitNet's checkpoint stores attention projections separately
-    # (q_proj, k_proj, v_proj) and MLP gate / up separately, but kb_nano
+    # (q_proj, k_proj, v_proj) and MLP gate / up separately, but fastkernels
     # consolidates each group into a single ``BitLinearMerged`` for SOTA
     # parity with vllm_repo/BitNet's ``wqkv`` and ``w13`` and to halve
     # GEMM kernel launch overhead.  ``packed_modules_mapping`` tells the

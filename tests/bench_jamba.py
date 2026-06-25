@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Throughput, latency, and alignment benchmark: kb-nano JambaEngine vs vLLM (or HF) reference.
+Throughput, latency, and alignment benchmark: fastkernels JambaEngine vs vLLM (or HF) reference.
 
 Mirrors the structure of ``tests/bench_fla.py``: each engine runs in its
 own long-lived subprocess that processes all scenarios sequentially,
@@ -9,10 +9,10 @@ avoiding repeated model loading.
 The reference engine is HuggingFace transformers' ``JambaForCausalLM``
 driven via ``.generate()``.  By default we use HF's *fast* Mamba kernel
 path (``use_mamba_kernels=True``), which dispatches to the same
-``causal_conv1d_*`` / ``selective_*`` kernels that kb-nano consumes as
+``causal_conv1d_*`` / ``selective_*`` kernels that fastkernels consumes as
 L1 ops.  This is the fair reference: both sides are pinned to the same
 underlying CUDA primitives, and the only difference is the pipeline
-wiring (kb-nano's flat-varlen JambaEngine vs HF's per-step
+wiring (fastkernels's flat-varlen JambaEngine vs HF's per-step
 ``.generate``).  Pass ``--ref-slow-mamba`` to fall back to HF's pure
 PyTorch ``slow_forward`` (Python-loop) path -- only useful for
 debugging / numerical comparison, not for honest perf claims.
@@ -23,7 +23,7 @@ serving setup; in this environment HF is the supported path.
 Usage:
     python tests/bench_jamba.py --model ai21labs/Jamba-tiny-dev
     python tests/bench_jamba.py --model ai21labs/Jamba-v0.1
-    python tests/bench_jamba.py --model ... --skip-ref   # kb-nano only
+    python tests/bench_jamba.py --model ... --skip-ref   # fastkernels only
 """
 
 from __future__ import annotations
@@ -59,10 +59,10 @@ _PROJECT_ROOT = _PACKAGE_DIR.parent
 
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from kb_nano.bench.utils.worker import run_worker
-from kb_nano.bench.utils.real_prompts import load_real_prompt_workload
-from kb_nano.bench.utils.workloads import LATENCY_WORKLOADS, THROUGHPUT_WORKLOADS
-from kb_nano.tests.bench_vllm import compute_alignment
+from fastkernels.bench.utils.worker import run_worker
+from fastkernels.bench.utils.real_prompts import load_real_prompt_workload
+from fastkernels.bench.utils.workloads import LATENCY_WORKLOADS, THROUGHPUT_WORKLOADS
+from fastkernels.tests.bench_vllm import compute_alignment
 
 
 SCENARIOS = [
@@ -97,7 +97,7 @@ from transformers import AutoConfig, AutoTokenizer, JambaForCausalLM
 def _load_jamba_ref(model_name, dtype, device, use_mamba_kernels=True):
     # By default HF uses its fused Mamba CUDA path (selective_scan_fn /
     # selective_state_update from mamba_ssm + causal_conv1d_fn / update
-    # from causal_conv1d).  These are the same kernels kb-nano calls as
+    # from causal_conv1d).  These are the same kernels fastkernels calls as
     # L1 ops, so the perf comparison is a fair pipeline-vs-pipeline
     # measurement.  ``use_mamba_kernels=False`` forces HF down its
     # Python-loop ``slow_forward`` -- not a fair perf reference, only
@@ -277,7 +277,7 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 # vLLM reference subprocess worker (preferred reference: continuous batching,
 # paged-KV, CUDA-graph captured decode -- the apples-to-apples SOTA setup vs
-# kb-nano's own continuous-batched JambaEngine)
+# fastkernels's own continuous-batched JambaEngine)
 # ---------------------------------------------------------------------------
 VLLM_REF_WORKER = r'''
 import json, os, sys, time
@@ -411,9 +411,9 @@ if __name__ == "__main__":
 
 
 # ---------------------------------------------------------------------------
-# kb-nano JambaEngine subprocess worker
+# fastkernels JambaEngine subprocess worker
 # ---------------------------------------------------------------------------
-KB_NANO_JAMBA_WORKER = r'''
+FASTKERNELS_JAMBA_WORKER = r'''
 import json, os, sys, time
 
 
@@ -555,7 +555,7 @@ def _fit_prompt_to_context(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Throughput & alignment benchmark: kb-nano JambaEngine vs vLLM (or HF) reference",
+        description="Throughput & alignment benchmark: fastkernels JambaEngine vs vLLM (or HF) reference",
     )
     parser.add_argument("--model", type=str, default="ai21labs/Jamba-tiny-dev")
     parser.add_argument("--num-seqs", type=int, default=1000,
@@ -585,7 +585,7 @@ def main():
                         help="Max concurrent sequences in the reference "
                              "engine (vLLM continuous-batched scheduler) "
                              "or max micro-batch (HF .generate). Default "
-                             "256 matches kb-nano's max_num_seqs default "
+                             "256 matches fastkernels's max_num_seqs default "
                              "and bench_vllm.py.")
     parser.add_argument("--ref-gpu-memory-utilization", type=float, default=0.9,
                         help="vLLM-only: fraction of GPU memory vLLM may "
@@ -599,7 +599,7 @@ def main():
     parser.add_argument("--max-output-tokens", type=int, default=256,
                         help="Cap each scenario's output_len to this value.")
     parser.add_argument("--skip-ref", action="store_true",
-                        help="Skip the HF reference (kb-nano only)")
+                        help="Skip the HF reference (fastkernels only)")
     parser.add_argument(
         "--ref-slow-mamba", action="store_true",
         help=(
@@ -707,7 +707,7 @@ def main():
 
     print("=" * 70)
     ref_name = "vLLM" if args.ref == "vllm" else "HF"
-    print(f"  kb-nano JambaEngine vs {ref_name} reference -- Multi-Scenario Benchmark")
+    print(f"  fastkernels JambaEngine vs {ref_name} reference -- Multi-Scenario Benchmark")
     print("=" * 70)
     print(f"  Model            : {args.model}")
     print(f"  Seqs/scenario    : {args.num_seqs}")
@@ -775,12 +775,12 @@ def main():
     kb_cfg["package_name"] = _PACKAGE_DIR.name
     kb_cfg["max_num_seqs"] = args.max_num_seqs
     kb_raw = run_worker(
-        KB_NANO_JAMBA_WORKER, kb_cfg,
-        f"kb-nano JambaEngine [{short_name}] all scenarios",
+        FASTKERNELS_JAMBA_WORKER, kb_cfg,
+        f"fastkernels JambaEngine [{short_name}] all scenarios",
         timeout=21600,
     )
     if kb_raw is None:
-        print("  ERROR: kb-nano subprocess failed.")
+        print("  ERROR: fastkernels subprocess failed.")
         sys.exit(1)
 
     kb_latency = kb_raw.get("latency", [])
@@ -799,9 +799,9 @@ def main():
             r = {
                 "scenario": sc["name"],
                 "num_seqs": args.num_seqs,
-                "kb_nano_elapsed": kb_d["elapsed"],
-                "kb_nano_output_tokens": kb_d["total_output_tokens"],
-                "kb_nano_tok_per_s": kb_tps,
+                "fastkernels_elapsed": kb_d["elapsed"],
+                "fastkernels_output_tokens": kb_d["total_output_tokens"],
+                "fastkernels_tok_per_s": kb_tps,
             }
             if args.num_seqs:
                 r["avg_output_len"] = kb_d["total_output_tokens"] / args.num_seqs
@@ -819,7 +819,7 @@ def main():
             if args.output_dir:
                 d = os.path.join(args.output_dir, sc["name"])
                 os.makedirs(d, exist_ok=True)
-                with open(os.path.join(d, "kb_nano_outputs.json"), "w") as f:
+                with open(os.path.join(d, "fastkernels_outputs.json"), "w") as f:
                     json.dump(kb_d, f, indent=2)
                 if ref_thr is not None:
                     with open(os.path.join(d, "ref_outputs.json"), "w") as f:
@@ -827,16 +827,16 @@ def main():
             all_results.append(r)
 
         print(f"\n\n{'=' * 100}")
-        print(f"  THROUGHPUT SUMMARY (kb-nano JambaEngine vs {ref_name} reference)")
+        print(f"  THROUGHPUT SUMMARY (fastkernels JambaEngine vs {ref_name} reference)")
         print(f"{'=' * 100}")
         print(
             f"  {'SCENARIO':<16} {'OUT':>5} "
-            f"{'KB-NANO tok/s':>15} {f'{ref_name} tok/s':>12} {'SPEEDUP':>9} "
+            f"{'FASTKERNELS tok/s':>15} {f'{ref_name} tok/s':>12} {'SPEEDUP':>9} "
             f"{'AVG MATCH TOKS':>18}"
         )
         print(f"  {'-' * 95}")
         for r in all_results:
-            kb_str = f"{r['kb_nano_tok_per_s']:,.0f}"
+            kb_str = f"{r['fastkernels_tok_per_s']:,.0f}"
             f_str = f"{r['ref_tok_per_s']:,.0f}" if "ref_tok_per_s" in r else "N/A"
             spd_str = f"{r['speedup']:.2f}x" if "speedup" in r else "N/A"
             align = r.get("alignment", {})
@@ -860,8 +860,8 @@ def main():
         print(f"{'=' * 110}")
         print(
             f"  {'SCENARIO':<18} {'BS':>4} {'OUT':>5} {'ITERS':>6}"
-            f"  {'KB-NANO med':>12} {'HF med':>12}"
-            f"  {'KB-NANO ms/tok':>15} {'HF ms/tok':>12} {'SPEEDUP':>8}"
+            f"  {'FASTKERNELS med':>12} {'HF med':>12}"
+            f"  {'FASTKERNELS ms/tok':>15} {'HF ms/tok':>12} {'SPEEDUP':>8}"
         )
         print(f"  {'-' * 105}")
         for i, kb_lat in enumerate(kb_latency):
@@ -877,9 +877,9 @@ def main():
                 "batch_size": bs,
                 "output_len": out_len,
                 "num_iters": kb_lat["num_iters"],
-                "kb_nano_median_s": kb_med,
-                "kb_nano_ms_per_tok": kb_ms_per_tok,
-                "kb_nano_latencies": kb_lat["latencies"],
+                "fastkernels_median_s": kb_med,
+                "fastkernels_ms_per_tok": kb_ms_per_tok,
+                "fastkernels_latencies": kb_lat["latencies"],
             }
             f_med_str = "N/A"; spd_str = "N/A"; f_ms_str = "N/A"
             if i < len(ref_latency):

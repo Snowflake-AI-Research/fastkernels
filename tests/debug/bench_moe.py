@@ -28,7 +28,7 @@ def main():
     torch.set_default_dtype(torch.bfloat16)
 
     if cfg.get("pytorch_reference", False):
-        from kb_nano.infra.kernel_swapper import (
+        from fastkernels.infra.kernel_swapper import (
             apply_candidates,
             discover_references,
             print_reference_summary,
@@ -38,8 +38,8 @@ def main():
             print_reference_summary(references)
             apply_candidates(references)
 
-    from kb_nano.tasks.baseline.L2.mixtral_moe import MixtralMoE
-    from kb_nano.tasks.baseline.L4.mixtral import MixtralConfig
+    from fastkernels.tasks.baseline.L2.mixtral_moe import MixtralMoE
+    from fastkernels.tasks.baseline.L4.mixtral import MixtralConfig
 
     tp = cfg.get("tp", 1)
 
@@ -117,7 +117,7 @@ def main():
     parser.add_argument("--tp", type=int, default=1)
     parser.add_argument(
         "--pytorch-reference", action="store_true", default=False,
-        help="Patch semantic PyTorch references from tasks/reference/L*/ into kb-nano.",
+        help="Patch semantic PyTorch references from tasks/reference/L*/ into fastkernels.",
     )
     args = parser.parse_args()
 

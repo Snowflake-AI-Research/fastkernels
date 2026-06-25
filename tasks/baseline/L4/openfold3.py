@@ -362,13 +362,13 @@ class OpenFold3Model(nn.Module):
 def load_openfold3_checkpoint(
     model: OpenFold3Model, checkpoint_path: str,
 ) -> None:
-    """Load an OpenFold3 checkpoint into a kb-nano OpenFold3Model.
+    """Load an OpenFold3 checkpoint into a fastkernels OpenFold3Model.
 
-    The kb-nano model architecture is a 1:1 match with the reference
+    The fastkernels model architecture is a 1:1 match with the reference
     OpenFold/OpenFold3 checkpoint, so strict loading is used.
 
     Args:
-        model: kb-nano OpenFold3Model instance.
+        model: fastkernels OpenFold3Model instance.
         checkpoint_path: Path to the checkpoint file.
     """
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)

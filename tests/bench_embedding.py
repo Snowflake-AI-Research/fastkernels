@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Token-level embedding throughput/latency benchmark: kb-nano vs vLLM."""
+"""Token-level embedding throughput/latency benchmark: fastkernels vs vLLM."""
 
 from __future__ import annotations
 
@@ -20,8 +20,8 @@ _PROJECT_ROOT = _PACKAGE_DIR.parent
 
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from kb_nano.bench.utils.worker import run_worker
-from kb_nano.bench.utils.workloads import (
+from fastkernels.bench.utils.worker import run_worker
+from fastkernels.bench.utils.workloads import (
     EMBEDDING_LATENCY_WORKLOADS,
     EMBEDDING_THROUGHPUT_WORKLOADS,
     EmbeddingThroughputWorkload,
@@ -342,8 +342,8 @@ def _latency_stats(latencies):
 KB_WORKER = WORKER_SHARED + r'''
 def _load_kb_engine(cfg, device, dtype):
     sys.path.insert(0, cfg["project_root"])
-    from kb_nano.infra.embedding_engine import EmbeddingEngine
-    print(f"  Loading kb-nano model {cfg['model_name']} on {device}", flush=True)
+    from fastkernels.infra.embedding_engine import EmbeddingEngine
+    print(f"  Loading fastkernels model {cfg['model_name']} on {device}", flush=True)
     return EmbeddingEngine(
         cfg["model_name"],
         seed=cfg["seed"],
@@ -355,7 +355,7 @@ def _load_kb_engine(cfg, device, dtype):
 
 
 def _encode(engine, prompts, cfg):
-    print(f"  kb-nano encode: {len(prompts)} requests", flush=True)
+    print(f"  fastkernels encode: {len(prompts)} requests", flush=True)
     outputs = engine.encode(
         prompts,
         pooling_task="token_embed",
@@ -377,11 +377,11 @@ def main():
         {"prompt_token_ids": r["prompt_token_ids"]}
         for r in cfg["records"][:min(4, len(cfg["records"]))]
     ]
-    print(f"  kb-nano warmup: {len(warm_prompts)} requests", flush=True)
+    print(f"  fastkernels warmup: {len(warm_prompts)} requests", flush=True)
     _encode(engine, warm_prompts, cfg)
 
     prompts = [{"prompt_token_ids": r["prompt_token_ids"]} for r in cfg["records"]]
-    print(f"  kb-nano timed throughput encode starting: {len(prompts)} requests", flush=True)
+    print(f"  fastkernels timed throughput encode starting: {len(prompts)} requests", flush=True)
     _cuda_sync()
     start = time.perf_counter()
     outputs = _encode(engine, prompts, cfg)
@@ -396,7 +396,7 @@ def main():
             for r in cfg["records"][:spec["batch_size"]]
         ]
         print(
-            f"  kb-nano latency {spec['name']}: "
+            f"  fastkernels latency {spec['name']}: "
             f"{spec['num_warmup']} warmup, {spec['num_iters']} timed iterations",
             flush=True,
         )
@@ -723,17 +723,17 @@ def _run_one_workload(
         if vllm_raw is None:
             raise SystemExit("vLLM embedding worker failed")
 
-    print(f"  Launching kb-nano worker for {workload.name}", flush=True)
+    print(f"  Launching fastkernels worker for {workload.name}", flush=True)
     kb_cfg = dict(common_cfg)
-    kb_cfg["output_npz"] = str(scenario_dir / "kb_nano_outputs.npz")
+    kb_cfg["output_npz"] = str(scenario_dir / "fastkernels_outputs.npz")
     kb_raw = run_worker(
         KB_WORKER,
         kb_cfg,
-        f"kb-nano [{workload.model_name}] token_embed",
+        f"fastkernels [{workload.model_name}] token_embed",
         timeout=10800,
     )
     if kb_raw is None:
-        raise SystemExit("kb-nano embedding worker failed")
+        raise SystemExit("fastkernels embedding worker failed")
 
     print(f"  Aggregating throughput results for {workload.name}", flush=True)
     kb_tps = kb_raw["total_input_tokens"] / kb_raw["elapsed"]
@@ -751,9 +751,9 @@ def _run_one_workload(
         "num_requests": len(records),
         "max_length": max_length,
         "total_input_tokens": total_input_tokens,
-        "kb_nano_elapsed": kb_raw["elapsed"],
-        "kb_nano_input_tok_per_s": kb_tps,
-        "kb_nano_output_artifact": kb_raw["output_npz"],
+        "fastkernels_elapsed": kb_raw["elapsed"],
+        "fastkernels_input_tok_per_s": kb_tps,
+        "fastkernels_output_artifact": kb_raw["output_npz"],
     }
     artifacts_deleted = False
     if vllm_raw is not None:
@@ -788,10 +788,10 @@ def _run_one_workload(
             "batch_size": kb_lat["batch_size"],
             "input_tokens": kb_lat["input_tokens"],
             "num_iters": kb_lat["num_iters"],
-            "kb_nano_median_s": kb_lat["median_s"],
-            "kb_nano_p99_s": kb_lat["p99_s"],
-            "kb_nano_ms_per_tok": kb_lat["median_s"] / kb_lat["input_tokens"] * 1000,
-            "kb_nano_latencies": kb_lat["latencies"],
+            "fastkernels_median_s": kb_lat["median_s"],
+            "fastkernels_p99_s": kb_lat["p99_s"],
+            "fastkernels_ms_per_tok": kb_lat["median_s"] / kb_lat["input_tokens"] * 1000,
+            "fastkernels_latencies": kb_lat["latencies"],
         }
         if idx < len(vllm_latency):
             v_lat = vllm_latency[idx]
@@ -813,7 +813,7 @@ def _print_summary(results: list[dict], latency_results: list[dict]) -> None:
     print(f"{'=' * 104}")
     print(
         f"  {'SCENARIO':<28} {'REQS':>5} {'TOKENS':>10} "
-        f"{'KB-NANO tok/s':>15} {'vLLM tok/s':>12} {'SPEEDUP':>8} "
+        f"{'FASTKERNELS tok/s':>15} {'vLLM tok/s':>12} {'SPEEDUP':>8} "
         f"{'CORRECT':>8} {'MIN COS':>9}",
     )
     print(f"  {'-' * 96}")
@@ -825,7 +825,7 @@ def _print_summary(results: list[dict], latency_results: list[dict]) -> None:
         min_cos = f"{correctness['min_cosine']:.6f}" if correctness else "N/A"
         print(
             f"  {row['scenario']:<28} {row['num_requests']:>5} "
-            f"{row['total_input_tokens']:>10,} {row['kb_nano_input_tok_per_s']:>15,.0f} "
+            f"{row['total_input_tokens']:>10,} {row['fastkernels_input_tok_per_s']:>15,.0f} "
             f"{vllm_tps:>12} {speedup:>8} {correct:>8} {min_cos:>9}",
         )
     print(f"{'=' * 104}")
@@ -836,7 +836,7 @@ def _print_summary(results: list[dict], latency_results: list[dict]) -> None:
         print(f"{'=' * 112}")
         print(
             f"  {'MODEL':<16} {'SCENARIO':<18} {'BS':>4} {'TOKENS':>8} {'ITERS':>6} "
-            f"{'KB-NANO med':>12} {'vLLM med':>12} "
+            f"{'FASTKERNELS med':>12} {'vLLM med':>12} "
             f"{'KB ms/tok':>11} {'vLLM ms/tok':>12} {'SPEEDUP':>8}",
         )
         print(f"  {'-' * 104}")
@@ -848,15 +848,15 @@ def _print_summary(results: list[dict], latency_results: list[dict]) -> None:
             print(
                 f"  {model:<16} {row['scenario']:<18} {row['batch_size']:>4} "
                 f"{row['input_tokens']:>8,} {row['num_iters']:>6} "
-                f"{row['kb_nano_median_s']:.4f}s{'':<3} {v_med:>12} "
-                f"{row['kb_nano_ms_per_tok']:>11.2f} {v_ms:>12} {speedup:>8}",
+                f"{row['fastkernels_median_s']:.4f}s{'':<3} {v_med:>12} "
+                f"{row['fastkernels_ms_per_tok']:>11.2f} {v_ms:>12} {speedup:>8}",
             )
         print(f"{'=' * 112}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Token-level embedding benchmark: kb-nano vs vLLM",
+        description="Token-level embedding benchmark: fastkernels vs vLLM",
     )
     parser.add_argument("--model", type=str, default="all")
     parser.add_argument("--tp", type=int, default=1)
@@ -882,14 +882,14 @@ def main() -> None:
         print("  NOTE: --run-id is ignored because --output-dir was provided.")
     args.artifact_dir = str(
         Path(tempfile.gettempdir())
-        / "kb_nano_embedding_outputs"
+        / "fastkernels_embedding_outputs"
         / Path(args.output_dir).name
     )
 
     vllm_port = None
     flashinfer_namespace = None
     previous_flashinfer_namespace_env = os.environ.get(
-        "KB_NANO_FLASHINFER_SOCKET_NAMESPACE",
+        "FASTKERNELS_FLASHINFER_SOCKET_NAMESPACE",
     )
     if not args.skip_vllm:
         vllm_port, vllm_port_lock = _reserve_tcp_port(
@@ -899,15 +899,15 @@ def main() -> None:
         os.environ["VLLM_PORT"] = str(vllm_port)
         if args.tp > 1:
             flashinfer_namespace = (
-                os.environ.get("KB_NANO_FLASHINFER_SOCKET_NAMESPACE")
+                os.environ.get("FASTKERNELS_FLASHINFER_SOCKET_NAMESPACE")
                 or f"bench-embedding-{os.getpid()}-{vllm_port}"
             )
-            os.environ["KB_NANO_FLASHINFER_SOCKET_NAMESPACE"] = flashinfer_namespace
+            os.environ["FASTKERNELS_FLASHINFER_SOCKET_NAMESPACE"] = flashinfer_namespace
             _install_flashinfer_sitecustomize()
 
     workloads = _select_workloads(args.model)
     print("=" * 78)
-    print("  kb-nano Embedding Baseline vs vLLM -- token_embed Benchmark")
+    print("  fastkernels Embedding Baseline vs vLLM -- token_embed Benchmark")
     print("=" * 78)
     print(f"  Workloads      : {', '.join(w.name for w in workloads)}")
     print("  Mode           : token_embed")
@@ -938,9 +938,9 @@ def main() -> None:
         latency_results.extend(latency)
 
     if previous_flashinfer_namespace_env is None:
-        os.environ.pop("KB_NANO_FLASHINFER_SOCKET_NAMESPACE", None)
+        os.environ.pop("FASTKERNELS_FLASHINFER_SOCKET_NAMESPACE", None)
     else:
-        os.environ["KB_NANO_FLASHINFER_SOCKET_NAMESPACE"] = previous_flashinfer_namespace_env
+        os.environ["FASTKERNELS_FLASHINFER_SOCKET_NAMESPACE"] = previous_flashinfer_namespace_env
 
     _print_summary(throughput_results, latency_results)
 

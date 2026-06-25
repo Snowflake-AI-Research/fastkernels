@@ -1,4 +1,4 @@
-"""GPT-OSS MoE: MXFP4-native fused MoE composed from KB-Nano L1 ops.
+"""GPT-OSS MoE: MXFP4-native fused MoE composed from FastKernels L1 ops.
 
 32 experts (top-4, softmax routing), router bias, expert gate/up/down biases,
 OAI SwiGLU activation fused inside the Triton matmul_ogs kernel.
@@ -24,7 +24,7 @@ def _round_up(x: int, align: int) -> int:
 
 
 class GptOssMoE(nn.Module):
-    """MXFP4-native MoE composed from KB-Nano L1 ops.
+    """MXFP4-native MoE composed from FastKernels L1 ops.
 
     Weights stay in packed uint8 MXFP4 format. Routing, swizzling and the
     fused matmul_ogs forward are all delegated to ``L1.mxfp4_moe``.
@@ -218,5 +218,5 @@ class GptOssMoE(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self._use_custom_op:
-            return torch.ops.kb_nano.moe_forward(hidden_states, self._layer_name)
+            return torch.ops.fastkernels.moe_forward(hidden_states, self._layer_name)
         return self.forward_impl(hidden_states)

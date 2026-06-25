@@ -98,7 +98,7 @@ def load_ours_model(model_name: str, device: str = "cuda", dtype: torch.dtype = 
     if is_convnextv2_model(model_name):
         from transformers import ConvNextV2Config, ConvNextV2ForImageClassification as HFConvNextV2ForImageClassification
         try:
-            from kb_nano.tasks.baseline.L4.convnextv2 import ConvNextV2ForImageClassification
+            from fastkernels.tasks.baseline.L4.convnextv2 import ConvNextV2ForImageClassification
         except ModuleNotFoundError:
             from tasks.baseline.L4.convnextv2 import ConvNextV2ForImageClassification
 
@@ -112,7 +112,7 @@ def load_ours_model(model_name: str, device: str = "cuda", dtype: torch.dtype = 
     if is_efficientnetv2_model(model_name):
         import timm
         try:
-            from kb_nano.tasks.baseline.L4.efficientnetv2 import EfficientNetV2ForImageClassification
+            from fastkernels.tasks.baseline.L4.efficientnetv2 import EfficientNetV2ForImageClassification
         except ModuleNotFoundError:
             from tasks.baseline.L4.efficientnetv2 import EfficientNetV2ForImageClassification
 

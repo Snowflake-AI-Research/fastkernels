@@ -25,16 +25,16 @@ unsuitable here for two reasons:
 The orchestration here is a line-for-line port of
 ``vllm.model_executor.layers.fused_moe.fused_moe.fused_experts_impl``
 restricted to the ``use_fp8_w8a8 + block_shape`` path that DeepSeek
-hits.  All compute kernels are kb_nano L1 primitives that we have
+hits.  All compute kernels are fastkernels L1 primitives that we have
 already verified produce bit-identical outputs to vLLM's:
 
-* ``_C.moe_align_block_size``           (kb_nano binding of the same
+* ``_C.moe_align_block_size``           (fastkernels binding of the same
                                          sgl-kernel CUDA source vLLM uses)
 * ``_per_token_group_quant_fp8``        (calls ``torch.ops._C.per_token_group_fp8_quant``)
 * ``MoeGroupedGemm._fused_moe_kernel``  (Triton kernel forked from vLLM)
-* ``torch.ops._C.silu_and_mul``         (vLLM's packed CUDA kernel; kb_nano
+* ``torch.ops._C.silu_and_mul``         (vLLM's packed CUDA kernel; fastkernels
                                          re-uses the same op)
-* ``_C.moe_sum``                        (kb_nano CUDA kernel; falls back to
+* ``_C.moe_sum``                        (fastkernels CUDA kernel; falls back to
                                          ``at::sum_out`` for top_k > 4 which
                                          matches vLLM's PyTorch reference for
                                          DeepSeek's top_k = 8)
@@ -68,7 +68,7 @@ def _moe_align_block_size_fresh(
     Mirrors ``vllm.model_executor.layers.fused_moe.moe_align_block_size``
     (no ``expert_map``, ``ignore_invalid_experts=True`` semantics).  All
     output tensors are freshly allocated, matching vLLM and avoiding
-    the captured-pointer aliasing trap that bit kb_nano's persistent
+    the captured-pointer aliasing trap that bit fastkernels's persistent
     ``MoeAlign`` buffers when used inside CUDA graphs.
     """
     numel = topk_ids.numel()

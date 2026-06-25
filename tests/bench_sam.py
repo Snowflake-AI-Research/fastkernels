@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Throughput, latency, and correctness benchmark: kb-nano SAM3 baseline vs
+Throughput, latency, and correctness benchmark: fastkernels SAM3 baseline vs
 the reference SAM3 library (facebook/sam3).
 
 Both engines load **shared pretrained weights** from the same checkpoint.
@@ -12,7 +12,7 @@ Both engines run in subprocesses to avoid import contamination.
 Usage:
     python tests/test_sam.py --model facebook/sam3.1
 
-    python tests/test_sam.py --skip-reference   # kb-nano only
+    python tests/test_sam.py --skip-reference   # fastkernels only
     python tests/test_sam.py --skip-throughput   # latency only
     python tests/test_sam.py --modality all      # image + video scenarios
 """
@@ -33,8 +33,8 @@ _THIS_DIR = Path(__file__).resolve().parent
 _PACKAGE_DIR = _THIS_DIR.parent
 _PROJECT_ROOT = _PACKAGE_DIR.parent
 
-from kb_nano.bench.utils.worker import run_worker
-from kb_nano.bench.utils.workloads import (
+from fastkernels.bench.utils.worker import run_worker
+from fastkernels.bench.utils.workloads import (
     SEGMENTATION_LATENCY_WORKLOADS,
     SEGMENTATION_THROUGHPUT_WORKLOADS,
     SEGMENTATION_VIDEO_WORKLOADS,
@@ -358,7 +358,7 @@ def main():
         t = torch.load(entry["tensor_path"], map_location="cpu", weights_only=True)
         images.append(t.to(device="cuda", dtype=model_dtype))
 
-    # Tokenize all text queries and save for kb-nano
+    # Tokenize all text queries and save for fastkernels
     text_queries = [e["text_query"] for e in entries]
     all_token_ids = []
     for q in text_queries:
@@ -478,9 +478,9 @@ if __name__ == "__main__":
 
 
 # ---------------------------------------------------------------------------
-# kb-nano SAM3 subprocess worker
+# fastkernels SAM3 subprocess worker
 # ---------------------------------------------------------------------------
-KB_NANO_SAM3_WORKER = r'''
+FASTKERNELS_SAM3_WORKER = r'''
 import json, sys, time, os
 import torch
 import numpy as np
@@ -490,13 +490,13 @@ def main():
         cfg = json.load(f)
 
     try:
-        from kb_nano.tasks.baseline.L4.sam3 import Sam3Config, Sam3Model, load_sam3_checkpoint
+        from fastkernels.tasks.baseline.L4.sam3 import Sam3Config, Sam3Model, load_sam3_checkpoint
     except ImportError:
         sys.path.insert(0, cfg["project_root"])
-        from kb_nano.tasks.baseline.L4.sam3 import Sam3Config, Sam3Model, load_sam3_checkpoint
+        from fastkernels.tasks.baseline.L4.sam3 import Sam3Config, Sam3Model, load_sam3_checkpoint
 
     if cfg.get("pytorch_reference", False):
-        from kb_nano.infra.kernel_swapper import (
+        from fastkernels.infra.kernel_swapper import (
             apply_candidates,
             discover_references,
             print_reference_summary,
@@ -506,7 +506,7 @@ def main():
             print_reference_summary(references)
             apply_candidates(references)
 
-    print("  Building kb-nano SAM3 model ...", flush=True)
+    print("  Building fastkernels SAM3 model ...", flush=True)
     config = Sam3Config.from_pretrained(cfg["model"])
     model = Sam3Model(config)
 
@@ -530,7 +530,7 @@ def main():
         if dp.major >= 8:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
-    print("  kb-nano SAM3 model loaded.", flush=True)
+    print("  fastkernels SAM3 model loaded.", flush=True)
 
     feats_dir = cfg.get("feats_dir")
 
@@ -645,7 +645,7 @@ def main():
             "per_image": per_image_stats,
             "latency": latency_results,
         }, f)
-    print("  kb-nano SAM3 done.", flush=True)
+    print("  fastkernels SAM3 done.", flush=True)
 
 if __name__ == "__main__":
     main()
@@ -672,7 +672,7 @@ def _compare_tensor_pair(ref: "torch.Tensor", kb: "torch.Tensor"):
 
 
 def _compare_predictions(feats_dir: str, num_items: int) -> dict:
-    """Compare saved boxes, masks, and logits between reference and kb-nano."""
+    """Compare saved boxes, masks, and logits between reference and fastkernels."""
     import torch
 
     results = {"boxes": [], "masks": [], "logits": []}
@@ -717,7 +717,7 @@ def _print_throughput_comparison(kb_raw, ref_raw):
     print("\n" + "=" * 90)
     print("  THROUGHPUT COMPARISON (images/sec)")
     print("=" * 90)
-    header = f"  {'Scenario':<25} {'Images':>7} {'kb-nano':>12}"
+    header = f"  {'Scenario':<25} {'Images':>7} {'fastkernels':>12}"
     if ref_raw:
         header += f" {'reference':>12} {'Speedup':>10}"
     print(header)
@@ -738,7 +738,7 @@ def _print_latency_comparison(kb_latency, ref_latency):
     print("  LATENCY COMPARISON (seconds)")
     print("=" * 90)
     header = f"  {'Scenario':<25} {'BS':>4} {'Res':>5}"
-    header += f" {'kb-nano p50':>12}"
+    header += f" {'fastkernels p50':>12}"
     if ref_latency:
         header += f" {'reference p50':>14} {'Speedup':>10}"
     print(header)
@@ -752,7 +752,7 @@ def _print_latency_comparison(kb_latency, ref_latency):
             "scenario": kb_lat["name"],
             "batch_size": kb_lat["batch_size"],
             "resolution": kb_lat["resolution"],
-            "kb_nano_median_s": kb_p50,
+            "fastkernels_median_s": kb_p50,
         }
 
         line = f"  {kb_lat['name']:<25} {kb_lat['batch_size']:>4} {kb_lat['resolution']:>5}"
@@ -897,7 +897,7 @@ def main():
     clips = video_clips[:num_clips]
     per_clip_stats = []
 
-    # Save video-specific token IDs for kb-nano worker
+    # Save video-specific token IDs for fastkernels worker
     if feats_dir:
         video_token_ids = []
         for clip_info in clips:
@@ -964,7 +964,7 @@ if __name__ == "__main__":
 '''
 
 
-KB_NANO_SAM3_VIDEO_WORKER = r'''
+FASTKERNELS_SAM3_VIDEO_WORKER = r'''
 import json, sys, time, os
 import torch
 import numpy as np
@@ -974,15 +974,15 @@ def main():
         cfg = json.load(f)
 
     try:
-        from kb_nano.tasks.baseline.L4.sam3 import Sam3Config, Sam3Model, load_sam3_checkpoint
-        from kb_nano.tasks.baseline.L4.sam3_tracker import Sam3TrackerPredictor, build_tracker_components
+        from fastkernels.tasks.baseline.L4.sam3 import Sam3Config, Sam3Model, load_sam3_checkpoint
+        from fastkernels.tasks.baseline.L4.sam3_tracker import Sam3TrackerPredictor, build_tracker_components
     except ImportError:
         sys.path.insert(0, cfg["project_root"])
-        from kb_nano.tasks.baseline.L4.sam3 import Sam3Config, Sam3Model, load_sam3_checkpoint
-        from kb_nano.tasks.baseline.L4.sam3_tracker import Sam3TrackerPredictor, build_tracker_components
+        from fastkernels.tasks.baseline.L4.sam3 import Sam3Config, Sam3Model, load_sam3_checkpoint
+        from fastkernels.tasks.baseline.L4.sam3_tracker import Sam3TrackerPredictor, build_tracker_components
 
     if cfg.get("pytorch_reference", False):
-        from kb_nano.infra.kernel_swapper import (
+        from fastkernels.infra.kernel_swapper import (
             apply_candidates,
             discover_references,
             print_reference_summary,
@@ -992,7 +992,7 @@ def main():
             print_reference_summary(references)
             apply_candidates(references)
 
-    print("  Building kb-nano SAM3 video model ...", flush=True)
+    print("  Building fastkernels SAM3 video model ...", flush=True)
 
     # Build detector
     config = Sam3Config.from_pretrained(cfg["model"])
@@ -1040,7 +1040,7 @@ def main():
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
 
-    print("  kb-nano SAM3 video model loaded.", flush=True)
+    print("  fastkernels SAM3 video model loaded.", flush=True)
 
     feats_dir = cfg.get("feats_dir")
     video_clips = cfg.get("video_clips", [])
@@ -1109,7 +1109,7 @@ def main():
             "frames_per_sec": total_frames / total_elapsed if total_elapsed > 0 else 0,
             "per_clip": per_clip_stats,
         }, f)
-    print("  kb-nano SAM3 video done.", flush=True)
+    print("  fastkernels SAM3 video done.", flush=True)
 
 if __name__ == "__main__":
     main()
@@ -1139,7 +1139,7 @@ def _save_video_clips_for_workers(veval_samples, feats_dir, max_clips=10, max_fr
 
 
 def _compare_video_predictions(feats_dir, num_clips):
-    """Compare saved video boxes/masks between reference and kb-nano."""
+    """Compare saved video boxes/masks between reference and fastkernels."""
     import torch
 
     results = {"video_boxes": [], "video_masks": []}
@@ -1202,7 +1202,7 @@ def _print_video_correctness(video_comparison):
 # ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
-        description="Throughput & correctness benchmark: kb-nano SAM3 vs reference",
+        description="Throughput & correctness benchmark: fastkernels SAM3 vs reference",
     )
     parser.add_argument("--model", type=str, default="facebook/sam3.1")
     parser.add_argument("--tp", type=int, default=1)
@@ -1212,7 +1212,7 @@ def main():
     parser.add_argument("--skip-reference", action="store_true")
     parser.add_argument(
         "--pytorch-reference", action="store_true", default=False,
-        help="Patch semantic PyTorch references from tasks/reference/L*/ into kb-nano.",
+        help="Patch semantic PyTorch references from tasks/reference/L*/ into fastkernels.",
     )
     parser.add_argument("--skip-latency", action="store_true")
     parser.add_argument("--latency-iters", type=int, default=20)
@@ -1347,7 +1347,7 @@ def main():
             print(f"  WARNING: Could not download checkpoint: {e}")
 
     print("=" * 70)
-    print("  kb-nano SAM3 Baseline vs Reference -- Segmentation Benchmark")
+    print("  fastkernels SAM3 Baseline vs Reference -- Segmentation Benchmark")
     print("=" * 70)
     print(f"  Model          : {args.model}")
     print(f"  GPU            : {gpu}")
@@ -1377,7 +1377,7 @@ def main():
         if ref_raw is None:
             print("  WARNING: Reference SAM3 subprocess failed.")
 
-    # -- Run kb-nano SAM3 --
+    # -- Run fastkernels SAM3 --
     kb_config = {
         "model": args.model, "seed": args.seed,
         "project_root": str(_PROJECT_ROOT), "package_name": _PACKAGE_DIR.name,
@@ -1389,12 +1389,12 @@ def main():
         "pytorch_reference": args.pytorch_reference,
     }
     kb_raw = run_worker(
-        KB_NANO_SAM3_WORKER, kb_config,
-        f"kb-nano SAM3 [{args.model.split('/')[-1]}]",
+        FASTKERNELS_SAM3_WORKER, kb_config,
+        f"fastkernels SAM3 [{args.model.split('/')[-1]}]",
         timeout=3600,
     )
     if kb_raw is None:
-        print("  ERROR: kb-nano subprocess failed.")
+        print("  ERROR: fastkernels subprocess failed.")
         sys.exit(1)
 
     num_items = kb_raw["num_items"]
@@ -1426,7 +1426,7 @@ def main():
         print(f"  Prepared {len(video_clips)} video clips for benchmarking", flush=True)
 
         if video_clips:
-            # Run reference video worker first (saves video_token_ids.pt for kb-nano)
+            # Run reference video worker first (saves video_token_ids.pt for fastkernels)
             ref_video_raw = None
             if not args.skip_reference:
                 ref_video_config = {
@@ -1444,7 +1444,7 @@ def main():
                     fps = ref_video_raw.get("frames_per_sec", 0)
                     print(f"\n  Reference video: {fps:.1f} frames/sec", flush=True)
 
-            # Run kb-nano video worker
+            # Run fastkernels video worker
             kb_video_config = {
                 "model": args.model, "seed": args.seed,
                 "project_root": str(_PROJECT_ROOT),
@@ -1455,13 +1455,13 @@ def main():
                 "pytorch_reference": args.pytorch_reference,
             }
             kb_video_raw = run_worker(
-                KB_NANO_SAM3_VIDEO_WORKER, kb_video_config,
-                f"kb-nano SAM3 Video [{args.model.split('/')[-1]}]",
+                FASTKERNELS_SAM3_VIDEO_WORKER, kb_video_config,
+                f"fastkernels SAM3 Video [{args.model.split('/')[-1]}]",
                 timeout=3600,
             )
             if kb_video_raw:
                 fps = kb_video_raw.get("frames_per_sec", 0)
-                print(f"  kb-nano video: {fps:.1f} frames/sec", flush=True)
+                print(f"  fastkernels video: {fps:.1f} frames/sec", flush=True)
 
             # Video correctness comparison
             if not args.skip_reference:
@@ -1478,7 +1478,7 @@ def main():
             "tp": args.tp, "seed": args.seed, "num_items": num_items,
             "dataset_image": f"SACo-Gold/{args.gold_subset}",
             "dataset_video": f"SACo-VEval/{args.veval_subset}",
-            "kb_nano_items_per_sec": kb_ips,
+            "fastkernels_items_per_sec": kb_ips,
         }
         if ref_raw:
             combined["ref_items_per_sec"] = ref_raw["items_per_sec"]

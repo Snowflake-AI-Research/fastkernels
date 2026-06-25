@@ -306,7 +306,7 @@ class Attention(nn.Module):
     def forward(self, query: torch.Tensor, key: torch.Tensor,
                 value: torch.Tensor) -> torch.Tensor:
         if self._use_custom_op:
-            return torch.ops.kb_nano.unified_attention(
+            return torch.ops.fastkernels.unified_attention(
                 query, key, value, self._layer_name,
             )
         return self.forward_impl(query, key, value)

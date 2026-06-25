@@ -3,7 +3,7 @@ title: Building an Agent
 description: Use an LLM to automatically generate and benchmark replacement kernels.
 ---
 
-kb-nano includes an agent that uses an LLM to generate replacement kernels, validate them, and benchmark them end-to-end — all in a single run. You can use it as-is or as a starting point for building your own agent.
+fastkernels includes an agent that uses an LLM to generate replacement kernels, validate them, and benchmark them end-to-end — all in a single run. You can use it as-is or as a starting point for building your own agent.
 
 ## How the Agent Works
 
@@ -18,15 +18,15 @@ The agent follows a four-stage pipeline:
 
 ```bash
 # Generate all L1 kernels for Llama
-kb_nano agent \
+fastkernels agent \
     --model meta-llama/Llama-3.1-8B-Instruct --level 1
 
 # CUDA-only kernels (no Triton/PyTorch builtins)
-kb_nano agent \
+fastkernels agent \
     --model meta-llama/Llama-3.1-8B-Instruct --level 1 --cuda-only
 
 # Mixtral L2 operators with TP
-kb_nano agent \
+fastkernels agent \
     --model mistralai/Mixtral-8x7B-Instruct-v0.1 --level 2 --tp 4
 ```
 
@@ -53,7 +53,7 @@ The agent in `agent/agent.py` is structured around a few composable pieces you c
 ### Operator Discovery
 
 ```python
-from kb_nano.agent.agent import discover_operators
+from fastkernels.agent.agent import discover_operators
 
 ops = discover_operators("meta-llama/Llama-3.1-8B-Instruct", level=1)
 for op in ops:
@@ -77,14 +77,14 @@ Once your agent has produced kernels, place them at `tasks/candidate/L{level}/{o
 
 ### Experiment Tracking
 
-All `kb_nano agent` runs are automatically logged to MLflow. You can also use the [tracking API](/experiment-tracking#tracking-api) in your own agent to log kernel generations, benchmark results, and custom metrics:
+All `fastkernels agent` runs are automatically logged to MLflow. You can also use the [tracking API](/experiment-tracking#tracking-api) in your own agent to log kernel generations, benchmark results, and custom metrics:
 
 ```python
-from kb_nano.bench.tracking import tracker
+from fastkernels.bench.tracking import tracker
 
 with tracker.start_run("my-agent-run", params={"model": "llama", "level": 1}):
     tracker.log_kernel("rms_norm", level=1, code=kernel_source)
     tracker.log_metrics({"compile_time_s": 12.3, "my_score": 0.95})
 ```
 
-Use `kb_nano history` to query past runs from the CLI, or `kb_nano mlflow-ui` to launch the web UI. See [Experiment Tracking](/experiment-tracking) for full details.
+Use `fastkernels history` to query past runs from the CLI, or `fastkernels mlflow-ui` to launch the web UI. See [Experiment Tracking](/experiment-tracking) for full details.

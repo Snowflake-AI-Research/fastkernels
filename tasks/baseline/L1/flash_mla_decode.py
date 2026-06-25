@@ -22,7 +22,7 @@ import torch.nn as nn
 # vLLM ships a fully vendored copy of FlashMLA under
 # ``vllm.third_party.flashmla.flash_mla_interface`` together with its
 # compiled ``vllm._flashmla_C`` / ``vllm._flashmla_extension_C`` kernels,
-# so kb_nano does not need to build FlashMLA separately.  The standalone
+# so fastkernels does not need to build FlashMLA separately.  The standalone
 # ``flash_mla`` package remains supported as a fallback for environments
 # that predate the vendored copy.
 try:

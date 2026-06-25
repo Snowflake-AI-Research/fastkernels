@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Throughput, latency, and correctness benchmark: kb-nano vs timm
+Throughput, latency, and correctness benchmark: fastkernels vs timm
 for vision encoder models (SigLIP-2, DINOv3, SwinV2, MobileNetV4).
 
 Runs standardized vision encoder workloads and compares:
@@ -49,8 +49,8 @@ _PROJECT_ROOT = _PACKAGE_DIR.parent
 
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from kb_nano.bench.utils.worker import run_worker
-from kb_nano.bench.utils.workloads import (
+from fastkernels.bench.utils.worker import run_worker
+from fastkernels.bench.utils.workloads import (
     VISION_ENCODER_LATENCY_WORKLOADS,
     VISION_ENCODER_THROUGHPUT_WORKLOADS,
 )
@@ -352,9 +352,9 @@ if __name__ == "__main__":
 
 
 # ---------------------------------------------------------------------------
-# kb-nano subprocess worker
+# fastkernels subprocess worker
 # ---------------------------------------------------------------------------
-KB_NANO_WORKER = _WORKER_COMMON + r'''
+FASTKERNELS_WORKER = _WORKER_COMMON + r'''
 
 def main():
     with open(sys.argv[1]) as f:
@@ -363,7 +363,7 @@ def main():
     pkg = cfg["package_name"]
 
     if cfg.get("pytorch_reference", False):
-        from kb_nano.infra.kernel_swapper import (
+        from fastkernels.infra.kernel_swapper import (
             apply_candidates,
             discover_references,
             print_reference_summary,
@@ -385,12 +385,12 @@ def main():
     ModelClass = getattr(mod, kb_class)
 
     print(
-        f"Loading kb-nano model: {kb_class} from timm={timm_name}",
+        f"Loading fastkernels model: {kb_class} from timm={timm_name}",
         file=sys.stderr, flush=True,
     )
     model = ModelClass.from_timm(timm_name).to(device="cuda", dtype=dtype).eval()
 
-    results = run_benchmark(model, cfg, "kb-nano")
+    results = run_benchmark(model, cfg, "fastkernels")
 
     with open(cfg["output_file"], "w") as f:
         json.dump(results, f)
@@ -442,7 +442,7 @@ def _print_throughput_comparison(
     print("\n" + "=" * 90)
     print("  THROUGHPUT COMPARISON (images/sec)")
     print("=" * 90)
-    header = f"  {'Scenario':<25} {'Images':>7} {'kb-nano':>12}"
+    header = f"  {'Scenario':<25} {'Images':>7} {'fastkernels':>12}"
     if ref_results:
         header += f" {'timm':>12} {'Speedup':>10}"
     print(header)
@@ -466,7 +466,7 @@ def _print_latency_comparison(
     print("\n" + "=" * 90)
     print("  LATENCY COMPARISON (seconds)")
     print("=" * 90)
-    header = f"  {'Scenario':<25} {'kb-nano p50':>12} {'kb-nano p99':>12}"
+    header = f"  {'Scenario':<25} {'fastkernels p50':>12} {'fastkernels p99':>12}"
     if ref_results:
         header += f" {'timm p50':>12} {'timm p99':>12} {'Speedup':>10}"
     print(header)
@@ -516,7 +516,7 @@ def _compare_embeddings(kb_embed_dir: str, ref_embed_dir: str) -> dict:
         if len(kb_emb) != len(ref_emb):
             print(
                 f"  WARNING: shape mismatch for {fname}: "
-                f"kb-nano={kb_emb.shape} vs timm={ref_emb.shape}, skipping",
+                f"fastkernels={kb_emb.shape} vs timm={ref_emb.shape}, skipping",
                 file=sys.stderr,
             )
             continue
@@ -586,7 +586,7 @@ def _print_correctness_comparison(correctness: dict):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Vision encoder benchmark: kb-nano vs timm",
+        description="Vision encoder benchmark: fastkernels vs timm",
     )
     parser.add_argument(
         "--model", type=str, required=True,
@@ -595,11 +595,11 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--skip-timm", action="store_true",
-        help="Skip timm reference; only benchmark kb-nano (no correctness)",
+        help="Skip timm reference; only benchmark fastkernels (no correctness)",
     )
     parser.add_argument(
         "--pytorch-reference", action="store_true", default=False,
-        help="Patch semantic PyTorch references from tasks/reference/L*/ into kb-nano.",
+        help="Patch semantic PyTorch references from tasks/reference/L*/ into fastkernels.",
     )
     parser.add_argument("--skip-throughput", action="store_true")
     parser.add_argument("--skip-latency", action="store_true")
@@ -667,7 +667,7 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
     if save_embeddings:
-        kb_embed_dir = os.path.join(args.output_dir, "embeddings", "kb_nano")
+        kb_embed_dir = os.path.join(args.output_dir, "embeddings", "fastkernels")
         ref_embed_dir = os.path.join(args.output_dir, "embeddings", "timm")
     else:
         kb_embed_dir = None
@@ -700,7 +700,7 @@ def main():
         "seed": args.seed,
         "dtype": args.dtype,
         "project_root": str(_PROJECT_ROOT),
-        "package_name": "kb_nano",
+        "package_name": "fastkernels",
         "warmup_resolution": default_res,
         "image_mean": model_info["image_mean"],
         "image_std": model_info["image_std"],
@@ -710,7 +710,7 @@ def main():
     if "strict_img_size" in model_info:
         base_config["strict_img_size"] = model_info["strict_img_size"]
 
-    # --- kb-nano benchmark ---
+    # --- fastkernels benchmark ---
     kb_config = {
         **base_config,
         "scenarios": scenarios,
@@ -720,8 +720,8 @@ def main():
     if kb_embed_dir:
         kb_config["embed_dir"] = kb_embed_dir
     kb_data = run_worker(
-        KB_NANO_WORKER, kb_config,
-        "kb-nano vision encoder benchmark", timeout=36000,
+        FASTKERNELS_WORKER, kb_config,
+        "fastkernels vision encoder benchmark", timeout=36000,
     )
 
     # --- timm benchmark ---
@@ -771,7 +771,7 @@ def main():
             "dtype": args.dtype,
             "dataset": dataset_name,
             "dataset_split": dataset_split,
-            "kb_nano": kb_data,
+            "fastkernels": kb_data,
         }
         if ref_data:
             results["timm"] = ref_data
@@ -781,7 +781,7 @@ def main():
             json.dump(results, f, indent=2)
         print(f"\n  Results saved to: {results_path}")
     else:
-        print("ERROR: kb-nano benchmark failed.")
+        print("ERROR: fastkernels benchmark failed.")
         sys.exit(1)
 
 

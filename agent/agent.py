@@ -2,19 +2,19 @@
 """LLM-powered kernel generation agent.
 
 Uses Claude Opus 4.6 (via the internal Corvo endpoint) to generate
-replacement kernels for kb_nano operators, then benchmarks them using
-the kb_nano.bench suite.
+replacement kernels for fastkernels operators, then benchmarks them using
+the fastkernels.bench suite.
 
 Usage:
-    python -m kb_nano.agent.agent \
+    python -m fastkernels.agent.agent \
         --model meta-llama/Llama-3.1-8B-Instruct \
         --level 1
 
-    python -m kb_nano.agent.agent \
+    python -m fastkernels.agent.agent \
         --model meta-llama/Llama-3.1-8B-Instruct \
         --level 1 --cuda-only --max-retries 3
 
-    python -m kb_nano.agent.agent \
+    python -m fastkernels.agent.agent \
         --model mistralai/Mixtral-8x7B-Instruct-v0.1 \
         --level 2 --tp 4
 """
@@ -37,14 +37,14 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
-from kb_nano import CANDIDATE_DIR, CUDA_BUILD_CACHE, KB_ROOT, PREV_ATTEMPTS_DIR, PROJECT_ROOT
-from kb_nano.bench.tracking import tracker
+from fastkernels import CANDIDATE_DIR, CUDA_BUILD_CACHE, KB_ROOT, PREV_ATTEMPTS_DIR, PROJECT_ROOT
+from fastkernels.bench.tracking import tracker
 
 _PROJECT_ROOT = str(PROJECT_ROOT)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from kb_nano.agent.llm_api import call_llm_async
+from fastkernels.agent.llm_api import call_llm_async
 
 _KB_ROOT = KB_ROOT
 _CANDIDATE_DIR = CANDIDATE_DIR
@@ -94,7 +94,7 @@ def _detect_model_key(model_name: str) -> str:
 
 def discover_operators(model_name: str, level: int) -> list[OperatorSpec]:
     """Find all operators at the given level used by the given model."""
-    from kb_nano.infra.kernel_swapper import discover_targets
+    from fastkernels.infra.kernel_swapper import discover_targets
 
     model_key = _detect_model_key(model_name)
     targets = discover_targets()
@@ -913,7 +913,7 @@ def _archive_existing_candidates() -> None:
 # ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
-        description="LLM-powered kernel generation agent for kb_nano",
+        description="LLM-powered kernel generation agent for fastkernels",
     )
     parser.add_argument(
         "--model", type=str, required=True,
@@ -977,7 +977,7 @@ def _run_agent(args):
     _CUDA_BUILD_CACHE.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70)
-    print("  kb-nano LLM Kernel Generation Agent")
+    print("  fastkernels LLM Kernel Generation Agent")
     print("=" * 70)
     print(f"  Model:       {args.model}")
     print(f"  Level:       L{args.level}")

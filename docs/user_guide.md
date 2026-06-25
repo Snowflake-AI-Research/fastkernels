@@ -1,4 +1,4 @@
-# kb-nano User Guide
+# fastkernels User Guide
 
 A standalone LLM inference engine with a benchmarking suite for evaluating custom CUDA/Triton/PyTorch kernels. Supports **Llama 3.1** and **Mixtral-8x7B** with tensor parallelism.
 
@@ -7,8 +7,8 @@ A standalone LLM inference engine with a benchmarking suite for evaluating custo
 ## Quick Start
 
 ```bash
-git clone git@github.com:sfc-gh-goliaro/kb-nano.git
-cd kb-nano
+git clone https://github.com/Snowflake-AI-Research/fastkernels.git
+cd fastkernels
 pip install .
 ```
 
@@ -16,45 +16,45 @@ pip install .
 
 ## Benchmarking
 
-kb-nano provides three complementary benchmarking tools.
+fastkernels provides three complementary benchmarking tools.
 
 ### E2E Benchmark CLI
 
-`kb_nano e2e` mirrors vLLM's benchmarking CLI. The same flags work in both tools, making it easy to compare results:
+`fastkernels e2e` mirrors vLLM's benchmarking CLI. The same flags work in both tools, making it easy to compare results:
 
 ```bash
 # Throughput (mirrors `vllm bench throughput`)
-kb_nano e2e throughput \
+fastkernels e2e throughput \
     --model meta-llama/Llama-3.1-8B-Instruct \
     --dataset-name random --random-input-len 512 --random-output-len 128 \
     --num-prompts 200 --tp 4
 
 # Latency
-kb_nano e2e latency \
+fastkernels e2e latency \
     --model meta-llama/Llama-3.1-8B-Instruct \
     --input-len 128 --output-len 128
 
 # Evaluate candidate kernels from tasks/candidate/ against baseline
-kb_nano eval \
+fastkernels eval \
     --model meta-llama/Llama-3.1-8B-Instruct
 ```
 
 ### Kernel Benchmark CLI
 
-`kb_nano kernels` benchmarks a single operator replacement. It instantiates the baseline and candidate modules, compares their `forward()` outputs with a tolerance-normalized max error ratio, and measures wall-clock speedup. FP8 `(tensor, scale)` output pairs are compared after dequantization with scale-derived tolerances.
+`fastkernels kernels` benchmarks a single operator replacement. It instantiates the baseline and candidate modules, compares their `forward()` outputs with a tolerance-normalized max error ratio, and measures wall-clock speedup. FP8 `(tensor, scale)` output pairs are compared after dequantization with scale-derived tolerances.
 
 ```bash
 # List all benchmarkable targets
-kb_nano kernels --list
+fastkernels kernels --list
 
 # Show model-to-operator mapping
-kb_nano kernels --map
+fastkernels kernels --map
 
 # Benchmark a candidate from tasks/candidate/
-kb_nano kernels --target rms_norm
+fastkernels kernels --target rms_norm
 
 # Filter by model and TP degree
-kb_nano kernels \
+fastkernels kernels \
     --target rms_norm \
     --model llama31 \
     --tp 1
@@ -64,7 +64,7 @@ A benchmark is **PASS** if the candidate output's max error ratio is <= 1.0 agai
 
 ### vLLM Alignment Test
 
-`tests/bench_vllm.py` runs kb-nano and vLLM side-by-side across three workload scenarios (prefill-heavy, balanced, decode-heavy) plus latency benchmarks, comparing throughput and per-token alignment:
+`tests/bench_vllm.py` runs fastkernels and vLLM side-by-side across three workload scenarios (prefill-heavy, balanced, decode-heavy) plus latency benchmarks, comparing throughput and per-token alignment:
 
 ```bash
 python tests/bench_vllm.py --model meta-llama/Llama-3.1-8B-Instruct
@@ -95,15 +95,15 @@ The agent uses Claude to generate replacement kernels, validate them, and benchm
 
 ```bash
 # Generate all L1 kernels for Llama
-kb_nano agent \
+fastkernels agent \
     --model meta-llama/Llama-3.1-8B-Instruct --level 1
 
 # CUDA-only kernels (no Triton/PyTorch builtins)
-kb_nano agent \
+fastkernels agent \
     --model meta-llama/Llama-3.1-8B-Instruct --level 1 --cuda-only
 
 # Mixtral L2 operators with TP
-kb_nano agent \
+fastkernels agent \
     --model mistralai/Mixtral-8x7B-Instruct-v0.1 --level 2 --tp 4
 ```
 
@@ -115,7 +115,7 @@ Generated kernels are saved to `tasks/candidate/L{level}/{op_name}.py`.
 
 ## Experiment Tracking
 
-Every `kb_nano agent`, `kb_nano kernels`, `kb_nano eval`, and `kb_nano e2e` run is automatically logged to [MLflow](https://mlflow.org). This provides:
+Every `fastkernels agent`, `fastkernels kernels`, `fastkernels eval`, and `fastkernels e2e` run is automatically logged to [MLflow](https://mlflow.org). This provides:
 
 - **Kernel lineage**: Every generated kernel is stored as an MLflow artifact, linked to the run parameters that produced it.
 - **Benchmark history**: Speedup, correctness, and max error ratio for every operator across every benchmark run.
@@ -125,21 +125,21 @@ Every `kb_nano agent`, `kb_nano kernels`, `kb_nano eval`, and `kb_nano e2e` run 
 
 | Command | Logged data |
 |---------|-------------|
-| `kb_nano agent` | Run params, per-op generation success/attempts, unit test results, e2e speedup, kernel source code |
-| `kb_nano kernels` | Bench params, per-operator per-scenario speedup/correctness, kernel source code |
-| `kb_nano eval` | Per-model throughput/latency speedup, alignment rate, MacroEval speedup/correctness/coverage/score, wall-clock time |
-| `kb_nano e2e` | Throughput (tokens/s), latency (percentiles), serve metrics (TTFT, TPOT, ITL) |
+| `fastkernels agent` | Run params, per-op generation success/attempts, unit test results, e2e speedup, kernel source code |
+| `fastkernels kernels` | Bench params, per-operator per-scenario speedup/correctness, kernel source code |
+| `fastkernels eval` | Per-model throughput/latency speedup, alignment rate, MacroEval speedup/correctness/coverage/score, wall-clock time |
+| `fastkernels e2e` | Throughput (tokens/s), latency (percentiles), serve metrics (TTFT, TPOT, ITL) |
 
 ### Querying from the CLI
 
 ```bash
-kb_nano history                  # recent runs
-kb_nano history --op rms_norm    # history for one operator
-kb_nano history --best           # best speedup per operator
-kb_nano history --limit 50       # show more results
+fastkernels history                  # recent runs
+fastkernels history --op rms_norm    # history for one operator
+fastkernels history --best           # best speedup per operator
+fastkernels history --limit 50       # show more results
 ```
 
-#### Sample output: `kb_nano history`
+#### Sample output: `fastkernels history`
 
 ```
 ======================================================================
@@ -153,7 +153,7 @@ kb_nano history --limit 50       # show more results
 ======================================================================
 ```
 
-#### Sample output: `kb_nano history --op rms_norm`
+#### Sample output: `fastkernels history --op rms_norm`
 
 ```
 ======================================================================
@@ -167,7 +167,7 @@ kb_nano history --limit 50       # show more results
 ======================================================================
 ```
 
-#### Sample output: `kb_nano history --best`
+#### Sample output: `fastkernels history --best`
 
 ```
 ======================================================================
@@ -186,7 +186,7 @@ kb_nano history --limit 50       # show more results
 Any kernel optimization script can use the tracking API directly:
 
 ```python
-from kb_nano.bench.tracking import tracker
+from fastkernels.bench.tracking import tracker
 
 with tracker.start_run("my-run", params={"model": "llama", "level": 1}):
     # Log a generated kernel (stored as MLflow artifact)
@@ -219,16 +219,16 @@ The full API surface is five logging functions plus one context manager:
 ### MLflow Web UI
 
 ```bash
-kb_nano mlflow-ui
+fastkernels mlflow-ui
 # Open http://localhost:5000 in your browser
 # Press Ctrl+C to stop
 ```
 
-The UI launches a local MLflow server at http://localhost:5000 backed by the `mlruns/` directory. All runs are logged under the `kb_nano` experiment.
+The UI launches a local MLflow server at http://localhost:5000 backed by the `mlruns/` directory. All runs are logged under the `fastkernels` experiment.
 
 #### Navigating the UI
 
-1. **Experiment list** (left sidebar): Select the `kb_nano` experiment to see all tracked runs.
+1. **Experiment list** (left sidebar): Select the `fastkernels` experiment to see all tracked runs.
 2. **Runs table**: Each row is a tracked run (agent, kernel benchmark, eval, or e2e). Columns show run name, start time, duration, and logged metrics. Click column headers to sort -- e.g., sort by `e2e_speedup` to find your fastest runs.
 3. **Filtering**: Use the search bar to filter runs by parameters or metrics. Examples:
    - `params.level = "1"` -- show only L1 runs
@@ -272,10 +272,10 @@ Each run is tagged with a `tier` that indicates its source:
 
 | Tag | Source command | Key metrics |
 |-----|---------------|-------------|
-| `agent` | `kb_nano agent` | `gen_{op}_success`, `utest_{op}_success`, `e2e_speedup`, `e2e_token_match_rate` |
-| `kernel` | `kb_nano kernels` | `{op}_avg_speedup`, `{op}_passed`, `{op}_failed`, `avg_speedup` |
-| `eval` | `kb_nano eval` | `avg_throughput_speedup`, `avg_latency_speedup`, `alignment_rate`, `macro_speedup`, `macro_correctness`, `macro_coverage`, `macro_score` |
-| `e2e` | `kb_nano e2e` | `tokens_per_second`, `avg_latency`, `mean_ttft_ms` (varies by bench type) |
+| `agent` | `fastkernels agent` | `gen_{op}_success`, `utest_{op}_success`, `e2e_speedup`, `e2e_token_match_rate` |
+| `kernel` | `fastkernels kernels` | `{op}_avg_speedup`, `{op}_passed`, `{op}_failed`, `avg_speedup` |
+| `eval` | `fastkernels eval` | `avg_throughput_speedup`, `avg_latency_speedup`, `alignment_rate`, `macro_speedup`, `macro_correctness`, `macro_coverage`, `macro_score` |
+| `e2e` | `fastkernels e2e` | `tokens_per_second`, `avg_latency`, `mean_ttft_ms` (varies by bench type) |
 
 ### Disabling tracking
 
@@ -317,7 +317,7 @@ Every module's `__init__` and `forward` signatures are designed to mirror the co
 
 Key conventions:
 
-| kb-nano module | vLLM equivalent | `forward` signature |
+| fastkernels module | vLLM equivalent | `forward` signature |
 |---|---|---|
 | `LlamaAttention` | `LlamaAttention` | `(positions, hidden_states) -> Tensor` |
 | `LlamaDecoderLayer` | `LlamaDecoderLayer` | `(positions, hidden_states, residual) -> (Tensor, Tensor)` |
@@ -380,7 +380,7 @@ class RMSNorm(nn.Module):
 ```
 
 ```bash
-kb_nano kernels --target rms_norm
+fastkernels kernels --target rms_norm
 ```
 
 You can use pure PyTorch, Triton (`triton.jit`), inline CUDA (`torch.utils.cpp_extension.load_inline`), or external libraries. Avoid importing `vllm` or `sgl_kernel` in your replacement -- the point is to provide an alternative implementation.
@@ -393,20 +393,20 @@ You can use pure PyTorch, Triton (`triton.jit`), inline CUDA (`torch.utils.cpp_e
 
 | Variable | Default | Description |
 |---|---|---|
-| `KB_NANO_NCCL_PORT` | `29501` | TCP port for NCCL process group initialization. |
-| `KB_NANO_PROFILE` | `0` | Set to `1` to enable internal profiling timers. |
-| `KB_NANO_DISABLE_CUSTOM_AR` | `0` | Set to `1` to disable custom IPC all-reduce (use NCCL). |
+| `FASTKERNELS_NCCL_PORT` | `29501` | TCP port for NCCL process group initialization. |
+| `FASTKERNELS_PROFILE` | `0` | Set to `1` to enable internal profiling timers. |
+| `FASTKERNELS_DISABLE_CUSTOM_AR` | `0` | Set to `1` to disable custom IPC all-reduce (use NCCL). |
 
 ### Troubleshooting
 
 **GPU memory**: The engine fills ~90% of free GPU memory with KV cache. Use a smaller model or increase TP if you run out of memory.
 
-**NCCL port conflict**: Set `KB_NANO_NCCL_PORT=29502` if another instance is using the default port.
+**NCCL port conflict**: Set `FASTKERNELS_NCCL_PORT=29502` if another instance is using the default port.
 
-**Custom all-reduce hangs**: Disable with `KB_NANO_DISABLE_CUSTOM_AR=1`.
+**Custom all-reduce hangs**: Disable with `FASTKERNELS_DISABLE_CUSTOM_AR=1`.
 
 **HuggingFace auth**: Run `huggingface-cli login` for gated models like Llama.
 
-**Bench target not found**: Run `kb_nano kernels --list` to see available targets. Names match file names under `tasks/baseline/` (without `.py`).
+**Bench target not found**: Run `fastkernels kernels --list` to see available targets. Names match file names under `tasks/baseline/` (without `.py`).
 
 **Class name mismatch**: Your replacement class must have the exact same name as the baseline class (e.g. `RMSNorm`, not `MyRMSNorm`).

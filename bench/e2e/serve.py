@@ -1,15 +1,15 @@
-"""Online serving benchmark for kb-nano.
+"""Online serving benchmark for fastkernels.
 
 Modeled after ``vllm bench serve``. Sends async HTTP requests to a running
-OpenAI-compatible server (``kb_nano.infra.server``) and measures TTFT, TPOT,
+OpenAI-compatible server (``fastkernels.infra.server``) and measures TTFT, TPOT,
 ITL, E2E latency, and throughput.
 
 Prerequisites:
     Start the server first:
-        python -m kb_nano.infra.server --model meta-llama/Llama-3.1-8B-Instruct
+        python -m fastkernels.infra.server --model meta-llama/Llama-3.1-8B-Instruct
 
 Usage:
-    python -m kb_nano.bench.e2e serve \\
+    python -m fastkernels.bench.e2e serve \\
         --model meta-llama/Llama-3.1-8B-Instruct \\
         --base-url http://localhost:8000 \\
         --dataset-name random --random-input-len 512 --random-output-len 128 \\
@@ -33,12 +33,12 @@ import numpy as np
 from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer
 
-from kb_nano.bench.utils.datasets import (
+from fastkernels.bench.utils.datasets import (
     SampleRequest,
     add_dataset_parser,
     get_samples,
 )
-from kb_nano.infra.kernel_swapper import discover_candidates, print_candidate_summary
+from fastkernels.infra.kernel_swapper import discover_candidates, print_candidate_summary
 
 
 @dataclass
@@ -494,7 +494,7 @@ async def main_async(args: argparse.Namespace):
             print(f"\nNOTE: Candidate kernels detected: {names}.")
             print("      These must be applied server-side. Ensure the server")
             print("      was started WITHOUT --no-candidate-kernels:")
-            print("          python -m kb_nano.infra.server --model <model>\n")
+            print("          python -m fastkernels.infra.server --model <model>\n")
 
     if args.model is None:
         print("Model not specified, fetching from server...")
@@ -529,7 +529,7 @@ async def main_async(args: argparse.Namespace):
     sampling_params = _build_sampling_payload(args)
 
     print("=" * 70)
-    print("  kb-nano Serving Benchmark")
+    print("  fastkernels Serving Benchmark")
     print("=" * 70)
     print(f"  Model          : {args.model}")
     print(f"  Server         : {api_url}")
@@ -622,7 +622,7 @@ async def main_async(args: argparse.Namespace):
     }
 
     # Log to MLflow
-    from kb_nano.bench.tracking import tracker
+    from fastkernels.bench.tracking import tracker
 
     tracker.log_e2e(result_json, bench_type="serve")
 

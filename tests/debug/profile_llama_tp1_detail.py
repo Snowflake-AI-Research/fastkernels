@@ -9,7 +9,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from kb_nano.infra.engine import LlamaEngine, SamplingParams
+from fastkernels.infra.engine import LlamaEngine, SamplingParams
 
 MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 TP = 1

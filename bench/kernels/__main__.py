@@ -1,24 +1,24 @@
-"""CLI entry point for the kb-nano kernel benchmark suite.
+"""CLI entry point for the fastkernels kernel benchmark suite.
 
 Usage:
     # Test all operators that have candidates
-    python -m kb_nano.bench.kernels
+    python -m fastkernels.bench.kernels
 
     # Test a specific operator
-    python -m kb_nano.bench.kernels --target rms_norm
+    python -m fastkernels.bench.kernels --target rms_norm
 
     # Filter to a specific model family
-    python -m kb_nano.bench.kernels --target rms_norm --model llama
+    python -m fastkernels.bench.kernels --target rms_norm --model llama
 
     # Filter to TP=4 scenarios only
-    python -m kb_nano.bench.kernels --target rms_norm --tp 4
+    python -m fastkernels.bench.kernels --target rms_norm --tp 4
 
     # Restrict to LLM category
-    python -m kb_nano.bench.kernels --target rms_norm --category llm
+    python -m fastkernels.bench.kernels --target rms_norm --category llm
 
     # List available targets
-    python -m kb_nano.bench.kernels --list
-    python -m kb_nano.bench.kernels --list --level 1
+    python -m fastkernels.bench.kernels --list
+    python -m fastkernels.bench.kernels --list --level 1
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ from __future__ import annotations
 import argparse
 import sys
 
-from kb_nano.infra.kernel_swapper import (
+from fastkernels.infra.kernel_swapper import (
     list_targets,
     print_model_operator_map,
 )
@@ -34,12 +34,12 @@ from kb_nano.infra.kernel_swapper import (
 from .result import KernelBenchResult
 from .runner import run_all_kernel_benchmarks, run_kernel_benchmark
 
-from kb_nano import run_output_path
+from fastkernels import run_output_path
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="kb-nano CUDA kernel benchmark suite (isolated forward() testing)",
+        description="fastkernels CUDA kernel benchmark suite (isolated forward() testing)",
     )
     parser.add_argument(
         "--list", action="store_true",
@@ -119,7 +119,7 @@ def main():
 
     output_path = args.output_json or str(run_output_path("kernels"))
 
-    from kb_nano.bench.tracking import tracker
+    from fastkernels.bench.tracking import tracker
 
     run_name = f"kernels_{args.target or 'all'}"
     bench_params = {

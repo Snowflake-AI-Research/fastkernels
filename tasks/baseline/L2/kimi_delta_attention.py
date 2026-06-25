@@ -67,7 +67,7 @@ class KimiDeltaAttention(nn.Module):
     """Kimi Linear's KDA layer.
 
     Uses vLLM/FLA kernels for the gate and the gated delta attention core,
-    while reading runtime state + metadata from kb_nano's global Context.
+    while reading runtime state + metadata from fastkernels's global Context.
     """
 
     def __init__(self, config, layer_idx: int, quant_config: dict | None = None):
@@ -358,7 +358,7 @@ class KimiDeltaAttention(nn.Module):
             device=hidden_states.device,
         )
         if self._use_custom_op:
-            torch.ops.kb_nano.kda_attention(
+            torch.ops.fastkernels.kda_attention(
                 q_proj_states,
                 k_proj_states,
                 v_proj_states,

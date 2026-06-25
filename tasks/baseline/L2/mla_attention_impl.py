@@ -15,7 +15,7 @@ MLA equivalent of attention_impl.py's Attention class. Handles:
 
 The default is BF16 so that ``topk_indices``, attention outputs, and
 downstream MoE expert assignments are bit-for-bit comparable to vLLM's
-stock path. Set ``KB_NANO_KV_CACHE_DTYPE=fp8_ds_mla`` to switch to the
+stock path. Set ``FASTKERNELS_KV_CACHE_DTYPE=fp8_ds_mla`` to switch to the
 FP8 KV cache (extra memory savings, extra quantization noise).
 """
 
@@ -48,16 +48,16 @@ MIN_HEADS_FOR_BF16_PREFILL = 32
 
 
 def _default_kv_cache_dtype() -> str:
-    """Resolve the MLA KV cache dtype from ``KB_NANO_KV_CACHE_DTYPE``.
+    """Resolve the MLA KV cache dtype from ``FASTKERNELS_KV_CACHE_DTYPE``.
 
     Defaults to ``"auto"`` (BF16), matching stock vLLM on DeepSeek-V3.2.
     """
-    v = os.environ.get("KB_NANO_KV_CACHE_DTYPE", "auto").strip().lower()
+    v = os.environ.get("FASTKERNELS_KV_CACHE_DTYPE", "auto").strip().lower()
     if v in ("", "auto", "bf16", "bfloat16"):
         return "auto"
     if v in ("fp8", "fp8_ds_mla"):
         return "fp8_ds_mla"
-    raise ValueError(f"Unsupported KB_NANO_KV_CACHE_DTYPE={v!r}")
+    raise ValueError(f"Unsupported FASTKERNELS_KV_CACHE_DTYPE={v!r}")
 
 
 def _compute_fp8_decode_padded_heads(num_heads: int) -> int:
@@ -194,7 +194,7 @@ class MLAAttention(nn.Module):
         # symbolic under torch.compile (passing a precomputed ``int[]`` here
         # would force Dynamo to specialize ``q.shape[0]`` to a constant).
         if self._use_custom_op:
-            return torch.ops.kb_nano.unified_mla_attention(
+            return torch.ops.fastkernels.unified_mla_attention(
                 q, kv_c_normed, k_pe, topk_indices, self._layer_name,
             )
         return self.forward_impl(q, kv_c_normed, k_pe, topk_indices)

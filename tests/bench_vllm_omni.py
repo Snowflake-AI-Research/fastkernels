@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Throughput, latency, and correctness benchmark: kb-nano vs vllm-omni
+Throughput, latency, and correctness benchmark: fastkernels vs vllm-omni
 for diffusion models (FLUX.1-dev, HunyuanVideo-1.5) and TTS models (CosyVoice3).
 
 The benchmark mode is inferred from the model's category:
@@ -43,9 +43,9 @@ _THIS_DIR = Path(__file__).resolve().parent
 _PACKAGE_DIR = _THIS_DIR.parent
 _PROJECT_ROOT = _PACKAGE_DIR.parent
 
-from kb_nano.bench.eval.config import MODEL_CATEGORY
-from kb_nano.bench.utils.worker import run_worker
-from kb_nano.bench.utils.workloads import (
+from fastkernels.bench.eval.config import MODEL_CATEGORY
+from fastkernels.bench.utils.worker import run_worker
+from fastkernels.bench.utils.workloads import (
     COSYVOICE3_CONFIG,
     DIFFUSION_LATENCY_WORKLOADS,
     DIFFUSION_THROUGHPUT_WORKLOADS,
@@ -360,7 +360,7 @@ if __name__ == "__main__":
 '''
 
 
-FLUX_KB_NANO_WORKER = r'''
+FLUX_FASTKERNELS_WORKER = r'''
 import json, os, sys, time, torch
 from tqdm import tqdm
 
@@ -371,7 +371,7 @@ def main():
     sys.path.insert(0, cfg["project_root"])
 
     if cfg.get("pytorch_reference", False):
-        from kb_nano.infra.kernel_swapper import (
+        from fastkernels.infra.kernel_swapper import (
             apply_candidates,
             discover_references,
             print_reference_summary,
@@ -429,7 +429,7 @@ def main():
         )
         total_elapsed = 0.0
         total_images = 0
-        desc = f"kb-nano {scenario['name']}"
+        desc = f"fastkernels {scenario['name']}"
         pbar = tqdm(batches, desc=desc, unit="batch", file=sys.stderr)
         for batch_idx, batch_prompts in enumerate(pbar):
             torch.cuda.synchronize()
@@ -470,10 +470,10 @@ def main():
         )
         num_warmup = ls.get("num_warmup", 2)
         num_iters = ls.get("num_iters", 5)
-        for i in tqdm(range(num_warmup), desc=f"kb-nano latency warmup {ls['name']}", file=sys.stderr):
+        for i in tqdm(range(num_warmup), desc=f"fastkernels latency warmup {ls['name']}", file=sys.stderr):
             torch.cuda.synchronize(); engine.generate(prompts, params); torch.cuda.synchronize()
         latencies = []
-        for i in tqdm(range(num_iters), desc=f"kb-nano latency {ls['name']}", file=sys.stderr):
+        for i in tqdm(range(num_iters), desc=f"fastkernels latency {ls['name']}", file=sys.stderr):
             torch.cuda.synchronize()
             t0 = time.perf_counter()
             engine.generate(prompts, params)
@@ -498,7 +498,7 @@ if __name__ == "__main__":
 # HunyuanVideo workers
 # ═══════════════════════════════════════════════════════════════════════════
 
-HUNYUAN_KB_NANO_WORKER = r'''
+HUNYUAN_FASTKERNELS_WORKER = r'''
 import json, os, sys, time, torch
 import numpy as np
 from tqdm import tqdm
@@ -509,7 +509,7 @@ def main():
     sys.path.insert(0, cfg["project_root"])
 
     if cfg.get("pytorch_reference", False):
-        from kb_nano.infra.kernel_swapper import (
+        from fastkernels.infra.kernel_swapper import (
             apply_candidates,
             discover_references,
             print_reference_summary,
@@ -520,14 +520,14 @@ def main():
             apply_candidates(references)
 
     try:
-        from kb_nano.infra.diffusion_engine import DiffusionEngine
-        from kb_nano.tasks.baseline.L4.hunyuan_video import (
+        from fastkernels.infra.diffusion_engine import DiffusionEngine
+        from fastkernels.tasks.baseline.L4.hunyuan_video import (
             HunyuanVideoDiffusionSamplingParams,
         )
     except (ImportError, ModuleNotFoundError):
         sys.path.insert(0, cfg["project_root"])
-        from kb_nano.infra.diffusion_engine import DiffusionEngine
-        from kb_nano.tasks.baseline.L4.hunyuan_video import (
+        from fastkernels.infra.diffusion_engine import DiffusionEngine
+        from fastkernels.tasks.baseline.L4.hunyuan_video import (
             HunyuanVideoDiffusionSamplingParams,
         )
 
@@ -569,7 +569,7 @@ def main():
         )
         total_elapsed = 0.0
         total_videos = 0
-        desc = f"kb-nano {scenario['name']}"
+        desc = f"fastkernels {scenario['name']}"
         pbar = tqdm(enumerate(prompts), total=len(prompts), desc=desc, unit="vid", file=sys.stderr)
         for pi, prompt in pbar:
             torch.cuda.synchronize()
@@ -602,10 +602,10 @@ def main():
         )
         num_warmup = ls.get("num_warmup", 2)
         num_iters = ls.get("num_iters", 5)
-        for i in tqdm(range(num_warmup), desc=f"kb-nano warmup {ls['name']}", file=sys.stderr):
+        for i in tqdm(range(num_warmup), desc=f"fastkernels warmup {ls['name']}", file=sys.stderr):
             torch.cuda.synchronize(); engine.generate([prompt], params); torch.cuda.synchronize()
         latencies = []
-        for i in tqdm(range(num_iters), desc=f"kb-nano latency {ls['name']}", file=sys.stderr):
+        for i in tqdm(range(num_iters), desc=f"fastkernels latency {ls['name']}", file=sys.stderr):
             torch.cuda.synchronize()
             t0 = time.perf_counter()
             engine.generate([prompt], params)
@@ -970,7 +970,7 @@ if __name__ == "__main__":
 '''
 
 
-KB_NANO_TTS_WORKER = r'''
+FASTKERNELS_TTS_WORKER = r'''
 import json, os, sys, time, torch
 import numpy as np
 from tqdm import tqdm
@@ -1039,7 +1039,7 @@ def main():
     sys.path.insert(0, cfg["project_root"])
 
     if cfg.get("pytorch_reference", False):
-        from kb_nano.infra.kernel_swapper import (
+        from fastkernels.infra.kernel_swapper import (
             apply_candidates,
             discover_references,
             print_reference_summary,
@@ -1100,7 +1100,7 @@ def main():
         total_utterances = 0
         total_audio_duration = 0.0
 
-        desc = f"kb-nano TTS {scenario['name']}"
+        desc = f"fastkernels TTS {scenario['name']}"
         pbar = tqdm(texts, desc=desc, unit="utt", file=sys.stderr)
         for utt_idx, text in enumerate(pbar):
             inputs = _preprocess(
@@ -1160,7 +1160,7 @@ def main():
             tokenizer, speech_tok, campplus, feat_ext, config, "cpu",
         )
 
-        for _ in tqdm(range(num_warmup), desc=f"kb-nano latency warmup {ls['name']}", file=sys.stderr):
+        for _ in tqdm(range(num_warmup), desc=f"fastkernels latency warmup {ls['name']}", file=sys.stderr):
             torch.cuda.synchronize()
             model.generate(
                 text_token=inputs["text_token"],
@@ -1173,7 +1173,7 @@ def main():
             torch.cuda.synchronize()
 
         latencies = []
-        for _ in tqdm(range(num_iters), desc=f"kb-nano latency {ls['name']}", file=sys.stderr):
+        for _ in tqdm(range(num_iters), desc=f"fastkernels latency {ls['name']}", file=sys.stderr):
             torch.cuda.synchronize()
             t0 = time.perf_counter()
             model.generate(
@@ -1538,7 +1538,7 @@ def _print_throughput_comparison(
     print("\n" + "=" * 90)
     print(f"  THROUGHPUT COMPARISON ({unit}/sec)")
     print("=" * 90)
-    header = f"  {'Scenario':<25} {unit.title():>7} {'kb-nano':>12}"
+    header = f"  {'Scenario':<25} {unit.title():>7} {'fastkernels':>12}"
     if vllm_results:
         header += f" {'vllm-omni':>12} {'Speedup':>10}"
     print(header)
@@ -1565,7 +1565,7 @@ def _print_latency_comparison(
     header = f"  {'Scenario':<25}"
     if is_video:
         header += f" {'Res':>10} {'Frames':>7}"
-    header += f" {'kb-nano p50':>12}"
+    header += f" {'fastkernels p50':>12}"
     if vllm_results:
         header += f" {'vllm-omni p50':>14} {'Speedup':>10}"
     print(header)
@@ -1660,7 +1660,7 @@ def _print_tts_throughput_comparison(kb_results: list[dict],
     print("\n" + "=" * 90)
     print("  TTS THROUGHPUT COMPARISON")
     print("=" * 90)
-    header = f"  {'Scenario':<20} {'Utts':>6} {'kb-nano utt/s':>14} {'kb-nano RTF':>12}"
+    header = f"  {'Scenario':<20} {'Utts':>6} {'fastkernels utt/s':>14} {'fastkernels RTF':>12}"
     if vllm_results:
         header += f" {'vllm-omni utt/s':>16} {'vllm-omni RTF':>14} {'Speedup':>8}"
     print(header)
@@ -1685,7 +1685,7 @@ def _print_tts_latency_comparison(kb_results: list[dict],
     print("\n" + "=" * 80)
     print("  TTS LATENCY COMPARISON (seconds)")
     print("=" * 80)
-    header = f"  {'Scenario':<20} {'kb-nano p50':>12}"
+    header = f"  {'Scenario':<20} {'fastkernels p50':>12}"
     if vllm_results:
         header += f" {'vllm-omni p50':>14} {'Speedup':>8}"
     print(header)
@@ -1744,7 +1744,7 @@ def _compute_mel_spectrogram(audio: np.ndarray, sr: int = 24000,
 
 
 def _compare_tts_audio(kb_audio_dir: str, vllm_audio_dir: str) -> dict:
-    """Compare TTS audio between kb-nano and vllm-omni using mel spectrogram
+    """Compare TTS audio between fastkernels and vllm-omni using mel spectrogram
     cosine similarity.
     """
     import torch
@@ -1905,7 +1905,7 @@ def _infer_mode(model: str) -> str:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Benchmark: kb-nano vs vllm-omni (diffusion / TTS)",
+        description="Benchmark: fastkernels vs vllm-omni (diffusion / TTS)",
     )
     parser.add_argument("--model", type=str, default="black-forest-labs/FLUX.1-dev",
                         help="Model name (mode is inferred from MODEL_CATEGORY)")
@@ -1915,7 +1915,7 @@ def main():
                         help="Skip vllm-omni (no correctness comparison)")
     parser.add_argument(
         "--pytorch-reference", action="store_true", default=False,
-        help="Patch semantic PyTorch references from tasks/reference/L*/ into kb-nano.",
+        help="Patch semantic PyTorch references from tasks/reference/L*/ into fastkernels.",
     )
     parser.add_argument("--skip-throughput", action="store_true",
                         help="Skip throughput phase (run latency only)")
@@ -1951,7 +1951,7 @@ def _run_flux(args, gpu_name: str):
     bench_prompts = _get_parti_prompts(args.seed)
 
     print(f"\n{'=' * 70}")
-    print("  kb-nano vs vllm-omni -- FLUX Benchmark")
+    print("  fastkernels vs vllm-omni -- FLUX Benchmark")
     print(f"{'=' * 70}")
     print(f"  Model          : {args.model}")
     print(f"  GPU            : {gpu_name}")
@@ -1963,7 +1963,7 @@ def _run_flux(args, gpu_name: str):
     run_vllm = not args.skip_vllm_omni
     save_latents = run_vllm
 
-    kb_latent_dir = os.path.join(args.output_dir, "latents", "kb_nano") if save_latents else None
+    kb_latent_dir = os.path.join(args.output_dir, "latents", "fastkernels") if save_latents else None
     vllm_latent_dir = os.path.join(args.output_dir, "latents", "vllm_omni") if save_latents else None
 
     base_config = {
@@ -1971,13 +1971,13 @@ def _run_flux(args, gpu_name: str):
         "seed": args.seed,
         "enforce_eager": args.enforce_eager,
         "project_root": str(_PROJECT_ROOT),
-        "package_name": "kb_nano",
+        "package_name": "fastkernels",
     }
 
     scenarios = _build_flux_throughput_scenarios(bench_prompts, args.batch_size) if not args.skip_throughput else []
     latency_scenarios = _build_flux_latency_scenarios(bench_prompts) if not args.skip_latency else []
 
-    # --- kb-nano ---
+    # --- fastkernels ---
     kb_config = {
         **base_config,
         "scenarios": scenarios,
@@ -1986,7 +1986,7 @@ def _run_flux(args, gpu_name: str):
     }
     if kb_latent_dir:
         kb_config["latent_dir"] = kb_latent_dir
-    kb_data = run_worker(FLUX_KB_NANO_WORKER, kb_config, "kb-nano FLUX benchmark", timeout=36000)
+    kb_data = run_worker(FLUX_FASTKERNELS_WORKER, kb_config, "fastkernels FLUX benchmark", timeout=36000)
 
     # --- vllm-omni ---
     vllm_data = None
@@ -2016,7 +2016,7 @@ def _run_flux(args, gpu_name: str):
         _save_results(args, gpu_name, bench_prompts, kb_data, vllm_data, correctness,
                       prompts_source="nateraw/parti-prompts")
     else:
-        print("ERROR: kb-nano benchmark failed.")
+        print("ERROR: fastkernels benchmark failed.")
         sys.exit(1)
 
 
@@ -2024,7 +2024,7 @@ def _run_hunyuan(args, gpu_name: str):
     bench_prompts = _get_movie_gen_prompts(args.seed)
 
     print(f"\n{'=' * 70}")
-    print("  kb-nano vs vllm-omni -- HunyuanVideo-1.5 Benchmark")
+    print("  fastkernels vs vllm-omni -- HunyuanVideo-1.5 Benchmark")
     print(f"{'=' * 70}")
     print(f"  Model          : {args.model}")
     print(f"  GPU            : {gpu_name}")
@@ -2037,7 +2037,7 @@ def _run_hunyuan(args, gpu_name: str):
     run_vllm = not args.skip_vllm_omni
     save_frames = run_vllm
 
-    kb_frames_dir = os.path.join(args.output_dir, "frames", "kb_nano") if save_frames else None
+    kb_frames_dir = os.path.join(args.output_dir, "frames", "fastkernels") if save_frames else None
     vllm_frames_dir = os.path.join(args.output_dir, "frames", "vllm_omni") if save_frames else None
 
     base_config = {
@@ -2045,7 +2045,7 @@ def _run_hunyuan(args, gpu_name: str):
         "seed": args.seed,
         "enforce_eager": True,
         "project_root": str(_PROJECT_ROOT),
-        "package_name": "kb_nano",
+        "package_name": "fastkernels",
     }
 
     scenarios = _build_hunyuan_throughput_scenarios(bench_prompts) if not args.skip_throughput else []
@@ -2059,7 +2059,7 @@ def _run_hunyuan(args, gpu_name: str):
         print(f"  Latency        : {lat_desc} ({args.latency_iters} iters)")
     print(f"{'=' * 70}")
 
-    # --- kb-nano ---
+    # --- fastkernels ---
     kb_config = {
         **base_config,
         "scenarios": scenarios,
@@ -2068,7 +2068,7 @@ def _run_hunyuan(args, gpu_name: str):
     }
     if kb_frames_dir:
         kb_config["frames_dir"] = kb_frames_dir
-    kb_data = run_worker(HUNYUAN_KB_NANO_WORKER, kb_config, "kb-nano HunyuanVideo benchmark", timeout=36000)
+    kb_data = run_worker(HUNYUAN_FASTKERNELS_WORKER, kb_config, "fastkernels HunyuanVideo benchmark", timeout=36000)
 
     # --- vllm-omni ---
     vllm_data = None
@@ -2098,7 +2098,7 @@ def _run_hunyuan(args, gpu_name: str):
         _save_results(args, gpu_name, bench_prompts, kb_data, vllm_data, correctness,
                       prompts_source="meta-ai-for-media-research/movie_gen_video_bench")
     else:
-        print("ERROR: kb-nano benchmark failed.")
+        print("ERROR: fastkernels benchmark failed.")
         sys.exit(1)
 
 
@@ -2121,7 +2121,7 @@ def _run_tts(args, gpu_name: str):
     ref_sr = 24000
     prompt_text = "Testing my voice."
 
-    kb_audio_dir = os.path.join(args.output_dir, "audio", "kb_nano")
+    kb_audio_dir = os.path.join(args.output_dir, "audio", "fastkernels")
     vllm_audio_dir = os.path.join(args.output_dir, "audio", "vllm_omni")
 
     base_config = {
@@ -2130,7 +2130,7 @@ def _run_tts(args, gpu_name: str):
         "n_timesteps": COSYVOICE3_CONFIG.n_timesteps,
         "sample_rate": COSYVOICE3_CONFIG.sample_rate,
         "project_root": str(_PROJECT_ROOT),
-        "package_name": "kb_nano",
+        "package_name": "fastkernels",
         "ref_audio": ref_audio.tolist(),
         "ref_sr": ref_sr,
         "prompt_text": prompt_text,
@@ -2155,8 +2155,8 @@ def _run_tts(args, gpu_name: str):
         "pytorch_reference": args.pytorch_reference,
     }
     kb_data = run_worker(
-        KB_NANO_TTS_WORKER, kb_config,
-        "kb-nano TTS benchmark", timeout=36000,
+        FASTKERNELS_TTS_WORKER, kb_config,
+        "fastkernels TTS benchmark", timeout=36000,
     )
 
     vllm_data = None
@@ -2207,7 +2207,7 @@ def _run_tts(args, gpu_name: str):
             "seed": args.seed,
             "n_timesteps": COSYVOICE3_CONFIG.n_timesteps,
             "dataset": "SEED-TTS-Eval",
-            "kb_nano": kb_data,
+            "fastkernels": kb_data,
             "code2wav_equivalence": c2w_eq,
         }
         if vllm_data:
@@ -2220,7 +2220,7 @@ def _run_tts(args, gpu_name: str):
             json.dump(results, f, indent=2)
         print(f"\n  Results saved to: {results_path}")
     else:
-        print("ERROR: kb-nano TTS benchmark failed.")
+        print("ERROR: fastkernels TTS benchmark failed.")
         sys.exit(1)
 
 
@@ -2236,7 +2236,7 @@ def _save_results(
         "seed": args.seed,
         "prompts_source": prompts_source,
         "num_prompts": len(bench_prompts),
-        "kb_nano": kb_data,
+        "fastkernels": kb_data,
     }
     if vllm_data:
         results["vllm_omni"] = vllm_data

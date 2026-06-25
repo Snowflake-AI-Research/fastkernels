@@ -1,4 +1,4 @@
-"""Token-by-token decode comparison: kb-nano vs SOTA on a single prompt.
+"""Token-by-token decode comparison: fastkernels vs SOTA on a single prompt.
 
 For one fixed prompt, generate N tokens greedily with each engine and
 report (a) where the first divergence occurs and (b) how many tokens
@@ -22,14 +22,14 @@ import torch
 
 _THIS_DIR = Path(__file__).resolve().parent
 _PROJECT_ROOT = _THIS_DIR.parent.parent
-os.environ.setdefault("KB_NANO_DISABLE_FASTSAFETENSORS", "1")
+os.environ.setdefault("FASTKERNELS_DISABLE_FASTSAFETENSORS", "1")
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 
-def run_kb_nano(prompt_ids: list[int], out_len: int) -> list[int]:
-    from kb_nano.infra import weight_loader as _wl
+def run_fastkernels(prompt_ids: list[int], out_len: int) -> list[int]:
+    from fastkernels.infra import weight_loader as _wl
     _wl._HAS_FASTSAFETENSORS = False
-    from kb_nano.infra.engine import LlamaEngine, SamplingParams
+    from fastkernels.infra.engine import LlamaEngine, SamplingParams
 
     print(f"[kb] loading engine...", flush=True)
     engine = LlamaEngine(
@@ -83,7 +83,7 @@ def main() -> None:
     prompt_ids = [rng.randint(2, 50000) for _ in range(args.prompt_len)]
 
     sota_tokens = run_sota(prompt_ids, args.out_len, args.bitnet_repo)
-    kb_tokens = run_kb_nano(prompt_ids, args.out_len)
+    kb_tokens = run_fastkernels(prompt_ids, args.out_len)
 
     print(f"\nPrompt[:8] = {prompt_ids[:8]}")
     print(f"SOTA out  ({len(sota_tokens)}): {sota_tokens[:30]}")

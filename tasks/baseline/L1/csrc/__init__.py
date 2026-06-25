@@ -10,7 +10,7 @@ from torch.utils.cpp_extension import load as _load_ext
 _DIR = os.path.dirname(os.path.abspath(__file__))
 
 _C = _load_ext(
-    name="kb_nano_L1_ops",
+    name="fastkernels_L1_ops",
     sources=[os.path.join(_DIR, f) for f in [
         "binding.cpp", "rmsnorm.cu", "rmsnorm_quant.cu",
         "activation.cu", "pos_enc.cu",

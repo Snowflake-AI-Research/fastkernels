@@ -216,15 +216,15 @@ def main():
 
     # Import our model implementation
     if model_name == "fla-hub/gla-2.7B-100B":
-        from kb_nano.tasks.baseline.L4.gla import GLAConfig, GLAForCausalLM
+        from fastkernels.tasks.baseline.L4.gla import GLAConfig, GLAForCausalLM
         config = GLAConfig.from_pretrained(model_path)
         model = GLAForCausalLM(config)
     elif model_name == "fla-hub/retnet-2.7B-100B":
-        from kb_nano.tasks.baseline.L4.retnet import RetNetConfig, RetNetForCausalLM
+        from fastkernels.tasks.baseline.L4.retnet import RetNetConfig, RetNetForCausalLM
         config = RetNetConfig.from_pretrained(model_path)
         model = RetNetForCausalLM(config)
     elif model_name in ("fla-hub/rwkv7-2.9B-g1", "fla-hub/rwkv7-2.9B-world"):
-        from kb_nano.tasks.baseline.L4.rwkv7 import RWKV7Config, RWKV7ForCausalLM
+        from fastkernels.tasks.baseline.L4.rwkv7 import RWKV7Config, RWKV7ForCausalLM
         config = RWKV7Config.from_pretrained(model_path)
         model = RWKV7ForCausalLM(config)
     else:

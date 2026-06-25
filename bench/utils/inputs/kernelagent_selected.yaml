@@ -1,4 +1,4 @@
-# Additional KernelAgent evaluation scenarios for selected kb_nano workloads.
+# Additional KernelAgent evaluation scenarios for selected fastkernels workloads.
 #
 # These are workload-shaped synthetic scenarios for operators whose generated
 # KernelAgent candidates were staged under tasks/candidate/. Data-dependent MoE

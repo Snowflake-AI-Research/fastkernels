@@ -19,7 +19,7 @@ from .csrc import _C
 # Uses Tensor(a!) annotations so Inductor auto-functionalizes correctly.
 # ---------------------------------------------------------------------------
 
-_lib = torch.library.Library("kb_nano_rope", "DEF")
+_lib = torch.library.Library("fastkernels_rope", "DEF")
 
 _lib.define(
     "rotary_embedding(Tensor positions, Tensor(a!) query, "
@@ -169,7 +169,7 @@ class RotaryEmbedding(nn.Module):
         cache = self.cos_sin_cache
         if cache.dtype != query.dtype:
             cache = cache.to(query.dtype)
-        torch.ops.kb_nano_rope.rotary_embedding(
+        torch.ops.fastkernels_rope.rotary_embedding(
             positions, query, key, self.head_dim, cache, self.is_neox_style,
         )
         return query, key

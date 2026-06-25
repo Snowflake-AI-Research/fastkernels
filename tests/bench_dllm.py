@@ -129,16 +129,16 @@ sys.path.insert(0, cfg["project_root"])
 
 pkg_root = Path(cfg["project_root"])
 spec = importlib.util.spec_from_file_location(
-    "kb_nano", pkg_root / "__init__.py",
+    "fastkernels", pkg_root / "__init__.py",
     submodule_search_locations=[str(pkg_root)],
 )
-kb_nano = importlib.util.module_from_spec(spec)
-sys.modules["kb_nano"] = kb_nano
-spec.loader.exec_module(kb_nano)
+fastkernels = importlib.util.module_from_spec(spec)
+sys.modules["fastkernels"] = fastkernels
+spec.loader.exec_module(fastkernels)
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from kb_nano.infra.dllm_engine import (
+from fastkernels.infra.dllm_engine import (
     LLaDAEngine,
     DLLMSamplingParams,
     masked_diffusion_generate,
@@ -486,7 +486,7 @@ def main():
         "ours_backend": args.ours_backend,
     }
 
-    ours = run_worker(DLLM_WORKER, {**common, "backend": "ours"}, "kb-nano LLaDA")
+    ours = run_worker(DLLM_WORKER, {**common, "backend": "ours"}, "fastkernels LLaDA")
     references = {}
     comparisons = {}
     if not args.skip_reference:

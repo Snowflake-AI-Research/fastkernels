@@ -1,7 +1,7 @@
 """Thin adapter over vLLM's dataset infrastructure.
 
 Re-exports the key types and functions from vllm.benchmarks.datasets so that
-kb_nano benchmarks can use the exact same dataset CLI, loading, and sampling
+fastkernels benchmarks can use the exact same dataset CLI, loading, and sampling
 logic -- including all dataset types (random, random-mm, sharegpt, sonnet,
 burstgpt, hf, custom, custom_mm, prefix_repetition, etc.) and full multimodal
 support.

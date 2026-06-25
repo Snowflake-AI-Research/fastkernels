@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Throughput, latency, and correctness benchmark: kb-nano vs open-oasis.
+"""Throughput, latency, and correctness benchmark: fastkernels vs open-oasis.
 
 Runs the full Oasis 500M autoregressive diffusion pipeline for both engines:
 prompt VAE encode, DiT denoising rollout, and VAE decode.
@@ -45,24 +45,24 @@ from tqdm import tqdm
 def _bootstrap_local_package() -> None:
     root = Path(__file__).resolve().parent.parent
     spec = importlib.util.spec_from_file_location(
-        "kb_nano",
+        "fastkernels",
         root / "__init__.py",
         submodule_search_locations=[str(root)],
     )
     module = importlib.util.module_from_spec(spec)
-    sys.modules["kb_nano"] = module
+    sys.modules["fastkernels"] = module
     assert spec.loader is not None
     spec.loader.exec_module(module)
 
 
 _bootstrap_local_package()
 
-from kb_nano.tasks.baseline.L4.oasis import (  # noqa: E402
+from fastkernels.tasks.baseline.L4.oasis import (  # noqa: E402
     OasisConfig,
     OasisPipeline,
     OasisSamplingParams,
 )
-from kb_nano.bench.utils.workloads import (  # noqa: E402
+from fastkernels.bench.utils.workloads import (  # noqa: E402
     OASIS_LATENCY_WORKLOADS,
     OASIS_THROUGHPUT_WORKLOADS,
     OasisWorkload,
@@ -239,15 +239,15 @@ def _build_open_oasis(
     return model, vae, utils_mod.sigmoid_beta_schedule
 
 
-def _build_kb_nano(model_dir: str, *, device: torch.device, dtype: torch.dtype) -> OasisPipeline:
-    _log("building kb-nano Oasis pipeline")
+def _build_fastkernels(model_dir: str, *, device: torch.device, dtype: torch.dtype) -> OasisPipeline:
+    _log("building fastkernels Oasis pipeline")
     pipeline = OasisPipeline(OasisConfig())
-    _log("loading kb-nano Oasis weights")
+    _log("loading fastkernels Oasis weights")
     pipeline.load_weights(model_dir)
     del dtype
     pipeline.model.to(device=device)
     pipeline.vae.to(device=device)
-    _log("kb-nano Oasis pipeline ready")
+    _log("fastkernels Oasis pipeline ready")
     return pipeline.eval()
 
 
@@ -712,13 +712,13 @@ def _print_results_summary(results: dict[str, Any]) -> None:
         print(f"{'=' * 110}")
         print(
             f"  {'SCENARIO':<24} {'CLIPS':>5} {'FRAMES':>6} {'DDIM':>5}"
-            f" {'KB-NANO vid/s':>15} {'open-oasis vid/s':>17} {'SPEEDUP':>8}"
+            f" {'FASTKERNELS vid/s':>15} {'open-oasis vid/s':>17} {'SPEEDUP':>8}"
             f" {'CORRECT':>9} {'MIN COS':>10}"
         )
         print(f"  {'-' * 104}")
         for item in throughput:
             scenario = item["scenario"]
-            kb_vps = item["kb_nano"]["videos_per_second"]
+            kb_vps = item["fastkernels"]["videos_per_second"]
             ref_vps = item.get("open_oasis", {}).get("videos_per_second")
             speedup = item.get("speedup")
             correctness_status, min_cosine = _correctness_summary(item.get("correctness"))
@@ -737,12 +737,12 @@ def _print_results_summary(results: dict[str, Any]) -> None:
         print(f"{'=' * 105}")
         print(
             f"  {'SCENARIO':<24} {'CLIPS':>5} {'FRAMES':>6} {'DDIM':>5}"
-            f" {'KB-NANO p50':>15} {'open-oasis p50':>17} {'SPEEDUP':>8}"
+            f" {'FASTKERNELS p50':>15} {'open-oasis p50':>17} {'SPEEDUP':>8}"
         )
         print(f"  {'-' * 91}")
         for item in latency:
             scenario = item["scenario"]
-            kb_p50 = item["kb_nano"]["latency_ms_p50"]
+            kb_p50 = item["fastkernels"]["latency_ms_p50"]
             ref_p50 = item.get("open_oasis", {}).get("latency_ms_p50")
             speedup = item.get("latency_ratio_p50")
             print(
@@ -755,7 +755,7 @@ def _print_results_summary(results: dict[str, Any]) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Oasis 500M benchmark: kb-nano vs open-oasis")
+    parser = argparse.ArgumentParser(description="Oasis 500M benchmark: fastkernels vs open-oasis")
     parser.add_argument("--model", default=OASIS_MODEL)
     parser.add_argument("--open-oasis-src", default=None, help="Path to an open-oasis checkout")
     parser.add_argument("--seed", type=int, default=0)
@@ -798,7 +798,7 @@ def main() -> None:
         device=device,
     )
 
-    kb = _build_kb_nano(model_dir, device=device, dtype=dtype)
+    kb = _build_fastkernels(model_dir, device=device, dtype=dtype)
     ref_model = ref_vae = ref_beta_schedule = None
     if not args.skip_open_oasis:
         assert open_oasis_src is not None
@@ -837,11 +837,11 @@ def main() -> None:
             ):
                 correctness_dtype = torch.float32
                 _log(
-                    f"{scenario.name}: running correctness pass for kb-nano and open-oasis "
+                    f"{scenario.name}: running correctness pass for fastkernels and open-oasis "
                     f"with dtype={correctness_dtype}"
                 )
                 with torch.inference_mode():
-                    _log(f"{scenario.name}: correctness kb-nano rollout")
+                    _log(f"{scenario.name}: correctness fastkernels rollout")
                     kb_out = _run_kb_pipeline(
                         kb,
                         scenario_prompt,
@@ -870,7 +870,7 @@ def main() -> None:
                 )
                 _log(f"{scenario.name}: correctness overall_pass={correctness['overall_pass']}")
 
-            _log(f"{scenario.name}: benchmarking kb-nano")
+            _log(f"{scenario.name}: benchmarking fastkernels")
             kb_metrics = _benchmark(
                 lambda s=scenario, p=scenario_prompt, a=scenario_actions: _run_kb_pipeline(
                     kb, p, a, s, dtype=dtype, seed=args.seed
@@ -879,11 +879,11 @@ def main() -> None:
                 warmup=WARMUP_ITERS,
                 iters=timed_iters,
                 units_per_iter=units_per_iter,
-                desc=f"kb-nano {scenario.name}",
+                desc=f"fastkernels {scenario.name}",
             )
             item: dict[str, Any] = {
                 "scenario": scenario.__dict__,
-                "kb_nano": kb_metrics,
+                "fastkernels": kb_metrics,
             }
             if correctness is not None:
                 item["correctness"] = correctness

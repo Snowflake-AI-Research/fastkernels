@@ -92,7 +92,7 @@ class KimiMoE(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self._use_custom_op:
-            return torch.ops.kb_nano.moe_forward(hidden_states, self._layer_name)
+            return torch.ops.fastkernels.moe_forward(hidden_states, self._layer_name)
         return self.forward_impl(hidden_states)
 
     def forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:

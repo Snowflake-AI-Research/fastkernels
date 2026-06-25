@@ -841,7 +841,7 @@ ALL_STRUCTURE_PREDICTION_WORKLOADS = {
 
 @dataclass(frozen=True)
 class DP3ModelConfig:
-    """Hyperparameters that drive both kb-nano DP3 and the reference engine."""
+    """Hyperparameters that drive both fastkernels DP3 and the reference engine."""
     num_inference_steps: int
     horizon: int
     n_obs_steps: int

@@ -96,7 +96,7 @@ class DeepSeekMLAAttention(nn.Module):
             is_sparse=self.is_v32,
         )
         # Share the kv_b_proj module so ``MLAAttention.forward_impl`` (and
-        # the ``kb_nano::unified_mla_attention`` custom op) can project
+        # the ``fastkernels::unified_mla_attention`` custom op) can project
         # kv_c_normed -> kv without routing a non-tensor arg through the
         # op schema. Bypass ``nn.Module.__setattr__`` to avoid double
         # registration as a submodule.

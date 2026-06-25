@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Throughput, latency, and alignment benchmark: kb-nano FLAEngine vs FLA reference.
+Throughput, latency, and alignment benchmark: fastkernels FLAEngine vs FLA reference.
 
 Mirrors the structure of ``tests/bench_vllm.py`` but for the recurrent
 linear-attention models that ship in this branch:
@@ -14,7 +14,7 @@ library: ``fla.models.{gla,retnet,rwkv7}.{...}ForCausalLM`` driven via
 ``transformers.generate``, which is exactly the recipe FLA's own
 ``benchmarks/benchmark_generation.py`` uses. Both sides batch all
 prompts in a single forward call so they exercise their respective
-batched-decode paths apples-to-apples (kb-nano's FLAEngine adds
+batched-decode paths apples-to-apples (fastkernels's FLAEngine adds
 chunked prefill + continuous batching on top).
 
 Each engine is launched in its own long-lived subprocess that processes
@@ -24,7 +24,7 @@ Usage:
     python tests/bench_fla.py --model fla-hub/gla-2.7B-100B
     python tests/bench_fla.py --model fla-hub/retnet-2.7B-100B
     python tests/bench_fla.py --model fla-hub/rwkv7-2.9B-g1
-    python tests/bench_fla.py --model ... --skip-fla   # kb-nano only
+    python tests/bench_fla.py --model ... --skip-fla   # fastkernels only
 """
 
 from __future__ import annotations
@@ -60,10 +60,10 @@ _PROJECT_ROOT = _PACKAGE_DIR.parent
 
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from kb_nano.bench.utils.worker import run_worker
-from kb_nano.bench.utils.real_prompts import load_real_prompt_workload
-from kb_nano.bench.utils.workloads import LATENCY_WORKLOADS, THROUGHPUT_WORKLOADS
-from kb_nano.tests.bench_vllm import compute_alignment
+from fastkernels.bench.utils.worker import run_worker
+from fastkernels.bench.utils.real_prompts import load_real_prompt_workload
+from fastkernels.bench.utils.workloads import LATENCY_WORKLOADS, THROUGHPUT_WORKLOADS
+from fastkernels.tests.bench_vllm import compute_alignment
 
 
 SCENARIOS = [
@@ -485,7 +485,7 @@ def main():
         )
 
         # Process in micro-batches of `max_num_seqs` so peak memory is the
-        # same as kb-nano's continuous-batching ceiling. HF's .generate
+        # same as fastkernels's continuous-batching ceiling. HF's .generate
         # has no continuous-batching, so this is the apples-to-apples way
         # to keep both engines at the same concurrency.
         bs_cap = cfg.get("ref_max_num_seqs", cfg.get("max_num_seqs", 512))
@@ -585,9 +585,9 @@ if __name__ == "__main__":
 
 
 # ---------------------------------------------------------------------------
-# kb-nano FLAEngine subprocess worker
+# fastkernels FLAEngine subprocess worker
 # ---------------------------------------------------------------------------
-KB_NANO_FLA_WORKER = r'''
+FASTKERNELS_FLA_WORKER = r'''
 import json, os, sys, time
 
 
@@ -598,7 +598,7 @@ def main():
     pkg = cfg["package_name"]
 
     if cfg.get("pytorch_reference", False):
-        from kb_nano.infra.kernel_swapper import (
+        from fastkernels.infra.kernel_swapper import (
             apply_candidates,
             discover_references,
             print_reference_summary,
@@ -751,7 +751,7 @@ def _fit_prompt_to_context(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Throughput & alignment benchmark: kb-nano FLAEngine vs FLA reference",
+        description="Throughput & alignment benchmark: fastkernels FLAEngine vs FLA reference",
     )
     parser.add_argument("--model", type=str, default="fla-hub/gla-2.7B-100B")
     parser.add_argument("--num-seqs", type=int, default=1000)
@@ -769,10 +769,10 @@ def main():
     parser.add_argument("--max-prefill-tokens", type=int, default=196608,
                         help="Max tokens per batched prefill forward.")
     parser.add_argument("--skip-fla", action="store_true",
-                        help="Skip the FLA reference (kb-nano only)")
+                        help="Skip the FLA reference (fastkernels only)")
     parser.add_argument(
         "--pytorch-reference", action="store_true", default=False,
-        help="Patch semantic PyTorch references from tasks/reference/L*/ into kb-nano.",
+        help="Patch semantic PyTorch references from tasks/reference/L*/ into fastkernels.",
     )
     parser.add_argument("--skip-throughput", action="store_true")
     parser.add_argument("--skip-latency", action="store_true")
@@ -866,7 +866,7 @@ def main():
             })
 
     print("=" * 70)
-    print("  kb-nano FLAEngine vs FLA reference -- Multi-Scenario Benchmark")
+    print("  fastkernels FLAEngine vs FLA reference -- Multi-Scenario Benchmark")
     print("=" * 70)
     print(f"  Model            : {args.model}")
     print(f"  Seqs/scenario    : {args.num_seqs}")
@@ -917,12 +917,12 @@ def main():
     kb_cfg["chunked_prefill_size"] = args.chunked_prefill_size
     kb_cfg["pytorch_reference"] = args.pytorch_reference
     kb_raw = run_worker(
-        KB_NANO_FLA_WORKER, kb_cfg,
-        f"kb-nano FLAEngine [{short_name}] all scenarios",
+        FASTKERNELS_FLA_WORKER, kb_cfg,
+        f"fastkernels FLAEngine [{short_name}] all scenarios",
         timeout=10800,
     )
     if kb_raw is None:
-        print("  ERROR: kb-nano subprocess failed.")
+        print("  ERROR: fastkernels subprocess failed.")
         sys.exit(1)
 
     kb_latency = kb_raw.get("latency", [])
@@ -941,9 +941,9 @@ def main():
             r = {
                 "scenario": sc["name"],
                 "num_seqs": args.num_seqs,
-                "kb_nano_elapsed": kb_d["elapsed"],
-                "kb_nano_output_tokens": kb_d["total_output_tokens"],
-                "kb_nano_tok_per_s": kb_tps,
+                "fastkernels_elapsed": kb_d["elapsed"],
+                "fastkernels_output_tokens": kb_d["total_output_tokens"],
+                "fastkernels_tok_per_s": kb_tps,
             }
             if "input_len" in sc:
                 r["input_len"] = sc["input_len"]
@@ -965,7 +965,7 @@ def main():
             if args.output_dir:
                 d = os.path.join(args.output_dir, sc["name"])
                 os.makedirs(d, exist_ok=True)
-                with open(os.path.join(d, "kb_nano_outputs.json"), "w") as f:
+                with open(os.path.join(d, "fastkernels_outputs.json"), "w") as f:
                     json.dump(kb_d, f, indent=2)
                 if fla_thr is not None:
                     with open(os.path.join(d, "fla_outputs.json"), "w") as f:
@@ -973,16 +973,16 @@ def main():
             all_results.append(r)
 
         print(f"\n\n{'=' * 100}")
-        print("  THROUGHPUT SUMMARY (kb-nano FLAEngine vs FLA reference)")
+        print("  THROUGHPUT SUMMARY (fastkernels FLAEngine vs FLA reference)")
         print(f"{'=' * 100}")
         print(
             f"  {'SCENARIO':<16} {'IN':>5} {'OUT':>5} "
-            f"{'KB-NANO tok/s':>15} {'FLA tok/s':>12} {'SPEEDUP':>9} "
+            f"{'FASTKERNELS tok/s':>15} {'FLA tok/s':>12} {'SPEEDUP':>9} "
             f"{'AVG MATCH TOKS':>18}"
         )
         print(f"  {'-' * 95}")
         for r in all_results:
-            kb_str = f"{r['kb_nano_tok_per_s']:,.0f}"
+            kb_str = f"{r['fastkernels_tok_per_s']:,.0f}"
             f_str = f"{r['fla_tok_per_s']:,.0f}" if "fla_tok_per_s" in r else "N/A"
             spd_str = f"{r['speedup']:.2f}x" if "speedup" in r else "N/A"
             align = r.get("alignment", {})
@@ -1011,8 +1011,8 @@ def main():
         print(f"{'=' * 110}")
         print(
             f"  {'SCENARIO':<18} {'BS':>4} {'OUT':>5} {'ITERS':>6}"
-            f"  {'KB-NANO med':>12} {'FLA med':>12}"
-            f"  {'KB-NANO ms/tok':>15} {'FLA ms/tok':>12} {'SPEEDUP':>8}"
+            f"  {'FASTKERNELS med':>12} {'FLA med':>12}"
+            f"  {'FASTKERNELS ms/tok':>15} {'FLA ms/tok':>12} {'SPEEDUP':>8}"
         )
         print(f"  {'-' * 105}")
 
@@ -1030,10 +1030,10 @@ def main():
                 "batch_size": bs,
                 "output_len": out_len,
                 "num_iters": kb_lat["num_iters"],
-                "kb_nano_median_s": kb_med,
-                "kb_nano_p99_s": kb_p99,
-                "kb_nano_ms_per_tok": kb_ms_per_tok,
-                "kb_nano_latencies": kb_lat["latencies"],
+                "fastkernels_median_s": kb_med,
+                "fastkernels_p99_s": kb_p99,
+                "fastkernels_ms_per_tok": kb_ms_per_tok,
+                "fastkernels_latencies": kb_lat["latencies"],
             }
 
             f_med_str = "N/A"; spd_str = "N/A"; f_ms_str = "N/A"

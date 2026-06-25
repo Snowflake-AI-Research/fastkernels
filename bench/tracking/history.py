@@ -1,4 +1,4 @@
-"""CLI for ``kb_nano history`` and ``kb_nano mlflow-ui``.
+"""CLI for ``fastkernels history`` and ``fastkernels mlflow-ui``.
 
 Queries the local MLflow tracking store and prints human-readable
 tables.
@@ -29,12 +29,12 @@ def _short_id(run_id: str) -> str:
 
 
 # ------------------------------------------------------------------
-# kb_nano history
+# fastkernels history
 # ------------------------------------------------------------------
 def history_main():
-    """Entry point for ``kb_nano history``."""
+    """Entry point for ``fastkernels history``."""
     parser = argparse.ArgumentParser(
-        prog="kb_nano history",
+        prog="fastkernels history",
         description="Query tracked experiment runs from MLflow.",
     )
     parser.add_argument(
@@ -51,7 +51,7 @@ def history_main():
     )
     args = parser.parse_args()
 
-    from kb_nano.bench.tracking.tracker import _ensure_init
+    from fastkernels.bench.tracking.tracker import _ensure_init
 
     if not _ensure_init():
         print("  mlflow is not installed. Install with: pip install mlflow")
@@ -66,7 +66,7 @@ def history_main():
 
 
 def _print_recent(limit: int) -> None:
-    from kb_nano.bench.tracking.tracker import query_runs
+    from fastkernels.bench.tracking.tracker import query_runs
 
     runs = query_runs(max_results=limit)
     if not runs:
@@ -121,7 +121,7 @@ def _print_recent(limit: int) -> None:
 
 
 def _print_operator_history(op_name: str, limit: int) -> None:
-    from kb_nano.bench.tracking.tracker import query_runs
+    from fastkernels.bench.tracking.tracker import query_runs
 
     runs = query_runs(max_results=limit * 3)  # fetch extra, then filter
 
@@ -182,7 +182,7 @@ def _print_operator_history(op_name: str, limit: int) -> None:
 
 
 def _print_best(limit: int) -> None:
-    from kb_nano.bench.tracking.tracker import query_runs
+    from fastkernels.bench.tracking.tracker import query_runs
 
     runs = query_runs(max_results=500)
     if not runs:
@@ -228,11 +228,11 @@ def _print_best(limit: int) -> None:
 
 
 # ------------------------------------------------------------------
-# kb_nano mlflow-ui
+# fastkernels mlflow-ui
 # ------------------------------------------------------------------
 def mlflow_ui_main():
-    """Entry point for ``kb_nano mlflow-ui``."""
-    from kb_nano import MLFLOW_TRACKING_DIR
+    """Entry point for ``fastkernels mlflow-ui``."""
+    from fastkernels import MLFLOW_TRACKING_DIR
 
     backend_store = f"file://{MLFLOW_TRACKING_DIR}"
     print("  Starting MLflow UI...")

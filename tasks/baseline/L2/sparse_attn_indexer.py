@@ -150,7 +150,7 @@ class SparseAttnIndexer(nn.Module):
             object.__setattr__(self, "_rope_emb", rope_emb)
 
         if self._use_custom_op:
-            return torch.ops.kb_nano.sparse_attn_indexer(
+            return torch.ops.fastkernels.sparse_attn_indexer(
                 hidden_states, q_latent, positions, self._layer_name,
             )
         return self.forward_impl(hidden_states, q_latent, positions)

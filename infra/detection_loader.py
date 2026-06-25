@@ -28,7 +28,7 @@ def _hf_name_to_ultralytics_pt(model_name: str) -> str:
     base = model_name.split("/")[-1]
     if not base.endswith(".pt"):
         base += ".pt"
-    cache_dir = Path(tempfile.gettempdir()) / "kb_nano" / "ultralytics"
+    cache_dir = Path(tempfile.gettempdir()) / "fastkernels" / "ultralytics"
     cache_dir.mkdir(parents=True, exist_ok=True)
     return str(cache_dir / base)
 
@@ -170,14 +170,14 @@ def load_reference_detector(model_name: str, device: str = "cuda", dtype: torch.
 
 def load_ours_detector(model_name: str, device: str = "cuda", dtype: torch.dtype = torch.float16):
     if is_yolov10_model(model_name):
-        from kb_nano.tasks.baseline.L4.yolov10 import YOLOv10ForObjectDetection
+        from fastkernels.tasks.baseline.L4.yolov10 import YOLOv10ForObjectDetection
 
         return YOLOv10ForObjectDetection.from_pretrained(
             model_name, device=device, dtype=dtype
         )
 
     if is_rtdetrv2_model(model_name):
-        from kb_nano.tasks.baseline.L4.rtdetrv2 import RTDetrV2ForObjectDetection
+        from fastkernels.tasks.baseline.L4.rtdetrv2 import RTDetrV2ForObjectDetection
 
         return RTDetrV2ForObjectDetection.from_pretrained(
             model_name, device=device, dtype=dtype

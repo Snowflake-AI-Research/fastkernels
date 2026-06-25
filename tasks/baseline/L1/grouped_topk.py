@@ -106,7 +106,7 @@ class GroupedTopK(nn.Module):
         topk_group: int,
         topk: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Fast path: kb_nano's fused noaux_tc CUDA kernel
+        # Fast path: fastkernels's fused noaux_tc CUDA kernel
         # (``_C.grouped_topk``, verbatim port of vLLM's
         # ``torch.ops._moe_C.grouped_topk``).  Conditions match
         # ``grouped_topk_router.py:95-101``.  Saves ~10 separate Triton/PyTorch

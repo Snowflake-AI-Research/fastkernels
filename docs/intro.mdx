@@ -1,11 +1,11 @@
 ---
-title: Intro to KB Nano
+title: Intro to FastKernels
 description: 
 ---
 
-Welcome to KB Nano, your launchpad for engineering the world's fastest GPU code. We provide a library of state-of-the-art GPU kernels and a rigorous benchmark suite to push the limits of hardware performance.
+Welcome to FastKernels, your launchpad for engineering the world's fastest GPU code. We provide a library of state-of-the-art GPU kernels and a rigorous benchmark suite to push the limits of hardware performance.
 
-## Why you'll love KB Nano
+## Why you'll love FastKernels
 
 - 🚀 **Built from production** — Kernel specs, signatures, and baseline implementations are derived directly from SOTA production frameworks — every kernel you write is a drop-in replacement, not a toy exercise
 - 🧬 **Massive Kernel Coverage**: Stress-test 54 frontier architectures — benchmarking everything from *Linear Attention* and *Gated Delta Net* to *DeepSeek DSA*, *World Models*, *Diffusion*, and so much more — alongside the battle-tested ones powering production today
@@ -21,8 +21,8 @@ Welcome to KB Nano, your launchpad for engineering the world's fastest GPU code.
 <Steps>
   <Step title="Clone and install">
     ```bash
-    git clone git@github.com:sfc-gh-goliaro/kb_nano.git
-    cd kb_nano
+    git clone https://github.com/Snowflake-AI-Research/fastkernels.git
+    cd fastkernels
     pip install .
     ```
   </Step>
@@ -30,7 +30,7 @@ Welcome to KB Nano, your launchpad for engineering the world's fastest GPU code.
     Each supported model architecture is implemented in a modular fashion under `tasks/baseline/`, organized in four levels from individual kernels (L1) up to full models (L4). See [Architecture](/architecture) for details on the hierarchy and interface conventions.
 
     <Tree>
-      <Tree.Folder name="kb_nano/tasks/baseline" defaultOpen>
+      <Tree.Folder name="fastkernels/tasks/baseline" defaultOpen>
         <Tree.Folder name="L1 — Single-kernel ops">
           <Tree.File name="allreduce.py" />
           <Tree.File name="embedding.py" />
@@ -71,7 +71,7 @@ Welcome to KB Nano, your launchpad for engineering the world's fastest GPU code.
     </Tree>
   </Step>
   <Step title="Write your optimized version">
-    Place your replacement in `kb_nano/tasks/candidate/L{level}/{op_name}.py`. You can work at any abstraction level — swap a single kernel (L1), an attention block (L2), a decoder layer (L3), or an entire model (L4).
+    Place your replacement in `fastkernels/tasks/candidate/L{level}/{op_name}.py`. You can work at any abstraction level — swap a single kernel (L1), an attention block (L2), a decoder layer (L3), or an entire model (L4).
 
     To scaffold candidate files with the correct signatures and TODOs to fill in:
 
@@ -109,14 +109,14 @@ Welcome to KB Nano, your launchpad for engineering the world's fastest GPU code.
     </Expandable>
   </Step>
   <Step title="Benchmark and iterate">
-    kb-nano provides hierarchical benchmarking tools. Start by testing individual kernels in isolation, then measure their end-to-end impact on the full model:
+    fastkernels provides hierarchical benchmarking tools. Start by testing individual kernels in isolation, then measure their end-to-end impact on the full model:
 
     ```bash
     # Kernel-level: correctness + speedup for a single operator
-    kb_nano kernels --target rms_norm
+    fastkernels kernels --target rms_norm
 
     # E2E: throughput with your candidates swapped into the model
-    kb_nano eval \
+    fastkernels eval \
         --model meta-llama/Llama-3.1-8B-Instruct
     ```
 

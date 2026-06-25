@@ -6,16 +6,16 @@ Measures prefill vs decode time, per-step latency breakdown (scheduling,
 GPU call, tolist sync, post-processing), and scaling across batch sizes.
 
 Usage:
-    python -m kb-nano.tests.profile_gap \
+    python -m fastkernels.tests.profile_gap \
         --model meta-llama/Llama-3.1-8B-Instruct --tp 4
 
     # Multiple batch sizes
-    python -m kb-nano.tests.profile_gap \
+    python -m fastkernels.tests.profile_gap \
         --model meta-llama/Llama-3.1-8B-Instruct --tp 4 \
         --batch-sizes 32 64 128 256
 
     # Also run 70B to check model-size scaling
-    python -m kb-nano.tests.profile_gap \
+    python -m fastkernels.tests.profile_gap \
         --model meta-llama/Llama-3.1-70B-Instruct --tp 4
 """
 
@@ -80,11 +80,11 @@ if __name__ == "__main__":
 '''
 
 # ---------------------------------------------------------------------------
-# Our engine worker script (subprocess, with KB_NANO_PROFILE=1)
+# Our engine worker script (subprocess, with FASTKERNELS_PROFILE=1)
 # ---------------------------------------------------------------------------
 OURS_WORKER = r'''
 import json, os, sys, time
-os.environ["KB_NANO_PROFILE"] = "1"
+os.environ["FASTKERNELS_PROFILE"] = "1"
 
 with open(sys.argv[1]) as f:
     cfg = json.load(f)

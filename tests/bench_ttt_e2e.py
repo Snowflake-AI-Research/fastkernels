@@ -1,8 +1,8 @@
-"""TTT-E2E benchmark: kb-nano vs official JAX reference.
+"""TTT-E2E benchmark: fastkernels vs official JAX reference.
 
-Compares the kb-nano implementation in
-``kb_nano/tasks/baseline/{L2,L3,L4}/ttt_e2e_*.py`` and
-``kb_nano/infra/ttt_e2e_engine.py`` against the JAX reference at
+Compares the fastkernels implementation in
+``fastkernels/tasks/baseline/{L2,L3,L4}/ttt_e2e_*.py`` and
+``fastkernels/infra/ttt_e2e_engine.py`` against the JAX reference at
 ``github.com/test-time-training/e2e``.
 
 Honest framing of what this comparison does and does not measure:
@@ -10,11 +10,11 @@ Honest framing of what this comparison does and does not measure:
     Numerics don't care which framework computed them; if both engines load
     the same weights and produce the same NLL on the same input, the math
     is right.
-  - Throughput: kb-nano (PyTorch) vs JAX. Both run on the same B200 GPU at
+  - Throughput: fastkernels (PyTorch) vs JAX. Both run on the same B200 GPU at
     the same dtype (compute_dtype="bf16"), so the speedup ratio is the
     relative cost of bf16 matmuls + sliding-window attention + (optional)
     inner-loop SGD on each framework. JAX gets the benefit of XLA
-    compilation through ``jax.lax.scan`` etc.; kb-nano does not.
+    compilation through ``jax.lax.scan`` etc.; fastkernels does not.
   - This is the SOTA-library comparison required by CLAUDE.md. The framework
     gap is a known caveat, called out in README.
 
@@ -31,13 +31,13 @@ Workload:
     control (frozen prime FFN, baseline transformer behavior).
   - **Random-init weights only**. The official trained checkpoints live on
     Requester-Pays GCS and we do not download them; the bench's purpose is
-    cross-framework parity (kb-nano matches JAX's compute) and per-framework
+    cross-framework parity (fastkernels matches JAX's compute) and per-framework
     perf. Real perplexity numbers would require the trained checkpoints.
 
 Output: a JSON results blob plus a short text summary printed to stdout.
 
 Usage:
-  CUDA_VISIBLE_DEVICES=3 python -m kb_nano.tests.bench_ttt_e2e \\
+  CUDA_VISIBLE_DEVICES=3 python -m fastkernels.tests.bench_ttt_e2e \\
       --variant 125m_e2e --seq-lens 8192 --n-sequences 4 \\
       --modes pretrain meta
 """
@@ -192,10 +192,10 @@ def _run_jax_worker(args_list: list[str]) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# kb-nano runner (in-process)
+# fastkernels runner (in-process)
 # ---------------------------------------------------------------------------
 
-def _run_kbnano(
+def _run_fastkernels(
     config: dict,
     weights_npz: Path,
     input_ids: np.ndarray,
@@ -206,11 +206,11 @@ def _run_kbnano(
     device: str = "cuda",
     attention_backend: str = "cudnn",
 ) -> dict:
-    """Run kb-nano forward and return per-token NLL + timings."""
+    """Run fastkernels forward and return per-token NLL + timings."""
     import torch
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from kb_nano.infra.ttt_e2e_engine import TTTE2EEngine
-    from kb_nano.tasks.baseline.L4.ttt_e2e import TTTE2EConfig
+    from fastkernels.infra.ttt_e2e_engine import TTTE2EEngine
+    from fastkernels.tasks.baseline.L4.ttt_e2e import TTTE2EConfig
 
     m = config["model"]
     t = config["training"]
@@ -239,7 +239,7 @@ def _run_kbnano(
     cdt = dt_map[compute_dtype]
     pdt = dt_map["fp32"]  # storage in fp32 → keeps RMSNorm precision via _rms_native
 
-    print(f"[bench] kb-nano: building engine, dtype={compute_dtype} ...", flush=True)
+    print(f"[bench] fastkernels: building engine, dtype={compute_dtype} ...", flush=True)
     t0 = time.time()
     # We store params in compute_dtype (bf16) to hit fast-path matmuls; the
     # RMSNormNative L1 op does fp32-internal math so RMSNorm precision matches
@@ -257,19 +257,19 @@ def _run_kbnano(
         T = int(input_ids.shape[-1])
         engine.capture_meta_graph(batch_size=1, seq_len=T)
     build_s = time.time() - t0
-    print(f"[bench] kb-nano: engine built in {build_s:.2f}s", flush=True)
+    print(f"[bench] fastkernels: engine built in {build_s:.2f}s", flush=True)
 
     ids_t = torch.from_numpy(input_ids).long().to(device)
     if ids_t.dim() == 1:
         ids_t = ids_t.unsqueeze(0)
 
     # Warmup (compile / cache CUDA tensors).
-    print(f"[bench] kb-nano: warmup forward (mode={train_mode}) ...", flush=True)
+    print(f"[bench] fastkernels: warmup forward (mode={train_mode}) ...", flush=True)
     t0 = time.time()
     out = engine.forward(ids_t, train_mode=train_mode)
     torch.cuda.synchronize()
     warm_s = time.time() - t0
-    print(f"[bench] kb-nano: warmup done in {warm_s:.2f}s", flush=True)
+    print(f"[bench] fastkernels: warmup done in {warm_s:.2f}s", flush=True)
 
     # Timed runs.
     times = []
@@ -279,7 +279,7 @@ def _run_kbnano(
         out = engine.forward(ids_t, train_mode=train_mode)
         torch.cuda.synchronize()
         times.append(time.time() - t0)
-    print(f"[bench] kb-nano: timed runs (s): {[f'{x:.3f}' for x in times]}", flush=True)
+    print(f"[bench] fastkernels: timed runs (s): {[f'{x:.3f}' for x in times]}", flush=True)
 
     nll = out.token_nll.float().cpu().numpy()
     return {
@@ -300,9 +300,9 @@ def main():
     p.add_argument("--seq-len", type=int, default=8192)
     p.add_argument("--n-sequences", type=int, default=2)
     p.add_argument("--modes", nargs="+", default=["pretrain", "meta"])
-    p.add_argument("--cache-dir", default="/raid/user_data/olu/kb_nano_ttt_e2e_cache")
-    p.add_argument("--skip-jax", action="store_true", help="Skip the JAX reference (kb-nano-only).")
-    p.add_argument("--skip-kbnano", action="store_true", help="Skip kb-nano (JAX-only).")
+    p.add_argument("--cache-dir", default="/raid/user_data/olu/fastkernels_ttt_e2e_cache")
+    p.add_argument("--skip-jax", action="store_true", help="Skip the JAX reference (fastkernels-only).")
+    p.add_argument("--skip-fastkernels", action="store_true", help="Skip fastkernels (JAX-only).")
     p.add_argument("--runs", type=int, default=3)
     p.add_argument("--results-out", default=None, help="Optional: write a JSON summary to this path.")
     p.add_argument("--attention-backend", choices=["cudnn", "flex"], default="cudnn",
@@ -371,8 +371,8 @@ def main():
                 jax_compile = float(z["compile_s"])
 
             kb_nll = kb_runs = kb_warm = None
-            if not args.skip_kbnano:
-                r = _run_kbnano(cfg_run, weights, inputs[si], mode, runs=args.runs,
+            if not args.skip_fastkernels:
+                r = _run_fastkernels(cfg_run, weights, inputs[si], mode, runs=args.runs,
                                 attention_backend=args.attention_backend)
                 kb_nll = r["token_nll"][0]   # (B=1, T) -> (T,)
                 kb_runs = r["run_times_s"]
@@ -386,7 +386,7 @@ def main():
                     "run_times_s": jax_runs,
                 }
             if kb_nll is not None:
-                entry["kbnano"] = {
+                entry["fastkernels"] = {
                     "nll_mean": float(kb_nll.mean()),
                     "warm_s": kb_warm,
                     "run_times_s": kb_runs,
@@ -412,9 +412,9 @@ def main():
             if "jax" in e:
                 jr = np.median(e["jax"]["run_times_s"]) if e["jax"]["run_times_s"] else 0.0
                 line += f" jax(med={jr:.3f}s,nll={e['jax']['nll_mean']:.4f})"
-            if "kbnano" in e:
-                kr = np.median(e["kbnano"]["run_times_s"]) if e["kbnano"]["run_times_s"] else 0.0
-                line += f" kb(med={kr:.3f}s,nll={e['kbnano']['nll_mean']:.4f})"
+            if "fastkernels" in e:
+                kr = np.median(e["fastkernels"]["run_times_s"]) if e["fastkernels"]["run_times_s"] else 0.0
+                line += f" kb(med={kr:.3f}s,nll={e['fastkernels']['nll_mean']:.4f})"
             if "diff" in e:
                 line += f" diff(max={e['diff']['max_abs']:.4e},mean={e['diff']['mean_abs']:.4e})"
             print(line, flush=True)

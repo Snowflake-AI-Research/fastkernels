@@ -240,7 +240,7 @@ class SigLIP2Model(nn.Module):
 
 
 def _remap_timm_to_kb(timm_sd: dict) -> dict:
-    """Remap timm NaFlexVit state dict keys to kb-nano SigLIP2Model keys.
+    """Remap timm NaFlexVit state dict keys to fastkernels SigLIP2Model keys.
 
     timm keys (after checkpoint_filter_fn):
         embeds.proj.weight          -> proj.weight
@@ -267,7 +267,7 @@ def _remap_timm_to_kb(timm_sd: dict) -> dict:
         elif k.startswith("embeds."):
             nk = k.replace("embeds.", "")
 
-        # Remap nn.Linear weights to kb_nano Linear (which wraps Matmul)
+        # Remap nn.Linear weights to fastkernels Linear (which wraps Matmul)
         nk = _remap_linear_key(nk)
 
         out[nk] = v
@@ -275,10 +275,10 @@ def _remap_timm_to_kb(timm_sd: dict) -> dict:
 
 
 def _remap_linear_key(key: str) -> str:
-    """Remap plain linear weight/bias to kb_nano Linear structure.
+    """Remap plain linear weight/bias to fastkernels Linear structure.
 
     timm: module.weight / module.bias
-    kb_nano Linear: module.weight / module.bias  (same, stored as nn.Parameter)
+    fastkernels Linear: module.weight / module.bias  (same, stored as nn.Parameter)
 
     For the L1 Linear wrapper, weights are stored directly as self.weight
     and self.bias (nn.Parameter), same names as nn.Linear. No remapping

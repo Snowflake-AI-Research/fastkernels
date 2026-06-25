@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Throughput + alignment benchmark for kb-nano BitNet b1.58 vs Microsoft
+"""Throughput + alignment benchmark for fastkernels BitNet b1.58 vs Microsoft
 BitNet GPU lib.
 
 The SOTA reference is the official Microsoft BitNet GPU implementation
@@ -17,7 +17,7 @@ Both engines run the same 3-scenario LLM workload from
   * balanced     ( 512 prefill / 512 decode)
   * decode-heavy ( 512 prefill / 1024 decode)
 
-with 1000 requests per scenario.  kb-nano uses paged scheduling across
+with 1000 requests per scenario.  fastkernels uses paged scheduling across
 the full request set.  The official Microsoft decode GEMM only implements
 ``M == 1`` kernels, so the SOTA worker must use ``--gen-bsz 1`` and loop
 requests one-by-one.
@@ -28,7 +28,7 @@ the BitNet tokenizer and normalized to the fixed scenario lengths.  They
 return per-request output token ids.  Throughput is measured against the
 official CUDA-graph path, while alignment is computed against the same
 official models run with fresh per-step attention metadata.  This avoids
-comparing kb-nano against a known Microsoft FastGen CUDA-graph metadata
+comparing fastkernels against a known Microsoft FastGen CUDA-graph metadata
 bug where generated tokens are not represented correctly in the replayed
 attention bias.
 
@@ -50,15 +50,15 @@ Usage:
 ------
 ::
 
-    # full benchmark (kb-nano + Microsoft BitNet GPU on all 3 scenarios,
+    # full benchmark (fastkernels + Microsoft BitNet GPU on all 3 scenarios,
     # 1000 reqs each) -- requires BITNET_REPO env or --bitnet-repo flag.
     BITNET_REPO=/path/to/microsoft/BitNet \\
         python tests/bench_microsoft_bitnet.py
 
-    # smoke run using kb-nano's continuous scheduler
+    # smoke run using fastkernels's continuous scheduler
     python tests/bench_microsoft_bitnet.py --num-prompts 32 --kb-bsz 0 --skip-sota
 
-    # kb-nano only
+    # fastkernels only
     python tests/bench_microsoft_bitnet.py --skip-sota
 """
 
@@ -150,7 +150,7 @@ def _build_real_token_prompts(
     except Exception:
         pass
 
-    from kb_nano.bench.utils.real_prompts import (
+    from fastkernels.bench.utils.real_prompts import (
         DEFAULT_WORKLOAD_DATASETS,
         load_real_prompt_workload,
     )
@@ -179,7 +179,7 @@ def _build_real_token_prompts(
 
 
 # ---------------------------------------------------------------------------
-# kb-nano subprocess worker.
+# fastkernels subprocess worker.
 # Returns per-request output token ids in ``outputs`` so the parent can
 # do per-scenario alignment against the SOTA reference.
 # ---------------------------------------------------------------------------
@@ -195,10 +195,10 @@ if cfg.get("bitnet_kernel_so"):
 
 # fastsafetensors GDS path is unreliable on some hosts; force the
 # threaded safetensors loader so the bench focuses on inference perf.
-from kb_nano.infra import weight_loader as _wl
+from fastkernels.infra import weight_loader as _wl
 _wl._HAS_FASTSAFETENSORS = False
 
-from kb_nano.infra.engine import LlamaEngine, SamplingParams
+from fastkernels.infra.engine import LlamaEngine, SamplingParams
 
 engine = LlamaEngine(
     model_name=cfg["model"],
@@ -491,7 +491,7 @@ for sc in cfg["scenarios"]:
     # early-stop check, but the bundled Llama-3 tiktoken Tokenizer only
     # exposes ``eos_id``.  We force-disable early-stop by setting an
     # unreachable id so the bench runs ``gen_length`` decode iterations
-    # for every prompt (ignore_eos=True semantics, matching kb-nano).
+    # for every prompt (ignore_eos=True semantics, matching fastkernels).
     g.tokenizer.eot_id = -1
     torch.cuda.synchronize()
     print(f"[sota] build took {time.perf_counter() - build_t0:.1f}s",
@@ -577,7 +577,7 @@ os._exit(0)
 # Exact free-running token prefixes are brittle on natural-language prompts:
 # once two numerically close logits choose different but plausible tokens,
 # the rest of the sequence diverges.  This worker scores both SOTA-generated
-# and kb-nano-generated sequences under the official direct-decode path with
+# and fastkernels-generated sequences under the official direct-decode path with
 # teacher forcing, matching the "feed generated text back to the reference
 # model and check top-k" alignment used by other LLM benchmarks.
 # ---------------------------------------------------------------------------
@@ -815,11 +815,11 @@ def _print_throughput_table(label: str, data: dict):
 def _print_summary_table(sota_data: dict, kb_data: dict,
                          alignments: dict[str, dict]):
     print(f"\n{'=' * 100}")
-    print("  SUMMARY (kb-nano vs Microsoft BitNet GPU)")
+    print("  SUMMARY (fastkernels vs Microsoft BitNet GPU)")
     print(f"{'=' * 100}")
     header = (
         f"  {'SCENARIO':<16} {'IN':>5} {'OUT':>5} "
-        f"{'KB-NANO tok/s':>15} {'SOTA tok/s':>12} {'SPEEDUP':>8} "
+        f"{'FASTKERNELS tok/s':>15} {'SOTA tok/s':>12} {'SPEEDUP':>8} "
         f"{'AVG PREFIX':>15} {'POS MATCH':>12} {'EXACT':>10}"
     )
     print(header)
@@ -893,7 +893,7 @@ def _persist_results(output_dir: str, model: str, num_prompts: int,
             for sc in scenarios
         ],
         "sota": sota_data,
-        "kb_nano": kb_data,
+        "fastkernels": kb_data,
         "alignment": alignments,
         "topk_alignment": topk_alignments,
     }
@@ -906,7 +906,7 @@ def _persist_results(output_dir: str, model: str, num_prompts: int,
             by_name.setdefault(row["name"], {})["sota_outputs"] = row
     if kb_data:
         for row in kb_data["throughput"]:
-            by_name.setdefault(row["name"], {})["kb_nano_outputs"] = row
+            by_name.setdefault(row["name"], {})["fastkernels_outputs"] = row
 
     for scenario_name, records in by_name.items():
         sdir = os.path.join(output_dir, scenario_name)
@@ -937,7 +937,7 @@ def main():
     ap.add_argument("--prompt-source", choices=("real", "random"),
                     default="real",
                     help="Prompt content source. 'real' uses the "
-                         "WildChat-derived kb-nano workload datasets and "
+                         "WildChat-derived fastkernels workload datasets and "
                          "normalizes them to fixed BitNet SOTA graph shapes; "
                          "'random' keeps the old deterministic token-id "
                          "debug workload.")
@@ -959,12 +959,12 @@ def main():
                          "the official direct-decode reference. Throughput "
                          "still uses --num-prompts.")
     ap.add_argument("--kb-bsz", type=int, default=1,
-                    help="Number of requests per kb-nano generate() call. "
+                    help="Number of requests per fastkernels generate() call. "
                          "Default 1 matches the Microsoft BitNet GPU "
                          "baseline's M==1 decode limit; use 0 to benchmark "
-                         "kb-nano's continuous scheduler over all prompts.")
+                         "fastkernels's continuous scheduler over all prompts.")
     ap.add_argument("--use-kb-cudagraph", action="store_true",
-                    help="Enable kb-nano CUDA graphs for debugging. The "
+                    help="Enable fastkernels CUDA graphs for debugging. The "
                          "default eager path is the alignment reference.")
     ap.add_argument("--skip-topk-alignment", action="store_true",
                     help="Skip teacher-forced top-k scoring under the "
@@ -972,7 +972,7 @@ def main():
     ap.add_argument("--skip-sota", action="store_true",
                     help="Skip the Microsoft BitNet GPU SOTA reference run")
     ap.add_argument("--skip-kb", action="store_true",
-                    help="Skip kb-nano (SOTA only)")
+                    help="Skip fastkernels (SOTA only)")
     ap.add_argument("--output-dir", type=str, default=None,
                     help="Directory to save per-scenario outputs and "
                          "alignment json (default: tests/results/<gpu>/"
@@ -1081,13 +1081,13 @@ def main():
             "kb_bsz": args.kb_bsz,
             "bitnet_kernel_so": kernel_so if os.path.isfile(kernel_so) else "",
         }
-        kb_data = run_worker(KB_WORKER, kb_cfg, f"kb-nano [{args.model}]")
+        kb_data = run_worker(KB_WORKER, kb_cfg, f"fastkernels [{args.model}]")
         if kb_data:
             kb_kernel = (
                 "official ladder decode"
                 if os.path.isfile(kernel_so) else "Triton fallback"
             )
-            _print_throughput_table(f"kb-nano (W1.58A8 {kb_kernel})",
+            _print_throughput_table(f"fastkernels (W1.58A8 {kb_kernel})",
                                     kb_data)
 
     alignments: dict[str, dict] = {}

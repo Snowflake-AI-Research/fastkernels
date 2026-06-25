@@ -1,7 +1,7 @@
 """Mamba2 decoder layer: RMSNorm + Mamba2Mixer with vLLM-style residual.
 
 Mirrors ``vllm/model_executor/models/mamba2.Mamba2DecoderLayer`` and
-follows kb_nano's ``LlamaDecoderLayer`` residual convention:
+follows fastkernels's ``LlamaDecoderLayer`` residual convention:
 
   - first layer (residual is None): residual = hidden_states;
     hidden_states = norm(hidden_states)

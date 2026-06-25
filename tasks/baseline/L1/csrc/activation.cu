@@ -1,4 +1,4 @@
-// Standalone SiLU-and-Mul activation kernel for kb_nano.
+// Standalone SiLU-and-Mul activation kernel for fastkernels.
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/all.h>

@@ -311,7 +311,7 @@ def main():
         "checkpoint_file": checkpoint_info["checkpoint_file"] if checkpoint_info is not None else None,
         "checkpoint_loaded_tensors": checkpoint_info["loaded_tensors"] if checkpoint_info is not None else 0,
         "correctness_metric": "final_feature_alignment",
-        "ours": {"baseline_name": "kb-nano", "points_per_second": ours_tps},
+        "ours": {"baseline_name": "fastkernels", "points_per_second": ours_tps},
     }
 
     if ref is not None:

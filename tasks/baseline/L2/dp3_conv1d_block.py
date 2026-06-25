@@ -38,7 +38,7 @@ class Conv1dBlock(nn.Module):
                 padding=kernel_size // 2,
             ),
             # eps=1e-5 matches torch.nn.GroupNorm default (the reference
-            # uses nn.GroupNorm directly); kb-nano's L1 GroupNorm defaults
+            # uses nn.GroupNorm directly); fastkernels's L1 GroupNorm defaults
             # to eps=1e-6.
             GroupNorm(n_groups, out_channels, eps=1e-5),
             Mish(),

@@ -91,13 +91,13 @@ def format_table(all_results: list[dict], gpu: str) -> str:
             lines.append("#### Throughput")
             lines.append("")
             lines.append(
-                "| Scenario | kb-nano tok/s | vLLM tok/s | Speedup "
+                "| Scenario | fastkernels tok/s | vLLM tok/s | Speedup "
                 "| Avg Token Match |"
             )
             lines.append("|---|---|---|---|---|")
 
             for s in scenarios:
-                kb = s["kb_nano_tok_per_s"]
+                kb = s["fastkernels_tok_per_s"]
                 v = s.get("vllm_tok_per_s", 0)
                 sp = s.get("speedup", 0)
                 a = s.get("alignment", {})
@@ -118,13 +118,13 @@ def format_table(all_results: list[dict], gpu: str) -> str:
             lines.append("#### Latency")
             lines.append("")
             lines.append(
-                "| Scenario | BS | IN | OUT | kb-nano median | vLLM median "
-                "| kb-nano ms/tok | vLLM ms/tok | Speedup |"
+                "| Scenario | BS | IN | OUT | fastkernels median | vLLM median "
+                "| fastkernels ms/tok | vLLM ms/tok | Speedup |"
             )
             lines.append("|---|---|---|---|---|---|---|---|---|")
             for ls in lat_scenarios:
-                kb_med = ls["kb_nano_median_s"]
-                kb_mpt = ls["kb_nano_ms_per_tok"]
+                kb_med = ls["fastkernels_median_s"]
+                kb_mpt = ls["fastkernels_ms_per_tok"]
                 v_med = ls.get("vllm_median_s")
                 v_mpt = ls.get("vllm_ms_per_tok")
                 speedup = ls.get("speedup")
@@ -150,7 +150,7 @@ def format_table(all_results: list[dict], gpu: str) -> str:
 # ---------------------------------------------------------------------------
 
 _PALETTE = {
-    "kb-nano": "#2563eb",
+    "fastkernels": "#2563eb",
     "vLLM": "#9ca3af",
 }
 
@@ -163,7 +163,7 @@ def _make_throughput_fig(all_results: list[dict], gpu: str) -> plt.Figure:
             groups.append(
                 {
                     "label": f"{label}\n{s['scenario']}",
-                    "kb": s["kb_nano_tok_per_s"],
+                    "kb": s["fastkernels_tok_per_s"],
                     "vllm": s.get("vllm_tok_per_s", 0),
                 }
             )
@@ -174,12 +174,12 @@ def _make_throughput_fig(all_results: list[dict], gpu: str) -> plt.Figure:
 
     fig, ax = plt.subplots(figsize=(max(10, n * 1.4), 6))
     bars_kb = ax.bar(x - w / 2, [g["kb"] for g in groups], w,
-                     label="kb-nano", color=_PALETTE["kb-nano"])
+                     label="fastkernels", color=_PALETTE["fastkernels"])
     bars_vl = ax.bar(x + w / 2, [g["vllm"] for g in groups], w,
                      label="vLLM", color=_PALETTE["vLLM"])
 
     ax.set_ylabel("Throughput (tok/s)")
-    ax.set_title(f"kb-nano vs vLLM Throughput — {gpu}")
+    ax.set_title(f"fastkernels vs vLLM Throughput — {gpu}")
     ax.set_xticks(x)
     ax.set_xticklabels([g["label"] for g in groups], fontsize=8, ha="center")
     ax.legend()
@@ -217,7 +217,7 @@ def _make_speedup_fig(all_results: list[dict], gpu: str) -> plt.Figure:
     n = len(items)
     y = np.arange(n)
 
-    colors = [_PALETTE["kb-nano"] if it["speedup"] >= 1.0 else "#ef4444"
+    colors = [_PALETTE["fastkernels"] if it["speedup"] >= 1.0 else "#ef4444"
               for it in items]
 
     fig, ax = plt.subplots(figsize=(8, max(4, n * 0.45)))
@@ -225,7 +225,7 @@ def _make_speedup_fig(all_results: list[dict], gpu: str) -> plt.Figure:
     ax.set_yticks(y)
     ax.set_yticklabels([it["label"] for it in items], fontsize=9)
     ax.axvline(1.0, color="black", linewidth=0.8, linestyle="--")
-    ax.set_xlabel("Speedup (kb-nano / vLLM)")
+    ax.set_xlabel("Speedup (fastkernels / vLLM)")
     ax.set_title(f"Speedup vs vLLM — {gpu}")
 
     for bar, it in zip(bars, items):
@@ -243,7 +243,7 @@ def _make_latency_fig(all_results: list[dict], gpu: str) -> plt.Figure | None:
         for ls in r.get("latency_scenarios", []):
             groups.append({
                 "label": f"{label}\n{ls['scenario']} (bs={ls['batch_size']})",
-                "kb": ls["kb_nano_median_s"] * 1000,
+                "kb": ls["fastkernels_median_s"] * 1000,
                 "vllm": ls.get("vllm_median_s", 0) * 1000,
             })
 
@@ -256,12 +256,12 @@ def _make_latency_fig(all_results: list[dict], gpu: str) -> plt.Figure | None:
 
     fig, ax = plt.subplots(figsize=(max(10, n * 1.8), 6))
     bars_kb = ax.bar(x - w / 2, [g["kb"] for g in groups], w,
-                     label="kb-nano", color=_PALETTE["kb-nano"])
+                     label="fastkernels", color=_PALETTE["fastkernels"])
     bars_vl = ax.bar(x + w / 2, [g["vllm"] for g in groups], w,
                      label="vLLM", color=_PALETTE["vLLM"])
 
     ax.set_ylabel("Median Latency (ms)")
-    ax.set_title(f"kb-nano vs vLLM Latency — {gpu}")
+    ax.set_title(f"fastkernels vs vLLM Latency — {gpu}")
     ax.set_xticks(x)
     ax.set_xticklabels([g["label"] for g in groups], fontsize=8, ha="center")
     ax.legend()

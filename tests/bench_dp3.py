@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Throughput, latency, and correctness benchmark: kb-nano DP3 vs reference DP3.
+"""Throughput, latency, and correctness benchmark: fastkernels DP3 vs reference DP3.
 
-Compares kb-nano's L1-L4 DP3 implementation against the official 3D Diffusion
+Compares fastkernels's L1-L4 DP3 implementation against the official 3D Diffusion
 Policy reference (https://github.com/YanjieZe/3D-Diffusion-Policy) on real
 3-D point-cloud robotics data.
 
@@ -17,7 +17,7 @@ Inputs (default — real data):
 
 Weights:
   - DP3 publishes no pretrained checkpoints. By default we initialise a
-    kb-nano DP3 model with a fixed seed and save it in the reference's
+    fastkernels DP3 model with a fixed seed and save it in the reference's
     checkpoint format (``cfg`` + ``state_dicts['model']``); both engines
     load this shared checkpoint. Random-init weights are sufficient for
     kernel/math-equivalence validation: the U-Net runs the same code path
@@ -26,7 +26,7 @@ Weights:
     checkpoint produced by the reference's ``train.py``.
 
 What this validates:
-  - End-to-end correctness: kb-nano vs reference action chunks per frame
+  - End-to-end correctness: fastkernels vs reference action chunks per frame
     (max abs diff + cosine similarity) on real point cloud inputs.
   - Speed parity: throughput (inferences/sec) and latency (P50/P99
     per-inference ms) on identical inputs and weights.
@@ -37,7 +37,7 @@ What this does NOT validate (out of scope):
 
 Usage:
     python tests/bench_dp3.py                              # real xarm data
-    python tests/bench_dp3.py --skip-reference             # kb-nano only
+    python tests/bench_dp3.py --skip-reference             # fastkernels only
     python tests/bench_dp3.py --variant dp3                # full DP3 (heavier U-Net)
     python tests/bench_dp3.py --num-requests 50
     python tests/bench_dp3.py --synthetic-only             # debug only
@@ -63,8 +63,8 @@ _PROJECT_ROOT = _PACKAGE_DIR.parent
 
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from kb_nano.bench.utils.worker import run_worker
-from kb_nano.bench.utils.workloads import (
+from fastkernels.bench.utils.worker import run_worker
+from fastkernels.bench.utils.workloads import (
     DP3_CONFIG,
     DP3_THROUGHPUT_WORKLOADS,
     DP3_LATENCY_WORKLOADS,
@@ -98,15 +98,15 @@ def materialize_shared_checkpoint(
 
     We build the **reference** ``DP3`` policy (which uses ``nn.Linear`` /
     ``nn.Conv1d`` with proper Kaiming-uniform init) and save its state_dict.
-    Both kb-nano and reference workers then load identical
+    Both fastkernels and reference workers then load identical
     properly-initialized weights from this single file. This avoids
-    kb-nano's L1 ``Linear`` having uninitialized weights (it uses
+    fastkernels's L1 ``Linear`` having uninitialized weights (it uses
     ``torch.empty()`` and relies on a checkpoint to fill values — fine in
     production, but breaks random-init benchmarks).
 
     Args:
         action_dim / state_dim / num_points: dimensions taken from the real
-            dataset so kb-nano and reference share the same architecture.
+            dataset so fastkernels and reference share the same architecture.
         dp3_repo: path to the reference 3D-Diffusion-Policy clone (must be
             on PYTHONPATH for the reference module imports).
 
@@ -296,7 +296,7 @@ def materialize_dataset(
     Saves to ``cache_dir`` and returns ``(paths, gt_actions)``. ``gt_actions``
     is ``(num_frames, action_dim)`` ground-truth actions when real data is
     used (otherwise ``None``); the bench reports it for transparency but
-    does not use it as a correctness target — kb-nano vs reference must
+    does not use it as a correctness target — fastkernels vs reference must
     match each other, not the GT actions.
     """
     import torch
@@ -476,10 +476,10 @@ def _load_xarm_pointclouds(
 
 
 # ---------------------------------------------------------------------------
-# kb-nano DP3 worker (runs in subprocess)
+# fastkernels DP3 worker (runs in subprocess)
 # ---------------------------------------------------------------------------
 
-KB_NANO_DP3_WORKER = r'''
+FASTKERNELS_DP3_WORKER = r'''
 import json, os, sys, time
 with open(sys.argv[1]) as f:
     cfg = json.load(f)
@@ -488,8 +488,8 @@ sys.path.insert(0, cfg["project_root"])
 import numpy as np
 import torch
 
-from kb_nano.infra.dp3_engine import DP3Engine
-from kb_nano.tasks.baseline.L4.dp3 import DP3SamplingParams
+from fastkernels.infra.dp3_engine import DP3Engine
+from fastkernels.tasks.baseline.L4.dp3 import DP3SamplingParams
 
 def main():
     engine = DP3Engine(
@@ -546,7 +546,7 @@ def main():
             "name": sc["name"], "batch_size": bsz, "num_requests": n_req,
             "elapsed_s": elapsed, "throughput_req_s": n_req / elapsed,
         })
-        print(f"  [kb-nano] {sc['name']}: {n_req} reqs in {elapsed:.3f}s "
+        print(f"  [fastkernels] {sc['name']}: {n_req} reqs in {elapsed:.3f}s "
               f"= {n_req/elapsed:.2f} req/s", flush=True)
 
     for sc in cfg.get("latency_scenarios", []):
@@ -581,7 +581,7 @@ def main():
             "min_ms": min(latencies), "max_ms": max(latencies),
             "all_ms": latencies,
         })
-        print(f"  [kb-nano] {sc['name']} bsz={bsz}: "
+        print(f"  [fastkernels] {sc['name']} bsz={bsz}: "
               f"P50={results['latency'][-1]['p50_ms']:.2f}ms "
               f"P99={results['latency'][-1]['p99_ms']:.2f}ms", flush=True)
 
@@ -660,7 +660,7 @@ def main():
     policy = _build_ref_policy(payload)
 
     sd = payload["state_dicts"]["model"]
-    # Drop kb-nano-only marker / ref-only buffers that aren't in sd.
+    # Drop fastkernels-only marker / ref-only buffers that aren't in sd.
     sd = dict(sd)
     missing, unexpected = policy.load_state_dict(sd, strict=False)
     benign_missing = ("noise_scheduler_pc.", "mask_generator.", "_dummy_variable")
@@ -676,7 +676,7 @@ def main():
     )
     policy = policy.cuda()
     # Pre-move scheduler's alphas_cumprod to GPU so the per-step
-    # scheduler.step() arithmetic runs on GPU — matches kb-nano's
+    # scheduler.step() arithmetic runs on GPU — matches fastkernels's
     # DP3Pipeline.conditional_sample, which does the same. Without this,
     # diffusers lazily transfers per call and accumulates 1-ULP-per-step
     # rounding drift over 10 DDIM steps.
@@ -701,7 +701,7 @@ def main():
     noise_all = torch.from_numpy(noise).cuda()
 
     # Patch torch.randn so the trajectory init in conditional_sample uses
-    # our shared noise tensor (matches kb-nano injection).
+    # our shared noise tensor (matches fastkernels injection).
     orig_randn = torch.randn
     g = {"noise": None}
     def my_randn(*a, **kw):
@@ -723,7 +723,7 @@ def main():
         bsz = sc["batch_size"]
         n_req = sc["num_requests"]
         torch.randn = my_randn
-        # Per-scenario warmup at matching bsz — apples-to-apples vs kb-nano.
+        # Per-scenario warmup at matching bsz — apples-to-apples vs fastkernels.
         for _ in range(2):
             g["noise"] = noise_all[:bsz]
             with torch.no_grad():
@@ -801,7 +801,7 @@ main()
 # ---------------------------------------------------------------------------
 
 def _print_throughput_comparison(kb, ref):
-    print(f"\n{'Scenario':<22}{'kb-nano req/s':>16}{'reference req/s':>20}{'speedup':>12}")
+    print(f"\n{'Scenario':<22}{'fastkernels req/s':>16}{'reference req/s':>20}{'speedup':>12}")
     print("─" * 70)
     rd = {r["name"]: r for r in (ref or [])}
     for k in kb:
@@ -884,14 +884,14 @@ def _print_correctness(c: dict):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="DP3 benchmark: kb-nano vs reference 3D-Diffusion-Policy",
+        description="DP3 benchmark: fastkernels vs reference 3D-Diffusion-Policy",
     )
     parser.add_argument("--variant", choices=("simple_dp3", "dp3"),
                         default="simple_dp3",
                         help="Model variant — Simple-DP3 (smaller, ~25 FPS on A40) or full DP3.")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Path to a real reference DP3 ckpt (latest.ckpt). "
-                             "If unset, a kb-nano random-init checkpoint is created.")
+                             "If unset, a fastkernels random-init checkpoint is created.")
     parser.add_argument("--dp3-repo", type=str,
                         default="/raid/user_data/olu/3D-Diffusion-Policy/3D-Diffusion-Policy",
                         help="Path to the cloned 3D-Diffusion-Policy repo (must be "
@@ -905,11 +905,11 @@ def main():
     parser.add_argument("--num-requests", type=int, default=100,
                         help="Number of frames per throughput scenario.")
     parser.add_argument("--enforce-eager", action="store_true", default=True,
-                        help="Skip torch.compile on kb-nano (default — apples-to-apples vs ref).")
+                        help="Skip torch.compile on fastkernels (default — apples-to-apples vs ref).")
     parser.add_argument("--torch-compile", dest="enforce_eager", action="store_false",
-                        help="Enable torch.compile(reduce-overhead) on kb-nano U-Net.")
+                        help="Enable torch.compile(reduce-overhead) on fastkernels U-Net.")
     parser.add_argument("--skip-reference", action="store_true",
-                        help="kb-nano only.")
+                        help="fastkernels only.")
     parser.add_argument("--skip-throughput", action="store_true")
     parser.add_argument("--skip-latency", action="store_true")
     parser.add_argument("--synthetic-only", action="store_true",
@@ -991,11 +991,11 @@ def main():
         for w in DP3_LATENCY_WORKLOADS
     ] if not args.skip_latency else []
 
-    # --- 3. Run kb-nano worker ---
+    # --- 3. Run fastkernels worker ---
     actions_root = os.path.join(args.output_dir, "actions")
     if os.path.isdir(actions_root):
         shutil.rmtree(actions_root)
-    kb_actions = os.path.join(actions_root, "kb_nano")
+    kb_actions = os.path.join(actions_root, "fastkernels")
     ref_actions = os.path.join(actions_root, "reference")
 
     kb_cfg = {
@@ -1009,10 +1009,10 @@ def main():
         "num_inference_steps": args.num_steps,
         "enforce_eager": args.enforce_eager,
     }
-    print("\n--- kb-nano DP3 ---")
-    kb_data = run_worker(KB_NANO_DP3_WORKER, kb_cfg, "kb-nano DP3", timeout=3600)
+    print("\n--- fastkernels DP3 ---")
+    kb_data = run_worker(FASTKERNELS_DP3_WORKER, kb_cfg, "fastkernels DP3", timeout=3600)
     if kb_data is None:
-        print("ERROR: kb-nano worker failed.", file=sys.stderr)
+        print("ERROR: fastkernels worker failed.", file=sys.stderr)
         return 1
 
     # --- 4. Run reference worker ---
@@ -1065,7 +1065,7 @@ def main():
         "seed": args.seed,
         "num_steps": args.num_steps,
         "num_requests": args.num_requests,
-        "kb_nano": kb_data,
+        "fastkernels": kb_data,
         "reference": ref_data,
         "correctness": correctness,
     }

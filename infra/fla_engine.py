@@ -97,10 +97,10 @@ class _ActiveSeq:
 # Model loading
 # ---------------------------------------------------------------------------
 _REGISTRY = {
-    "fla-hub/gla-2.7B-100B": ("kb_nano.tasks.baseline.L4.gla", "GLAConfig", "GLAForCausalLM"),
-    "fla-hub/retnet-2.7B-100B": ("kb_nano.tasks.baseline.L4.retnet", "RetNetConfig", "RetNetForCausalLM"),
-    "fla-hub/rwkv7-2.9B-g1": ("kb_nano.tasks.baseline.L4.rwkv7", "RWKV7Config", "RWKV7ForCausalLM"),
-    "fla-hub/rwkv7-2.9B-world": ("kb_nano.tasks.baseline.L4.rwkv7", "RWKV7Config", "RWKV7ForCausalLM"),
+    "fla-hub/gla-2.7B-100B": ("fastkernels.tasks.baseline.L4.gla", "GLAConfig", "GLAForCausalLM"),
+    "fla-hub/retnet-2.7B-100B": ("fastkernels.tasks.baseline.L4.retnet", "RetNetConfig", "RetNetForCausalLM"),
+    "fla-hub/rwkv7-2.9B-g1": ("fastkernels.tasks.baseline.L4.rwkv7", "RWKV7Config", "RWKV7ForCausalLM"),
+    "fla-hub/rwkv7-2.9B-world": ("fastkernels.tasks.baseline.L4.rwkv7", "RWKV7Config", "RWKV7ForCausalLM"),
 }
 
 
@@ -194,7 +194,7 @@ class _SlotCache:
         cache holds contiguous ``[B, *state_shape]`` tensors (one
         index_select per layer).
         """
-        from kb_nano.tasks.baseline.L4.recurrent_cache import RecurrentCache
+        from fastkernels.tasks.baseline.L4.recurrent_cache import RecurrentCache
         c = RecurrentCache()
         for k, buf in self.states.items():
             c.states[k] = buf.index_select(0, slot_ids)
@@ -275,9 +275,9 @@ class FLAEngine:
 
         # Cache the ordered list of L2 attention + FFN module ids so state
         # gather/scatter walks them in deterministic, layer-natural order.
-        from kb_nano.tasks.baseline.L2.gla_attention import GatedLinearAttention
-        from kb_nano.tasks.baseline.L2.rwkv7_attention import RWKV7Attention
-        from kb_nano.tasks.baseline.L2.rwkv7_ffn import RWKV7FeedForward
+        from fastkernels.tasks.baseline.L2.gla_attention import GatedLinearAttention
+        from fastkernels.tasks.baseline.L2.rwkv7_attention import RWKV7Attention
+        from fastkernels.tasks.baseline.L2.rwkv7_ffn import RWKV7FeedForward
 
         attn_classes = (GatedLinearAttention, RWKV7Attention)
         # Order matters for stable cache walks
@@ -404,7 +404,7 @@ class FLAEngine:
         """Return a RecurrentCache covering ``active``, reusing the live
         cache if possible.
         """
-        from kb_nano.tasks.baseline.L4.recurrent_cache import RecurrentCache
+        from fastkernels.tasks.baseline.L4.recurrent_cache import RecurrentCache
         if self._same_active(active, self._live_active):
             cache = self._live_cache
         else:
@@ -440,7 +440,7 @@ class FLAEngine:
         chunks. Skipping the lm_head copy for the latter halves the
         return-side memory bandwidth in chunked-prefill paths.
         """
-        from kb_nano.tasks.baseline.L4.recurrent_cache import RecurrentCache
+        from fastkernels.tasks.baseline.L4.recurrent_cache import RecurrentCache
 
         # Prefill writes the slots in ``seqs``. If any of those slots is
         # currently held by the live decode cache, flush so the

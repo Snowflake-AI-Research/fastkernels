@@ -97,7 +97,7 @@ def main():
             height=height,
             spp=cfg["spp"],
         )
-        baseline_name = "kb-nano"
+        baseline_name = "fastkernels"
     elif cfg["backend"] == "reference":
         model = load_reference_instantngp(
             scene_name=cfg["scene"],

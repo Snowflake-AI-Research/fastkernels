@@ -173,7 +173,7 @@ class TTTE2EEngine:
         """
         ``param_dtype`` is the storage dtype of the bulk of model weights —
         bf16 by default, matching the JAX reference's ``compute_dtype="bf16"``
-        during forward. The kb-nano L1 RMSNorm/Linear CUDA kernels require x
+        during forward. The fastkernels L1 RMSNorm/Linear CUDA kernels require x
         and weight to share dtype, so storing weights in bf16 lets us hit the
         fast paths.
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Throughput, latency, and correctness benchmark: kb-nano OpenFold3 vs reference.
+Throughput, latency, and correctness benchmark: fastkernels OpenFold3 vs reference.
 
 Uses real precomputed MSAs from OpenProteinSet (AWS Registry of Open Data)
 to benchmark with biologically meaningful inputs rather than synthetic data.
@@ -46,8 +46,8 @@ _PROJECT_ROOT = _PACKAGE_DIR.parent
 
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from kb_nano.bench.utils.worker import run_worker
-from kb_nano.bench.utils.workloads import (
+from fastkernels.bench.utils.worker import run_worker
+from fastkernels.bench.utils.workloads import (
     STRUCTURE_PREDICTION_LATENCY_WORKLOADS,
     STRUCTURE_PREDICTION_THROUGHPUT_WORKLOADS,
 )
@@ -627,7 +627,7 @@ def extract_outputs_for_comparison(outputs, aux_outputs):
 
 
 # ---------------------------------------------------------------------------
-# Subprocess worker template (shared by kb-nano and reference)
+# Subprocess worker template (shared by fastkernels and reference)
 # ---------------------------------------------------------------------------
 
 _WORKER_BODY = _FEATURIZE_FN + r'''
@@ -641,7 +641,7 @@ def main():
     engine_label = cfg.get("engine_label", "engine")
 
     if cfg.get("pytorch_reference", False):
-        from kb_nano.infra.kernel_swapper import (
+        from fastkernels.infra.kernel_swapper import (
             apply_candidates,
             discover_references,
             print_reference_summary,
@@ -819,7 +819,7 @@ if __name__ == "__main__":
     main()
 '''
 
-KB_NANO_OF3_WORKER = _WORKER_BODY
+FASTKERNELS_OF3_WORKER = _WORKER_BODY
 REF_OF3_WORKER = _WORKER_BODY
 
 
@@ -931,7 +931,7 @@ def compute_alignment(kb_outputs: list[dict], ref_outputs: list[dict]) -> dict:
 def main():
     parser = argparse.ArgumentParser(
         description="Throughput, latency & correctness benchmark: "
-                    "kb-nano OpenFold3 vs reference openfold3",
+                    "fastkernels OpenFold3 vs reference openfold3",
     )
     parser.add_argument("--scenario", type=str, default=None,
                         choices=[s["name"] for s in SCENARIOS],
@@ -942,10 +942,10 @@ def main():
                         choices=["bfloat16", "float16", "float32"])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--skip-reference", action="store_true",
-                        help="Skip reference openfold3 (kb-nano only)")
+                        help="Skip reference openfold3 (fastkernels only)")
     parser.add_argument(
         "--pytorch-reference", action="store_true", default=False,
-        help="Patch semantic PyTorch references from tasks/reference/L*/ into kb-nano.",
+        help="Patch semantic PyTorch references from tasks/reference/L*/ into fastkernels.",
     )
     parser.add_argument("--skip-throughput", action="store_true")
     parser.add_argument("--skip-latency", action="store_true")
@@ -987,7 +987,7 @@ def main():
     )
 
     print("\n" + "=" * 80)
-    print("  kb-nano OpenFold3 vs Reference — End-to-End Benchmark")
+    print("  fastkernels OpenFold3 vs Reference — End-to-End Benchmark")
     print("=" * 80)
     print(f"  GPU            : {gpu}")
     print(f"  Dtype          : {args.dtype}")
@@ -1040,18 +1040,18 @@ def main():
         "use_torch_compile": args.torch_compile,
     }
 
-    # ---- Run kb-nano ----
+    # ---- Run fastkernels ----
     kb_config = {
         **base_config,
-        "engine_label": "kb-nano",
+        "engine_label": "fastkernels",
         "pytorch_reference": args.pytorch_reference,
     }
     kb_raw = run_worker(
-        KB_NANO_OF3_WORKER, kb_config,
-        "kb-nano OpenFold3 — all scenarios (real MSA data)", timeout=7200,
+        FASTKERNELS_OF3_WORKER, kb_config,
+        "fastkernels OpenFold3 — all scenarios (real MSA data)", timeout=7200,
     )
     if kb_raw is None:
-        print("  ERROR: kb-nano subprocess failed.")
+        print("  ERROR: fastkernels subprocess failed.")
         sys.exit(1)
 
     # ---- Run reference ----
@@ -1076,7 +1076,7 @@ def main():
             r = {
                 "scenario": scenario["name"], "num_queries": kb_d["num_queries"],
                 "total_tokens": kb_d["total_tokens"],
-                "kb_nano_elapsed": kb_d["elapsed"], "kb_nano_tok_per_s": kb_tok_s,
+                "fastkernels_elapsed": kb_d["elapsed"], "fastkernels_tok_per_s": kb_tok_s,
             }
             if ref_tp and i < len(ref_tp):
                 ref_d = ref_tp[i]
@@ -1096,7 +1096,7 @@ def main():
         nt = kl["n_tokens"]
         k_tps = nt / kl_med if kl_med > 0 else 0
         lr = {"scenario": kl["name"], "n_tokens": nt, "num_iters": kl["num_iters"],
-              "kb_nano_median_s": kl_med, "kb_nano_tok_per_s": k_tps, "kb_nano_latencies": kl["latencies"]}
+              "fastkernels_median_s": kl_med, "fastkernels_tok_per_s": k_tps, "fastkernels_latencies": kl["latencies"]}
         if i < len(ref_lat):
             rl = ref_lat[i]
             rl_med = float(np.median(rl["latencies"]))
@@ -1110,13 +1110,13 @@ def main():
     print(f"\n\n{'=' * W}")
     print("  RESULTS")
     print(f"{'=' * W}")
-    print(f"  {'':40s} KB-NANO    REFERENCE  SPEEDUP  CORRECT")
+    print(f"  {'':40s} FASTKERNELS    REFERENCE  SPEEDUP  CORRECT")
     print(f"  {'-' * (W - 2)}")
 
     if all_results:
         for r in all_results:
             a = r.get("alignment", {})
-            kb_str = f"{r['kb_nano_tok_per_s']:>6,.0f} tok/s"
+            kb_str = f"{r['fastkernels_tok_per_s']:>6,.0f} tok/s"
             ref_str = f"{r['ref_tok_per_s']:>5,.0f} tok/s" if "ref_tok_per_s" in r else f"{'N/A':>9s}"
             sp_str = f"{r['speedup']:.2f}x" if "speedup" in r else "N/A"
             pr = a.get("pass_rate")
@@ -1126,7 +1126,7 @@ def main():
 
     if lat_combined:
         for lr in lat_combined:
-            kb_str = f"{lr['kb_nano_median_s']:.3f}s"
+            kb_str = f"{lr['fastkernels_median_s']:.3f}s"
             ref_str = f"{lr['ref_median_s']:.3f}s" if "ref_median_s" in lr else "N/A"
             sp_str = f"{lr['speedup']:.2f}x" if "speedup" in lr else "N/A"
             label = f"  latency/{lr['scenario'].replace('single-', ''):<14s} ({lr['n_tokens']:>3}tok)"
@@ -1147,8 +1147,8 @@ def main():
             "max_msa_seqs": MAX_MSA_SEQS,
             "checkpoint": f"{HF_REPO_ID} ({HF_CHECKPOINT_FILE})",
             "data_source": "OpenProteinSet (AWS s3://openfold/pdb/)",
-            "kb_nano_params": kb_raw.get("params", 0),
-            "kb_nano_peak_mem_mb": kb_raw.get("peak_mem_mb", 0),
+            "fastkernels_params": kb_raw.get("params", 0),
+            "fastkernels_peak_mem_mb": kb_raw.get("peak_mem_mb", 0),
         }
         if ref_raw:
             combined["ref_params"] = ref_raw.get("params", 0)
@@ -1166,7 +1166,7 @@ def main():
             for i, sc in enumerate(throughput_scenarios):
                 sd = os.path.join(args.output_dir, sc["name"])
                 os.makedirs(sd, exist_ok=True)
-                with open(os.path.join(sd, "kb_nano_outputs.json"), "w") as f:
+                with open(os.path.join(sd, "fastkernels_outputs.json"), "w") as f:
                     json.dump(kb_raw["throughput"][i], f, indent=2)
                 if ref_raw and i < len(ref_raw["throughput"]):
                     with open(os.path.join(sd, "ref_outputs.json"), "w") as f:

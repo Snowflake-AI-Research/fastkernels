@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Throughput, latency, and correctness benchmark: kb-nano Pi0 vs a reference (OpenPI or HF).
+Throughput, latency, and correctness benchmark: fastkernels Pi0 vs a reference (OpenPI or HF).
 
 Runs standardized robotics VLA workloads and compares:
   - Throughput: inferences/sec for action generation
@@ -11,7 +11,7 @@ Runs standardized robotics VLA workloads and compares:
 Use ``--synthetic-only`` only for quick debugging; do not report those numbers
 as the main benchmark.
 
-**Like-with-like comparison:** both kb-nano and OpenPI load the **same
+**Like-with-like comparison:** both fastkernels and OpenPI load the **same
 fine-tuned Pi0 checkpoint** (``pi0_aloha_pen_uncap``, converted to PyTorch)
 with ``action_horizon=50``, ``action_dim=32``. Both sides apply matching
 ALOHA input transforms (joint flip, gripper encoding, z-score normalization)
@@ -32,7 +32,7 @@ Each engine runs in a subprocess. Install OpenPI via a **clone + uv sync**
 Usage:
     python tests/bench_openpi.py \\
         --reference-python /raid/user_data/olu/openpi/.venv/bin/python
-    python tests/bench_openpi.py --skip-reference       # kb-nano only
+    python tests/bench_openpi.py --skip-reference       # fastkernels only
     python tests/bench_openpi.py --reference hf         # HF Transformers Pi0
     python tests/bench_openpi.py --synthetic-only       # dev/debug only
     python tests/bench_openpi.py --num-requests 50 --num-steps 10
@@ -57,8 +57,8 @@ _PROJECT_ROOT = _PACKAGE_DIR.parent
 
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from kb_nano.bench.utils.worker import run_worker
-from kb_nano.bench.utils.workloads import PI0_CONFIG
+from fastkernels.bench.utils.worker import run_worker
+from fastkernels.bench.utils.workloads import PI0_CONFIG
 
 
 def _detect_gpu_name() -> str:
@@ -279,7 +279,7 @@ def make_synthetic_batch(batch_size, num_cameras, image_size=224, max_state_dim=
 
 
 def make_pi0_flow_noise(batch_size, chunk_size, max_action_dim, noise_seed, device, dtype):
-    """Deterministic flow-matching noise; must match kb-nano and HF workers."""
+    """Deterministic flow-matching noise; must match fastkernels and HF workers."""
     g = torch.Generator(device=device)
     g.manual_seed(int(noise_seed))
     return torch.randn(
@@ -663,7 +663,7 @@ def _libero_postprocess_actions(act, ns, raw_state_8=None):
 # ---- OpenPI observation converters ----
 
 def kb_batch_to_openpi_droid(batch):
-    """Map kb-nano batch -> OpenPI DroidInputs observation dict."""
+    """Map fastkernels batch -> OpenPI DroidInputs observation dict."""
     pv = batch["pixel_values"][0]  # (2, 3, H, W) float [0,1]
     st = batch["state"][0].detach().cpu().float().numpy()
 
@@ -688,7 +688,7 @@ def kb_batch_to_openpi_droid(batch):
 
 
 def kb_batch_to_openpi_libero(batch):
-    """Map kb-nano batch -> OpenPI LiberoInputs observation dict."""
+    """Map fastkernels batch -> OpenPI LiberoInputs observation dict."""
     pv = batch["pixel_values"][0]  # (2, 3, H, W) float [0,1]
     st = batch["state"][0].detach().cpu().float().numpy()
 
@@ -912,7 +912,7 @@ def _chw_float_to_chw_uint8(t):
 
 
 def kb_batch_to_openpi_aloha(batch, num_cameras):
-    """Map kb-nano batch dict -> OpenPI AlohaInputs keys (numpy CHW uint8)."""
+    """Map fastkernels batch dict -> OpenPI AlohaInputs keys (numpy CHW uint8)."""
     pv = batch["pixel_values"][0]
     st = batch["state"][0].detach().cpu().float().numpy()
     state_14 = np.zeros(14, dtype=np.float32)
@@ -943,7 +943,7 @@ def _get_batch(dataset_batches, idx, scenario_cameras, image_size, seed, strict_
 
 
 def _kb_batch_cuda_bf16(batch):
-    """Match kb-nano Pi0 dtype/device for cached CPU batches from the parent process."""
+    """Match fastkernels Pi0 dtype/device for cached CPU batches from the parent process."""
     dev = torch.device("cuda")
     dtype = torch.bfloat16
     out = {}
@@ -1219,10 +1219,10 @@ if __name__ == "__main__":
 
 
 # ---------------------------------------------------------------------------
-# kb-nano subprocess worker
+# fastkernels subprocess worker
 # ---------------------------------------------------------------------------
 
-KB_NANO_PI0_WORKER = r'''
+FASTKERNELS_PI0_WORKER = r'''
 import json, os, sys, time, torch, glob
 import numpy as np
 from tqdm import tqdm
@@ -1383,7 +1383,7 @@ def main():
             if os.path.isfile(nf):
                 scenario_noise = torch.load(nf, map_location="cpu", weights_only=True)
 
-        pbar = tqdm(range(num_requests), desc=f"kb-nano {scenario['name']}", file=sys.stderr)
+        pbar = tqdm(range(num_requests), desc=f"fastkernels {scenario['name']}", file=sys.stderr)
         for req_idx in pbar:
             synth_nc = _synth_cameras(dataset_name)
             batch = _get_batch(dataset_batches, req_idx, synth_nc, image_size,
@@ -1476,7 +1476,7 @@ def main():
                 return _get_batch(lat_ds, i % len(lat_ds), synth_nc, image_size, seed + 888 + i, strict_data)
             return make_synthetic_batch(1, synth_nc, image_size=image_size, seed=seed + 888 + i)
 
-        for wi in tqdm(range(ls.get("num_warmup", 3)), desc=f"kb-nano warmup {ls['name']}", file=sys.stderr):
+        for wi in tqdm(range(ls.get("num_warmup", 3)), desc=f"fastkernels warmup {ls['name']}", file=sys.stderr):
             batch = _lat_batch(wi)
             torch.cuda.synchronize()
             engine.generate(
@@ -1489,7 +1489,7 @@ def main():
             torch.cuda.synchronize()
 
         latencies = []
-        for ii in tqdm(range(ls.get("num_iters", 10)), desc=f"kb-nano latency {ls['name']}", file=sys.stderr):
+        for ii in tqdm(range(ls.get("num_iters", 10)), desc=f"fastkernels latency {ls['name']}", file=sys.stderr):
             batch = _lat_batch(ii + 1000)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -1523,7 +1523,7 @@ if __name__ == "__main__":
 
 
 # ---------------------------------------------------------------------------
-# Parent-side dataset materialization (runs in kb-nano interpreter)
+# Parent-side dataset materialization (runs in fastkernels interpreter)
 # ---------------------------------------------------------------------------
 
 def _batches_to_cpu_float32(batches: list[dict]) -> list[dict]:
@@ -1942,7 +1942,7 @@ def _print_throughput_comparison(kb_results, ref_results=None, ref_label: str = 
     print("\n" + "=" * 90)
     print(f"  THROUGHPUT COMPARISON (inferences/sec) — data: {data_src}")
     print("=" * 90)
-    header = f"  {'Scenario':<25} {'Requests':>9} {'kb-nano':>12}"
+    header = f"  {'Scenario':<25} {'Requests':>9} {'fastkernels':>12}"
     if ref_results:
         header += f" {ref_label:>12} {'Speedup':>10}"
     print(header)
@@ -1964,7 +1964,7 @@ def _print_latency_comparison(kb_results, ref_results=None, ref_label: str = "re
     print("\n" + "=" * 80)
     print("  LATENCY COMPARISON (seconds)")
     print("=" * 80)
-    header = f"  {'Scenario':<25} {'kb-nano p50':>12}"
+    header = f"  {'Scenario':<25} {'fastkernels p50':>12}"
     if ref_results:
         header += f" {rl:>12} {'Speedup':>10}"
     print(header)
@@ -2012,7 +2012,7 @@ def _compare_actions(kb_actions_dir, ref_actions_dir):
         n = min(kb_act.shape[0], ref_act.shape[0])
         kb_act = kb_act[:n]
         ref_act = ref_act[:n]
-        # Align horizon and action dims (e.g. kb-nano 32-dim vs OpenPI ALOHA 14-dim).
+        # Align horizon and action dims (e.g. fastkernels 32-dim vs OpenPI ALOHA 14-dim).
         if kb_act.ndim >= 3 and ref_act.ndim >= 3:
             h = min(kb_act.shape[1], ref_act.shape[1])
             d = min(kb_act.shape[2], ref_act.shape[2])
@@ -2074,7 +2074,7 @@ def _run_dataset_benchmark(
     import torch as _torch
 
     # Per-dataset model/checkpoint paths (fall back to global --model/--openpi-checkpoint).
-    # The OpenPI checkpoint defaults to the kb-nano model path so passing only --droid-model /
+    # The OpenPI checkpoint defaults to the fastkernels model path so passing only --droid-model /
     # --libero-model is enough for both sides to use the matching domain checkpoint.
     model_path = getattr(args, f"{dataset_name}_model", None) or args.model
     openpi_ckpt = (getattr(args, f"{dataset_name}_openpi_checkpoint", None)
@@ -2083,7 +2083,7 @@ def _run_dataset_benchmark(
 
     # Resolve action_horizon from the checkpoint's own config.json. OpenPI's
     # conversion script writes ``action_horizon`` (e.g. 10 for pi0_droid,
-    # 50 for pi0_aloha/libero). kb-nano's Pi0Config reads ``chunk_size`` but
+    # 50 for pi0_aloha/libero). fastkernels's Pi0Config reads ``chunk_size`` but
     # now falls back to ``action_horizon`` if only that is present. We use
     # this value to size the shared flow-matching noise; size mismatches
     # between noise and the model's config.action_horizon crash OpenPI with
@@ -2125,7 +2125,7 @@ def _run_dataset_benchmark(
         "num_steps": args.num_steps,
         "enforce_eager": args.enforce_eager,
         "project_root": str(_PROJECT_ROOT),
-        "package_name": "kb_nano",
+        "package_name": "fastkernels",
         "image_size": PI0_CONFIG.image_resolution[0],
         "chunk_size": ckpt_chunk_size,
         "max_action_dim": PI0_CONFIG.max_action_dim,
@@ -2137,7 +2137,7 @@ def _run_dataset_benchmark(
 
     save_actions = run_reference
     if save_actions:
-        kb_actions_dir = os.path.join(output_dir, "actions", "kb_nano")
+        kb_actions_dir = os.path.join(output_dir, "actions", "fastkernels")
         ref_actions_dir = os.path.join(output_dir, "actions", "openpi")
         actions_root = os.path.join(output_dir, "actions")
         if os.path.isdir(actions_root):
@@ -2151,12 +2151,12 @@ def _run_dataset_benchmark(
     if kb_actions_dir:
         kb_config["actions_dir"] = kb_actions_dir
 
-    print(f"\n--- {dataset_name.upper()} | kb-nano ---", flush=True)
-    kb_data = run_worker(KB_NANO_PI0_WORKER, kb_config,
-                         f"kb-nano Pi0 [{dataset_name}]", timeout=36000)
+    print(f"\n--- {dataset_name.upper()} | fastkernels ---", flush=True)
+    kb_data = run_worker(FASTKERNELS_PI0_WORKER, kb_config,
+                         f"fastkernels Pi0 [{dataset_name}]", timeout=36000)
     if kb_data is None:
-        print(f"ERROR: kb-nano [{dataset_name}] failed.", file=sys.stderr)
-        return {"error": "kb-nano failed"}
+        print(f"ERROR: fastkernels [{dataset_name}] failed.", file=sys.stderr)
+        return {"error": "fastkernels failed"}
 
     ref_data = None
     if run_reference and args.reference == "openpi":
@@ -2175,7 +2175,7 @@ def _run_dataset_benchmark(
                                  seed=args.seed, image_size=PI0_CONFIG.image_resolution[0])
             if batch_cache is None:
                 print(f"ERROR: Failed to materialize {dataset_name} batches.", file=sys.stderr)
-                return {"error": "materialization failed", "kb_nano": kb_data}
+                return {"error": "materialization failed", "fastkernels": kb_data}
             print(f"Materialized {dataset_name} batch cache: {cache_dir}", flush=True)
 
         ref_config = {
@@ -2227,12 +2227,12 @@ def _run_dataset_benchmark(
         if correctness:
             _print_correctness(correctness)
 
-    return {"kb_nano": kb_data, "reference": ref_data, "correctness": correctness}
+    return {"fastkernels": kb_data, "reference": ref_data, "correctness": correctness}
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Pi0 benchmark: kb-nano vs OpenPI — ALOHA, DROID, and LIBERO workloads",
+        description="Pi0 benchmark: fastkernels vs OpenPI — ALOHA, DROID, and LIBERO workloads",
     )
     parser.add_argument("--model", type=str, default="/raid/user_data/olu/pi0_aloha_pen_uncap_pytorch",
                         help="Default Pi0 checkpoint for all datasets")
@@ -2248,7 +2248,7 @@ def main():
                         default=["aloha", "droid", "libero"],
                         help="Datasets to benchmark (default: all three)")
     parser.add_argument("--skip-reference", action="store_true",
-                        help="Skip reference engine; kb-nano only")
+                        help="Skip reference engine; fastkernels only")
     parser.add_argument("--skip-openpi", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--skip-throughput", action="store_true")
     parser.add_argument("--skip-latency", action="store_true")

@@ -1,5 +1,5 @@
 """
-OpenAI-compatible HTTP server for kb_nano.
+OpenAI-compatible HTTP server for fastkernels.
 
 Serves /v1/chat/completions, /v1/completions, and /v1/models backed by
 the LlamaEngine.  Supports chat templates (via HuggingFace tokenizer),
@@ -7,7 +7,7 @@ multimodal message content (forward-compatible with Qwen VL), tensor
 parallelism, and SSE streaming.
 
 Usage:
-    python -m kb_nano.infra.server \
+    python -m fastkernels.infra.server \
         --model meta-llama/Llama-3.1-8B-Instruct \
         --port 8000 --tp 1
 """
@@ -48,7 +48,7 @@ class ModelCard(BaseModel):
     id: str
     object: str = "model"
     created: int = Field(default_factory=lambda: int(time.time()))
-    owned_by: str = "kb-nano"
+    owned_by: str = "fastkernels"
 
 
 class ModelList(BaseModel):
@@ -201,9 +201,9 @@ class CompletionStreamResponse(BaseModel):
 # Globals filled at startup
 # ---------------------------------------------------------------------------
 
-logger = logging.getLogger("kb_nano.server")
+logger = logging.getLogger("fastkernels.server")
 
-app = FastAPI(title="kb-nano OpenAI API")
+app = FastAPI(title="fastkernels OpenAI API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -293,8 +293,8 @@ def _build_sampling_params(
     seed: Optional[int],
     ignore_eos: bool = False,
 ):
-    """Build a kb_nano SamplingParams from request fields."""
-    from kb_nano.infra.engine import SamplingParams
+    """Build a fastkernels SamplingParams from request fields."""
+    from fastkernels.infra.engine import SamplingParams
 
     return SamplingParams(
         temperature=temperature if temperature is not None else 0.0,
@@ -571,7 +571,7 @@ async def _stream_completions(
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="kb-nano OpenAI-compatible server")
+    p = argparse.ArgumentParser(description="fastkernels OpenAI-compatible server")
     p.add_argument("--model", type=str, required=True,
                     help="HuggingFace model name (e.g. meta-llama/Llama-3.1-8B-Instruct)")
     p.add_argument("--host", type=str, default="0.0.0.0")
@@ -604,14 +604,14 @@ def main():
         "float32": torch.float32,
     }
 
-    # Add project root to path so kb_nano is importable
-    from kb_nano import PROJECT_ROOT
+    # Add project root to path so fastkernels is importable
+    from fastkernels import PROJECT_ROOT
     project_root = str(PROJECT_ROOT)
     if project_root not in sys.path:
         sys.path.insert(0, project_root)
 
     if not args.no_candidate_kernels:
-        from kb_nano.infra.kernel_swapper import (
+        from fastkernels.infra.kernel_swapper import (
             apply_candidates,
             discover_candidates,
             print_candidate_summary,
@@ -621,10 +621,10 @@ def main():
             print_candidate_summary(candidates)
             apply_candidates(candidates)
 
-    from kb_nano.infra.engine import LlamaEngine
+    from fastkernels.infra.engine import LlamaEngine
 
     logger.info("=" * 60)
-    logger.info("  kb-nano OpenAI-compatible server")
+    logger.info("  fastkernels OpenAI-compatible server")
     logger.info("=" * 60)
     logger.info(f"  Model:  {args.model}")
     logger.info(f"  TP:     {args.tp}")

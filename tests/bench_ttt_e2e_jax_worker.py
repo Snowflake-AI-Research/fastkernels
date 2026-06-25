@@ -6,7 +6,7 @@ in an isolated process. Two modes:
   --mode init_and_save
     Build a MetaModel from the given config json, initialize all weights from
     a deterministic seed, save the flat state dict as numpy ``.npz``. The
-    resulting file is portable: kb-nano loads from the same file via the name
+    resulting file is portable: fastkernels loads from the same file via the name
     map in ``infra/ttt_e2e_engine.py``.
 
   --mode run_forward
@@ -20,7 +20,7 @@ makes timings unreliable. Same pattern used by tests/bench_dp3.py.
 
 Run directly with the path to the cloned/vendored ttt-e2e repo on sys.path:
 
-    python -m kb_nano.tests.bench_ttt_e2e_jax_worker --help
+    python -m fastkernels.tests.bench_ttt_e2e_jax_worker --help
 """
 
 from __future__ import annotations

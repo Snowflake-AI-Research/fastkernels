@@ -8,8 +8,8 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from kb_nano.tasks.baseline.L1.moe_grouped_gemm import _fused_moe_kernel
-from kb_nano.tasks.baseline.L1.moe_align import MoeAlign
+from fastkernels.tasks.baseline.L1.moe_grouped_gemm import _fused_moe_kernel
+from fastkernels.tasks.baseline.L1.moe_align import MoeAlign
 import triton
 import triton.language as tl
 

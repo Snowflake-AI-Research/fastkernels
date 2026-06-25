@@ -3,8 +3,8 @@
 
 This freezes the InputRegistry scenarios used for the KernelAgent fairness
 benchmark so reruns are deterministic and auditable. The generated YAML can be
-used by setting ``KB_NANO_INPUTS_DIR`` to the output directory and
-``KB_NANO_GOLDEN_DIR`` to the generated golden directory.
+used by setting ``FASTKERNELS_INPUTS_DIR`` to the output directory and
+``FASTKERNELS_GOLDEN_DIR`` to the generated golden directory.
 """
 
 from __future__ import annotations
@@ -18,8 +18,8 @@ from typing import Any
 import torch
 import yaml
 
-from kb_nano import GOLDEN_DIR, INPUTS_DIR
-from kb_nano.bench.utils.input_registry import InputRegistry
+from fastkernels import GOLDEN_DIR, INPUTS_DIR
+from fastkernels.bench.utils.input_registry import InputRegistry
 
 
 def _safe_name(value: str) -> str:

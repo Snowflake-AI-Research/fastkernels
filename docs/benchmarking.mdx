@@ -3,13 +3,13 @@ title: Benchmarking
 description: Three-tier benchmarking infrastructure for kernel development.
 ---
 
-kb-nano uses a three-tier benchmarking system. Each tier adds scope: isolated kernels → full-model inference → multi-model evaluation sweeps.
+fastkernels uses a three-tier benchmarking system. Each tier adds scope: isolated kernels → full-model inference → multi-model evaluation sweeps.
 
 | Tier | Scope | CLI |
 |------|-------|-----|
-| 1 — Kernel | Single operator `forward()` in isolation | `kb_nano kernels` |
-| 2 — E2E | Full-model throughput, latency, serving | `kb_nano e2e` |
-| 3 — Eval | Standardized multi-model sweep | `kb_nano eval` |
+| 1 — Kernel | Single operator `forward()` in isolation | `fastkernels kernels` |
+| 2 — E2E | Full-model throughput, latency, serving | `fastkernels e2e` |
+| 3 — Eval | Standardized multi-model sweep | `fastkernels eval` |
 
 ---
 
@@ -19,20 +19,20 @@ Tests a single operator replacement by instantiating baseline and candidate `nn.
 
 ```bash
 # Run all operators that have candidates in tasks/candidate/
-kb_nano kernels
+fastkernels kernels
 
 # Single operator
-kb_nano kernels --target rms_norm
+fastkernels kernels --target rms_norm
 
 # Filter by model / TP / category
-kb_nano kernels --target rms_norm --model llama31 --tp 1
+fastkernels kernels --target rms_norm --model llama31 --tp 1
 
 # List available targets
-kb_nano kernels --list
-kb_nano kernels --list --level 1
+fastkernels kernels --list
+fastkernels kernels --list --level 1
 
 # Show model-to-operator mapping
-kb_nano kernels --map
+fastkernels kernels --map
 ```
 
 **Key flags:**
@@ -57,18 +57,18 @@ Full-model inference benchmarks. The CLI mirrors vLLM's interface, so the same f
 
 ```bash
 # Throughput
-kb_nano e2e throughput \
+fastkernels e2e throughput \
     --model meta-llama/Llama-3.1-8B-Instruct \
     --dataset-name random --random-input-len 512 --random-output-len 128 \
     --num-prompts 200 --tp 4
 
 # Latency
-kb_nano e2e latency \
+fastkernels e2e latency \
     --model meta-llama/Llama-3.1-8B-Instruct \
     --input-len 128 --output-len 128
 
 # Online serving
-kb_nano e2e serve [args...]
+fastkernels e2e serve [args...]
 ```
 
 ---
@@ -79,17 +79,17 @@ Runs a standardized evaluation across all candidate kernels using fixed workload
 
 ```bash
 # Full sweep (auto-detects models from candidates)
-kb_nano eval
+fastkernels eval
 
 # Specific model and TP
-kb_nano eval \
+fastkernels eval \
     --model meta-llama/Llama-3.1-8B-Instruct --tp 1 4
 
 # Filter by category
-kb_nano eval --category llm
+fastkernels eval --category llm
 
 # Control scale
-kb_nano eval --num-prompts 500 --gpu-pool 4
+fastkernels eval --num-prompts 500 --gpu-pool 4
 ```
 
 **Key flags:**
@@ -145,19 +145,19 @@ definitions live in `bench/kernels/benchmark_scenarios/small/config.yaml`, raw t
 
 ```bash
 # Legacy config-derived manifest generator
-kb_nano generate-inputs
+fastkernels generate-inputs
 
 # Workload-derived registry pipeline
-kb_nano trace-inputs --config bench/kernels/benchmark_scenarios/small/config.yaml
-kb_nano build-input-registry
-kb_nano validate-input-registry
+fastkernels trace-inputs --config bench/kernels/benchmark_scenarios/small/config.yaml
+fastkernels build-input-registry
+fastkernels validate-input-registry
 ```
 
 ---
 
 ## Experiment Tracking
 
-All three benchmark tiers automatically log their results to MLflow. After any `kb_nano kernels`, `kb_nano e2e`, or `kb_nano eval` run, you can query the results with `kb_nano history` or browse them in the MLflow web UI via `kb_nano mlflow-ui`. See [Experiment Tracking](/experiment-tracking) for details.
+All three benchmark tiers automatically log their results to MLflow. After any `fastkernels kernels`, `fastkernels e2e`, or `fastkernels eval` run, you can query the results with `fastkernels history` or browse them in the MLflow web UI via `fastkernels mlflow-ui`. See [Experiment Tracking](/experiment-tracking) for details.
 
 ---
 

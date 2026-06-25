@@ -15,8 +15,8 @@ from dataclasses import dataclass, field
 
 from transformers import AutoTokenizer
 
-from kb_nano.bench.utils.real_prompts import load_real_prompt_workload
-from kb_nano.bench.utils.workloads import (
+from fastkernels.bench.utils.real_prompts import load_real_prompt_workload
+from fastkernels.bench.utils.workloads import (
     LATENCY_WORKLOADS,
     THROUGHPUT_WORKLOADS,
 )
@@ -72,7 +72,7 @@ class EvalPlanner:
         if self.config.models:
             return self.config.models
 
-        from kb_nano.infra.kernel_swapper import discover_candidates
+        from fastkernels.infra.kernel_swapper import discover_candidates
         candidates = discover_candidates()
         if not candidates:
             return []

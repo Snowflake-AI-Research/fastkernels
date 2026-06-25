@@ -1,7 +1,7 @@
 """DP3 inference engine for 3D diffusion policy models.
 
 Loads a reference DP3 / Simple-DP3 checkpoint (a dill-pickled payload from
-``train.py`` / ``TrainDP3Workspace``) into the kb-nano DP3Pipeline and
+``train.py`` / ``TrainDP3Workspace``) into the fastkernels DP3Pipeline and
 exposes a ``generate()`` API for action-chunk inference.
 
 Mirrors the Pi0Engine pattern but specialized for DP3:
@@ -9,7 +9,7 @@ Mirrors the Pi0Engine pattern but specialized for DP3:
       by the reference's training loop.
     - The checkpoint contains both ``state_dicts['ema_model']`` (preferred at
       inference) and ``state_dicts['model']`` plus the OmegaConf ``cfg``
-      that produced them; we read ``cfg`` to size the kb-nano DP3Config.
+      that produced them; we read ``cfg`` to size the fastkernels DP3Config.
 """
 
 from __future__ import annotations
@@ -62,7 +62,7 @@ def _load_dp3_checkpoint(path: str) -> dict[str, Any]:
 
 
 def _config_from_payload(payload: dict[str, Any]) -> DP3Config:
-    """Derive a kb-nano DP3Config from the reference's OmegaConf training cfg."""
+    """Derive a fastkernels DP3Config from the reference's OmegaConf training cfg."""
     cfg = payload.get("cfg")
     if cfg is None:
         raise KeyError(

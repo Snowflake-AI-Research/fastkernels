@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Throughput and alignment benchmark: kb-nano baseline vs vLLM.
+Throughput and alignment benchmark: fastkernels baseline vs vLLM.
 
 For LLM models: runs three text-only scenarios (prefill-heavy, balanced,
 decode-heavy) using WildChat-derived HuggingFace datasets, tokenized with
@@ -12,7 +12,7 @@ single-video) using real multimodal datasets (VisionArena, MMVU). Qwen-Omni
 extends this to text, image, video, and audio using real text/multimodal/audio
 datasets.
 
-Each engine (vLLM, kb-nano) is loaded once in a single long-lived subprocess
+Each engine (vLLM, fastkernels) is loaded once in a single long-lived subprocess
 that processes all scenarios sequentially, avoiding repeated model loading.
 
 Usage:
@@ -22,7 +22,7 @@ Usage:
     # VLM benchmark (auto-detected from model name)
     python tests/bench_vllm.py --model Qwen/Qwen2-VL-7B-Instruct
 
-    python tests/bench_vllm.py --skip-vllm  # kb-nano only
+    python tests/bench_vllm.py --skip-vllm  # fastkernels only
 """
 
 from __future__ import annotations
@@ -78,14 +78,14 @@ def _reserve_tcp_port(preferred: int | None = None) -> tuple[int, object]:
     The lock avoids two copies of this script choosing the same port before
     their subprocesses initialize torch/vLLM distributed state.
     """
-    min_port = int(os.environ.get("KB_NANO_BENCH_PORT_MIN", "20000"))
-    max_port = int(os.environ.get("KB_NANO_BENCH_PORT_MAX", "60999"))
+    min_port = int(os.environ.get("FASTKERNELS_BENCH_PORT_MIN", "20000"))
+    max_port = int(os.environ.get("FASTKERNELS_BENCH_PORT_MAX", "60999"))
     if min_port > max_port:
-        raise SystemExit("KB_NANO_BENCH_PORT_MIN must be <= KB_NANO_BENCH_PORT_MAX")
+        raise SystemExit("FASTKERNELS_BENCH_PORT_MIN must be <= FASTKERNELS_BENCH_PORT_MAX")
 
     lock_dir = Path(os.environ.get(
-        "KB_NANO_BENCH_PORT_LOCK_DIR",
-        "/tmp/kb_nano_bench_ports",
+        "FASTKERNELS_BENCH_PORT_LOCK_DIR",
+        "/tmp/fastkernels_bench_ports",
     ))
     lock_dir.mkdir(parents=True, exist_ok=True)
 
@@ -131,14 +131,14 @@ def _make_run_id(requested: str | None) -> str:
 def _install_flashinfer_sitecustomize() -> None:
     """Patch FlashInfer IPC socket IDs in every spawned vLLM rank."""
     site_dir = Path(os.environ.get(
-        "KB_NANO_FLASHINFER_SITECUSTOMIZE_DIR",
-        "/tmp/kb_nano_flashinfer_sitecustomize",
+        "FASTKERNELS_FLASHINFER_SITECUSTOMIZE_DIR",
+        "/tmp/fastkernels_flashinfer_sitecustomize",
     ))
     site_dir.mkdir(parents=True, exist_ok=True)
     (site_dir / "sitecustomize.py").write_text(r'''
 import os
 
-namespace = os.environ.get("KB_NANO_FLASHINFER_SOCKET_NAMESPACE")
+namespace = os.environ.get("FASTKERNELS_FLASHINFER_SOCKET_NAMESPACE")
 if namespace:
     try:
         import hashlib
@@ -146,7 +146,7 @@ if namespace:
     except Exception:
         pass
     else:
-        if not getattr(mnnvl.IpcSocket, "_kb_nano_namespaced", False):
+        if not getattr(mnnvl.IpcSocket, "_fastkernels_namespaced", False):
             original_init = mnnvl.IpcSocket.__init__
             namespace_bits = int.from_bytes(
                 hashlib.blake2b(namespace.encode(), digest_size=8).digest(),
@@ -159,7 +159,7 @@ if namespace:
                 original_init(self, rank, op_id, use_abstract)
 
             mnnvl.IpcSocket.__init__ = namespaced_init
-            mnnvl.IpcSocket._kb_nano_namespaced = True
+            mnnvl.IpcSocket._fastkernels_namespaced = True
 ''')
 
     current = os.environ.get("PYTHONPATH", "")
@@ -351,7 +351,7 @@ os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
 
 def _configure_parallel_safe_flashinfer():
-    namespace = os.environ.get("KB_NANO_FLASHINFER_SOCKET_NAMESPACE")
+    namespace = os.environ.get("FASTKERNELS_FLASHINFER_SOCKET_NAMESPACE")
     if not namespace:
         return
     try:
@@ -359,7 +359,7 @@ def _configure_parallel_safe_flashinfer():
         from flashinfer.comm import mnnvl
     except Exception:
         return
-    if getattr(mnnvl.IpcSocket, "_kb_nano_namespaced", False):
+    if getattr(mnnvl.IpcSocket, "_fastkernels_namespaced", False):
         return
 
     original_init = mnnvl.IpcSocket.__init__
@@ -374,7 +374,7 @@ def _configure_parallel_safe_flashinfer():
         original_init(self, rank, op_id, use_abstract)
 
     mnnvl.IpcSocket.__init__ = namespaced_init
-    mnnvl.IpcSocket._kb_nano_namespaced = True
+    mnnvl.IpcSocket._fastkernels_namespaced = True
 
 _configure_parallel_safe_flashinfer()
 
@@ -497,9 +497,9 @@ if __name__ == "__main__":
 '''
 
 # ---------------------------------------------------------------------------
-# Multi-scenario kb-nano subprocess worker
+# Multi-scenario fastkernels subprocess worker
 # ---------------------------------------------------------------------------
-KB_NANO_WORKER = r'''
+FASTKERNELS_WORKER = r'''
 import json, os, sys, time
 os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
 
@@ -899,7 +899,7 @@ os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
 
 def _configure_parallel_safe_flashinfer():
-    namespace = os.environ.get("KB_NANO_FLASHINFER_SOCKET_NAMESPACE")
+    namespace = os.environ.get("FASTKERNELS_FLASHINFER_SOCKET_NAMESPACE")
     if not namespace:
         return
     try:
@@ -907,7 +907,7 @@ def _configure_parallel_safe_flashinfer():
         from flashinfer.comm import mnnvl
     except Exception:
         return
-    if getattr(mnnvl.IpcSocket, "_kb_nano_namespaced", False):
+    if getattr(mnnvl.IpcSocket, "_fastkernels_namespaced", False):
         return
 
     original_init = mnnvl.IpcSocket.__init__
@@ -922,7 +922,7 @@ def _configure_parallel_safe_flashinfer():
         original_init(self, rank, op_id, use_abstract)
 
     mnnvl.IpcSocket.__init__ = namespaced_init
-    mnnvl.IpcSocket._kb_nano_namespaced = True
+    mnnvl.IpcSocket._fastkernels_namespaced = True
 
 _configure_parallel_safe_flashinfer()
 
@@ -1109,9 +1109,9 @@ if __name__ == "__main__":
 '''
 
 # ---------------------------------------------------------------------------
-# Multi-scenario kb-nano subprocess worker (VLM, multi-modal)
+# Multi-scenario fastkernels subprocess worker (VLM, multi-modal)
 # ---------------------------------------------------------------------------
-KB_NANO_VLM_WORKER = _MM_PRELOAD_FN + r'''
+FASTKERNELS_VLM_WORKER = _MM_PRELOAD_FN + r'''
 import json, os, sys, time
 os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
 
@@ -1185,7 +1185,7 @@ def main():
             max_input_tokens = cfg["max_model_len"] - scenario["output_len"]
             mm_data = _filter_and_prepare(
                 mm_data, processor, max_input_tokens)
-            print(f"  kb-nano: {len(mm_data)} items after token-count filter "
+            print(f"  fastkernels: {len(mm_data)} items after token-count filter "
                   f"(max_input={max_input_tokens})")
 
             prompts = [item["prompt"] for item in mm_data]
@@ -1337,7 +1337,7 @@ os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
 
 def _configure_parallel_safe_flashinfer():
-    namespace = os.environ.get("KB_NANO_FLASHINFER_SOCKET_NAMESPACE")
+    namespace = os.environ.get("FASTKERNELS_FLASHINFER_SOCKET_NAMESPACE")
     if not namespace:
         return
     try:
@@ -1345,7 +1345,7 @@ def _configure_parallel_safe_flashinfer():
         from flashinfer.comm import mnnvl
     except Exception:
         return
-    if getattr(mnnvl.IpcSocket, "_kb_nano_namespaced", False):
+    if getattr(mnnvl.IpcSocket, "_fastkernels_namespaced", False):
         return
 
     original_init = mnnvl.IpcSocket.__init__
@@ -1360,7 +1360,7 @@ def _configure_parallel_safe_flashinfer():
         original_init(self, rank, op_id, use_abstract)
 
     mnnvl.IpcSocket.__init__ = namespaced_init
-    mnnvl.IpcSocket._kb_nano_namespaced = True
+    mnnvl.IpcSocket._fastkernels_namespaced = True
 
 _configure_parallel_safe_flashinfer()
 
@@ -1522,9 +1522,9 @@ if __name__ == "__main__":
 '''
 
 # ---------------------------------------------------------------------------
-# Multi-scenario kb-nano subprocess worker (Whisper, audio)
+# Multi-scenario fastkernels subprocess worker (Whisper, audio)
 # ---------------------------------------------------------------------------
-KB_NANO_WHISPER_WORKER = r'''
+FASTKERNELS_WHISPER_WORKER = r'''
 import json, sys, time
 import numpy as np
 
@@ -1738,7 +1738,7 @@ def compute_alignment(
 # ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
-        description="Throughput & alignment benchmark: kb-nano baseline vs vLLM",
+        description="Throughput & alignment benchmark: fastkernels baseline vs vLLM",
     )
     parser.add_argument(
         "--model", type=str, default="meta-llama/Llama-3.1-8B-Instruct",
@@ -1786,7 +1786,7 @@ def main():
     )
     parser.add_argument(
         "--pytorch-reference", action="store_true", default=False,
-        help="Patch semantic PyTorch references from tasks/reference/L*/ into kb-nano.",
+        help="Patch semantic PyTorch references from tasks/reference/L*/ into fastkernels.",
     )
     args = parser.parse_args()
     args.trust_remote_code = (
@@ -1812,15 +1812,15 @@ def main():
         print("  NOTE: --run-id is ignored because --output-dir was provided.")
 
     kb_nccl_port, kb_nccl_lock = _reserve_tcp_port(
-        preferred=_parse_port_env("KB_NANO_NCCL_PORT"),
+        preferred=_parse_port_env("FASTKERNELS_NCCL_PORT"),
     )
     _HELD_PORT_LOCKS.append(kb_nccl_lock)
-    os.environ["KB_NANO_NCCL_PORT"] = str(kb_nccl_port)
+    os.environ["FASTKERNELS_NCCL_PORT"] = str(kb_nccl_port)
 
     vllm_port = None
     flashinfer_namespace = None
     previous_flashinfer_namespace_env = os.environ.get(
-        "KB_NANO_FLASHINFER_SOCKET_NAMESPACE",
+        "FASTKERNELS_FLASHINFER_SOCKET_NAMESPACE",
     )
     if not args.skip_vllm:
         vllm_port, vllm_port_lock = _reserve_tcp_port(
@@ -1830,10 +1830,10 @@ def main():
         os.environ["VLLM_PORT"] = str(vllm_port)
         if args.tp > 1:
             flashinfer_namespace = (
-                os.environ.get("KB_NANO_FLASHINFER_SOCKET_NAMESPACE")
+                os.environ.get("FASTKERNELS_FLASHINFER_SOCKET_NAMESPACE")
                 or f"bench-vllm-{os.getpid()}-{vllm_port}"
             )
-            os.environ["KB_NANO_FLASHINFER_SOCKET_NAMESPACE"] = flashinfer_namespace
+            os.environ["FASTKERNELS_FLASHINFER_SOCKET_NAMESPACE"] = flashinfer_namespace
             _install_flashinfer_sitecustomize()
 
     if is_whisper:
@@ -2009,7 +2009,7 @@ def main():
                 })
 
     print("=" * 70)
-    print("  kb-nano Baseline vs vLLM -- Multi-Scenario Benchmark")
+    print("  fastkernels Baseline vs vLLM -- Multi-Scenario Benchmark")
     print("=" * 70)
     print(f"  Model          : {args.model}")
     model_type_str = (
@@ -2028,7 +2028,7 @@ def main():
     print(f"  Seed           : {args.seed}")
     print(f"  Trust RC       : {args.trust_remote_code}")
     print(f"  Max seq len    : {global_max_seq_len}")
-    print(f"  kb-nano port   : {kb_nccl_port}")
+    print(f"  fastkernels port   : {kb_nccl_port}")
     if vllm_port is not None:
         print(f"  vLLM port      : {vllm_port}")
         if flashinfer_namespace is not None:
@@ -2045,13 +2045,13 @@ def main():
 
     if is_whisper:
         vllm_worker = VLLM_WHISPER_WORKER
-        kb_worker = KB_NANO_WHISPER_WORKER
+        kb_worker = FASTKERNELS_WHISPER_WORKER
     elif is_vlm or is_qwen_omni:
         vllm_worker = VLLM_VLM_WORKER
-        kb_worker = KB_NANO_VLM_WORKER
+        kb_worker = FASTKERNELS_VLM_WORKER
     else:
         vllm_worker = VLLM_WORKER
-        kb_worker = KB_NANO_WORKER
+        kb_worker = FASTKERNELS_WORKER
 
     if is_whisper:
         global_max_seq_len = 448  # Whisper max_target_positions
@@ -2087,13 +2087,13 @@ def main():
             timeout=10800,
         )
         if previous_flashinfer_namespace_env is None:
-            os.environ.pop("KB_NANO_FLASHINFER_SOCKET_NAMESPACE", None)
+            os.environ.pop("FASTKERNELS_FLASHINFER_SOCKET_NAMESPACE", None)
         else:
-            os.environ["KB_NANO_FLASHINFER_SOCKET_NAMESPACE"] = (
+            os.environ["FASTKERNELS_FLASHINFER_SOCKET_NAMESPACE"] = (
                 previous_flashinfer_namespace_env
             )
 
-    # -- Run kb-nano (one subprocess, all scenarios) --
+    # -- Run fastkernels (one subprocess, all scenarios) --
     kb_root = str(_PROJECT_ROOT)
     package_name = _PACKAGE_DIR.name
     kb_config = {
@@ -2114,11 +2114,11 @@ def main():
     os.environ["MASTER_PORT"] = str(kb_nccl_port)
     kb_raw = run_worker(
         kb_worker, kb_config,
-        f"kb-nano [{short_name}] all scenarios (TP={args.tp})",
+        f"fastkernels [{short_name}] all scenarios (TP={args.tp})",
         timeout=10800,
     )
     if kb_raw is None:
-        print("  ERROR: kb-nano subprocess failed.")
+        print("  ERROR: fastkernels subprocess failed.")
         sys.exit(1)
 
     kb_latency = kb_raw.get("latency", [])
@@ -2137,9 +2137,9 @@ def main():
             result = {
                 "scenario": scenario["name"],
                 "num_seqs": kb_data.get("num_seqs", args.num_seqs),
-                "kb_nano_elapsed": kb_data["elapsed"],
-                "kb_nano_output_tokens": kb_data["total_output_tokens"],
-                "kb_nano_tok_per_s": kb_tps,
+                "fastkernels_elapsed": kb_data["elapsed"],
+                "fastkernels_output_tokens": kb_data["total_output_tokens"],
+                "fastkernels_tok_per_s": kb_tps,
             }
             if "input_len" in scenario:
                 result["input_len"] = scenario["input_len"]
@@ -2173,7 +2173,7 @@ def main():
                 scenario_dir = os.path.join(args.output_dir, scenario["name"])
                 os.makedirs(scenario_dir, exist_ok=True)
 
-                kb_out_path = os.path.join(scenario_dir, "kb_nano_outputs.json")
+                kb_out_path = os.path.join(scenario_dir, "fastkernels_outputs.json")
                 with open(kb_out_path, "w") as f:
                     json.dump(kb_data, f, indent=2)
 
@@ -2190,26 +2190,26 @@ def main():
         if is_whisper:
             header = (
                 f"  {'SCENARIO':<16} {'SEQS':>5} {'AUDIO':>8} {'OUT':>5} "
-                f"{'KB-NANO tok/s':>15} {'vLLM tok/s':>12} {'SPEEDUP':>8} "
+                f"{'FASTKERNELS tok/s':>15} {'vLLM tok/s':>12} {'SPEEDUP':>8} "
                 f"{'AVG MATCH TOKS':>15}"
             )
         elif is_vlm or is_qwen_omni:
             header = (
                 f"  {'SCENARIO':<16} {'OUT':>5} "
-                f"{'KB-NANO tok/s':>15} {'vLLM tok/s':>12} {'SPEEDUP':>8} "
+                f"{'FASTKERNELS tok/s':>15} {'vLLM tok/s':>12} {'SPEEDUP':>8} "
                 f"{'AVG MATCH TOKS':>15}"
             )
         else:
             header = (
                 f"  {'SCENARIO':<16} {'IN':>5} {'OUT':>5} "
-                f"{'KB-NANO tok/s':>15} {'vLLM tok/s':>12} {'SPEEDUP':>8} "
+                f"{'FASTKERNELS tok/s':>15} {'vLLM tok/s':>12} {'SPEEDUP':>8} "
                 f"{'AVG MATCH TOKS':>15}"
             )
         print(header)
         print(f"  {'-' * 84}")
 
         for r in all_results:
-            kb_tps_str = f"{r['kb_nano_tok_per_s']:,.0f}"
+            kb_tps_str = f"{r['fastkernels_tok_per_s']:,.0f}"
             v_tps_str = (
                 f"{r['vllm_tok_per_s']:,.0f}" if "vllm_tok_per_s" in r else "N/A"
             )
@@ -2268,8 +2268,8 @@ def main():
         print(f"{'=' * 110}")
         print(
             f"  {'SCENARIO':<18} {'BS':>4} {'OUT':>5} {'ITERS':>6}"
-            f"  {'KB-NANO med':>12} {'vLLM med':>12}"
-            f"  {'KB-NANO ms/tok':>15} {'vLLM ms/tok':>12} {'SPEEDUP':>8}"
+            f"  {'FASTKERNELS med':>12} {'vLLM med':>12}"
+            f"  {'FASTKERNELS ms/tok':>15} {'vLLM ms/tok':>12} {'SPEEDUP':>8}"
         )
         print(f"  {'-' * 100}")
 
@@ -2287,10 +2287,10 @@ def main():
                 "batch_size": bs,
                 "output_len": out_len,
                 "num_iters": kb_lat["num_iters"],
-                "kb_nano_median_s": kb_med,
-                "kb_nano_p99_s": kb_p99,
-                "kb_nano_ms_per_tok": kb_ms_per_tok,
-                "kb_nano_latencies": kb_lat["latencies"],
+                "fastkernels_median_s": kb_med,
+                "fastkernels_p99_s": kb_p99,
+                "fastkernels_ms_per_tok": kb_ms_per_tok,
+                "fastkernels_latencies": kb_lat["latencies"],
             }
             if "input_len" in kb_lat:
                 lat_result["input_len"] = kb_lat["input_len"]
@@ -2340,7 +2340,7 @@ def main():
             "temperature": args.temperature,
             "num_seqs": args.num_seqs,
             "enforce_eager": args.enforce_eager,
-            "kb_nano_nccl_port": kb_nccl_port,
+            "fastkernels_nccl_port": kb_nccl_port,
             "vllm_flashinfer_socket_namespace": flashinfer_namespace,
         }
         if vllm_port is not None:

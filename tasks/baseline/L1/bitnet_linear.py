@@ -2,7 +2,7 @@
 
 This module provides two parameter-holding modules that wrap the
 :func:`bitnet_int8xint2_linear` kernel from
-``kb_nano/tasks/baseline/L1/bitnet_int8xint2_linear.py``:
+``fastkernels/tasks/baseline/L1/bitnet_int8xint2_linear.py``:
 
 * :class:`BitLinear` - single projection (one HF Linear in, one out).
 * :class:`BitLinearMerged` - fused projection used to consolidate
@@ -57,7 +57,7 @@ def _bitnet_use_bf16_path(M: int) -> bool:
     """True iff this call should use the bf16 fake-quant prefill path.
 
     Mirrors SOTA's hybrid model split (separate ``BitLinear(nn.Linear)``
-    for prefill, ``BitLinearKernel`` for decode) using kb-nano's engine
+    for prefill, ``BitLinearKernel`` for decode) using fastkernels's engine
     context flag.  Outside an engine context we fall back to an
     M-threshold heuristic (1024) so unit tests / micro-benchmarks pick
     a sensible default.
@@ -155,7 +155,7 @@ class BitLinear(nn.Module):
         elif loaded.dtype == torch.uint8 and loaded.shape == (
             self.out_features, self.in_features // VALUES_PER_BYTE
         ):
-            # Already KN-packed (e.g. another kb_nano checkpoint).
+            # Already KN-packed (e.g. another fastkernels checkpoint).
             kn = loaded.to(param.device)
         else:
             # Treat as bf16 master weights with values already in {-1, 0, +1}.
@@ -227,7 +227,7 @@ class BitLinearMerged(nn.Module):
     """W1.58A8 linear with multiple shards fused along the output dim.
 
     Mirrors ``QKVParallelLinear`` / ``MergedColumnParallelLinear`` from
-    kb_nano's L2 parallel-linear primitives, except specialized to BitNet's
+    fastkernels's L2 parallel-linear primitives, except specialized to BitNet's
     int8-x-int2 GEMM and *without* tensor-parallel sharding (BitNet 2B is TP=1
     by design - the model is small enough to fit on a single GPU).
     """

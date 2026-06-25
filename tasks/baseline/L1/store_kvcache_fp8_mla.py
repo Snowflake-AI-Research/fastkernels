@@ -16,7 +16,7 @@ Supports two cache layouts via ``kv_cache_dtype``:
   Cache tensor shape: ``[num_blocks, block_size, 656]`` with ``dtype=torch.uint8``.
 
 The default is BF16 to match vLLM's stock behaviour (``kv_cache_dtype=auto``
-on DeepSeek-V3.2 selects BF16 KV cache). Use the ``KB_NANO_KV_CACHE_DTYPE``
+on DeepSeek-V3.2 selects BF16 KV cache). Use the ``FASTKERNELS_KV_CACHE_DTYPE``
 env var to force ``fp8_ds_mla`` for extra memory savings at the cost of
 numerical drift vs. vLLM.
 """

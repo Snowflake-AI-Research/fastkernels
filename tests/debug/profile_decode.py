@@ -9,7 +9,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from kb_nano.infra.engine import LlamaEngine, SamplingParams
+from fastkernels.infra.engine import LlamaEngine, SamplingParams
 
 MODEL = os.environ.get("MODEL", "mistralai/Mixtral-8x7B-Instruct-v0.1")
 TP = int(os.environ.get("TP", "4"))

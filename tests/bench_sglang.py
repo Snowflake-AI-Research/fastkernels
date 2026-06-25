@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Throughput, latency, and alignment benchmark for EAGLE-3 speculative decoding:
-``kb-nano`` (LlamaEagle3Engine) vs the reference SOTA ``sglang`` implementation.
+``fastkernels`` (LlamaEagle3Engine) vs the reference SOTA ``sglang`` implementation.
 
 Both engines are loaded in long-lived subprocesses to avoid CUDA/import
 contamination and to make sure each backend gets a fresh, isolated process.
@@ -18,7 +18,7 @@ spec-decoding benchmark since the draft head has nothing meaningful to predict).
 
 Usage:
     python tests/bench_sglang.py
-    python tests/bench_sglang.py --skip-sglang   # kb-nano only
+    python tests/bench_sglang.py --skip-sglang   # fastkernels only
     python tests/bench_sglang.py --num-seqs 64 --output-len 256
 """
 
@@ -44,11 +44,11 @@ _PROJECT_ROOT = _PACKAGE_DIR.parent
 
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from kb_nano.bench.utils.real_prompts import (  # noqa: E402
+from fastkernels.bench.utils.real_prompts import (  # noqa: E402
     DEFAULT_WORKLOAD_DATASETS,
     load_real_prompt_workload,
 )
-from kb_nano.bench.utils.worker import run_worker  # noqa: E402
+from fastkernels.bench.utils.worker import run_worker  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -317,9 +317,9 @@ if __name__ == "__main__":
 
 
 # ---------------------------------------------------------------------------
-# kb-nano subprocess worker
+# fastkernels subprocess worker
 # ---------------------------------------------------------------------------
-KB_NANO_EAGLE3_WORKER = r'''
+FASTKERNELS_EAGLE3_WORKER = r'''
 import json, sys, time
 
 def main():
@@ -484,7 +484,7 @@ def compute_alignment(a_outputs: list[dict], b_outputs: list[dict]) -> dict:
 # ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
-        description="EAGLE-3 spec-decoding benchmark: kb-nano vs sglang",
+        description="EAGLE-3 spec-decoding benchmark: fastkernels vs sglang",
     )
     parser.add_argument(
         "--model", type=str, default="meta-llama/Llama-3.1-8B-Instruct",
@@ -527,13 +527,13 @@ def main():
     parser.add_argument("--max-running-requests", type=int, default=8)
     parser.add_argument("--cuda-graph-max-bs", type=int, default=8)
     parser.add_argument("--skip-sglang", action="store_true")
-    parser.add_argument("--skip-kb-nano", action="store_true")
+    parser.add_argument("--skip-fastkernels", action="store_true")
     parser.add_argument("--skip-throughput", action="store_true")
     parser.add_argument("--skip-latency", action="store_true")
     parser.add_argument(
         "--enforce-eager", action="store_true",
         help="Run both engines in pure eager mode (no CUDA graphs, no torch.compile). "
-             "On sglang this maps to disable_cuda_graph=True; kb-nano is already "
+             "On sglang this maps to disable_cuda_graph=True; fastkernels is already "
              "eager so this is a no-op on its side. Use for apples-to-apples "
              "comparisons isolating raw kernel/dispatch perf.",
     )
@@ -542,8 +542,8 @@ def main():
         default="/home/yak/miniconda3/envs/sglang-bench/bin/python",
         help="Python interpreter to use for the sglang subprocess. We launch "
              "sglang in an isolated conda env so its torch / CUDA versions do "
-             "not conflict with kb-nano's (e.g. sglang ships torch 2.9 + cu128, "
-             "kb-nano runs on torch 2.10 + cu130). Default points at the "
+             "not conflict with fastkernels's (e.g. sglang ships torch 2.9 + cu128, "
+             "fastkernels runs on torch 2.10 + cu130). Default points at the "
              "`sglang-bench` env created by tests/setup_sglang_env.sh.",
     )
     parser.add_argument(
@@ -601,7 +601,7 @@ def main():
         })
 
     print("=" * 70)
-    print("  EAGLE-3 Speculative Decoding Benchmark: kb-nano vs sglang")
+    print("  EAGLE-3 Speculative Decoding Benchmark: fastkernels vs sglang")
     print("=" * 70)
     print(f"  Target model           : {args.model}")
     print(f"  Draft  model           : {args.draft_model}")
@@ -646,11 +646,11 @@ def main():
             python_executable=args.sglang_python,
         )
         if sgl_raw is None:
-            print("  WARNING: sglang subprocess failed -- continuing with kb-nano only")
+            print("  WARNING: sglang subprocess failed -- continuing with fastkernels only")
 
-    # ------------------ kb-nano ------------------
+    # ------------------ fastkernels ------------------
     kb_raw = None
-    if not args.skip_kb_nano:
+    if not args.skip_fastkernels:
         kb_cfg = {
             "model": args.model,
             "draft_model": args.draft_model,
@@ -670,11 +670,11 @@ def main():
             "latency_scenarios": latency_scenarios,
         }
         kb_raw = run_worker(
-            KB_NANO_EAGLE3_WORKER, kb_cfg,
-            f"kb-nano [EAGLE-3] {args.model.split('/')[-1]}",
+            FASTKERNELS_EAGLE3_WORKER, kb_cfg,
+            f"fastkernels [EAGLE-3] {args.model.split('/')[-1]}",
         )
         if kb_raw is None:
-            print("  ERROR: kb-nano subprocess failed.")
+            print("  ERROR: fastkernels subprocess failed.")
             sys.exit(1)
 
     # ------------------ Throughput summary + alignment ------------------
@@ -687,7 +687,7 @@ def main():
         print("  THROUGHPUT SUMMARY")
         print(f"{'=' * 100}")
         print(
-            f"  {'SCENARIO':<32} {'KB-NANO tok/s':>14} {'SGLANG tok/s':>14}"
+            f"  {'SCENARIO':<32} {'FASTKERNELS tok/s':>14} {'SGLANG tok/s':>14}"
             f" {'SPEEDUP':>8} {'AVG MATCH TOKS':>18}"
         )
         print(f"  {'-' * 96}")
@@ -714,9 +714,9 @@ def main():
             if kb_data:
                 kb_tps = kb_data["total_output_tokens"] / max(1e-9, kb_data["elapsed"])
                 kb_tps_str = f"{kb_tps:,.1f}"
-                entry["kb_nano_elapsed"] = kb_data["elapsed"]
-                entry["kb_nano_output_tokens"] = kb_data["total_output_tokens"]
-                entry["kb_nano_tok_per_s"] = kb_tps
+                entry["fastkernels_elapsed"] = kb_data["elapsed"]
+                entry["fastkernels_output_tokens"] = kb_data["total_output_tokens"]
+                entry["fastkernels_tok_per_s"] = kb_tps
             if sg_data:
                 sg_tps = sg_data["total_output_tokens"] / max(1e-9, sg_data["elapsed"])
                 sg_tps_str = f"{sg_tps:,.1f}"
@@ -724,7 +724,7 @@ def main():
                 entry["sglang_output_tokens"] = sg_data["total_output_tokens"]
                 entry["sglang_tok_per_s"] = sg_tps
             if kb_data and sg_data:
-                entry["speedup_vs_sglang"] = entry["kb_nano_tok_per_s"] / entry["sglang_tok_per_s"]
+                entry["speedup_vs_sglang"] = entry["fastkernels_tok_per_s"] / entry["sglang_tok_per_s"]
                 speedup_str = f"{entry['speedup_vs_sglang']:.2f}x"
 
                 if args.temperature == 0.0:
@@ -762,7 +762,7 @@ def main():
         print(f"{'=' * 110}")
         print(
             f"  {'SCENARIO':<32} {'BS':>4} {'OUT':>5} {'ITERS':>6}"
-            f"  {'KB-NANO med':>13} {'SGLANG med':>13}"
+            f"  {'FASTKERNELS med':>13} {'SGLANG med':>13}"
             f"  {'KB ms/tok':>11} {'SG ms/tok':>11} {'SPEEDUP':>9}"
         )
         print(f"  {'-' * 106}")
@@ -788,12 +788,12 @@ def main():
             if kb_lat_i:
                 kb_lats = np.array(kb_lat_i["latencies"])
                 kb_med = float(np.median(kb_lats))
-                entry["kb_nano_median_s"] = kb_med
-                entry["kb_nano_p99_s"] = float(np.percentile(kb_lats, 99))
-                entry["kb_nano_ms_per_tok"] = (kb_med / total_out) * 1000
-                entry["kb_nano_latencies"] = kb_lat_i["latencies"]
+                entry["fastkernels_median_s"] = kb_med
+                entry["fastkernels_p99_s"] = float(np.percentile(kb_lats, 99))
+                entry["fastkernels_ms_per_tok"] = (kb_med / total_out) * 1000
+                entry["fastkernels_latencies"] = kb_lat_i["latencies"]
                 kb_med_str = f"{kb_med:.4f}s"
-                kb_ms_str = f"{entry['kb_nano_ms_per_tok']:.2f}"
+                kb_ms_str = f"{entry['fastkernels_ms_per_tok']:.2f}"
             if sg_lat_i:
                 sg_lats = np.array(sg_lat_i["latencies"])
                 sg_med = float(np.median(sg_lats))
@@ -804,7 +804,7 @@ def main():
                 sg_med_str = f"{sg_med:.4f}s"
                 sg_ms_str = f"{entry['sglang_ms_per_tok']:.2f}"
             if kb_lat_i and sg_lat_i:
-                entry["speedup_vs_sglang"] = entry["sglang_median_s"] / entry["kb_nano_median_s"]
+                entry["speedup_vs_sglang"] = entry["sglang_median_s"] / entry["fastkernels_median_s"]
                 speedup_str = f"{entry['speedup_vs_sglang']:.2f}x"
 
             print(
@@ -826,7 +826,7 @@ def main():
                 sc_dir = os.path.join(args.output_dir, sc["name"])
                 os.makedirs(sc_dir, exist_ok=True)
                 if kb_raw and i < len(kb_raw.get("throughput", [])):
-                    with open(os.path.join(sc_dir, "kb_nano_outputs.json"), "w") as f:
+                    with open(os.path.join(sc_dir, "fastkernels_outputs.json"), "w") as f:
                         json.dump(kb_raw["throughput"][i], f, indent=2)
                 if sgl_raw and i < len(sgl_raw.get("throughput", [])):
                     with open(os.path.join(sc_dir, "sglang_outputs.json"), "w") as f:

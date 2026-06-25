@@ -3,7 +3,7 @@
 This file is used for specification/prompting and optional validation only.
 It is not the production baseline and should not be used for reported speed.
 
-Limitations: this reference keeps kb-nano's Context-driven interface but routes
+Limitations: this reference keeps fastkernels's Context-driven interface but routes
 the attention math through the semantic L1 references. Chunked local attention
 metadata is intentionally approximated by the same Python remap helpers as the
 baseline.

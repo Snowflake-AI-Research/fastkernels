@@ -178,7 +178,7 @@ def _remap_qwen3_vl_name(name: str) -> str:
 
 
 def _remap_qwen2_5_omni_name(name: str) -> str | None:
-    """Map Qwen2.5-Omni Thinker weights to kb-nano module names."""
+    """Map Qwen2.5-Omni Thinker weights to fastkernels module names."""
     if name.startswith(("talker.", "token2wav.")):
         return None
     if name.startswith("thinker.lm_head."):
@@ -709,7 +709,7 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
         #  - A_log -> A   (we negate-exp at load time via the param's
         #    weight_loader, matching vLLM's MambaMixer/MambaMixer2)
         #  - backbone.embeddings.weight -> backbone.embeddings.embedding_op.emb.weight
-        #    (kb_nano's VocabParallelEmbedding wraps the weight inside
+        #    (fastkernels's VocabParallelEmbedding wraps the weight inside
         #    embedding_op.emb)
         if is_mamba:
             if "A_log" in mapped_name:
@@ -1337,13 +1337,13 @@ def load_model(
     if model_type in ("flux", "hunyuan_video"):
         raise ValueError(
             "Diffusion models should be loaded via "
-            "kb_nano.infra.diffusion_engine.DiffusionEngine, "
+            "fastkernels.infra.diffusion_engine.DiffusionEngine, "
             "not the LLM load_model() path."
         )
     if model_type == "cosyvoice3":
         raise ValueError(
             "CosyVoice3 TTS models should be loaded via "
-            "kb_nano.infra.tts_engine.TTSEngine, "
+            "fastkernels.infra.tts_engine.TTSEngine, "
             "not the LLM load_model() path."
         )
     if model_type == "jamba":
@@ -1354,13 +1354,13 @@ def load_model(
         # per-pipeline weight loader documented in CLAUDE.md).
         raise ValueError(
             "Jamba models should be loaded via "
-            "kb_nano.infra.jamba_engine.JambaEngine, "
+            "fastkernels.infra.jamba_engine.JambaEngine, "
             "not the LLM load_model() path."
         )
     if model_type == "pi0":
         raise ValueError(
             "Pi0 robotics VLA models should be loaded via "
-            "kb_nano.infra.pi0_engine.Pi0Engine, "
+            "fastkernels.infra.pi0_engine.Pi0Engine, "
             "not the LLM load_model() path."
         )
     if model_type == "gpt_oss":
@@ -1713,7 +1713,7 @@ def _override_bitnet_bf16_with_master(model, model_name: str,
                 t_int8, s_bf16, fq_bf16 = quant_weight_int8_and_fp16(w)
                 ternary_parts.append(t_int8)
                 fake_parts.append(fq_bf16)
-                # kb-nano stores per-row scale across the shard's rows;
+                # fastkernels stores per-row scale across the shard's rows;
                 # SOTA stores a single scalar per shard.  Broadcast the
                 # SOTA scalar across the matching number of rows so the
                 # int8xint2 GEMM kernel sees the right per-row dequant.

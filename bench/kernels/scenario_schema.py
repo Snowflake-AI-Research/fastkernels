@@ -1,6 +1,6 @@
 """Schema helpers for workload-derived input registry traces.
 
-The raw trace is kb_nano-specific and intentionally richer than the final
+The raw trace is fastkernels-specific and intentionally richer than the final
 registry.  The exported workload trace mirrors the FlashInfer Trace shape:
 ``definition``, embedded ``workload``, and nullable ``solution``/``evaluation``.
 """

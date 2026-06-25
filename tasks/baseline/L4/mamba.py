@@ -1,6 +1,6 @@
 """Standalone Mamba v1 model implementation.
 
-Follows kb_nano's ``LlamaForCausalLM`` interface:
+Follows fastkernels's ``LlamaForCausalLM`` interface:
 ``forward(input_ids, positions)`` returning hidden states; ``compute_logits``
 performs the LM-head projection separately.
 

@@ -1,7 +1,7 @@
 """Gated linear attention (covers both GLA and RetNet).
 
 The forward signature matches FLA's ``GatedLinearAttention.forward``
-exactly so kb-nano kernels are drop-in for FLA users:
+exactly so fastkernels kernels are drop-in for FLA users:
 
     forward(hidden_states, attention_mask=None,
             past_key_values=None, use_cache=False, **kwargs)

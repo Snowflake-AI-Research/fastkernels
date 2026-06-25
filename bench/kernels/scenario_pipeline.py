@@ -31,9 +31,9 @@ import yaml
 from safetensors.torch import save_file
 from tqdm.auto import tqdm
 
-from kb_nano import GOLDEN_DIR, INPUTS_DIR, KB_ROOT, TRACE_DIR
-from kb_nano.bench.kernels.scenario_registry import InputRegistry
-from kb_nano.bench.kernels.scenario_schema import (
+from fastkernels import GOLDEN_DIR, INPUTS_DIR, KB_ROOT, TRACE_DIR
+from fastkernels.bench.kernels.scenario_registry import InputRegistry
+from fastkernels.bench.kernels.scenario_schema import (
     DATA_DEPENDENT_INPUTS,
     DATA_DEPENDENT_OPS,
     TraceEvent,
@@ -131,12 +131,12 @@ def _model_family_matches(model_key: str, family: str) -> bool:
 def _resolve_targets(model_key: str) -> dict[type, str]:
     """Import benchmark target classes used by the current model family.
 
-    This uses the same model/operator map as ``python -m kb_nano.bench.kernels
+    This uses the same model/operator map as ``python -m fastkernels.bench.kernels
     --map``.  The fallback path is only for environments where full discovery
     fails because of optional dependencies.
     """
     try:
-        from kb_nano.infra.kernel_swapper import discover_targets
+        from fastkernels.infra.kernel_swapper import discover_targets
 
         targets = [
             t for t in discover_targets()
@@ -157,14 +157,14 @@ def _resolve_targets(model_key: str) -> dict[type, str]:
         import importlib
         import torch.nn as nn
 
-        from kb_nano import KB_ROOT
+        from fastkernels import KB_ROOT
 
         for level in ("L1", "L2", "L3", "L4"):
             level_dir = KB_ROOT / "tasks" / "baseline" / level
             for path in sorted(level_dir.glob("*.py")):
                 if path.name.startswith("_"):
                     continue
-                module_name = f"kb_nano.tasks.baseline.{level}.{path.stem}"
+                module_name = f"fastkernels.tasks.baseline.{level}.{path.stem}"
                 try:
                     mod = importlib.import_module(module_name)
                 except Exception:
@@ -612,7 +612,7 @@ def trace_llm_model(
     num_requests: int | None = None,
     decode_cap: int | None = None,
 ) -> Path:
-    from kb_nano.infra.engine import LlamaEngine, SamplingParams
+    from fastkernels.infra.engine import LlamaEngine, SamplingParams
 
     key = model_key or _short_model_key(model_name)
     trace_path = trace_dir / key / f"tp{tp}" / dtype / f"{workload}.jsonl"
@@ -707,7 +707,7 @@ def trace_fla_model(
 ) -> Path:
     if tp != 1:
         raise ValueError(f"FLAEngine only supports tp=1, got tp={tp}")
-    from kb_nano.infra.fla_engine import FLAEngine, SamplingParams
+    from fastkernels.infra.fla_engine import FLAEngine, SamplingParams
 
     key = model_key or _short_model_key(model_name)
     trace_path = trace_dir / key / f"tp{tp}" / dtype / f"{workload}.jsonl"
@@ -779,9 +779,9 @@ def trace_diffusion_model(
 ) -> Path:
     if tp != 1:
         raise ValueError(f"DiffusionEngine only supports tp=1, got tp={tp}")
-    from kb_nano.bench.utils.workloads import DIFFUSION_THROUGHPUT_WORKLOADS, FLUX_CONFIG
-    from kb_nano.infra.diffusion_engine import DiffusionEngine
-    from kb_nano.tasks.baseline.L4.flux import DiffusionSamplingParams
+    from fastkernels.bench.utils.workloads import DIFFUSION_THROUGHPUT_WORKLOADS, FLUX_CONFIG
+    from fastkernels.infra.diffusion_engine import DiffusionEngine
+    from fastkernels.tasks.baseline.L4.flux import DiffusionSamplingParams
 
     by_name = {w.name: w for w in DIFFUSION_THROUGHPUT_WORKLOADS}
     if workload not in by_name:
@@ -845,8 +845,8 @@ def trace_embedding_model(
 ) -> Path:
     if tp != 1:
         raise ValueError(f"EmbeddingEngine only supports tp=1, got tp={tp}")
-    from kb_nano.bench.utils.workloads import EMBEDDING_THROUGHPUT_WORKLOADS
-    from kb_nano.infra.embedding_engine import EmbeddingEngine
+    from fastkernels.bench.utils.workloads import EMBEDDING_THROUGHPUT_WORKLOADS
+    from fastkernels.infra.embedding_engine import EmbeddingEngine
 
     by_name = {w.name: w for w in EMBEDDING_THROUGHPUT_WORKLOADS}
     if workload not in by_name:
@@ -897,9 +897,9 @@ def trace_oasis_model(
 ) -> Path:
     if tp != 1:
         raise ValueError(f"OasisEngine only supports tp=1, got tp={tp}")
-    from kb_nano.bench.utils.workloads import OASIS_THROUGHPUT_WORKLOADS
-    from kb_nano.infra.oasis_engine import OasisEngine
-    from kb_nano.tasks.baseline.L4.oasis import OasisSamplingParams
+    from fastkernels.bench.utils.workloads import OASIS_THROUGHPUT_WORKLOADS
+    from fastkernels.infra.oasis_engine import OasisEngine
+    from fastkernels.tasks.baseline.L4.oasis import OasisSamplingParams
 
     by_name = {w.name: w for w in OASIS_THROUGHPUT_WORKLOADS}
     if workload not in by_name:
@@ -958,8 +958,8 @@ def trace_detection_model(
 ) -> Path:
     if tp != 1:
         raise ValueError(f"Detection tracing only supports tp=1, got tp={tp}")
-    from kb_nano.bench.utils.workloads import DETECTION_THROUGHPUT_WORKLOADS
-    from kb_nano.infra.detection_loader import load_ours_detector
+    from fastkernels.bench.utils.workloads import DETECTION_THROUGHPUT_WORKLOADS
+    from fastkernels.infra.detection_loader import load_ours_detector
 
     by_name = {w.name: w for w in DETECTION_THROUGHPUT_WORKLOADS}
     if workload not in by_name:
@@ -1013,8 +1013,8 @@ def trace_vlm_model(
     num_requests: int | None = None,
     decode_cap: int | None = None,
 ) -> Path:
-    from kb_nano.bench.utils.workloads import VLM_THROUGHPUT_WORKLOADS
-    from kb_nano.infra.engine import LlamaEngine, SamplingParams
+    from fastkernels.bench.utils.workloads import VLM_THROUGHPUT_WORKLOADS
+    from fastkernels.infra.engine import LlamaEngine, SamplingParams
 
     by_name = {w.name: w for w in VLM_THROUGHPUT_WORKLOADS}
     if workload not in by_name:
@@ -1059,7 +1059,7 @@ def trace_vlm_model(
             else:
                 from PIL import Image
                 from transformers import AutoProcessor
-                from kb_nano.tests import bench_vllm as bench_vllm_mod
+                from fastkernels.tests import bench_vllm as bench_vllm_mod
 
                 ns: dict[str, Any] = {}
                 exec(bench_vllm_mod._MM_PRELOAD_FN, ns)
@@ -1176,8 +1176,8 @@ def _load_standard_workload(
     decode_cap: int | None,
     seed: int,
 ) -> tuple[list[list[int]], list[int]]:
-    from kb_nano.bench.utils.real_prompts import load_real_prompt_workload
-    from kb_nano.bench.utils.workloads import THROUGHPUT_WORKLOADS, VLM_THROUGHPUT_WORKLOADS
+    from fastkernels.bench.utils.real_prompts import load_real_prompt_workload
+    from fastkernels.bench.utils.workloads import THROUGHPUT_WORKLOADS, VLM_THROUGHPUT_WORKLOADS
 
     by_name = {w.name: w for w in THROUGHPUT_WORKLOADS}
     if workload not in by_name:
@@ -1321,7 +1321,7 @@ def _run_trace_jobs_parallel(
     running: list[dict[str, Any]] = []
     free_gpus = list(gpu_ids)
     failures: list[tuple[dict[str, Any], int]] = []
-    next_port = int(os.environ.get("KB_NANO_TRACE_BASE_PORT", "29501"))
+    next_port = int(os.environ.get("FASTKERNELS_TRACE_BASE_PORT", "29501"))
 
     def launch(job: dict[str, Any], assigned_gpus: list[str] | None) -> None:
         nonlocal next_port
@@ -1341,10 +1341,10 @@ def _run_trace_jobs_parallel(
             cmd.append("--ops")
             cmd.extend(ops)
         env = dict(os.environ)
-        env["KB_NANO_TRACE_CHILD"] = "1"
+        env["FASTKERNELS_TRACE_CHILD"] = "1"
         # LlamaEngine reads this at import time. Give each concurrent child a
         # separate rendezvous port so independent process groups do not collide.
-        env["KB_NANO_NCCL_PORT"] = str(next_port)
+        env["FASTKERNELS_NCCL_PORT"] = str(next_port)
         next_port += 1
         if assigned_gpus is not None:
             env["CUDA_VISIBLE_DEVICES"] = ",".join(assigned_gpus)
@@ -1461,7 +1461,7 @@ def trace_inputs_main() -> None:
         os.environ["VLLM_DEEP_GEMM_WARMUP"] = "skip"
         print("No-golden tracing: skipping DeepGEMM JIT warmup")
 
-    if args.clean and os.environ.get("KB_NANO_TRACE_CHILD") != "1":
+    if args.clean and os.environ.get("FASTKERNELS_TRACE_CHILD") != "1":
         _clean_trace_outputs(trace_dir, output_dir)
 
     runnable_jobs = []
@@ -1474,7 +1474,7 @@ def trace_inputs_main() -> None:
         print("All requested trace jobs already exist; nothing to trace.")
         return
 
-    if len(runnable_jobs) > 1 and os.environ.get("KB_NANO_TRACE_CHILD") != "1":
+    if len(runnable_jobs) > 1 and os.environ.get("FASTKERNELS_TRACE_CHILD") != "1":
         gpu_ids = _visible_gpu_ids()
         if gpu_ids:
             print(f"Scheduling {len(runnable_jobs)} trace job(s) across visible GPU(s): {','.join(gpu_ids)}")
@@ -1693,7 +1693,7 @@ def _flashinfer_workload(event: dict[str, Any], scenario_inputs: dict[str, Any])
         },
         "solution": None,
         "evaluation": None,
-        "kb_nano": {
+        "fastkernels": {
             "op": event["op"],
             "model_key": event["model_key"],
             "model": event["model"],
@@ -2376,9 +2376,9 @@ def capture_golden_data(
     print(f"  Data-dependent ops: {GOLDEN_CAPTURE_OPS}")
 
     try:
-        from kb_nano.infra.engine import LlamaEngine, SamplingParams
+        from fastkernels.infra.engine import LlamaEngine, SamplingParams
     except ImportError:
-        print("ERROR: Cannot import kb_nano.infra.engine. Make sure the package is installed.")
+        print("ERROR: Cannot import fastkernels.infra.engine. Make sure the package is installed.")
         return saved_files
 
     engine = LlamaEngine(

@@ -210,7 +210,7 @@ def _get_moe_configs(E: int, N: int, dtype: str | None,
 
     config_file_paths = []
 
-    user_folder = os.environ.get("KB_NANO_TUNED_CONFIG_FOLDER")
+    user_folder = os.environ.get("FASTKERNELS_TUNED_CONFIG_FOLDER")
     if user_folder is not None:
         config_file_paths.append(os.path.join(user_folder, json_file_name))
 
@@ -257,7 +257,7 @@ def _get_vllm_default_config(M: int, E: int = 0, dtype: str | None = None) -> di
     """vLLM-style BF16/FP16 MoE defaults.
 
     Gemma4's BF16 top-8 experts are much closer to vLLM's generic MoE path
-    than to the older kb-nano heuristic, especially in decode where tokens are
+    than to the older fastkernels heuristic, especially in decode where tokens are
     spread thinly across 128 experts.
     """
     if M <= 32:

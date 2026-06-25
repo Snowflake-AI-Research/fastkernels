@@ -13,7 +13,7 @@ Implementation mirrors vLLM's ``MambaMixer2``
 
 State (conv_state, ssm_state) and per-batch metadata (which slot to
 read/write, which sequences carry an initial state, prefill vs decode
-split, chunk indices, ...) are read from kb_nano's global ``Context``
+split, chunk indices, ...) are read from fastkernels's global ``Context``
 (``infra/context.py``) — analogous to vLLM's ``ForwardContext``.
 
 Weight names from HF Mamba2 checkpoint
@@ -427,7 +427,7 @@ class Mamba2Mixer(nn.Module):
         has_decode = num_decode_tokens > 0
         num_actual = num_prefill_tokens + num_decode_tokens
 
-        # Prefill tokens come first, decode tokens last (kb_nano convention).
+        # Prefill tokens come first, decode tokens last (fastkernels convention).
         hsBC_p, hsBC_d = torch.split(
             hsBC[:num_actual], [num_prefill_tokens, num_decode_tokens], dim=0,
         )
@@ -535,7 +535,7 @@ class Mamba2Mixer(nn.Module):
             dtype=hidden_states.dtype,
         )
         if self._use_custom_op:
-            torch.ops.kb_nano.mamba2_conv_ssm_forward(
+            torch.ops.fastkernels.mamba2_conv_ssm_forward(
                 projected_states,
                 ssm_output,
                 self._layer_name,

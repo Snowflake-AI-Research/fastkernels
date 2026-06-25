@@ -25,12 +25,12 @@ _PROJECT_ROOT = _PACKAGE_DIR.parent
 
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from kb_nano.bench.utils.real_prompts import (  # noqa: E402
+from fastkernels.bench.utils.real_prompts import (  # noqa: E402
     DEFAULT_WORKLOAD_DATASETS,
     load_real_prompt_workload,
 )
-from kb_nano.bench.utils.worker import run_worker  # noqa: E402
-from kb_nano.tests.bench_sglang import PROMPTS  # noqa: E402
+from fastkernels.bench.utils.worker import run_worker  # noqa: E402
+from fastkernels.tests.bench_sglang import PROMPTS  # noqa: E402
 
 
 RANK_WORKER = r'''
@@ -235,7 +235,7 @@ def main() -> None:
     args = parse_args()
     scenario = _scenario_name(args)
     scenario_dir = Path(args.output_dir) / scenario
-    kb_path = scenario_dir / "kb_nano_outputs.json"
+    kb_path = scenario_dir / "fastkernels_outputs.json"
     sglang_path = scenario_dir / "sglang_outputs.json"
     if not kb_path.exists() or not sglang_path.exists():
         raise SystemExit(
@@ -245,7 +245,7 @@ def main() -> None:
     prompts = _load_prompts(args)
     outputs = {
         "sglang": json.loads(sglang_path.read_text())["outputs"],
-        "kb_nano": json.loads(kb_path.read_text())["outputs"],
+        "fastkernels": json.loads(kb_path.read_text())["outputs"],
     }
     max_total = max(
         len(prompt) + len(output["token_ids"])

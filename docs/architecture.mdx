@@ -1,13 +1,13 @@
 ---
 title: Architecture
-description: The L1–L4 operator hierarchy, interface mirroring, and how to extend kb-nano.
+description: The L1–L4 operator hierarchy, interface mirroring, and how to extend fastkernels.
 ---
 
-kb-nano takes a **top-down, model-driven** approach: rather than collecting synthetic operators in isolation, benchmark tasks are dynamically instantiated from the configuration files of real production models. This ensures every operator is tested with realistic shapes, dtypes, and data flows. The layered hierarchy below makes it possible to benchmark a single kernel replacement while measuring its impact all the way up to full-model inference.
+fastkernels takes a **top-down, model-driven** approach: rather than collecting synthetic operators in isolation, benchmark tasks are dynamically instantiated from the configuration files of real production models. This ensures every operator is tested with realistic shapes, dtypes, and data flows. The layered hierarchy below makes it possible to benchmark a single kernel replacement while measuring its impact all the way up to full-model inference.
 
 ## The L1-L4 Hierarchy
 
-All model operators live under [`tasks/baseline/`](https://github.com/sfc-gh-goliaro/kb-nano/tree/main/tasks/baseline) at four abstraction levels:
+All model operators live under [`tasks/baseline/`](https://github.com/Snowflake-AI-Research/fastkernels/tree/main/tasks/baseline) at four abstraction levels:
 
 - **L1** — Single-kernel ops (e.g. `rms_norm`, `silu_and_mul`, `rotary_emb`, `linear`)
 - **L2** — Multi-op blocks (e.g. `LlamaAttention`, `LlamaMLP`, `MixtralMoE`, `QKVParallelLinear`)
@@ -37,7 +37,7 @@ When you replace an L1 operator, the change propagates upward through every leve
 
 Every module's `__init__` and `forward` signatures are designed to mirror the corresponding vLLM module. This makes it easy to port optimizations between the two codebases and ensures candidate kernels can be validated against a well-known reference.
 
-| kb-nano module | vLLM equivalent | `forward` signature |
+| fastkernels module | vLLM equivalent | `forward` signature |
 |---|---|---|
 | `LlamaAttention` | `LlamaAttention` | `(positions, hidden_states) -> Tensor` |
 | `LlamaDecoderLayer` | `LlamaDecoderLayer` | `(positions, hidden_states, residual) -> (Tensor, Tensor)` |

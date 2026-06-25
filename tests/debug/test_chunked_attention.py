@@ -19,7 +19,7 @@ PACKAGE_DIR = os.path.dirname(THIS_DIR)
 PROJECT_ROOT = os.path.dirname(PACKAGE_DIR)
 sys.path.insert(0, PROJECT_ROOT)
 
-from kb_nano.tasks.baseline.L2.attention_impl import (
+from fastkernels.tasks.baseline.L2.attention_impl import (
     _chunked_prefill_remap,
     _chunked_decode_remap,
 )

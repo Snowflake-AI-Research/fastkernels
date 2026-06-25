@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Throughput, latency, and correctness benchmark: kb-nano vs diffusers + torch.compile
+Throughput, latency, and correctness benchmark: fastkernels vs diffusers + torch.compile
 for SDXL text-to-image.
 
 Runs standardized diffusion workloads and compares:
@@ -18,7 +18,7 @@ Each engine runs in a subprocess to avoid import contamination.
 
 Usage:
     python tests/bench_diffusers.py --model stabilityai/stable-diffusion-xl-base-1.0
-    python tests/bench_diffusers.py --skip-diffusers  # kb-nano only (no correctness)
+    python tests/bench_diffusers.py --skip-diffusers  # fastkernels only (no correctness)
     python tests/bench_diffusers.py --enforce-eager    # disable torch.compile for correctness
 """
 
@@ -41,8 +41,8 @@ _PROJECT_ROOT = _PACKAGE_DIR.parent
 
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from kb_nano.bench.utils.worker import run_worker
-from kb_nano.bench.utils.workloads import (
+from fastkernels.bench.utils.worker import run_worker
+from fastkernels.bench.utils.workloads import (
     DIFFUSION_LATENCY_WORKLOADS,
     DIFFUSION_THROUGHPUT_WORKLOADS,
     SDXL_CONFIG,
@@ -224,9 +224,9 @@ if __name__ == "__main__":
 
 
 # ---------------------------------------------------------------------------
-# kb-nano subprocess worker
+# fastkernels subprocess worker
 # ---------------------------------------------------------------------------
-KB_NANO_SDXL_WORKER = r'''
+FASTKERNELS_SDXL_WORKER = r'''
 import json, os, sys, time, torch
 from tqdm import tqdm
 
@@ -237,7 +237,7 @@ def main():
     pkg = cfg["package_name"]
 
     if cfg.get("pytorch_reference", False):
-        from kb_nano.infra.kernel_swapper import (
+        from fastkernels.infra.kernel_swapper import (
             apply_candidates,
             discover_references,
             print_reference_summary,
@@ -300,7 +300,7 @@ def main():
 
         total_elapsed = 0.0
         total_images = 0
-        desc = f"kb-nano {scenario['name']}"
+        desc = f"fastkernels {scenario['name']}"
         pbar = tqdm(batches, desc=desc, unit="batch", file=sys.stderr)
         for batch_idx, batch_prompts in enumerate(pbar):
             torch.cuda.synchronize()
@@ -341,13 +341,13 @@ def main():
         num_warmup = ls.get("num_warmup", 2)
         num_iters = ls.get("num_iters", 5)
 
-        for _ in tqdm(range(num_warmup), desc=f"kb-nano warmup {ls['name']}", file=sys.stderr):
+        for _ in tqdm(range(num_warmup), desc=f"fastkernels warmup {ls['name']}", file=sys.stderr):
             torch.cuda.synchronize()
             engine.generate(prompts, params)
             torch.cuda.synchronize()
 
         latencies = []
-        for _ in tqdm(range(num_iters), desc=f"kb-nano latency {ls['name']}", file=sys.stderr):
+        for _ in tqdm(range(num_iters), desc=f"fastkernels latency {ls['name']}", file=sys.stderr):
             torch.cuda.synchronize()
             t0 = time.perf_counter()
             engine.generate(prompts, params)
@@ -414,7 +414,7 @@ def _print_throughput_comparison(kb_results: list[dict], ref_results: list[dict]
     print("\n" + "=" * 90)
     print("  THROUGHPUT COMPARISON (images/sec)")
     print("=" * 90)
-    header = f"  {'Scenario':<25} {'Images':>7} {'kb-nano':>12}"
+    header = f"  {'Scenario':<25} {'Images':>7} {'fastkernels':>12}"
     if ref_results:
         header += f" {'diffusers':>12} {'Speedup':>10}"
     print(header)
@@ -435,7 +435,7 @@ def _print_latency_comparison(kb_results: list[dict], ref_results: list[dict] | 
     print("\n" + "=" * 80)
     print("  LATENCY COMPARISON (seconds)")
     print("=" * 80)
-    header = f"  {'Scenario':<25} {'kb-nano p50':>12}"
+    header = f"  {'Scenario':<25} {'fastkernels p50':>12}"
     if ref_results:
         header += f" {'diffusers p50':>14} {'Speedup':>10}"
     print(header)
@@ -484,7 +484,7 @@ def _compare_latents(kb_latent_dir: str, ref_latent_dir: str) -> dict:
         if len(kb_lat) != len(ref_lat):
             print(
                 f"  WARNING: shape mismatch for {fname}: "
-                f"kb-nano={kb_lat.shape} vs diffusers={ref_lat.shape}, skipping",
+                f"fastkernels={kb_lat.shape} vs diffusers={ref_lat.shape}, skipping",
                 file=sys.stderr,
             )
             continue
@@ -538,15 +538,15 @@ def _print_correctness_comparison(correctness: dict):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="SDXL benchmark: kb-nano vs diffusers")
+    parser = argparse.ArgumentParser(description="SDXL benchmark: fastkernels vs diffusers")
     parser.add_argument("--model", type=str, default="stabilityai/stable-diffusion-xl-base-1.0")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--skip-diffusers", action="store_true",
-                        help="Skip diffusers and only benchmark kb-nano")
+                        help="Skip diffusers and only benchmark fastkernels")
     parser.add_argument(
         "--pytorch-reference", action="store_true", default=False,
-        help="Patch semantic PyTorch references from tasks/reference/L*/ into kb-nano.",
+        help="Patch semantic PyTorch references from tasks/reference/L*/ into fastkernels.",
     )
     parser.add_argument(
         "--output-dir", type=str, default=None,
@@ -575,7 +575,7 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
     if save_latents:
-        kb_latent_dir = os.path.join(args.output_dir, "latents", "kb_nano")
+        kb_latent_dir = os.path.join(args.output_dir, "latents", "fastkernels")
         ref_latent_dir = os.path.join(args.output_dir, "latents", "diffusers")
     else:
         kb_latent_dir = None
@@ -586,13 +586,13 @@ def main():
         "seed": args.seed,
         "enforce_eager": args.enforce_eager,
         "project_root": str(_PROJECT_ROOT),
-        "package_name": "kb_nano",
+        "package_name": "fastkernels",
     }
 
     scenarios = _build_throughput_scenarios(bench_prompts)
     latency_scenarios = _build_latency_scenarios(bench_prompts)
 
-    # --- kb-nano benchmark ---
+    # --- fastkernels benchmark ---
     kb_config = {
         **base_config,
         "scenarios": scenarios,
@@ -602,8 +602,8 @@ def main():
     if kb_latent_dir:
         kb_config["latent_dir"] = kb_latent_dir
     kb_data = run_worker(
-        KB_NANO_SDXL_WORKER, kb_config,
-        "kb-nano SDXL benchmark", timeout=36000,
+        FASTKERNELS_SDXL_WORKER, kb_config,
+        "fastkernels SDXL benchmark", timeout=36000,
     )
 
     # --- diffusers benchmark ---
@@ -644,7 +644,7 @@ def main():
             "model": args.model,
             "gpu": gpu_name,
             "seed": args.seed,
-            "kb_nano": kb_data,
+            "fastkernels": kb_data,
         }
         if ref_data:
             results["diffusers"] = ref_data
@@ -654,7 +654,7 @@ def main():
             json.dump(results, f, indent=2)
         print(f"\n  Results saved to: {results_path}")
     else:
-        print("ERROR: kb-nano benchmark failed.")
+        print("ERROR: fastkernels benchmark failed.")
         sys.exit(1)
 
 

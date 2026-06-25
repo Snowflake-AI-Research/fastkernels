@@ -8,7 +8,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from kb_nano.infra.eagle3_engine import LlamaEagle3Engine, Eagle3SamplingParams
+from fastkernels.infra.eagle3_engine import LlamaEagle3Engine, Eagle3SamplingParams
 
 
 def main():

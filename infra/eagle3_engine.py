@@ -1,4 +1,4 @@
-"""EAGLE-3 speculative-decoding engine for kb_nano (eager, tree draft).
+"""EAGLE-3 speculative-decoding engine for fastkernels (eager, tree draft).
 
 Implements EAGLE-3 with K-branch tree drafting (matches sglang's
 ``select_top_k_tokens`` + ``build_tree_kernel_efficient`` + ``verify_tree_greedy``
@@ -661,7 +661,7 @@ class LlamaEagle3Engine:
         pos_t = torch.tensor(positions, dtype=torch.long, device=self.device)
         hidden_t = torch.cat(ext_hiddens, dim=0).to(self.device)
 
-        if os.environ.get("KB_NANO_EAGLE3_DEBUG") == "1":
+        if os.environ.get("FASTKERNELS_EAGLE3_DEBUG") == "1":
             print(f"  [_draft_extend] ids_t shape={ids_t.shape} dtype={ids_t.dtype} "
                   f"min={int(ids_t.min())} max={int(ids_t.max())}", flush=True)
             print(f"  [_draft_extend] pos_t shape={pos_t.shape} max={int(pos_t.max())}", flush=True)
@@ -672,7 +672,7 @@ class LlamaEagle3Engine:
             ids_t, pos_t, hidden_t,
         )
 
-        if os.environ.get("KB_NANO_EAGLE3_DEBUG") == "1":
+        if os.environ.get("FASTKERNELS_EAGLE3_DEBUG") == "1":
             print(f"  [_draft_extend] hidden_to_logits shape={hidden_to_logits.shape}", flush=True)
 
         # ``compute_logits`` (ParallelLMHead.project) slices to the last
@@ -1218,7 +1218,7 @@ class LlamaEagle3Engine:
     # ------------------------------------------------------------------
     def _eagle3_step(self, seqs: List[_Eagle3Sequence], eos_id: int):
         import os as _os
-        _dbg = _os.environ.get("KB_NANO_EAGLE3_DEBUG") == "1"
+        _dbg = _os.environ.get("FASTKERNELS_EAGLE3_DEBUG") == "1"
         if _dbg:
             print(f"[dbg] step start, n_active={len(seqs)} "
                   f"committed_lens={[s.t_committed_len for s in seqs]} "

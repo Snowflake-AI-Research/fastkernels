@@ -1,19 +1,19 @@
-"""Offline throughput benchmark for kb-nano.
+"""Offline throughput benchmark for fastkernels.
 
 Modeled after ``vllm bench throughput``. Runs ``LlamaEngine`` in offline mode
 with batched generation and measures requests/s, total tokens/s, and output
 tokens/s.
 
 Usage (standalone):
-    python -m kb_nano.bench.e2e throughput \\
+    python -m fastkernels.bench.e2e throughput \\
         --model meta-llama/Llama-3.1-8B-Instruct \\
-        --dataset-name kb_nano \\
+        --dataset-name fastkernels \\
         --num-prompts 100
 
 Usage (with subprocess isolation):
-    python -m kb_nano.bench.e2e throughput \\
+    python -m fastkernels.bench.e2e throughput \\
         --model meta-llama/Llama-3.1-8B-Instruct \\
-        --dataset-name kb_nano \\
+        --dataset-name fastkernels \\
         --subprocess
 """
 
@@ -34,21 +34,21 @@ import numpy as np
 import torch
 from transformers import AutoTokenizer
 
-from kb_nano.bench.utils.datasets import (
+from fastkernels.bench.utils.datasets import (
     SampleRequest,
     add_dataset_parser,
     get_samples,
 )
-from kb_nano.bench.utils.real_prompts import load_real_prompt_workload
-from kb_nano.bench.utils.worker import KB_NANO_WORKER, run_worker
-from kb_nano.infra.kernel_swapper import (
+from fastkernels.bench.utils.real_prompts import load_real_prompt_workload
+from fastkernels.bench.utils.worker import FASTKERNELS_WORKER, run_worker
+from fastkernels.infra.kernel_swapper import (
     apply_candidates,
     discover_candidates,
     print_candidate_summary,
 )
 
 
-def run_kb_nano(
+def run_fastkernels(
     requests: list[SampleRequest],
     model: str,
     tp: int,
@@ -58,8 +58,8 @@ def run_kb_nano(
     enforce_eager: bool,
     save_outputs: bool,
 ) -> dict:
-    """Run kb-nano offline throughput benchmark (in-process)."""
-    from kb_nano.infra.engine import LlamaEngine, SamplingParams
+    """Run fastkernels offline throughput benchmark (in-process)."""
+    from fastkernels.infra.engine import LlamaEngine, SamplingParams
 
     engine = LlamaEngine(
         model_name=model,
@@ -117,7 +117,7 @@ def run_kb_nano(
     return result
 
 
-def run_kb_nano_subprocess(
+def run_fastkernels_subprocess(
     requests: list[SampleRequest],
     model: str,
     tp: int,
@@ -130,8 +130,8 @@ def run_kb_nano_subprocess(
     gpu_memory_utilization: float = 0.9,
     max_model_len: int | None = None,
 ) -> dict | None:
-    """Run kb-nano offline throughput benchmark in a subprocess."""
-    from kb_nano import KB_ROOT, PROJECT_ROOT
+    """Run fastkernels offline throughput benchmark in a subprocess."""
+    from fastkernels import KB_ROOT, PROJECT_ROOT
     kb_root = str(PROJECT_ROOT)
     package_name = KB_ROOT.name
 
@@ -162,8 +162,8 @@ def run_kb_nano_subprocess(
 
     short_name = model.split("/")[-1]
     return run_worker(
-        KB_NANO_WORKER, config,
-        f"kb-nano [{short_name}] (TP={tp})",
+        FASTKERNELS_WORKER, config,
+        f"fastkernels [{short_name}] (TP={tp})",
     )
 
 
@@ -180,7 +180,7 @@ def validate_args(args: argparse.Namespace):
     dataset_name = getattr(args, "dataset_name", "random")
     dataset_path = getattr(args, "dataset_path", None)
 
-    if dataset_name == "kb_nano":
+    if dataset_name == "fastkernels":
         return
 
     if dataset_name in ("random", "random-mm", "random-rerank"):
@@ -270,10 +270,10 @@ def add_cli_args(parser: argparse.ArgumentParser):
         help="Disable candidate kernel auto-detection; use only baseline kernels",
     )
     parser.add_argument(
-        "--kb-nano-scenario", type=str, default="balanced",
+        "--fastkernels-scenario", type=str, default="balanced",
         choices=["prefill-heavy", "balanced", "decode-heavy"],
-        help="kb-nano WildChat-derived scenario to use with "
-             "--dataset-name=kb_nano.",
+        help="fastkernels WildChat-derived scenario to use with "
+             "--dataset-name=fastkernels.",
     )
 
     add_dataset_parser(parser)
@@ -315,10 +315,10 @@ def main(args: argparse.Namespace):
         args.request_id_prefix = ""
 
     dataset_name = getattr(args, "dataset_name", "random")
-    use_real_workload = dataset_name == "kb_nano"
+    use_real_workload = dataset_name == "fastkernels"
 
     if use_real_workload:
-        scenario_name = args.kb_nano_scenario
+        scenario_name = args.fastkernels_scenario
         samples = load_real_prompt_workload(
             scenario_name,
             tokenizer,
@@ -340,7 +340,7 @@ def main(args: argparse.Namespace):
     total_expected_output = sum(r.expected_output_len for r in requests)
 
     print("=" * 70)
-    print("  kb-nano Throughput Benchmark")
+    print("  fastkernels Throughput Benchmark")
     print("=" * 70)
     print(f"  Model          : {args.model}")
     print(f"  TP             : {args.tp}")
@@ -356,7 +356,7 @@ def main(args: argparse.Namespace):
     save_outputs = args.save_outputs is not None
 
     if args.subprocess:
-        data = run_kb_nano_subprocess(
+        data = run_fastkernels_subprocess(
             requests, args.model, args.tp, args.seed,
             args.temperature, args.top_p, args.enforce_eager, save_outputs,
             no_candidate_kernels=args.no_candidate_kernels,
@@ -365,7 +365,7 @@ def main(args: argparse.Namespace):
             print("  ERROR: Subprocess benchmark failed.")
             return
     else:
-        data = run_kb_nano(
+        data = run_fastkernels(
             requests, args.model, args.tp, args.seed,
             args.temperature, args.top_p, args.enforce_eager, save_outputs,
         )
@@ -405,14 +405,14 @@ def main(args: argparse.Namespace):
     }
 
     # Log to MLflow
-    from kb_nano.bench.tracking import tracker
+    from fastkernels.bench.tracking import tracker
 
     tracker.log_e2e(results, bench_type="throughput")
 
     if args.output_json:
         output_json = args.output_json
     else:
-        from kb_nano import run_output_path
+        from fastkernels import run_output_path
         output_json = str(run_output_path("throughput"))
 
     os.makedirs(os.path.dirname(output_json) or ".", exist_ok=True)
@@ -428,5 +428,5 @@ def main(args: argparse.Namespace):
         print(f"  Outputs saved to: {args.save_outputs}")
 
     if undo_info is not None:
-        from kb_nano.infra.kernel_swapper import restore
+        from fastkernels.infra.kernel_swapper import restore
         restore(undo_info)

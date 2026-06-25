@@ -8,7 +8,7 @@ Two variants:
     knobs and exposes ``softmax_mscale`` as an attention scaling factor.
 
 Both classes share the same L1 CUDA rotary kernel via
-``torch.ops.kb_nano_rope.rotary_embedding``; the only differences are how
+``torch.ops.fastkernels_rope.rotary_embedding``; the only differences are how
 the ``cos_sin_cache`` is computed and whether NeoX layout is used.
 
 References:
@@ -141,7 +141,7 @@ class YaRNRotaryEmbedding(nn.Module):
             return RotaryEmbedding.forward_native(
                 positions, query, key, self.head_dim, cache,
             )
-        torch.ops.kb_nano_rope.rotary_embedding(
+        torch.ops.fastkernels_rope.rotary_embedding(
             positions, query, key, self.head_dim, cache, True,
         )
         return query, key
@@ -206,7 +206,7 @@ class YarnRotaryEmbedding(nn.Module):
         # vLLM's ``DeepseekScalingRotaryEmbedding.forward_cuda`` prefers the
         # FlashInfer fused kernel when available (see
         # ``vllm/model_executor/layers/rotary_embedding/deepseek_scaling_rope.py:181-198``).
-        # FlashInfer keeps ``cos_sin_cache`` in float32; only the kb_nano
+        # FlashInfer keeps ``cos_sin_cache`` in float32; only the fastkernels
         # CUDA kernel needs the cache cast to query.dtype.
         if _USE_FLASHINFER_ROPE and query.dtype in (torch.float16, torch.bfloat16) \
                 and self.head_dim in (64, 128, 256, 512):
@@ -218,7 +218,7 @@ class YarnRotaryEmbedding(nn.Module):
         cache = self.cos_sin_cache
         if cache.dtype != query.dtype:
             cache = cache.to(query.dtype)
-        torch.ops.kb_nano_rope.rotary_embedding(
+        torch.ops.fastkernels_rope.rotary_embedding(
             positions, query, key, self.head_dim, cache, self.is_neox_style,
         )
         return query, key

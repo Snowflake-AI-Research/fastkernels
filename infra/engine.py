@@ -45,7 +45,7 @@ from ..tasks.baseline.L1.allreduce import set_custom_ar
 from .weight_loader import load_model
 
 MAX_MODEL_LEN = 131072
-NCCL_PORT = int(os.environ.get("KB_NANO_NCCL_PORT", "29501"))
+NCCL_PORT = int(os.environ.get("FASTKERNELS_NCCL_PORT", "29501"))
 
 
 def _load_tokenizer(model_name: str):
@@ -94,7 +94,7 @@ _DEFAULT_MAX_NUM_BATCHED_TOKENS, _DEFAULT_MAX_NUM_SEQS = (
     _detect_scheduling_defaults()
 )
 
-_PROFILE = os.environ.get("KB_NANO_PROFILE", "0") == "1"
+_PROFILE = os.environ.get("FASTKERNELS_PROFILE", "0") == "1"
 
 
 ATTN_BACKEND_CONFIG = get_attn_backend_config()
@@ -337,7 +337,7 @@ class ModelRunner:
         self.custom_ar = None
         if world_size > 1:
             self.cpu_group = dist.new_group(backend="gloo")
-            if not os.environ.get("KB_NANO_DISABLE_CUSTOM_AR", "0") == "1":
+            if not os.environ.get("FASTKERNELS_DISABLE_CUSTOM_AR", "0") == "1":
                 from ..tasks.baseline.L1.allreduce import CustomAllreduce
                 self.custom_ar = CustomAllreduce(
                     self.cpu_group, rank, max_size=8 * 1024 * 1024
@@ -1076,7 +1076,7 @@ class ModelRunner:
     # 14 buckets at bs=256 for both Mamba v1 (2.8B) and Mamba2 (Codestral
     # 7B) on H200.  Tunable via env if a model needs more.
     _MAMBA_GRAPH_RESERVE_BYTES = int(
-        os.environ.get("KB_NANO_MAMBA_GRAPH_RESERVE_BYTES", 1500 * 1024 * 1024)
+        os.environ.get("FASTKERNELS_MAMBA_GRAPH_RESERVE_BYTES", 1500 * 1024 * 1024)
     )
 
     def _compute_mamba_state_shapes(self):
@@ -3245,7 +3245,7 @@ class ModelRunner:
         """Allocate MLA KV cache + indexer K cache.
 
         The KV cache layout follows ``MLAAttention.kv_cache_dtype`` (set
-        via ``KB_NANO_KV_CACHE_DTYPE``, default ``"auto"`` = BF16):
+        via ``FASTKERNELS_KV_CACHE_DTYPE``, default ``"auto"`` = BF16):
 
         * ``"auto"`` (default): BF16 cache, shape
           ``[num_blocks, block_size, kv_lora_rank + qk_rope_head_dim]``
@@ -4664,7 +4664,7 @@ class ModelRunner:
         ctx.cross_block_tables = cross_bt
 
     def _compile_model(self):
-        """Apply torch.compile with KBNanoBackend (mirrors vLLM).
+        """Apply torch.compile with FastKernelsBackend (mirrors vLLM).
 
         The backend:
         1. Splits the graph at attention custom-op boundaries
@@ -5712,12 +5712,12 @@ class LlamaEngine:
         mr = self.model_runner
 
         # Optional per-step instrumentation -- enable with
-        # ``KB_NANO_PROFILE_MAMBA=1``.  Records wall-clock time spent
+        # ``FASTKERNELS_PROFILE_MAMBA=1``.  Records wall-clock time spent
         # in each phase (admit, decode-array prep, GPU dispatch, D2H
         # wait, finalize/dealloc) and prints a summary at the end so
         # we can see which phase dominates without resorting to a full
         # CUDA profiler.
-        _profile = os.environ.get("KB_NANO_PROFILE_MAMBA", "0") == "1"
+        _profile = os.environ.get("FASTKERNELS_PROFILE_MAMBA", "0") == "1"
         _stats = {
             "fast_steps": 0,
             "fast_admit": 0.0,
@@ -6218,7 +6218,7 @@ class LlamaEngine:
         all_seqs = list(waiting)
         num_prompts = len(prompts)
         _preprocess_time = time.perf_counter() - _preprocess_t0
-        if os.environ.get("KB_NANO_STEP_PROFILE") == "1":
+        if os.environ.get("FASTKERNELS_STEP_PROFILE") == "1":
             print(f"[Profile] Preprocessing {num_prompts} seqs: {_preprocess_time:.3f}s")
 
         pbar = None
@@ -6253,7 +6253,7 @@ class LlamaEngine:
             "mixed_mm": 0, "mixed_mm_pf_tokens": 0, "mixed_mm_dc_tokens": 0, "mixed_mm_time": 0.0,
             "mixed_text": 0, "mixed_text_pf_tokens": 0, "mixed_text_dc_tokens": 0,
         }
-        _step_profile_active = os.environ.get("KB_NANO_STEP_PROFILE") == "1"
+        _step_profile_active = os.environ.get("FASTKERNELS_STEP_PROFILE") == "1"
 
         def _finish_seq(seq: Sequence) -> None:
             nonlocal _pbar_pending, _pbar_pending_in, _pbar_pending_out

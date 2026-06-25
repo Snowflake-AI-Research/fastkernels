@@ -537,16 +537,16 @@ class JambaEngine:
         # largest-first strategy.
         # ------------------------------------------------------------------
         self._use_cuda_graphs = (
-            os.environ.get("KB_NANO_JAMBA_CUDA_GRAPHS", "1") not in ("0", "false", "False")
+            os.environ.get("FASTKERNELS_JAMBA_CUDA_GRAPHS", "1") not in ("0", "false", "False")
         )
         self._use_compile = (
-            os.environ.get("KB_NANO_JAMBA_COMPILE", "0") not in ("0", "false", "False")
+            os.environ.get("FASTKERNELS_JAMBA_COMPILE", "0") not in ("0", "false", "False")
         )
         # Decode bucket schedule.  vLLM uses [1, 2, 4, 8, 16, 24, 32,
         # 40, ...]; we cap at max_num_seqs.  Override via
-        # ``KB_NANO_JAMBA_BUCKETS=1,2,4,8,16,32`` if you need a denser
+        # ``FASTKERNELS_JAMBA_BUCKETS=1,2,4,8,16,32`` if you need a denser
         # or sparser schedule for a specific workload.
-        env_buckets = os.environ.get("KB_NANO_JAMBA_BUCKETS")
+        env_buckets = os.environ.get("FASTKERNELS_JAMBA_BUCKETS")
         if env_buckets:
             buckets = sorted({int(x) for x in env_buckets.split(",") if x.strip()})
         else:
@@ -783,7 +783,7 @@ class JambaEngine:
 
         if use_tqdm:
             from tqdm import tqdm
-            pbar = tqdm(total=len(all_seqs), desc="kb-nano Jamba")
+            pbar = tqdm(total=len(all_seqs), desc="fastkernels Jamba")
         else:
             pbar = None
 

@@ -682,10 +682,10 @@ class Sam3SegmentationHead(nn.Module):
 
 
 def load_sam3_checkpoint(model: "Sam3Model", checkpoint_path: str) -> Tuple[list, list]:
-    """Load a reference SAM3 checkpoint into a kb-nano Sam3Model.
+    """Load a reference SAM3 checkpoint into a fastkernels Sam3Model.
 
     Handles the key remapping between the reference Sam3Image module hierarchy
-    and the kb-nano Sam3Model hierarchy, including:
+    and the fastkernels Sam3Model hierarchy, including:
     - Prefix remapping (backbone.vision_backbone -> neck, etc.)
     - FPN conv name remapping (named submodules -> sequential indices)
     - Fused in_proj_weight/bias splitting into separate q/k/v projections
@@ -693,7 +693,7 @@ def load_sam3_checkpoint(model: "Sam3Model", checkpoint_path: str) -> Tuple[list
     - Encoder/decoder attention key splitting
 
     Args:
-        model: kb-nano Sam3Model instance.
+        model: fastkernels Sam3Model instance.
         checkpoint_path: Path to the .pt checkpoint file.
 
     Returns:
@@ -713,7 +713,7 @@ def load_sam3_checkpoint(model: "Sam3Model", checkpoint_path: str) -> Tuple[list
 
     # --- FPN conv key mapping ---
     # Reference: convs.0.dconv_2x2_0 / .dconv_2x2_1 / .conv_1x1 / .conv_3x3
-    # kb-nano:   convs.0.conv.{0,1,2,...}  (via nn.Sequential)
+    # fastkernels:   convs.0.conv.{0,1,2,...}  (via nn.Sequential)
     #
     # Scale 4.0 (convs.0): dconv_2x2_0->0, GELU->1(skipped), dconv_2x2_1->2, conv_1x1->3, conv_3x3->4
     # Scale 2.0 (convs.1): dconv_2x2->0, conv_1x1->1, conv_3x3->2
@@ -819,7 +819,7 @@ def load_sam3_checkpoint(model: "Sam3Model", checkpoint_path: str) -> Tuple[list
         if new_key == "text_encoder.token_embedding.weight":
             new_key = "text_encoder.token_embedding.emb.weight"
 
-        # --- text_encoder text_projection (not used in kb-nano, skip) ---
+        # --- text_encoder text_projection (not used in fastkernels, skip) ---
         if new_key == "text_encoder.text_projection":
             continue
 
@@ -847,7 +847,7 @@ def load_sam3_checkpoint(model: "Sam3Model", checkpoint_path: str) -> Tuple[list
 
         # --- Decoder layer: fused in_proj -> split q/k/v ---
         # Reference names: self_attn, cross_attn (image), ca_text
-        # kb-nano names: self_attn, cross_attn (image), ca_text (same now)
+        # fastkernels names: self_attn, cross_attn (image), ca_text (same now)
         dm = re.match(r"decoder\.layers\.(\d+)\.(self_attn|cross_attn|ca_text)\.(.*)", new_key)
         if dm:
             layer_idx = dm.group(1)
@@ -928,12 +928,12 @@ def load_sam3_checkpoint(model: "Sam3Model", checkpoint_path: str) -> Tuple[list
         if ".attn.freqs_cis" in new_key:
             new_key = new_key.replace(".attn.freqs_cis", ".attn.rope.freqs_cis")
 
-        # --- ViT MLP: mlp.fc1/fc2 -> mlp.fc1/fc2 (same in kb-nano) ---
+        # --- ViT MLP: mlp.fc1/fc2 -> mlp.fc1/fc2 (same in fastkernels) ---
         # (already matches)
 
         remapped[new_key] = val
 
-    # Handle kb-nano Linear wrapper: weight is stored directly, not inside .matmul
+    # Handle fastkernels Linear wrapper: weight is stored directly, not inside .matmul
     # Our Linear has .weight and .bias directly as nn.Parameter, same as nn.Linear
     # But our L1 Linear wraps Matmul - check if state dict keys need adjustment
     # Actually, our Linear stores .weight and .bias as nn.Parameter + .matmul as Matmul
@@ -949,7 +949,7 @@ def load_sam3_tracker_checkpoint(
 ) -> Tuple[list, list]:
     """Load tracker weights from a full SAM3 video model checkpoint.
 
-    Handles remapping from reference tracker.xxx keys to kb-nano Sam3TrackerPredictor.
+    Handles remapping from reference tracker.xxx keys to fastkernels Sam3TrackerPredictor.
 
     The reference checkpoint stores tracker weights under:
     - tracker.sam_prompt_encoder.xxx -> sam_prompt_encoder.xxx

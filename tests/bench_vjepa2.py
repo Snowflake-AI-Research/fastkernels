@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Throughput, latency, and alignment benchmark: kb-nano V-JEPA 2 vs transformers.
+Throughput, latency, and alignment benchmark: fastkernels V-JEPA 2 vs transformers.
 
 The default path benchmarks the predictive world-model forward:
   - encoder output alignment
@@ -35,24 +35,24 @@ _PACKAGE_DIR = _THIS_DIR.parent
 
 
 def _bootstrap_local_package() -> None:
-    existing = sys.modules.get("kb_nano")
+    existing = sys.modules.get("fastkernels")
     expected = str(_PACKAGE_DIR / "__init__.py")
     if existing is not None and getattr(existing, "__file__", None) == expected:
         return
     spec = importlib.util.spec_from_file_location(
-        "kb_nano",
+        "fastkernels",
         _PACKAGE_DIR / "__init__.py",
         submodule_search_locations=[str(_PACKAGE_DIR)],
     )
     module = importlib.util.module_from_spec(spec)
-    sys.modules["kb_nano"] = module
+    sys.modules["fastkernels"] = module
     assert spec.loader is not None
     spec.loader.exec_module(module)
 
 
 _bootstrap_local_package()
 
-from kb_nano.bench.utils.worker import run_worker
+from fastkernels.bench.utils.worker import run_worker
 
 
 def _detect_gpu_name() -> str:
@@ -102,12 +102,12 @@ from tqdm import tqdm
 
 def _bootstrap_local_package(package_root: str) -> None:
     spec = importlib.util.spec_from_file_location(
-        "kb_nano",
+        "fastkernels",
         os.path.join(package_root, "__init__.py"),
         submodule_search_locations=[package_root],
     )
     module = importlib.util.module_from_spec(spec)
-    sys.modules["kb_nano"] = module
+    sys.modules["fastkernels"] = module
     assert spec.loader is not None
     spec.loader.exec_module(module)
 
@@ -153,9 +153,9 @@ def _load_model(cfg):
 
     _bootstrap_local_package(cfg["package_root"])
     if task == "classification":
-        from kb_nano.tasks.baseline.L4.vjepa2 import VJEPA2ForVideoClassification as ModelCls
+        from fastkernels.tasks.baseline.L4.vjepa2 import VJEPA2ForVideoClassification as ModelCls
     else:
-        from kb_nano.tasks.baseline.L4.vjepa2 import VJEPA2Model as ModelCls
+        from fastkernels.tasks.baseline.L4.vjepa2 import VJEPA2Model as ModelCls
     model = ModelCls.from_pretrained(cfg["model"]).to(device=device, dtype=dtype).eval()
     return model, model.config, dtype
 
@@ -453,7 +453,7 @@ def _print_alignment(metrics: dict[str, dict[str, float]]) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Benchmark kb-nano V-JEPA 2 vs transformers")
+    parser = argparse.ArgumentParser(description="Benchmark fastkernels V-JEPA 2 vs transformers")
     parser.add_argument("--model", default="facebook/vjepa2-vitl-fpc64-256")
     parser.add_argument("--task", choices=["predictor", "encoder", "classification"], default="predictor")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -520,7 +520,7 @@ def main() -> None:
             "num_videos": args.num_videos,
             "batch_size": args.batch_size,
         }
-        ours = _run_phase(ours_cfg, "kb-nano V-JEPA 2 throughput")
+        ours = _run_phase(ours_cfg, "fastkernels V-JEPA 2 throughput")
         if ours is None:
             raise SystemExit(1)
         results["throughput"]["ours"] = ours
@@ -548,7 +548,7 @@ def main() -> None:
             "latency_warmup": args.latency_warmup,
             "latency_iters": args.latency_iters,
         }
-        ours = _run_phase(ours_cfg, "kb-nano V-JEPA 2 latency")
+        ours = _run_phase(ours_cfg, "fastkernels V-JEPA 2 latency")
         if ours is None:
             raise SystemExit(1)
         results["latency"]["ours"] = ours
@@ -577,7 +577,7 @@ def main() -> None:
             "alignment_videos": args.alignment_videos,
             "tensor_file": ours_tensor,
         }
-        ours = _run_phase(ours_cfg, "kb-nano V-JEPA 2 alignment")
+        ours = _run_phase(ours_cfg, "fastkernels V-JEPA 2 alignment")
         if ours is None:
             raise SystemExit(1)
         results["alignment"]["ours"] = ours

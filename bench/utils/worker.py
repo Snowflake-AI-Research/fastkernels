@@ -121,7 +121,7 @@ def run_worker(
             os.unlink(output_path)
 
 
-KB_NANO_WORKER = r'''
+FASTKERNELS_WORKER = r'''
 import json, sys, time
 with open(sys.argv[1]) as f:
     cfg = json.load(f)
@@ -214,7 +214,7 @@ if __name__ == "__main__":
     main()
 '''
 
-KB_NANO_MULTI_SCENARIO_WORKER = r'''
+FASTKERNELS_MULTI_SCENARIO_WORKER = r'''
 import json, sys, time
 
 def main():

@@ -188,7 +188,7 @@ class SwinV2Model(nn.Module):
 
 
 def _remap_timm_to_kb(timm_sd: dict) -> dict:
-    """Remap timm SwinTransformerV2 state dict keys to kb-nano SwinV2Model.
+    """Remap timm SwinTransformerV2 state dict keys to fastkernels SwinV2Model.
 
     timm native keys (after checkpoint_filter_fn):
         patch_embed.proj.weight/bias       -> patch_embed.proj.weight/bias

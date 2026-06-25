@@ -6,7 +6,7 @@ Mirrors :class:`L2.attention.LlamaAttention` exactly, sans RoPE: fused
 storage and TRTLLM/FA3 dispatch) -> ``RowParallelLinear`` output
 projection.
 
-This is the *portability* point of kb-nano: the L2 task interface is
+This is the *portability* point of fastkernels: the L2 task interface is
 identical to vLLM's ``vllm.model_executor.models.jamba.JambaAttentionDecoderLayer``'s
 attention sub-block, so a kernel optimised here drops into vLLM with
 no call-site change.

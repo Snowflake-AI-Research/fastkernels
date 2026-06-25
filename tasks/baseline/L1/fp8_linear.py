@@ -95,7 +95,7 @@ def _maybe_get_flashinfer_fp8_gemm():
 # This mirrors vLLM's direct_register_custom_op for fp8_gemm_nt_op.
 # ---------------------------------------------------------------------------
 
-_fp8_lib = torch.library.Library("kb_nano_fp8", "DEF")
+_fp8_lib = torch.library.Library("fastkernels_fp8", "DEF")
 
 _fp8_lib.define(
     "fp8_gemm_nt(Tensor q_input, Tensor input_scale, "
@@ -129,7 +129,7 @@ def _fp8_gemm_nt_meta(q_input, input_scale, weight, weight_scale, output):
 
 # ---------------------------------------------------------------------------
 # FlashInfer FP8 blockscale GEMM custom op (BF16 in, FP8 weight, BF16 out).
-# Used for M < 32 so kb_nano picks the same swapAB kernel as vLLM's
+# Used for M < 32 so fastkernels picks the same swapAB kernel as vLLM's
 # ``W8A8BlockFp8LinearOp.apply`` (see ``vllm/.../fp8_utils.py:402-407``).
 # ---------------------------------------------------------------------------
 
@@ -268,7 +268,7 @@ def _per_token_group_quant_fp8(x: torch.Tensor,
         # passing for ``column_major_scales=True`` without TMA padding (the
         # scale buffer is allocated by ``_alloc_colmajor_scale`` below with
         # plain ``(num_groups, M)`` row-major + permute).  Match vLLM's
-        # ``eps=1e-10`` (kb_nano previously used ``1e-12``).
+        # ``eps=1e-10`` (fastkernels previously used ``1e-12``).
         torch.ops._C.per_token_group_fp8_quant(
             x, out_fp8, out_scale, int(_GROUP_SIZE),
             _QUANT_EPS, _FP8_INFO.min, _FP8_INFO.max, True,
@@ -292,7 +292,7 @@ class PerTokenGroupQuantFp8(nn.Module):
     """In-place per-token-group FP8 quantization (single Triton/CUDA kernel).
 
     Public ``nn.Module`` wrapper around the registered
-    ``torch.ops.kb_nano_fp8.per_token_group_quant_fp8`` custom op.  L2
+    ``torch.ops.fastkernels_fp8.per_token_group_quant_fp8`` custom op.  L2
     callers that need activation quantization outside of ``Fp8Linear``
     (e.g. ``DeepSeekMoE``, ``SparseAttnIndexer``) should use this module
     instead of importing the private ``_per_token_group_quant_fp8``.
@@ -300,7 +300,7 @@ class PerTokenGroupQuantFp8(nn.Module):
 
     def forward(self, x: torch.Tensor, out_fp8: torch.Tensor,
                 out_scale: torch.Tensor) -> None:
-        torch.ops.kb_nano_fp8.per_token_group_quant_fp8(
+        torch.ops.fastkernels_fp8.per_token_group_quant_fp8(
             x.contiguous() if not x.is_contiguous() else x,
             out_fp8, out_scale,
         )
@@ -391,7 +391,7 @@ class Fp8Linear(nn.Module):
           ``disable_ue8m0_cast`` set per the resolved oracle).  Same path
           as ``vllm/.../fp8_utils.py:_run_deepgemm``.
 
-        FP8 ops are routed through ``torch.ops.kb_nano_fp8.*`` so they stay
+        FP8 ops are routed through ``torch.ops.fastkernels_fp8.*`` so they stay
         opaque to ``torch.compile`` (mirrors vLLM's
         ``torch.ops.vllm.fp8_gemm_nt_op`` / ``flashinfer_fp8_blockscale_gemm``).
         """
@@ -418,7 +418,7 @@ class Fp8Linear(nn.Module):
             output = torch.empty(
                 M, N, dtype=torch.bfloat16, device=input_2d.device,
             )
-            torch.ops.kb_nano_fp8.flashinfer_blockscale_gemm(
+            torch.ops.fastkernels_fp8.flashinfer_blockscale_gemm(
                 input_2d, weight_fp8, weight_scale_inv, output,
             )
             if bias is not None:
@@ -446,10 +446,10 @@ class Fp8Linear(nn.Module):
         # ``column_major_scales=True`` matches the SF layout DeepGEMM expects
         # (``vllm/.../fp8_utils.py:289-294`` uses the same setting). The
         # ``input_scale`` buffer was allocated with column-major strides above.
-        torch.ops.kb_nano_fp8.per_token_group_quant_fp8(
+        torch.ops.fastkernels_fp8.per_token_group_quant_fp8(
             input_2d, q_input, input_scale, True,
         )
-        torch.ops.kb_nano_fp8.fp8_gemm_nt(
+        torch.ops.fastkernels_fp8.fp8_gemm_nt(
             q_input, input_scale, weight_fp8, weight_scale_inv, output,
         )
 

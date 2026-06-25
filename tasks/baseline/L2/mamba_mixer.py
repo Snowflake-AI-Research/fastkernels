@@ -11,7 +11,7 @@ Implementation mirrors vLLM's ``MambaMixer``
     dt_proj) and RowParallelLinear (x_proj, out_proj), matching vLLM
 
 State (conv_state, ssm_state) and per-batch metadata are read from
-kb_nano's global ``Context`` (``infra/context.py``), analogous to
+fastkernels's global ``Context`` (``infra/context.py``), analogous to
 vLLM's ``ForwardContext``.
 
 Weight names from HF Mamba checkpoint

@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
-from kb_nano.bench.utils.datasets import SampleRequest
+from fastkernels.bench.utils.datasets import SampleRequest
 
 
 @dataclass
@@ -69,7 +69,7 @@ class BenchEngine(Protocol):
 
 
 class LLMEngine:
-    """BenchEngine wrapper around kb-nano's LlamaEngine.
+    """BenchEngine wrapper around fastkernels's LlamaEngine.
 
     Handles all LLM architectures supported by LlamaEngine:
     Llama, Mixtral, DeepSeek, Mamba, etc.
@@ -94,7 +94,7 @@ class LLMEngine:
 
     def _get_engine(self):
         if self._engine is None:
-            from kb_nano.infra.engine import LlamaEngine
+            from fastkernels.infra.engine import LlamaEngine
             kwargs: dict[str, Any] = {
                 "model_name": self.model_name,
                 "seed": self.seed,
@@ -108,7 +108,7 @@ class LLMEngine:
         return self._engine
 
     def warmup(self) -> None:
-        from kb_nano.infra.engine import SamplingParams
+        from fastkernels.infra.engine import SamplingParams
         engine = self._get_engine()
         engine.generate(["warmup"], SamplingParams(temperature=0.0, max_tokens=16))
 
@@ -121,7 +121,7 @@ class LLMEngine:
     ) -> ThroughputResult:
         import time
         import torch
-        from kb_nano.infra.engine import SamplingParams
+        from fastkernels.infra.engine import SamplingParams
 
         engine = self._get_engine()
         prompts = [r.prompt for r in requests]
@@ -175,7 +175,7 @@ class LLMEngine:
         import time
         import numpy as np
         import torch
-        from kb_nano.infra.engine import SamplingParams
+        from fastkernels.infra.engine import SamplingParams
 
         engine = self._get_engine()
         dummy_prompts = np.random.randint(
@@ -239,7 +239,7 @@ class DiffusionBenchEngine:
 
     def _get_engine(self):
         if self._engine is None:
-            from kb_nano.infra.diffusion_engine import DiffusionEngine
+            from fastkernels.infra.diffusion_engine import DiffusionEngine
             self._engine = DiffusionEngine(
                 model_name=self.model_name,
                 seed=self.seed,
@@ -260,7 +260,7 @@ class DiffusionBenchEngine:
     ) -> ThroughputResult:
         import time
         import torch
-        from kb_nano.tasks.baseline.L4.flux import DiffusionSamplingParams
+        from fastkernels.tasks.baseline.L4.flux import DiffusionSamplingParams
 
         engine = self._get_engine()
         prompts = [r.prompt for r in requests]
@@ -296,7 +296,7 @@ class DiffusionBenchEngine:
         import time
         import numpy as np
         import torch
-        from kb_nano.tasks.baseline.L4.flux import DiffusionSamplingParams
+        from fastkernels.tasks.baseline.L4.flux import DiffusionSamplingParams
 
         engine = self._get_engine()
         prompts = [f"A beautiful landscape photo, style {i}" for i in range(batch_size)]
@@ -354,7 +354,7 @@ class SegmentationBenchEngine:
     def _get_model(self):
         if self._model is None:
             import torch
-            from kb_nano.tasks.baseline.L4.sam3 import Sam3Config, Sam3Model
+            from fastkernels.tasks.baseline.L4.sam3 import Sam3Config, Sam3Model
 
             config = Sam3Config.from_pretrained(self.model_name)
             self._model = Sam3Model(config)

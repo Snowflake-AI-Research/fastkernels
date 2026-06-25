@@ -2,7 +2,7 @@
 
 Vendored kernels (see csrc/eagle_utils.cu) ported from sglang's sgl-kernel
 (Apache-2.0). Python wrappers mirror sglang's
-sglang/srt/speculative/eagle_utils.py one-for-one but call into the kb_nano
+sglang/srt/speculative/eagle_utils.py one-for-one but call into the fastkernels
 JIT extension instead of `sgl_kernel`.
 """
 

@@ -3,7 +3,7 @@ requires = ["setuptools>=64", "wheel", "torch>=2.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "kb_nano"
+name = "fastkernels"
 version = "0.1.0"
 description = "A CUDA kernel benchmarking library for LLM inference"
 readme = "README.md"
@@ -55,7 +55,7 @@ dependencies = [
 ]
 
 [project.scripts]
-kb_nano = "kb_nano.__main__:main"
+fastkernels = "fastkernels.__main__:main"
 
 [tool.uv]
 find-links = [
@@ -64,4 +64,4 @@ find-links = [
 no-build-isolation-package = ["flash-attn", "deep-gemm"]
 
 [tool.setuptools.package-dir]
-"kb_nano" = "."
+"fastkernels" = "."

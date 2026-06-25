@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Module-level correctness tests: kb-nano OpenFold3 vs reference openfold3.
+Module-level correctness tests: fastkernels OpenFold3 vs reference openfold3.
 
 For each key module (L1-L3), we:
 1. Instantiate the reference openfold3 module
 2. Randomize all weights (since default AF3 init zeros out output projections)
-3. Instantiate the kb-nano module and load the same weights
+3. Instantiate the fastkernels module and load the same weights
 4. Run identical inputs through both
 5. Compare outputs via cosine similarity and max absolute difference
 
@@ -59,7 +59,7 @@ def test_triangle_multiplication(device="cuda", dtype=torch.bfloat16):
     from openfold3.core.model.layers.triangular_multiplicative_update import (
         TriangleMultiplicationOutgoing as RefTriMulOut,
     )
-    from kb_nano.tasks.baseline.L2.alphafold3_triangle_multiplication import (
+    from fastkernels.tasks.baseline.L2.alphafold3_triangle_multiplication import (
         TriangleMultiplicationOutgoing as KBTriMulOut,
     )
 
@@ -93,7 +93,7 @@ def test_triangle_attention(device="cuda", dtype=torch.bfloat16):
     from openfold3.core.model.layers.triangular_attention import (
         TriangleAttention as RefTriAtt,
     )
-    from kb_nano.tasks.baseline.L2.alphafold3_triangle_attention import (
+    from fastkernels.tasks.baseline.L2.alphafold3_triangle_attention import (
         TriangleAttention as KBTriAtt,
     )
 
@@ -127,7 +127,7 @@ def test_outer_product_mean(device="cuda", dtype=torch.bfloat16):
     from openfold3.core.model.layers.outer_product_mean import (
         OuterProductMean as RefOPM,
     )
-    from kb_nano.tasks.baseline.L2.alphafold3_outer_product_mean import (
+    from fastkernels.tasks.baseline.L2.alphafold3_outer_product_mean import (
         OuterProductMean as KBOPM,
     )
 
@@ -159,7 +159,7 @@ def test_outer_product_mean(device="cuda", dtype=torch.bfloat16):
 def test_swiglu(device="cuda", dtype=torch.bfloat16):
     print("\n=== SwiGLU ===")
     from openfold3.core.model.primitives.activations import SwiGLU as RefSwiGLU
-    from kb_nano.tasks.baseline.L2.alphafold3_swiglu import SwiGLU as KBSwiGLU
+    from fastkernels.tasks.baseline.L2.alphafold3_swiglu import SwiGLU as KBSwiGLU
 
     c_in, c_out = 384, 1536
 
@@ -187,7 +187,7 @@ def test_swiglu(device="cuda", dtype=torch.bfloat16):
 def test_swiglu_transition(device="cuda", dtype=torch.bfloat16):
     print("\n=== SwiGLUTransition ===")
     from openfold3.core.model.layers.transition import SwiGLUTransition as RefTrans
-    from kb_nano.tasks.baseline.L2.alphafold3_swiglu_transition import SwiGLUTransition as KBTrans
+    from fastkernels.tasks.baseline.L2.alphafold3_swiglu_transition import SwiGLUTransition as KBTrans
 
     c_in, n = 128, 4
 
@@ -216,7 +216,7 @@ def test_swiglu_transition(device="cuda", dtype=torch.bfloat16):
 def test_attention(device="cuda", dtype=torch.bfloat16):
     print("\n=== Attention (MHA with biases) ===")
     from openfold3.core.model.primitives.attention import Attention as RefAttn
-    from kb_nano.tasks.baseline.L2.alphafold3_of3_attention import OF3Attention as KBAttn
+    from fastkernels.tasks.baseline.L2.alphafold3_of3_attention import OF3Attention as KBAttn
 
     c_q, c_hidden, no_heads = 384, 32, 16
     N = 48
@@ -246,7 +246,7 @@ def test_attention(device="cuda", dtype=torch.bfloat16):
 def test_pair_block(device="cuda", dtype=torch.bfloat16):
     print("\n=== PairBlock (L2) ===")
     from openfold3.core.model.latent.base_blocks import PairBlock as RefPairBlock
-    from kb_nano.tasks.baseline.L2.alphafold3_pair_block import PairBlock as KBPairBlock
+    from fastkernels.tasks.baseline.L2.alphafold3_pair_block import PairBlock as KBPairBlock
 
     c_z = 128
     N = 24
@@ -302,7 +302,7 @@ def test_pair_block(device="cuda", dtype=torch.bfloat16):
 def test_pairformer_block(device="cuda", dtype=torch.bfloat16):
     print("\n=== PairFormerBlock (L3) ===")
     from openfold3.core.model.latent.pairformer import PairFormerBlock as RefPFBlock
-    from kb_nano.tasks.baseline.L3.alphafold3_pairformer import PairFormerBlock as KBPFBlock
+    from fastkernels.tasks.baseline.L3.alphafold3_pairformer import PairFormerBlock as KBPFBlock
 
     c_s, c_z = 384, 128
     N = 24

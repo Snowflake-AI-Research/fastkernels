@@ -6,11 +6,11 @@ all of the routing/quantization/swizzling logic that GPT-OSS needs so
 that the L2 ``GptOssMoE`` module can stay pure-composition.
 
 Why we copy this code: the implementations of weight swizzling, routing
-data construction, and the fused matmul wrapper live inside vLLM. KB-Nano
+data construction, and the fused matmul wrapper live inside vLLM. FastKernels
 L2+ modules are not allowed to call into vLLM, so the relevant bits of
 ``vllm.model_executor.layers.fused_moe.gpt_oss_triton_kernels_moe`` and
 ``vllm.model_executor.layers.quantization.utils.mxfp4_utils`` are
-re-implemented here verbatim (modulo cleanup of code paths KB-Nano does
+re-implemented here verbatim (modulo cleanup of code paths FastKernels does
 not exercise -- AITER/ROCm fallbacks, expert parallelism, w4a8, and the
 ``use_legacy_triton_kernels`` shim).
 
@@ -100,7 +100,7 @@ def _swizzle_mxfp4(quant_tensor: torch.Tensor, scale: torch.Tensor, num_warps: i
     to be plugged into a ``PrecisionConfig``.
 
     Copied from ``vllm.model_executor.layers.quantization.utils.mxfp4_utils._swizzle_mxfp4``,
-    minus the ROCm/Hopper-old-torch fallbacks that KB-Nano does not exercise.
+    minus the ROCm/Hopper-old-torch fallbacks that FastKernels does not exercise.
     """
     _ensure_triton_kernels_on_path()
     import triton_kernels.matmul_ogs_details.opt_flags as opt_flags

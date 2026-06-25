@@ -1,4 +1,4 @@
-"""Layer-by-layer hidden-state diff: kb-nano vs Microsoft BitNet GPU SOTA.
+"""Layer-by-layer hidden-state diff: fastkernels vs Microsoft BitNet GPU SOTA.
 
 Runs the SAME single-prompt prefill through both models, captures the
 output of every named op (norm, qkv, rope, attn, sub_norm, o, ffn ...)
@@ -30,7 +30,7 @@ _PROJECT_ROOT = _THIS_DIR.parent.parent
 
 # Keep BitNet checkpoint loader from going through fastsafetensors GDS
 # (we need plain CPU/GPU loading for repeatable, deterministic numerics).
-os.environ.setdefault("KB_NANO_DISABLE_FASTSAFETENSORS", "1")
+os.environ.setdefault("FASTKERNELS_DISABLE_FASTSAFETENSORS", "1")
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 
@@ -54,7 +54,7 @@ def _neox_to_gptj_per_head(x: torch.Tensor, head_dim: int) -> torch.Tensor:
     """Permute the LAST dim of ``x`` from NeoX RoPE layout to GPT-J interleaved
     layout, applied independently per head along that dim.
 
-    NeoX layout (kb-nano's qkv_proj output, HF format): per head of size D the
+    NeoX layout (fastkernels's qkv_proj output, HF format): per head of size D the
     values are ``[d_0, d_1, ..., d_{D/2-1}, d_{D/2}, ..., d_{D-1}]`` with the
     rotation pairs being ``(d_i, d_{D/2+i})``.
 
@@ -62,7 +62,7 @@ def _neox_to_gptj_per_head(x: torch.Tensor, head_dim: int) -> torch.Tensor:
     values are ``[d_0, d_{D/2}, d_1, d_{D/2+1}, ...]`` with rotation pairs
     being ``(d_{2i}, d_{2i+1})``.
 
-    Used by the diff harness so that kb-nano's per-head q/k vectors are in
+    Used by the diff harness so that fastkernels's per-head q/k vectors are in
     the same layout as SOTA's before per-element comparison.
     """
     *lead, last = x.shape
@@ -88,23 +88,23 @@ def _diff(a: torch.Tensor, b: torch.Tensor) -> tuple[float, float, float]:
 
 
 # ---------------------------------------------------------------------------
-# kb-nano forward with hooks
+# fastkernels forward with hooks
 # ---------------------------------------------------------------------------
 
-def run_kb_nano(prompt_ids: list[int]) -> tuple[Captured, torch.Tensor]:
-    """Run kb-nano BitNet prefill once for ``prompt_ids`` (single seq) and
+def run_fastkernels(prompt_ids: list[int]) -> tuple[Captured, torch.Tensor]:
+    """Run fastkernels BitNet prefill once for ``prompt_ids`` (single seq) and
     return (captures, last_token_logits)."""
-    from kb_nano.infra import weight_loader as _wl
+    from fastkernels.infra import weight_loader as _wl
     # GDS may not be available in all environments; force the safetensors
     # CPU+stream loader to avoid cuFile errors.
     _wl._HAS_FASTSAFETENSORS = False
-    from kb_nano.infra.weight_loader import load_model
-    from kb_nano.infra.context import set_context, reset_context
-    from kb_nano.tasks.baseline.L1.bitnet_linear import BitLinear, BitLinearMerged
-    from kb_nano.tasks.baseline.L1.rms_norm import RMSNorm
-    from kb_nano.tasks.baseline.L2.bitnet_attention import BitNetAttention
-    from kb_nano.tasks.baseline.L2.bitnet_mlp import BitNetMLP
-    from kb_nano.tasks.baseline.L3.bitnet_decoder import BitNetDecoderLayer
+    from fastkernels.infra.weight_loader import load_model
+    from fastkernels.infra.context import set_context, reset_context
+    from fastkernels.tasks.baseline.L1.bitnet_linear import BitLinear, BitLinearMerged
+    from fastkernels.tasks.baseline.L1.rms_norm import RMSNorm
+    from fastkernels.tasks.baseline.L2.bitnet_attention import BitNetAttention
+    from fastkernels.tasks.baseline.L2.bitnet_mlp import BitNetMLP
+    from fastkernels.tasks.baseline.L3.bitnet_decoder import BitNetDecoderLayer
 
     print("[kb] loading model...")
     model, config = load_model("microsoft/bitnet-b1.58-2B-4T", dtype=torch.bfloat16)
@@ -201,7 +201,7 @@ def run_kb_nano(prompt_ids: list[int]) -> tuple[Captured, torch.Tensor]:
     req_id_per_token = torch.zeros(n_tokens, dtype=torch.int32, device="cuda")
 
     # Allocate KV cache for every BitNetAttention (engine normally does this).
-    from kb_nano.tasks.baseline.L2.attention_impl import Attention
+    from fastkernels.tasks.baseline.L2.attention_impl import Attention
     for mod in model.modules():
         if isinstance(mod, Attention):
             kv_shape = (n_blocks, block_size, n_kv_heads, head_dim)
@@ -379,7 +379,7 @@ def report(kb: Captured, sota: Captured, layer_filter: int | None = None) -> Non
     only_kb = sorted(set(kb.named) - set(sota.named))
     only_sota = sorted(set(sota.named) - set(kb.named))
     if only_kb:
-        print(f"\n[!] Only in kb-nano ({len(only_kb)}): {only_kb[:5]} ...")
+        print(f"\n[!] Only in fastkernels ({len(only_kb)}): {only_kb[:5]} ...")
     if only_sota:
         print(f"[!] Only in SOTA   ({len(only_sota)}): {only_sota[:5]} ...")
 
@@ -403,7 +403,7 @@ def report(kb: Captured, sota: Captured, layer_filter: int | None = None) -> Non
                 last_layer_printed = layer_idx
         a = kb.named[k]
         b = sota.named[k]
-        # Re-layout kb-nano's q/k tensors from NeoX -> GPT-J before
+        # Re-layout fastkernels's q/k tensors from NeoX -> GPT-J before
         # comparing element-wise to SOTA, since SOTA's wqkv weight is
         # pre-permuted by ``invert_convert_q/k`` at convert time.
         op = k.split("/")[-1] if "/" in k else k
@@ -454,7 +454,7 @@ def main() -> None:
     torch.set_default_device("cpu")
     torch.set_default_dtype(torch.float32)
 
-    kb_cap, kb_last_logits = run_kb_nano(prompt_ids)
+    kb_cap, kb_last_logits = run_fastkernels(prompt_ids)
 
     report(kb_cap, sota_cap, layer_filter=args.layer)
 
@@ -463,12 +463,12 @@ def main() -> None:
     print("\n--- Final last-token logits ---")
     max_abs, mean_abs, cos = _diff(kb_last_logits, sota_last_logits)
     print(f"max|d|={max_abs:.5f}  mean|d|={mean_abs:.5f}  cos={cos:.5f}")
-    print(f"argmax kb-nano = {int(kb_last_logits.argmax())}, "
+    print(f"argmax fastkernels = {int(kb_last_logits.argmax())}, "
           f"argmax SOTA = {int(sota_last_logits.argmax())}")
     # Top-5 each side.
     top_kb = torch.topk(kb_last_logits, 5)
     top_so = torch.topk(sota_last_logits, 5)
-    print(f"top-5 kb-nano: tokens={top_kb.indices.tolist()}, vals={[round(v, 3) for v in top_kb.values.tolist()]}")
+    print(f"top-5 fastkernels: tokens={top_kb.indices.tolist()}, vals={[round(v, 3) for v in top_kb.values.tolist()]}")
     print(f"top-5 SOTA   : tokens={top_so.indices.tolist()}, vals={[round(v, 3) for v in top_so.values.tolist()]}")
 
 

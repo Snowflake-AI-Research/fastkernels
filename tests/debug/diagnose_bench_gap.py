@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Definitive diagnosis of kb-nano vs vllm-omni misalignment.
+"""Definitive diagnosis of fastkernels vs vllm-omni misalignment.
 
 Tests each hypothesis with a single prompt/batch, identical seed,
 comparing at every stage:
@@ -47,10 +47,10 @@ SEED = 42
 PROMPT = ["A cat on a mat", "A sunset over the ocean", "A mountain landscape", "A bird in flight"]
 HEIGHT, WIDTH = 1024, 1024
 
-# ============= LOAD KB-NANO =============
-print("Loading kb-nano...")
-from kb_nano.infra.diffusion_engine import _download_flux_model, _load_flux_weights
-from kb_nano.tasks.baseline.L4.flux import FluxConfig, FluxPipeline, DiffusionSamplingParams
+# ============= LOAD FASTKERNELS =============
+print("Loading fastkernels...")
+from fastkernels.infra.diffusion_engine import _download_flux_model, _load_flux_weights
+from fastkernels.tasks.baseline.L4.flux import FluxConfig, FluxPipeline, DiffusionSamplingParams
 
 model_path = _download_flux_model(MODEL)
 config = FluxConfig.from_pretrained(model_path)
@@ -62,7 +62,7 @@ kb_pipe.text_encoder_2.to(device=DEVICE)
 kb_pipe.vae.to(device=DEVICE)
 kb_pipe.eval()
 
-log("setup", "diag.py:58", "kb-nano loaded", {
+log("setup", "diag.py:58", "fastkernels loaded", {
     "vae_dtype": kb_pipe.vae.dtype,
     "transformer_dtype": next(kb_pipe.transformer.parameters()).dtype,
     "clip_dtype": next(kb_pipe.text_encoder.parameters()).dtype,
@@ -232,7 +232,7 @@ with torch.inference_mode():
     sched_kb = deepcopy(kb_pipe.scheduler)
     sched_vo = deepcopy(kb_pipe.scheduler)
     sigmas = np.linspace(1.0, 1.0 / 28, 28)
-    from kb_nano.tasks.baseline.L4.flux import _calculate_shift
+    from fastkernels.tasks.baseline.L4.flux import _calculate_shift
     mu = _calculate_shift(kb_latents.shape[1],
         sched_kb.config.get("base_image_seq_len", 256),
         sched_kb.config.get("max_image_seq_len", 4096),
@@ -283,7 +283,7 @@ with torch.inference_mode():
     unpacked = kb_pipe._unpack_latents(lat_kb, HEIGHT, WIDTH, kb_pipe.vae_scale_factor)
     pre_vae = (unpacked / kb_pipe.vae.config.scaling_factor) + kb_pipe.vae.config.shift_factor
     
-    # Path A: fp32 VAE (what kb-nano benchmark does)
+    # Path A: fp32 VAE (what fastkernels benchmark does)
     img_fp32 = vae_fp32.decode(pre_vae.to(vae_fp32.dtype), return_dict=False)[0]
     
     # Path B: bf16 VAE (what vllm-omni does via set_default_torch_dtype(bf16))
@@ -308,12 +308,12 @@ with torch.inference_mode():
 
 # ============= FULL E2E: each pipeline's own CLIP =============
 print("\n" + "=" * 80)
-print("FULL E2E: kb-nano CLIP + T5 vs HF CLIP + same T5, same noise")
+print("FULL E2E: fastkernels CLIP + T5 vs HF CLIP + same T5, same noise")
 print("=" * 80)
 
 with torch.inference_mode():
     # vllm-omni uses HF CLIP pooled (already computed above)
-    # Denoise with kb-nano's CLIP pooled
+    # Denoise with fastkernels's CLIP pooled
     sched_a = deepcopy(kb_pipe.scheduler)
     sched_a.set_timesteps(sigmas=sigmas, mu=mu)
     sched_a.set_begin_index(0)
@@ -369,7 +369,7 @@ with torch.inference_mode():
     print(f"  kb-CLIP vs hf-CLIP decoded images (same fp32 VAE): cos={clip_img_cos:.10f}")
     
     # Now the full benchmark path:
-    # kb-nano: kb_pooled, fp32 VAE decode
+    # fastkernels: kb_pooled, fp32 VAE decode
     # vllm-omni: hf_pooled, bf16 VAE decode
     img_b_bf16 = vae_bf16.decode(pv_b.to(DTYPE), return_dict=False)[0]
     
@@ -378,7 +378,7 @@ with torch.inference_mode():
         "cos": benchmark_cos, "max_diff": maxd(img_a_fp32, img_b_bf16),
     })
     print(f"\n  *** EXACT BENCHMARK PATH ***")
-    print(f"  kb-nano (kb_clip + fp32 VAE) vs vllm-omni (hf_clip + bf16 VAE): cos={benchmark_cos:.10f}")
+    print(f"  fastkernels (kb_clip + fp32 VAE) vs vllm-omni (hf_clip + bf16 VAE): cos={benchmark_cos:.10f}")
     
     for i in range(4):
         pc = cos_sim(img_a_fp32[i], img_b_bf16[i])

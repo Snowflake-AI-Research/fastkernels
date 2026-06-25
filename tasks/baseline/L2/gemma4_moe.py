@@ -141,7 +141,7 @@ class Gemma4MoE(nn.Module):
 
     def forward(self, hidden_states, router_logits):
         if self._use_custom_op:
-            return torch.ops.kb_nano.gemma4_moe_forward(
+            return torch.ops.fastkernels.gemma4_moe_forward(
                 hidden_states, router_logits, self._layer_name,
             )
         return self.forward_impl(hidden_states, router_logits)

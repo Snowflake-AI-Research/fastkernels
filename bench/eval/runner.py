@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from kb_nano.bench.utils.worker import KB_NANO_MULTI_SCENARIO_WORKER, run_worker
+from fastkernels.bench.utils.worker import FASTKERNELS_MULTI_SCENARIO_WORKER, run_worker
 
 from .aggregator import Aggregator, EvalReport
 from .config import EvalConfig
@@ -38,7 +38,7 @@ def _run_subprocess(
     max_seq_len: int,
 ) -> dict | None:
     """Run a single E2E subprocess (baseline or candidate)."""
-    from kb_nano import KB_ROOT, PROJECT_ROOT
+    from fastkernels import KB_ROOT, PROJECT_ROOT
     kb_root = str(PROJECT_ROOT)
     package_name = KB_ROOT.name
 
@@ -58,7 +58,7 @@ def _run_subprocess(
     }
 
     return run_worker(
-        KB_NANO_MULTI_SCENARIO_WORKER, config,
+        FASTKERNELS_MULTI_SCENARIO_WORKER, config,
         f"{label_suffix} [{job.short_name}] (TP={job.tp})",
     )
 

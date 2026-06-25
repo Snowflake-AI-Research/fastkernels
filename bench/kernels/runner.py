@@ -15,8 +15,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from kb_nano.bench.kernels.scenario_registry import InputRegistry
-from kb_nano.infra.kernel_swapper import (
+from fastkernels.bench.kernels.scenario_registry import InputRegistry
+from fastkernels.infra.kernel_swapper import (
     BenchTarget,
     discover_references,
     discover_targets,
@@ -584,7 +584,7 @@ def run_all_kernel_benchmarks(
 
     Discovers all candidate kernels and runs isolated benchmarks for each.
     """
-    from kb_nano.infra.kernel_swapper import discover_candidates
+    from fastkernels.infra.kernel_swapper import discover_candidates
 
     if pytorch_reference:
         validation_mode = "pytorch_reference"

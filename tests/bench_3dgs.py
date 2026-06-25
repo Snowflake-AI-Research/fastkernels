@@ -123,7 +123,7 @@ def main():
     )
     ours_latency = measure_latency(ours, cfg["latency_iters"], cfg["num_cameras"])
     result["ours"] = {
-        "baseline_name": "kb-nano",
+        "baseline_name": "fastkernels",
         **ours_perf,
         "latency": ours_latency,
     }

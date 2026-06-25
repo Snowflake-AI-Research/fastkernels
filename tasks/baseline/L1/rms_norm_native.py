@@ -2,8 +2,8 @@
 
 Distinct from :class:`L1.rms_norm.RMSNorm`:
 
-  - That op dispatches to a CUDA kernel (vLLM's ``_C.rms_norm`` or kb-nano's
-    ``kb_nano_norm.rmsnorm``) by default. The kernel is empirically incorrect
+  - That op dispatches to a CUDA kernel (vLLM's ``_C.rms_norm`` or fastkernels's
+    ``fastkernels_norm.rmsnorm``) by default. The kernel is empirically incorrect
     for some hidden sizes (verified wrong output at hidden=16 and hidden=80,
     correct at 32 / 64 / 128) and has no autograd backward registered.
   - This op stays in pure PyTorch, computes variance + rsqrt in fp32 for

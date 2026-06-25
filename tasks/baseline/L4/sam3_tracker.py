@@ -71,7 +71,7 @@ def select_closest_cond_frames(frame_idx, cond_frame_outputs, max_cond_frame_num
 
 
 def fill_holes_in_mask_scores(mask, max_area=0):
-    """Placeholder for post-processing fill holes. In kb-nano, we skip connected components."""
+    """Placeholder for post-processing fill holes. In fastkernels, we skip connected components."""
     return mask
 
 

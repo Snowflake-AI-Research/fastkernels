@@ -26,7 +26,7 @@ class PoolingRequestOutput:
 
 
 class EmbeddingEngine:
-    """Minimal vLLM-compatible pooling interface for kb-nano embedders."""
+    """Minimal vLLM-compatible pooling interface for fastkernels embedders."""
 
     DEFAULT_MAX_NUM_BATCHED_TOKENS = 16384
     DEFAULT_MAX_NUM_SEQS = 1024
@@ -158,7 +158,7 @@ class EmbeddingEngine:
                 batch_iter,
                 total=len(scheduler_batches),
                 desc=(
-                    "kb-nano scheduled batches "
+                    "fastkernels scheduled batches "
                     f"(<= {self.max_num_batched_tokens} tok, <= {self.max_num_seqs} seq)"
                 ),
                 unit="batch",

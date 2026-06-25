@@ -163,7 +163,7 @@ def main():
         "num_views": cfg["num_views"],
         "num_samples": cfg["num_samples"],
         "ours": {
-            "baseline_name": "kb-nano-kernel",
+            "baseline_name": "fastkernels-kernel",
             **ours_perf,
             "latency": ours_latency,
         },

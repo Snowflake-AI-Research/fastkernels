@@ -1,20 +1,20 @@
-"""CLI entry point for the kb-nano eval sweep (Tier 3).
+"""CLI entry point for the fastkernels eval sweep (Tier 3).
 
 Usage:
     # Full eval (all models with candidate kernels, all categories)
-    python -m kb_nano.bench.eval
+    python -m fastkernels.bench.eval
 
     # Single category
-    python -m kb_nano.bench.eval --category llm
+    python -m fastkernels.bench.eval --category llm
 
     # Specific model
-    python -m kb_nano.bench.eval --model meta-llama/Llama-3.1-8B-Instruct
+    python -m fastkernels.bench.eval --model meta-llama/Llama-3.1-8B-Instruct
 
     # Restrict TP degrees
-    python -m kb_nano.bench.eval --tp 1 4
+    python -m fastkernels.bench.eval --tp 1 4
 
     # Custom output path (default: bench/results/eval_<timestamp>.json)
-    python -m kb_nano.bench.eval --output-json results/my_eval.json
+    python -m fastkernels.bench.eval --output-json results/my_eval.json
 """
 
 from __future__ import annotations
@@ -26,13 +26,13 @@ import sys
 from .config import EvalConfig
 from .runner import run_eval
 
-from kb_nano import run_output_path
+from fastkernels import run_output_path
 
 
 def main():
     parser = argparse.ArgumentParser(
-        prog="python -m kb_nano.bench.eval",
-        description="kb-nano evaluation sweep: standardized multi-model benchmarking",
+        prog="python -m fastkernels.bench.eval",
+        description="fastkernels evaluation sweep: standardized multi-model benchmarking",
     )
     parser.add_argument(
         "--model", type=str, nargs="*", default=None,
@@ -85,7 +85,7 @@ def main():
         num_prompts=args.num_prompts,
     )
 
-    from kb_nano.bench.tracking import tracker
+    from fastkernels.bench.tracking import tracker
 
     eval_params = {
         "models": str(args.model) if args.model else "auto",

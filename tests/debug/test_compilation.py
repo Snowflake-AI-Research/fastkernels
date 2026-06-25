@@ -25,7 +25,7 @@ torch.set_grad_enabled(False)
 
 
 def test_compilation(model_name: str, tp: int = 1, skip_vllm: bool = False):
-    from kb_nano.infra.engine import LlamaEngine, SamplingParams
+    from fastkernels.infra.engine import LlamaEngine, SamplingParams
 
     sp = SamplingParams(temperature=0.0, max_tokens=32, seed=42)
     prompts = [

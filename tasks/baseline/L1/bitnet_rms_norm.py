@@ -1,6 +1,6 @@
 """BitNet-specific RMSNorm that is bit-for-bit identical to SOTA.
 
-The default kb-nano ``RMSNorm`` (vllm's CUDA kernel) computes
+The default fastkernels ``RMSNorm`` (vllm's CUDA kernel) computes
 ``out = bf16( fp32(x * rstd) ) * bf16(weight)`` — i.e. it round-trips the
 normalized value through bf16 *before* multiplying by the weight, costing
 ~1 ULP of precision per element relative to xformers' kernel which keeps
@@ -12,7 +12,7 @@ That single extra round-trip is small per-op but compounds across 2 norms
 Combined with BitNet's ternary weights (which produce many close-magnitude
 logits), it's enough to flip ~20% of greedy-decode argmaxes vs SOTA.
 
-This module mirrors ``kb_nano.tasks.baseline.L1.RMSNorm``'s public API
+This module mirrors ``fastkernels.tasks.baseline.L1.RMSNorm``'s public API
 (same forward signature, same ``elementwise_affine`` semantics, same
 optional fused-add residual path) but dispatches to xformers' ``rms_norm``
 / ``rms_norm_add`` Triton kernels which are exactly what SOTA uses.

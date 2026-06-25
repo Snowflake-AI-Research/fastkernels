@@ -14,20 +14,20 @@ import torch
 def _bootstrap_local_package() -> None:
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     spec = importlib.util.spec_from_file_location(
-        "kb_nano",
+        "fastkernels",
         os.path.join(root, "__init__.py"),
         submodule_search_locations=[root],
     )
     module = importlib.util.module_from_spec(spec)
-    sys.modules["kb_nano"] = module
+    sys.modules["fastkernels"] = module
     assert spec.loader is not None
     spec.loader.exec_module(module)
 
 
 _bootstrap_local_package()
 
-from kb_nano.tasks.baseline.L4.dlrmv2 import DLRMv2, DLRMv2Config
-from kb_nano.tasks.baseline.L4.lightgcn import LightGCN, LightGCNConfig
+from fastkernels.tasks.baseline.L4.dlrmv2 import DLRMv2, DLRMv2Config
+from fastkernels.tasks.baseline.L4.lightgcn import LightGCN, LightGCNConfig
 
 
 class RecsysSmokeTests(unittest.TestCase):

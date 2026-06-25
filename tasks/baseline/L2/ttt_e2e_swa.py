@@ -18,7 +18,7 @@ calls). It uses:
     odd head_dim values where the L1 RMSNorm CUDA kernel is broken)
   - L1 :class:`TTTE2ERoPE` for interleaved RoPE
   - L1 :class:`DenseAttention` for the SDPA call (handles both prefix
-    and suffix paths via the ``attn_mask`` argument; the kb-nano CUDA
+    and suffix paths via the ``attn_mask`` argument; the fastkernels CUDA
     flash-attention L1 ops are paged-KV-cache-only and don't fit either
     of TTT-E2E's access patterns).
 """

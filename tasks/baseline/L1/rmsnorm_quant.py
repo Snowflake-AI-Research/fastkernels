@@ -3,7 +3,7 @@
 Single CUDA kernel that combines rmsnorm and FP8 quantization, eliminating
 the intermediate BF16 tensor and one kernel launch per decoder layer.
 
-Also registers the fused ops in the ``kb_nano_norm`` torch.library namespace
+Also registers the fused ops in the ``fastkernels_norm`` torch.library namespace
 so Inductor fusion passes can reference them.
 """
 
@@ -17,11 +17,11 @@ from .csrc import _C
 _FP8_GROUP_SIZE = 128
 
 # ---------------------------------------------------------------------------
-# Register fused ops in kb_nano_norm namespace for Inductor fusion passes.
+# Register fused ops in fastkernels_norm namespace for Inductor fusion passes.
 # These use the same Library as rms_norm.py (IMPL mode to extend it).
 # ---------------------------------------------------------------------------
 
-_fused_lib = torch.library.Library("kb_nano_norm", "DEF")
+_fused_lib = torch.library.Library("fastkernels_norm", "DEF")
 
 _fused_lib.define(
     "rmsnorm_fp8_quant(Tensor! output_fp8, Tensor! output_scales, "
@@ -63,7 +63,7 @@ def _fused_add_rmsnorm_fp8_quant_meta(output_fp8, output_scales,
 class RMSNormFP8Quant(nn.Module):
     """Fused RMSNorm + per-token-group FP8 quantization.
 
-    Stateless wrapper around ``torch.ops.kb_nano_norm.rmsnorm_fp8_quant``.
+    Stateless wrapper around ``torch.ops.fastkernels_norm.rmsnorm_fp8_quant``.
     The RMSNorm weight is owned by the parent module and passed through
     ``forward``.
     """
@@ -93,7 +93,7 @@ class RMSNormFP8Quant(nn.Module):
             num_groups, num_tokens, dtype=torch.float32, device=input.device,
         ).transpose(0, 1)
 
-        torch.ops.kb_nano_norm.rmsnorm_fp8_quant(
+        torch.ops.fastkernels_norm.rmsnorm_fp8_quant(
             output_fp8, output_scales, input, weight, eps,
         )
         return output_fp8, output_scales
@@ -103,7 +103,7 @@ class FusedAddRMSNormFP8Quant(nn.Module):
     """Fused residual-add + RMSNorm + per-token-group FP8 quantization.
 
     Stateless wrapper around
-    ``torch.ops.kb_nano_norm.fused_add_rmsnorm_fp8_quant``.
+    ``torch.ops.fastkernels_norm.fused_add_rmsnorm_fp8_quant``.
     """
 
     def forward(
@@ -126,7 +126,7 @@ class FusedAddRMSNormFP8Quant(nn.Module):
             num_groups, num_tokens, dtype=torch.float32, device=input.device,
         ).transpose(0, 1)
 
-        torch.ops.kb_nano_norm.fused_add_rmsnorm_fp8_quant(
+        torch.ops.fastkernels_norm.fused_add_rmsnorm_fp8_quant(
             output_fp8, output_scales, input, residual, weight, eps,
         )
         return output_fp8, output_scales, residual

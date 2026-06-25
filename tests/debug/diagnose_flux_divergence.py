@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Component-by-component divergence diagnostic between kb-nano and vllm-omni.
+"""Component-by-component divergence diagnostic between fastkernels and vllm-omni.
 
 Loads both pipelines in a single process, feeds identical inputs, and
 reports cosine similarity at every intermediate stage of the forward pass
@@ -51,14 +51,14 @@ def report(name: str, a: torch.Tensor, b: torch.Tensor, indent: int = 0):
 
 
 # ============================================================================
-# Load kb-nano pipeline
+# Load fastkernels pipeline
 # ============================================================================
 print("=" * 80)
-print("Loading kb-nano pipeline...")
+print("Loading fastkernels pipeline...")
 print("=" * 80)
 
-from kb_nano.infra.diffusion_engine import DiffusionEngine, _download_flux_model, _load_flux_weights
-from kb_nano.tasks.baseline.L4.flux import FluxConfig, FluxPipeline, DiffusionSamplingParams, _calculate_shift
+from fastkernels.infra.diffusion_engine import DiffusionEngine, _download_flux_model, _load_flux_weights
+from fastkernels.tasks.baseline.L4.flux import FluxConfig, FluxPipeline, DiffusionSamplingParams, _calculate_shift
 
 model_path = _download_flux_model(MODEL)
 config = FluxConfig.from_pretrained(model_path)
@@ -240,7 +240,7 @@ vo_t5_out = vo_t5(t5_ids)[0].to(dtype=DTYPE, device=DEVICE)
 
 report("T5 encoder output", kb_t5_out, vo_t5_out)
 
-# Use kb-nano's text embeddings as canonical input for the rest
+# Use fastkernels's text embeddings as canonical input for the rest
 prompt_embeds = kb_t5_out.clone()
 pooled_prompt_embeds = kb_pooled.clone()
 
@@ -254,7 +254,7 @@ print("\n" + "=" * 80)
 print("STAGE 1c: FULL ENCODE_PROMPT (end-to-end)")
 print("=" * 80)
 
-# What kb-nano's encode_prompt produces
+# What fastkernels's encode_prompt produces
 kb_prompt_embeds, kb_pooled_final, kb_text_ids = kb_pipe.encode_prompt(
     prompt=[PROMPT], num_images_per_prompt=1, max_sequence_length=512,
 )
@@ -460,7 +460,7 @@ sched_vo.set_begin_index(0)
 for step_idx, t in enumerate(timesteps):
     ts = t.expand(latents_kb.shape[0]).to(device=DEVICE, dtype=DTYPE)
 
-    # kb-nano forward
+    # fastkernels forward
     kb_noise = kb_pipe.transformer(
         hidden_states=latents_kb, timestep=ts / 1000, guidance=guidance,
         pooled_projections=pooled_prompt_embeds,
@@ -503,7 +503,7 @@ print("STAGE 8: FULL END-TO-END (each pipeline uses its own text encoders)")
 print("=" * 80)
 print("  This replicates what the benchmark does: each engine runs independently.")
 
-# kb-nano full pipeline
+# fastkernels full pipeline
 generator_kb = torch.Generator(device=DEVICE).manual_seed(SEED)
 kb_full_prompt_embeds, kb_full_pooled, kb_full_text_ids = kb_pipe.encode_prompt(
     prompt=[PROMPT], num_images_per_prompt=1, max_sequence_length=512,
