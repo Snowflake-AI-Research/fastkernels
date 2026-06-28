@@ -15,7 +15,11 @@ import torch
 import torch.nn as nn
 
 
-_KB_ROOT = Path(__file__).resolve().parents[1]
+from fastkernels import PROJECT_ROOT
+
+# Repo root: external checkouts (third_party/) live here, and worker
+# subprocesses add it to sys.path so they can ``import fastkernels``.
+_KB_ROOT = PROJECT_ROOT
 _INSTANT_NGP_ROOT = _KB_ROOT / "third_party" / "instant-ngp"
 _INSTANT_NGP_BUILD = _INSTANT_NGP_ROOT / "build"
 _SNAPSHOT_CACHE = Path.home() / ".cache" / "fastkernels" / "instantngp"
@@ -129,7 +133,7 @@ def _build_fox_snapshot_subprocess(
     script = f"""
 import sys
 sys.path.insert(0, {str(_KB_ROOT)!r})
-from infra.nerf_loader import _build_fox_snapshot_in_process
+from fastkernels.infra.nerf_loader import _build_fox_snapshot_in_process
 _build_fox_snapshot_in_process(
     scene_name={scene_name!r},
     train_steps={train_steps},

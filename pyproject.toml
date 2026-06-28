@@ -63,5 +63,9 @@ find-links = [
 ]
 no-build-isolation-package = ["flash-attn", "deep-gemm"]
 
-[tool.setuptools.package-dir]
-"fastkernels" = "."
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["fastkernels*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.cu", "*.cuh", "*.cpp", "*.cc", "*.h", "*.hpp", "*.yaml", "*.yml", "*.json", "*.jsonl", "*.md"]

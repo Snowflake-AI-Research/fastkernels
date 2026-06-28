@@ -13,8 +13,8 @@ _THIS_DIR = Path(__file__).resolve().parent
 _PACKAGE_DIR = _THIS_DIR.parent
 sys.path.insert(0, str(_PACKAGE_DIR))
 
-from bench.utils.worker import run_worker
-from infra.image_cls_loader import infer_image_mean_std, infer_image_size
+from fastkernels.bench.utils.worker import run_worker
+from fastkernels.infra.image_cls_loader import infer_image_mean_std, infer_image_size
 
 
 def _detect_gpu_name() -> str:

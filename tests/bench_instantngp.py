@@ -14,7 +14,7 @@ _KB_ROOT = Path(__file__).resolve().parents[1]
 if str(_KB_ROOT) not in sys.path:
     sys.path.insert(0, str(_KB_ROOT))
 
-from bench.utils.worker import run_worker
+from fastkernels.bench.utils.worker import run_worker
 
 
 INSTANTNGP_WORKER = r'''
@@ -26,7 +26,7 @@ with open(sys.argv[1]) as f:
 
 sys.path.insert(0, cfg["kb_root"])
 
-from infra.nerf_loader import load_fox_scene, load_ours_instantngp, load_reference_instantngp
+from fastkernels.infra.nerf_loader import load_fox_scene, load_ours_instantngp, load_reference_instantngp
 
 def render_views(model, view_indices):
     outputs = []

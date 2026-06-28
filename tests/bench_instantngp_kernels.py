@@ -12,7 +12,7 @@ _KB_ROOT = Path(__file__).resolve().parents[1]
 if str(_KB_ROOT) not in sys.path:
     sys.path.insert(0, str(_KB_ROOT))
 
-from bench.utils.worker import run_worker
+from fastkernels.bench.utils.worker import run_worker
 
 
 INSTANTNGP_KERNEL_WORKER = r'''
@@ -26,8 +26,8 @@ with open(sys.argv[1]) as f:
 sys.path.insert(0, cfg["kb_root"])
 
 import tinycudann as tcnn
-from infra.nerf_loader import sample_real_fox_field_inputs
-from tasks.baseline.L2.instantngp_field import InstantNGPField
+from fastkernels.infra.nerf_loader import sample_real_fox_field_inputs
+from fastkernels.tasks.baseline.L2.instantngp_field import InstantNGPField
 
 class ReferenceField(torch.nn.Module):
     def __init__(self, field: InstantNGPField):

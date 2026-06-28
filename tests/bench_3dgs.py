@@ -14,7 +14,7 @@ if str(_KB_ROOT) not in sys.path:
 
 import torch
 
-from bench.utils.worker import run_worker
+from fastkernels.bench.utils.worker import run_worker
 
 THREEDGS_WORKER = r'''
 import json, math, sys, time
@@ -25,7 +25,7 @@ with open(sys.argv[1]) as f:
 
 sys.path.insert(0, cfg["kb_root"])
 
-from infra.graphics_loader import load_3dgs_scene, load_ours_3dgs, load_reference_3dgs
+from fastkernels.infra.graphics_loader import load_3dgs_scene, load_ours_3dgs, load_reference_3dgs
 
 def render(model):
     with torch.inference_mode():

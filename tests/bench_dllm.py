@@ -25,7 +25,7 @@ _THIS_DIR = Path(__file__).resolve().parent
 _PACKAGE_DIR = _THIS_DIR.parent
 sys.path.insert(0, str(_PACKAGE_DIR))
 
-from bench.utils.worker import run_worker
+from fastkernels.bench.utils.worker import run_worker
 
 
 DEFAULT_TASK = "humaneval"

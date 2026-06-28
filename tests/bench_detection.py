@@ -35,12 +35,12 @@ _PROJECT_ROOT = _PACKAGE_DIR.parent
 
 sys.path.insert(0, str(_PACKAGE_DIR))
 
-from bench.utils.worker import run_worker
-from bench.utils.workloads import (
+from fastkernels.bench.utils.worker import run_worker
+from fastkernels.bench.utils.workloads import (
     DETECTION_LATENCY_WORKLOADS,
     DETECTION_THROUGHPUT_WORKLOADS,
 )
-from infra.detection_loader import infer_image_size
+from fastkernels.infra.detection_loader import infer_image_size
 
 
 def _detect_gpu_name() -> str:

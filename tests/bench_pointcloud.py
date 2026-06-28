@@ -14,8 +14,8 @@ if str(_KB_ROOT) not in sys.path:
 
 import torch
 
-from infra.pointcloud_loader import DEFAULT_PTV3_CHECKPOINT_FILE
-from bench.utils.worker import run_worker
+from fastkernels.infra.pointcloud_loader import DEFAULT_PTV3_CHECKPOINT_FILE
+from fastkernels.bench.utils.worker import run_worker
 
 POINTCLOUD_WORKER = r'''
 import json, os, random, sys, time
@@ -29,7 +29,7 @@ with open(sys.argv[1]) as f:
 
 sys.path.insert(0, cfg["kb_root"])
 
-from infra.pointcloud_loader import (
+from fastkernels.infra.pointcloud_loader import (
     default_ptv3_kwargs,
     load_point_backbone_checkpoint,
     load_ours_point_model,

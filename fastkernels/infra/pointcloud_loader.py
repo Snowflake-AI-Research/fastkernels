@@ -9,6 +9,8 @@ from pathlib import Path
 
 import torch
 
+from fastkernels import PROJECT_ROOT
+
 
 DEFAULT_PTV3_CHECKPOINT_REPO = "Pointcept/PointTransformerV3"
 DEFAULT_PTV3_CHECKPOINT_FILE = "scannet-semseg-pt-v3m1-0-base/model/model_best.pth"
@@ -20,7 +22,8 @@ def is_pointtransv3_model(model_name: str) -> bool:
 
 
 def _project_root() -> Path:
-    return Path(__file__).resolve().parent.parent
+    # Repo root, where external checkouts under third_party/ live.
+    return PROJECT_ROOT
 
 
 def _ptv3_repo_root() -> Path:
