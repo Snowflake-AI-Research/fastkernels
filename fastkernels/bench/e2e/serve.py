@@ -33,7 +33,7 @@ import numpy as np
 from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer
 
-from fastkernels.bench.utils.datasets import (
+from fastkernels.workloads import (
     SampleRequest,
     add_dataset_parser,
     get_samples,

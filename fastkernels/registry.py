@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
+
+from .workloads import (
+    LLM, VLM, Diffusion, Detection, Embedding, StructurePrediction, WorldModel,
+    Workload,
+)
 
 @dataclass(frozen=True)
 class Family:
@@ -80,24 +86,81 @@ _ARCHITECTURES = (
 )
 FASTKERNELS_ARCHITECTURES: dict[str, Architecture] = {a.module: a for a in _ARCHITECTURES}
 
+
+def _normalize(text: str) -> str:
+    """Lowercase, alphanumeric-only form for tolerant name matching."""
+    return "".join(ch for ch in text.lower() if ch.isalnum())
+
+
+@functools.lru_cache(maxsize=None)
+def _module_from_name(hf_name: str) -> str | None:
+    """Infer the L4 module from the HF name alone -- no config, no network.
+
+    Matches the normalized model name against each architecture's module stem
+    and display name, preferring the most specific (longest) match, e.g.
+    ``black-forest-labs/FLUX.1-dev`` -> ``flux`` and ``fla-hub/gla-2.7B-100B``
+    -> ``gla``. Returns ``None`` when nothing matches.
+    """
+    norm = _normalize(hf_name)
+    best_module: str | None = None
+    best_len = 0
+    for arch in _ARCHITECTURES:
+        for token in (arch.module, arch.class_name):
+            key = _normalize(token)
+            if len(key) >= 3 and key in norm and len(key) > best_len:
+                best_module, best_len = arch.module, len(key)
+    return best_module
+
+
+@functools.lru_cache(maxsize=None)
+def module_for(hf_name: str) -> str | None:
+    """Infer the fastkernels L4 module stem for a HuggingFace model.
+
+    Prefers the authoritative ``model_type`` from the model's config, read via
+    ``transformers`` (which, for uncached models, requires network access).
+    Several architectures can share a ``model_type`` (e.g. Llama, BitNet and
+    EAGLE-3 all report ``"llama"``), in which case the first registered one wins.
+
+    Falls back to a name-based match against the registered architectures only
+    when the config cannot be loaded (offline, gated, or a non-transformers
+    pipeline such as a diffusers model) or its ``model_type`` is unknown. This
+    keeps diffusers pipelines and custom repos (e.g. FLUX, YOLOv10, OpenFold3,
+    Oasis) resolvable. Returns ``None`` when neither the config nor the name
+    resolves.
+    """
+    try:
+        from transformers import AutoConfig
+
+        config = AutoConfig.from_pretrained(hf_name, trust_remote_code=True)
+        model_type = getattr(config, "model_type", None)
+    except Exception:
+        model_type = None
+    if model_type is not None:
+        for arch in _ARCHITECTURES:
+            if arch.model_type == model_type:
+                return arch.module
+    return _module_from_name(hf_name)
+
+
 @dataclass(frozen=True)
 class BenchmarkScenario:
-    module: str
     hf_name: str
     tp: int
     dtype: str
-    workloads: list[str]
+    workloads: list[Workload]
     num_requests: int | None = None
+    enforce_eager: bool = False
+    max_num_seqs: int | None = None
 
 # Benchmarking workload registry derived from bench.yaml
 DEFAULT_BENCHMARK: list[BenchmarkScenario] = [
-    BenchmarkScenario("llama", "meta-llama/Llama-3.1-8B-Instruct", 1, "bfloat16", ["prefill-heavy", "decode-heavy"], 100),
-    BenchmarkScenario("gpt_oss", "openai/gpt-oss-120b", 2, "mxfp4", ["prefill-heavy", "decode-heavy"], 100),
-    BenchmarkScenario("gla", "fla-hub/gla-2.7B-100B", 1, "bfloat16", ["prefill-heavy", "decode-heavy"], 100),
-    BenchmarkScenario("flux", "black-forest-labs/FLUX.1-dev", 1, "bfloat16", ["1024x1024", "512x512"]),
-    BenchmarkScenario("qwen3_vl", "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8", 4, "fp8", ["text-only", "image", "video"], 100),
-    BenchmarkScenario("yolov10", "jameslahm/yolov10n", 1, "bfloat16", ["coco-val"]),
-    BenchmarkScenario("openfold3", "OpenFold/OpenFold3", 1, "bfloat16", ["short", "medium", "long", "extra-long"]),
-    BenchmarkScenario("bge_m3", "BAAI/bge-m3", 1, "bfloat16", ["bge-m3-mldr-docs"]),
-    BenchmarkScenario("oasis", "Etched/oasis-500m", 1, "float16", ["short-bs4-16f-4ddim", "medium-bs8-24f-4ddim", "long-bs8-32f-4ddim", "denoise-bs4-16f-8ddim"]),
+    BenchmarkScenario("meta-llama/Llama-3.1-8B-Instruct", 1, "bfloat16", [LLM.prefill_heavy, LLM.decode_heavy], 100),
+    BenchmarkScenario("openai/gpt-oss-120b", 2, "mxfp4", [LLM.prefill_heavy, LLM.decode_heavy], 100),
+    BenchmarkScenario("fla-hub/gla-2.7B-100B", 1, "bfloat16", [LLM.prefill_heavy, LLM.decode_heavy], 100),
+    BenchmarkScenario("black-forest-labs/FLUX.1-dev", 1, "bfloat16", [Diffusion.res_1024, Diffusion.res_512]),
+    BenchmarkScenario("Qwen/Qwen3-VL-235B-A22B-Instruct-FP8", 4, "fp8", [VLM.text_only, VLM.image, VLM.video], 100),
+    BenchmarkScenario("jameslahm/yolov10n", 1, "bfloat16", [Detection.coco_val]),
+    BenchmarkScenario("OpenFold/OpenFold3", 1, "bfloat16", [StructurePrediction.short, StructurePrediction.medium, StructurePrediction.long, StructurePrediction.extra_long]),
+    BenchmarkScenario("BAAI/bge-m3", 1, "bfloat16", [Embedding.bge_m3_mldr_docs]),
+    BenchmarkScenario("Etched/oasis-500m", 1, "float16", [WorldModel.short_bs4_16f_4ddim, WorldModel.medium_bs8_24f_4ddim, WorldModel.long_bs8_32f_4ddim, WorldModel.denoise_bs4_16f_8ddim]),
 ]

@@ -254,30 +254,9 @@ def targets_for_model(model_key: str) -> list[BenchTarget]:
     return [t for t in discover_targets() if model_key in t.models]
 
 
-def print_model_operator_map() -> None:
-    """Print which operators each model uses, and which models each operator belongs to."""
-    targets = discover_targets()
-
-    model_to_targets: dict[str, list[BenchTarget]] = {}
-    for t in targets:
-        for m in t.models:
-            model_to_targets.setdefault(m, []).append(t)
-
-    print(f"\n{'=' * 70}")
-    print("  OPERATORS BY MODEL")
-    print(f"{'=' * 70}")
-    for model_key in sorted(model_to_targets):
-        ops = sorted(model_to_targets[model_key], key=lambda t: (t.level, t.name))
-        print(f"\n  {model_key}:")
-        for t in ops:
-            print(f"    L{t.level}  {t.name:<25} {t.target_cls.__name__}")
-
-    print(f"\n{'=' * 70}")
-    print("  MODELS BY OPERATOR")
-    print(f"{'=' * 70}")
-    for t in sorted(targets, key=lambda t: (t.level, t.name)):
-        print(f"  L{t.level}  {t.name:<25} {','.join(t.models)}")
-    print()
+# The human-readable model<->operator map now lives in ``fastkernels.list``
+# (``print_model_operator_map``), which builds it via pure static analysis with
+# no torch/import dependency.
 
 
 # ---------------------------------------------------------------------------

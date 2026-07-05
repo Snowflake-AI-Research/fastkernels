@@ -62,7 +62,7 @@ from fastkernels.tasks.baseline.L4.oasis import (  # noqa: E402
     OasisPipeline,
     OasisSamplingParams,
 )
-from fastkernels.bench.utils.workloads import (  # noqa: E402
+from fastkernels.workloads import (  # noqa: E402
     OASIS_LATENCY_WORKLOADS,
     OASIS_THROUGHPUT_WORKLOADS,
     OasisWorkload,

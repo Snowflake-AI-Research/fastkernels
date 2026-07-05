@@ -34,7 +34,7 @@ _PACKAGE_DIR = _THIS_DIR.parent
 _PROJECT_ROOT = _PACKAGE_DIR.parent
 
 from fastkernels.bench.utils.worker import run_worker
-from fastkernels.bench.utils.workloads import (
+from fastkernels.workloads import (
     SEGMENTATION_LATENCY_WORKLOADS,
     SEGMENTATION_THROUGHPUT_WORKLOADS,
     SEGMENTATION_VIDEO_WORKLOADS,

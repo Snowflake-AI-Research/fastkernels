@@ -178,9 +178,9 @@ from importlib import import_module
 
 run_worker = import_module(f"{_PACKAGE_NAME}.bench.utils.worker").run_worker
 load_real_prompt_workload = import_module(
-    f"{_PACKAGE_NAME}.bench.utils.real_prompts",
+    f"{_PACKAGE_NAME}.workloads",
 ).load_real_prompt_workload
-_workloads = import_module(f"{_PACKAGE_NAME}.bench.utils.workloads")
+_workloads = import_module(f"{_PACKAGE_NAME}.workloads")
 (
     ASR_LATENCY_WORKLOADS,
     ASR_THROUGHPUT_WORKLOADS,

@@ -26,10 +26,8 @@ from __future__ import annotations
 import argparse
 import sys
 
-from fastkernels.infra.kernel_swapper import (
-    list_targets,
-    print_model_operator_map,
-)
+from fastkernels.infra.kernel_swapper import list_targets
+from fastkernels.list import print_model_operator_map
 
 from .result import KernelBenchResult
 from .runner import run_all_kernel_benchmarks, run_kernel_benchmark

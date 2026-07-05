@@ -47,7 +47,7 @@ _PROJECT_ROOT = _PACKAGE_DIR.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from fastkernels.bench.utils.worker import run_worker
-from fastkernels.bench.utils.workloads import (
+from fastkernels.workloads import (
     STRUCTURE_PREDICTION_LATENCY_WORKLOADS,
     STRUCTURE_PREDICTION_THROUGHPUT_WORKLOADS,
 )

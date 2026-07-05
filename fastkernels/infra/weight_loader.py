@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import re
 from glob import glob
+from typing import TYPE_CHECKING
 
 import torch
 from huggingface_hub import snapshot_download
@@ -31,19 +32,17 @@ except ImportError:
 from concurrent.futures import ThreadPoolExecutor
 
 from .tp import _tp_size
-from ..tasks.baseline.L4.bitnet import BitNetConfig, BitNetForCausalLM
+# Only the (lightweight) Llama config/model is imported eagerly. Every other
+# architecture is imported lazily inside ``load_model`` / the EAGLE-3 loader so
+# that loading a plain Llama checkpoint does not require optional, arch-specific
+# dependencies (deep_gemm for DeepSeek, diffusers/peft for Flux, fla for the
+# linear-attention models, etc.).
 from ..tasks.baseline.L4.llama import LlamaConfig, LlamaForCausalLM
-from ..tasks.baseline.L4.llama_eagle3 import LlamaEagle3Config, LlamaForCausalLMEagle3
-from ..tasks.baseline.L4.llama4 import Llama4Config, Llama4ForCausalLM
-from ..tasks.baseline.L4.mixtral import MixtralConfig, MixtralForCausalLM
-from ..tasks.baseline.L4.qwen2_vl import Qwen2VLConfig, Qwen2VLForConditionalGeneration
-from ..tasks.baseline.L4.qwen3_vl import Qwen3VLConfig, Qwen3VLForConditionalGeneration
-from ..tasks.baseline.L4.qwen3_next import Qwen3NextConfig, Qwen3NextForCausalLM
-from ..tasks.baseline.L4.deepseek import DeepSeekV3Config, DeepSeekV3ForCausalLM
-from ..tasks.baseline.L4.flux import FluxConfig, FluxPipeline
-from ..tasks.baseline.L4.gemma4 import Gemma4Config, Gemma4ForCausalLM
-from ..tasks.baseline.L4.whisper import WhisperConfig, WhisperForConditionalGeneration
-from ..tasks.baseline.L4.cosyvoice3 import CosyVoice3Config, CosyVoice3ForTTS
+
+if TYPE_CHECKING:  # annotations only; never imported at runtime
+    from ..tasks.baseline.L4.llama_eagle3 import (
+        LlamaEagle3Config, LlamaForCausalLMEagle3,
+    )
 
 
 def default_weight_loader(param: torch.nn.Parameter, loaded_weight: torch.Tensor):
@@ -1371,6 +1370,7 @@ def load_model(
               f"top-{config.num_experts_per_tok})...")
         model = GptOssForCausalLM(config)
     elif model_type == "gemma4":
+        from ..tasks.baseline.L4.gemma4 import Gemma4Config, Gemma4ForCausalLM
         config = Gemma4Config.from_pretrained(model_name)
         config.dtype = dtype
         print(f"  Allocating Gemma4 model ({config.num_experts} experts, "
@@ -1419,6 +1419,9 @@ def load_model(
             print("  Allocating Qwen3-VL model...")
         model = Qwen3VLForConditionalGeneration(config, quant_config=quant_config)
     elif model_type == "qwen3_next":
+        from ..tasks.baseline.L4.qwen3_next import (
+            Qwen3NextConfig, Qwen3NextForCausalLM,
+        )
         config = Qwen3NextConfig.from_pretrained(model_name)
         config.dtype = dtype
         print(
@@ -1463,6 +1466,7 @@ def load_model(
               f"top-{config.num_experts_per_tok}, DSA topk={config.index_topk})...")
         model = DeepSeekV3ForCausalLM(config, quant_config=quant_config)
     elif model_type == "bitnet":
+        from ..tasks.baseline.L4.bitnet import BitNetConfig, BitNetForCausalLM
         config = BitNetConfig.from_pretrained(model_name)
         config.dtype = dtype
         print(f"  Allocating BitNet b1.58 model "
@@ -1584,8 +1588,51 @@ def load_model(
         if os.environ.get("KB_BITNET_BF16_ALIGN", "1") != "0":
             _override_bitnet_bf16_with_master(model, model_name, device)
 
+    _maybe_tie_word_embeddings(model, model_name, config)
+
     model.eval()
     return model, config
+
+
+def _maybe_tie_word_embeddings(model, model_name: str, config) -> None:
+    """Copy ``embed_tokens`` weights into ``lm_head`` for tied-embedding models.
+
+    Checkpoints for models with ``tie_word_embeddings=True`` (e.g.
+    Llama-3.2-1B/3B, Gemma, small Qwen) omit ``lm_head.weight``; without this
+    the LM head stays uninitialized and produces garbage logits. We detect the
+    flag from the HF config (fastkernels configs don't all carry it) and share
+    the embedding matrix into the LM head after loading.
+    """
+    tie = getattr(config, "tie_word_embeddings", None)
+    if tie is None:
+        try:
+            hf_cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+            tie = bool(getattr(hf_cfg, "tie_word_embeddings", False))
+        except (ValueError, OSError):
+            try:
+                tie = bool(_load_config_dict(model_name).get("tie_word_embeddings", False))
+            except Exception:
+                tie = False
+    if not tie:
+        return
+
+    try:
+        lm = model.get_parameter("lm_head.embedding_op.emb.weight")
+    except AttributeError:
+        return
+    for embed_name in (
+        "model.embed_tokens.embedding_op.emb.weight",
+        "model.model.embed_tokens.embedding_op.emb.weight",
+    ):
+        try:
+            emb = model.get_parameter(embed_name)
+        except AttributeError:
+            continue
+        if emb.shape == lm.shape:
+            lm.data.copy_(emb.data.to(device=lm.device, dtype=lm.dtype))
+            print("  Tied lm_head to embed_tokens (tie_word_embeddings=True).",
+                  flush=True)
+        return
 
 
 
@@ -1862,6 +1909,9 @@ def load_eagle3_draft_model(
     ``model.set_embed_tokens(target.model.embed_tokens)`` to share memory with
     the target.
     """
+    from ..tasks.baseline.L4.llama_eagle3 import (
+        LlamaEagle3Config, LlamaForCausalLMEagle3,
+    )
     model_path = snapshot_download(
         draft_repo,
         allow_patterns=["*.safetensors", "*.json", "*.bin"],

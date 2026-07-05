@@ -150,7 +150,7 @@ def _build_real_token_prompts(
     except Exception:
         pass
 
-    from fastkernels.bench.utils.real_prompts import (
+    from fastkernels.workloads import (
         DEFAULT_WORKLOAD_DATASETS,
         load_real_prompt_workload,
     )

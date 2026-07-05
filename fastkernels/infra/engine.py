@@ -32,7 +32,7 @@ from transformers import AutoTokenizer
 
 from .context import (
     AttnBackendConfig, CUDAGraphMode, auto_register_no_compile_layers,
-    disable_custom_ops, enable_custom_ops,
+    clear_no_compile_layers, disable_custom_ops, enable_custom_ops,
     get_attn_backend_config, get_context,
     KimiLinearMetadata, reset_context, set_context, set_forward_context,
     set_mamba_context, set_mixed_context,
@@ -4949,25 +4949,36 @@ class LlamaEngine:
         # Launch non-rank-0 workers
         self.workers = []
         self.events = []
+        # Register cleanup BEFORE spawning workers so that if construction fails
+        # partway (e.g. rank 0 OOMs after the workers are already spawned) the
+        # orphaned workers are still torn down instead of leaking their GPU
+        # memory and hanging the process at exit.
+        atexit.register(self._cleanup)
         ctx = mp.get_context("spawn")
-        for i in range(1, tensor_parallel_size):
-            event = ctx.Event()
-            p = ctx.Process(
-                target=ModelRunner,
-                args=(model_name, i, tensor_parallel_size, dtype,
-                      enforce_eager, event, shm_name),
-                kwargs=mr_kwargs,
-            )
-            p.start()
-            self.workers.append(p)
-            self.events.append(event)
+        try:
+            for i in range(1, tensor_parallel_size):
+                event = ctx.Event()
+                p = ctx.Process(
+                    target=ModelRunner,
+                    args=(model_name, i, tensor_parallel_size, dtype,
+                          enforce_eager, event, shm_name),
+                    kwargs=mr_kwargs,
+                )
+                p.start()
+                self.workers.append(p)
+                self.events.append(event)
 
-        # Rank 0 model runner (events is a list for rank 0)
-        self.model_runner = ModelRunner(
-            model_name, 0, tensor_parallel_size, dtype,
-            enforce_eager, self.events, shm_name,
-            **mr_kwargs,
-        )
+            # Rank 0 model runner (events is a list for rank 0)
+            self.model_runner = ModelRunner(
+                model_name, 0, tensor_parallel_size, dtype,
+                enforce_eager, self.events, shm_name,
+                **mr_kwargs,
+            )
+        except BaseException:
+            # Free workers/GPU immediately so the caller can recover (and the
+            # next engine is not starved of memory), then re-raise.
+            self._cleanup()
+            raise
         self.is_mamba = self.model_runner.is_mamba
         self.is_kimi_linear = self.model_runner.is_kimi_linear
         self.is_qwen3_next = self.model_runner.is_qwen3_next
@@ -5007,8 +5018,6 @@ class LlamaEngine:
             from transformers import WhisperProcessor
             self.whisper_processor = WhisperProcessor.from_pretrained(model_name)
 
-        atexit.register(self._cleanup)
-
     def _set_seeds(self, seed):
         random.seed(seed)
         np.random.seed(seed)
@@ -5016,14 +5025,40 @@ class LlamaEngine:
         torch.cuda.manual_seed_all(seed)
 
     def _cleanup(self):
-        if hasattr(self, "model_runner"):
+        # Idempotent: safe to call explicitly between scenarios and again at
+        # interpreter exit (via atexit). Tears the model down and, crucially,
+        # guarantees every spawned worker is dead so Python's built-in
+        # multiprocessing atexit handler (which joins non-daemon children with
+        # NO timeout) cannot hang the whole process at shutdown.
+        mr = getattr(self, "model_runner", None)
+        signalled = False
+        if mr is not None:
             try:
-                self.model_runner.call("exit")
+                mr.call("exit")
+                signalled = True
             except Exception:
                 pass
-            del self.model_runner
-            for p in self.workers:
-                p.join(timeout=10)
+            self.model_runner = None
+        for p in getattr(self, "workers", []):
+            try:
+                # Only wait for a graceful exit if we actually signalled one;
+                # otherwise (e.g. failed construction) go straight to kill.
+                if signalled:
+                    p.join(timeout=10)
+                if p.is_alive():
+                    p.kill()
+                    p.join(timeout=5)
+            except Exception:
+                pass
+        self.workers = []
+        # Drop the module-level registry that pins this model's attention/MoE
+        # layers (and the KV-cache slices they reference); otherwise the model
+        # and its KV cache cannot be garbage-collected between engines.
+        try:
+            clear_no_compile_layers()
+        except Exception:
+            pass
+        if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
     def _sample_greedy(self, logits):

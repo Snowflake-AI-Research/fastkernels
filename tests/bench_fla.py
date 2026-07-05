@@ -61,8 +61,11 @@ _PROJECT_ROOT = _PACKAGE_DIR.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from fastkernels.bench.utils.worker import run_worker
-from fastkernels.bench.utils.real_prompts import load_real_prompt_workload
-from fastkernels.bench.utils.workloads import LATENCY_WORKLOADS, THROUGHPUT_WORKLOADS
+from fastkernels.workloads import (
+    LATENCY_WORKLOADS,
+    THROUGHPUT_WORKLOADS,
+    load_real_prompt_workload,
+)
 from fastkernels.tests.bench_vllm import compute_alignment
 
 

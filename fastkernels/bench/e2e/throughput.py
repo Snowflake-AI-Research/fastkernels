@@ -34,12 +34,12 @@ import numpy as np
 import torch
 from transformers import AutoTokenizer
 
-from fastkernels.bench.utils.datasets import (
+from fastkernels.workloads import (
     SampleRequest,
     add_dataset_parser,
     get_samples,
+    load_real_prompt_workload,
 )
-from fastkernels.bench.utils.real_prompts import load_real_prompt_workload
 from fastkernels.bench.utils.worker import FASTKERNELS_WORKER, run_worker
 from fastkernels.infra.kernel_swapper import (
     apply_candidates,

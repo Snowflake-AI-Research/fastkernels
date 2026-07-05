@@ -164,7 +164,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     repo_root, _ = _repo_paths()
-    from fastkernels.bench.utils.real_prompts import (
+    from fastkernels.workloads import (
         DEFAULT_WORKLOAD_DATASETS,
         load_real_prompt_workload,
     )

@@ -58,7 +58,7 @@ _PROJECT_ROOT = _PACKAGE_DIR.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from fastkernels.bench.utils.worker import run_worker
-from fastkernels.bench.utils.workloads import PI0_CONFIG
+from fastkernels.workloads import PI0_CONFIG
 
 
 def _detect_gpu_name() -> str:

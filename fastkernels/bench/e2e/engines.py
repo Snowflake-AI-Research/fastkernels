@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
-from fastkernels.bench.utils.datasets import SampleRequest
+from fastkernels.workloads import SampleRequest
 
 
 @dataclass

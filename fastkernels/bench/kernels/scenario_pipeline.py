@@ -779,7 +779,7 @@ def trace_diffusion_model(
 ) -> Path:
     if tp != 1:
         raise ValueError(f"DiffusionEngine only supports tp=1, got tp={tp}")
-    from fastkernels.bench.utils.workloads import DIFFUSION_THROUGHPUT_WORKLOADS, FLUX_CONFIG
+    from fastkernels.workloads import DIFFUSION_THROUGHPUT_WORKLOADS, FLUX_CONFIG
     from fastkernels.infra.diffusion_engine import DiffusionEngine
     from fastkernels.tasks.baseline.L4.flux import DiffusionSamplingParams
 
@@ -845,7 +845,7 @@ def trace_embedding_model(
 ) -> Path:
     if tp != 1:
         raise ValueError(f"EmbeddingEngine only supports tp=1, got tp={tp}")
-    from fastkernels.bench.utils.workloads import EMBEDDING_THROUGHPUT_WORKLOADS
+    from fastkernels.workloads import EMBEDDING_THROUGHPUT_WORKLOADS
     from fastkernels.infra.embedding_engine import EmbeddingEngine
 
     by_name = {w.name: w for w in EMBEDDING_THROUGHPUT_WORKLOADS}
@@ -897,7 +897,7 @@ def trace_oasis_model(
 ) -> Path:
     if tp != 1:
         raise ValueError(f"OasisEngine only supports tp=1, got tp={tp}")
-    from fastkernels.bench.utils.workloads import OASIS_THROUGHPUT_WORKLOADS
+    from fastkernels.workloads import OASIS_THROUGHPUT_WORKLOADS
     from fastkernels.infra.oasis_engine import OasisEngine
     from fastkernels.tasks.baseline.L4.oasis import OasisSamplingParams
 
@@ -958,7 +958,7 @@ def trace_detection_model(
 ) -> Path:
     if tp != 1:
         raise ValueError(f"Detection tracing only supports tp=1, got tp={tp}")
-    from fastkernels.bench.utils.workloads import DETECTION_THROUGHPUT_WORKLOADS
+    from fastkernels.workloads import DETECTION_THROUGHPUT_WORKLOADS
     from fastkernels.infra.detection_loader import load_ours_detector
 
     by_name = {w.name: w for w in DETECTION_THROUGHPUT_WORKLOADS}
@@ -1013,7 +1013,7 @@ def trace_vlm_model(
     num_requests: int | None = None,
     decode_cap: int | None = None,
 ) -> Path:
-    from fastkernels.bench.utils.workloads import VLM_THROUGHPUT_WORKLOADS
+    from fastkernels.workloads import VLM_THROUGHPUT_WORKLOADS
     from fastkernels.infra.engine import LlamaEngine, SamplingParams
 
     by_name = {w.name: w for w in VLM_THROUGHPUT_WORKLOADS}
@@ -1176,8 +1176,11 @@ def _load_standard_workload(
     decode_cap: int | None,
     seed: int,
 ) -> tuple[list[list[int]], list[int]]:
-    from fastkernels.bench.utils.real_prompts import load_real_prompt_workload
-    from fastkernels.bench.utils.workloads import THROUGHPUT_WORKLOADS, VLM_THROUGHPUT_WORKLOADS
+    from fastkernels.workloads import (
+        THROUGHPUT_WORKLOADS,
+        VLM_THROUGHPUT_WORKLOADS,
+        load_real_prompt_workload,
+    )
 
     by_name = {w.name: w for w in THROUGHPUT_WORKLOADS}
     if workload not in by_name:

@@ -45,7 +45,7 @@ _PROJECT_ROOT = _PACKAGE_DIR.parent
 
 from fastkernels.bench.eval.config import MODEL_CATEGORY
 from fastkernels.bench.utils.worker import run_worker
-from fastkernels.bench.utils.workloads import (
+from fastkernels.workloads import (
     COSYVOICE3_CONFIG,
     DIFFUSION_LATENCY_WORKLOADS,
     DIFFUSION_THROUGHPUT_WORKLOADS,

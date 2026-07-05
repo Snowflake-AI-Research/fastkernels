@@ -969,7 +969,7 @@ def test_section_4():
     print("  SECTION 4: Standardized workloads")
     print(f"{'=' * 60}")
 
-    from fastkernels.bench.utils.workloads import (
+    from fastkernels.workloads import (
         LATENCY_WORKLOADS,
         THROUGHPUT_WORKLOADS,
         get_max_seq_len,

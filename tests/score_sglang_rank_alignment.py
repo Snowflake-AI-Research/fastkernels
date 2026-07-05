@@ -25,7 +25,7 @@ _PROJECT_ROOT = _PACKAGE_DIR.parent
 
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from fastkernels.bench.utils.real_prompts import (  # noqa: E402
+from fastkernels.workloads import (  # noqa: E402
     DEFAULT_WORKLOAD_DATASETS,
     load_real_prompt_workload,
 )
