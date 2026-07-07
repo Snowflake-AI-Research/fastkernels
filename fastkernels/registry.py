@@ -219,7 +219,7 @@ _VJEPA_ALL = [VideoRepresentation.predictor, VideoRepresentation.encoder, VideoR
 FULL_BENCHMARK: list[BenchmarkScenario] = [
     # --- Dense & MoE LLMs ---
     BenchmarkScenario("meta-llama/Llama-3.1-8B-Instruct", 1, "bfloat16", _LLM_ALL),
-    BenchmarkScenario("deepseek-ai/DeepSeek-V3.2-Exp", 8, "bfloat16", _LLM_ALL),
+    BenchmarkScenario("deepseek-ai/DeepSeek-V3.2-Exp", 8, "fp8", _LLM_ALL),
     BenchmarkScenario("mistralai/Mixtral-8x7B-v0.1", 2, "bfloat16", _LLM_ALL),
     BenchmarkScenario("1bitLLM/bitnet_b1_58-3B", 1, "bfloat16", _LLM_ALL),
     BenchmarkScenario("openai/gpt-oss-120b", 2, "mxfp4", _LLM_ALL),
@@ -232,7 +232,7 @@ FULL_BENCHMARK: list[BenchmarkScenario] = [
     BenchmarkScenario("fla-hub/gla-2.7B-100B", 1, "bfloat16", _LLM_ALL),
     BenchmarkScenario("fla-hub/retnet-2.7B-100B", 1, "bfloat16", _LLM_ALL),
     BenchmarkScenario("Qwen/Qwen3-Next-80B-A3B-Instruct", 4, "bfloat16", _LLM_ALL),
-    BenchmarkScenario("moonshotai/Kimi-Linear-48B-A3B-Instruct", 4, "bfloat16", _LLM_ALL),
+    BenchmarkScenario("moonshotai/Kimi-Linear-48B-A3B-Instruct", 2, "bfloat16", _LLM_ALL),
     BenchmarkScenario("ttt_e2e", 1, "bfloat16", _LLM_ALL),                      # TTT-E2E (Project Gutenberg contiguous text; random-init weights, no public ckpt)
     BenchmarkScenario("ai21labs/AI21-Jamba-Mini-1.7", 2, "bfloat16", _LLM_ALL),
     # --- Vision / Video / Audio ---
@@ -244,7 +244,7 @@ FULL_BENCHMARK: list[BenchmarkScenario] = [
     BenchmarkScenario("FunAudioLLM/Fun-CosyVoice3-0.5B-2512", 1, "bfloat16", _TTS_ALL),
     # --- Multimodal & Encoders ---
     BenchmarkScenario("Qwen/Qwen2-VL-7B-Instruct", 1, "bfloat16", _VLM_ALL),
-    BenchmarkScenario("Qwen/Qwen3-VL-235B-A22B-Instruct", 8, "bfloat16", _VLM_ALL),
+    BenchmarkScenario("Qwen/Qwen3-VL-235B-A22B-Instruct", 4, "fp8", _VLM_ALL),
     BenchmarkScenario("Qwen/Qwen2.5-Omni-7B", 1, "bfloat16", _OMNI_ALL),
     BenchmarkScenario("google/siglip2-so400m-patch16-naflex", 1, "bfloat16", _VISION_ENCODER_ALL),
     BenchmarkScenario("facebook/dinov3-vit7b16-pretrain-lvd1689m", 1, "bfloat16", _VISION_ENCODER_ALL),

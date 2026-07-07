@@ -11,11 +11,20 @@ capture workloads all come from a list of ``BenchmarkScenario`` objects
 (``CAPTURE_SCENARIOS`` below): each scenario is loaded into its own engine and
 every workload it lists is captured to a separate report.
 
+Scenarios are captured in parallel across the available GPUs. Each scenario
+runs in its own child process pinned to a private set of GPUs (a ``tp=N``
+scenario claims N GPUs) via ``CUDA_VISIBLE_DEVICES``; the scheduler packs
+scenarios onto the GPU pool by TP degree and launches the next one as soon as
+enough GPUs free up. Because every scenario is isolated in its own process, a
+crash, OOM or CUDA fault in one never brings down the others -- it is recorded
+as that scenario's failure and the rest continue. Use ``--gpus`` to restrict the
+pool (with a single GPU the scenarios simply run one at a time).
+
 Usage::
 
-    python -m fastkernels capture
-    python -m fastkernels capture --max-tokens 8 --output /tmp/llama32_1b_ops.json
-    python -m fastkernels capture --prompt "Say hello."   # ad-hoc prompt override
+    python -m fastkernels capture                          # parallel, all GPUs
+    python -m fastkernels capture --gpus 0,1,2,3           # restrict the GPU pool
+    python -m fastkernels capture --output /tmp/llama32_1b_ops.json
     python -m fastkernels.capture --selftest   # offline scheduler fuzz, no GPU
 
 The capture is cross-checked two independent ways: (1) a forward-pre-hook that
@@ -36,8 +45,12 @@ import importlib
 import importlib.util
 import inspect
 import json
+import os
 import pkgutil
+import shutil
+import subprocess
 import sys
+import time
 import traceback
 import types
 from datetime import datetime
@@ -46,11 +59,17 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from .registry import DEFAULT_BENCHMARK
+from .registry import FULL_BENCHMARK
 from .workloads import load_real_prompt_workload
 
 # Default directory for capture reports (override per-run with ``--output``).
 CAPTURE_DIR = Path.home() / ".fastkernels" / "captures"
+
+# Internal env var the parallel scheduler uses to tell a worker subprocess which
+# scenario to capture. It is set (alongside CUDA_VISIBLE_DEVICES) by the parent
+# and read at startup by the child; it is deliberately NOT a user-facing CLI
+# flag, so a normal ``fastkernels capture`` invocation never sees it.
+_WORKER_INDEX_ENV = "FK_CAPTURE_WORKER_INDEX"
 
 # The package that holds every fastkernels operator (nn.Module) definition.
 _BASELINE_PACKAGE = "fastkernels.tasks.baseline"
@@ -106,16 +125,16 @@ def _install_optional_dependency_stubs(names=_OPTIONAL_KERNEL_DEPS) -> list[str]
         stubbed.append(name)
     return stubbed
 
-# NOTE: The capture prompts now come from standardized BenchmarkScenario
-# workloads (``CAPTURE_SCENARIOS`` below) rather than these ad-hoc prompts. The
-# old ``DEFAULT_PROMPTS`` list is kept, commented out, for reference and quick
-# manual runs via ``--prompt``.
+# NOTE: The capture prompts come from standardized BenchmarkScenario workloads
+# (``CAPTURE_SCENARIOS`` below). The old ``DEFAULT_PROMPTS`` list (and the
+# ad-hoc ``--prompt`` override that consumed it) has been removed; the list is
+# kept here, commented out, for reference only.
 #
-# Short, varied prompts. They ask for brief answers so that -- once wrapped in
+# Short, varied prompts that ask for brief answers so that -- once wrapped in
 # the instruct chat template -- greedy decoding emits the end-of-turn token and
-# stops well before ``--max-tokens``. There are intentionally more prompts than
-# the default batch size so the continuous batch has to admit waiting requests
-# as earlier ones finish.
+# stops quickly. There are intentionally more prompts than the default batch
+# size so the continuous batch has to admit waiting requests as earlier ones
+# finish.
 # DEFAULT_PROMPTS = [
 #     "What is the capital of France? Answer in one word.",
 #     "What is 2 + 2? Reply with just the number.",
@@ -132,10 +151,9 @@ def _install_optional_dependency_stubs(names=_OPTIONAL_KERNEL_DEPS) -> list[str]
 # ]
 
 # Capture scenarios: each entry is loaded into its own engine and every workload
-# it lists is captured to a separate report. Here we run the first two
-# standardized benchmark scenarios from the registry (Llama-3.1-8B-Instruct and
-# gpt-oss-120b), each with its mixed/long-context workloads.
-CAPTURE_SCENARIOS = DEFAULT_BENCHMARK[:2]
+# it lists is captured to a separate report. We capture the full standardized
+# benchmark set from the registry, each scenario with its own workloads.
+CAPTURE_SCENARIOS = FULL_BENCHMARK[:]
 
 # qualified_name -> {"init": {...}, "forward": {...}}
 _RECORDS: dict[str, dict] = {}
@@ -865,31 +883,35 @@ def _report_path(output_arg, scenario, workload: str, multi: bool, num_requests:
     return CAPTURE_DIR / f"{slug}.json"
 
 
-def _prepare_prompts(engine, prompts: list[str], use_chat_template: bool):
-    """Return (engine_inputs, used_chat_template).
-
-    When a chat template is available we tokenize each prompt as a single-turn
-    user message with a generation prompt, so an instruct model produces a
-    bounded assistant turn ending in the end-of-turn token. Token-id lists are
-    handed to the engine directly to avoid re-adding a BOS token.
-    """
-    tok = engine.tokenizer
-    if use_chat_template and getattr(tok, "chat_template", None):
-        try:
-            return (
-                [
-                    tok.apply_chat_template(
-                        [{"role": "user", "content": p}],
-                        add_generation_prompt=True,
-                        tokenize=True,
-                    )
-                    for p in prompts
-                ],
-                True,
-            )
-        except Exception as exc:  # noqa: BLE001
-            print(f"  (chat template unavailable: {exc}; using raw prompts)")
-    return list(prompts), False
+# NOTE: ``_prepare_prompts`` supported the removed ``--prompt`` ad-hoc override
+# (raw strings, optionally chat-templated). It is kept here, commented out, for
+# reference; capture now only runs real scenario workloads (already tokenized).
+#
+# def _prepare_prompts(engine, prompts: list[str], use_chat_template: bool):
+#     """Return (engine_inputs, used_chat_template).
+#
+#     When a chat template is available we tokenize each prompt as a single-turn
+#     user message with a generation prompt, so an instruct model produces a
+#     bounded assistant turn ending in the end-of-turn token. Token-id lists are
+#     handed to the engine directly to avoid re-adding a BOS token.
+#     """
+#     tok = engine.tokenizer
+#     if use_chat_template and getattr(tok, "chat_template", None):
+#         try:
+#             return (
+#                 [
+#                     tok.apply_chat_template(
+#                         [{"role": "user", "content": p}],
+#                         add_generation_prompt=True,
+#                         tokenize=True,
+#                     )
+#                     for p in prompts
+#                 ],
+#                 True,
+#             )
+#         except Exception as exc:  # noqa: BLE001
+#             print(f"  (chat template unavailable: {exc}; using raw prompts)")
+#     return list(prompts), False
 
 
 def _capture_scenario(scenario, runs, args, LlamaEngine, SamplingParams,
@@ -944,43 +966,46 @@ def _capture_scenario(scenario, runs, args, LlamaEngine, SamplingParams,
                 engine.model_runner.model, instrumented,
             )
 
-            # 5) Assemble the capture inputs. For a scenario workload we load
-            #    real, chat-templated prompts, fed to the engine as token-id
-            #    lists; the --prompt override feeds ad-hoc raw strings instead.
-            if wl is None:
-                gen_prompts, used_chat_template = _prepare_prompts(
-                    engine, args.prompts, use_chat_template=not args.no_chat_template,
-                )
-                prompt_texts = list(args.prompts)
-                # Ad-hoc prompts have no reference response, so fall back to the
-                # fixed --max-tokens cap for every request.
-                max_new_tokens = [args.max_tokens] * len(gen_prompts)
-            else:
-                # Cap capture at ``--num-requests`` prompts per workload (enough
-                # to see the representative shapes without running the full
-                # throughput dataset); the loader returns fewer if the workload
-                # has fewer rows (e.g. long-context has 64).
-                n_req = args.num_requests
-                print(f"Loading '{wl_label}' workload prompts ({n_req}) ...")
-                samples = load_real_prompt_workload(
-                    wl_label, engine.tokenizer, num_requests=n_req,
-                )
-                gen_prompts = [list(s.prompt_token_ids) for s in samples]
-                # Per-request generation budget from the HF dataset's own
-                # response length (like bench_vllm.py), so the decode phase
-                # matches the workload's real output-length distribution instead
-                # of a flat cap.
-                max_new_tokens = [s.output_len for s in samples]
-                used_chat_template = True
-                # Decode WITH special tokens so the chat-template structure is
-                # preserved. Decoding with skip_special_tokens=True strips the
-                # structural delimiters (e.g. gpt-oss harmony's <|start|>/
-                # <|message|>) but keeps the plain-text role/channel labels,
-                # gluing them onto the content ("systemYou are ChatGPT...").
-                prompt_texts = [
-                    engine.tokenizer.decode(ids, skip_special_tokens=False)
-                    for ids in gen_prompts
-                ]
+            # 5) Assemble the capture inputs by loading real, chat-templated
+            #    prompts and feeding them to the engine as token-id lists.
+            #
+            #    NOTE: the ``--prompt`` ad-hoc override (and its ``--max-tokens``
+            #    budget) was removed. Previously a workload of ``None`` captured
+            #    user-supplied raw strings instead:
+            #
+            #        if wl is None:
+            #            gen_prompts, used_chat_template = _prepare_prompts(
+            #                engine, args.prompts,
+            #                use_chat_template=not args.no_chat_template)
+            #            prompt_texts = list(args.prompts)
+            #            max_new_tokens = [args.max_tokens] * len(gen_prompts)
+            #
+            #    Every run is now a real scenario workload.
+            #
+            # The loader returns every available row up to ``--num-requests``
+            # (the default is large enough to use them all); curated sets return
+            # fewer if they have fewer rows (e.g. long-context has 64).
+            n_req = args.num_requests
+            print(f"Loading '{wl_label}' workload prompts ({n_req}) ...")
+            samples = load_real_prompt_workload(
+                wl_label, engine.tokenizer, num_requests=n_req,
+            )
+            gen_prompts = [list(s.prompt_token_ids) for s in samples]
+            # Per-request generation budget from the HF dataset's own
+            # response length (like bench_vllm.py), so the decode phase
+            # matches the workload's real output-length distribution instead
+            # of a flat cap.
+            max_new_tokens = [s.output_len for s in samples]
+            used_chat_template = True
+            # Decode WITH special tokens so the chat-template structure is
+            # preserved. Decoding with skip_special_tokens=True strips the
+            # structural delimiters (e.g. gpt-oss harmony's <|start|>/
+            # <|message|>) but keeps the plain-text role/channel labels,
+            # gluing them onto the content ("systemYou are ChatGPT...").
+            prompt_texts = [
+                engine.tokenizer.decode(ids, skip_special_tokens=False)
+                for ids in gen_prompts
+            ]
             # One SamplingParams per request so each gets its own max_tokens.
             # ignore_eos is left False so short answers still stop naturally at
             # EOS (keeping stored responses clean); the dataset length is an
@@ -1053,9 +1078,7 @@ def _capture_scenario(scenario, runs, args, LlamaEngine, SamplingParams,
                 "max_batch_size": engine.max_num_seqs,
                 "batch_refilled": len(gen_prompts) > engine.max_num_seqs,
                 "used_chat_template": used_chat_template,
-                "max_new_tokens_source": (
-                    "fixed" if wl is None else "dataset_response_length"
-                ),
+                "max_new_tokens_source": "dataset_response_length",
                 "max_new_tokens_range": [min(max_new_tokens), max(max_new_tokens)],
                 "num_finished_by_eos": num_eos,
                 "num_hit_max_tokens": len(gen_lengths) - num_eos,
@@ -1142,6 +1165,220 @@ def _capture_scenario(scenario, runs, args, LlamaEngine, SamplingParams,
     return written, ok
 
 
+# ---------------------------------------------------------------------------
+# GPU-aware parallel scheduler
+#
+# Each scenario is captured in its own child process, pinned to a private set of
+# GPUs via ``CUDA_VISIBLE_DEVICES`` (a scenario with ``tp=N`` claims N GPUs).
+# Subprocess isolation is what makes this robust: capture instruments operators
+# with process-global monkey-patches and accumulates into module-level dicts, so
+# scenarios cannot safely share an interpreter -- and a crash, OOM or CUDA fault
+# in one child can never take down the parent or the other scenarios. The
+# scheduler packs scenarios onto the available GPUs by TP degree and launches
+# the next one as soon as enough GPUs free up.
+# ---------------------------------------------------------------------------
+def _detect_gpu_ids(explicit: str | None) -> list[str]:
+    """Physical GPU ids available for scheduling, as opaque strings.
+
+    Priority: ``--gpus`` > ``CUDA_VISIBLE_DEVICES`` > ``nvidia-smi`` > torch.
+    Ids stay strings so integer indices and MIG/UUID device specs both
+    round-trip cleanly into each child's ``CUDA_VISIBLE_DEVICES``.
+    """
+    if explicit:
+        return [tok.strip() for tok in explicit.split(",") if tok.strip()]
+    env = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if env is not None and env.strip() != "":
+        return [tok.strip() for tok in env.split(",") if tok.strip()]
+    nvsmi = shutil.which("nvidia-smi")
+    if nvsmi is not None:
+        try:
+            out = subprocess.run(
+                [nvsmi, "--query-gpu=index", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=30, check=True,
+            ).stdout
+            ids = [ln.strip() for ln in out.splitlines() if ln.strip()]
+            if ids:
+                return ids
+        except Exception:  # noqa: BLE001 - fall back to torch below
+            pass
+    try:
+        n = torch.cuda.device_count()
+    except Exception:  # noqa: BLE001
+        n = 0
+    return [str(i) for i in range(n)]
+
+
+def _scenario_log_name(scenario, index: int) -> str:
+    """Filesystem-safe, per-scenario log filename stem."""
+    model = scenario.hf_name.replace("/", "__")
+    return f"{index:02d}_{model}_tp{scenario.tp}_{scenario.dtype}"
+
+
+def _wait_any(running: dict, poll: float = 1.0) -> list:
+    """Block until at least one running child exits; return the finished procs."""
+    while True:
+        done = [proc for proc in running if proc.poll() is not None]
+        if done:
+            return done
+        time.sleep(poll)
+
+
+def _print_log_tail(log_path: Path, n: int = 20) -> None:
+    try:
+        lines = log_path.read_text(errors="replace").splitlines()
+    except OSError:
+        return
+    tail = lines[-n:]
+    print(f"     --- last {len(tail)} line(s) of {log_path} ---")
+    for ln in tail:
+        print(f"     | {ln}")
+
+
+def _worker_command(args) -> list[str]:
+    """Argv for a worker child. Which scenario it captures is passed out-of-band
+    via the ``_WORKER_INDEX_ENV`` environment variable (set by ``_launch``), so
+    there is no user-facing scenario-selection flag.
+    """
+    cmd = [
+        sys.executable, "-m", "fastkernels.capture",
+        "--num-requests", str(args.num_requests),
+    ]
+    if args.output:
+        cmd += ["--output", args.output]
+    return cmd
+
+
+def _run_scenarios_parallel(scenarios, args, gpu_ids: list[str]) -> int:
+    """Capture ``scenarios`` concurrently, packing them onto ``gpu_ids`` by TP.
+
+    Returns a process exit code (0 iff every scenario captured and verified).
+    Any scenario that fails -- to schedule, build, run, or verify -- is recorded
+    and reported without affecting the others.
+    """
+    total = len(gpu_ids)
+    log_dir = CAPTURE_DIR / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    # status: index -> (state, detail); state in {ok, verify-failed, error, skipped}
+    results: dict[int, tuple[str, str]] = {}
+    pending: list[tuple[int, object]] = []
+    for i, s in enumerate(scenarios):
+        if s.tp > total:
+            detail = f"needs tp={s.tp} > {total} GPU(s) available"
+            results[i] = ("skipped", detail)
+            print(f"  !! SKIP scenario[{i}] {s.hf_name}: {detail}")
+        else:
+            pending.append((i, s))
+    # Larger-TP scenarios first so they claim GPUs instead of being starved by a
+    # stream of single-GPU jobs; ties keep registry order.
+    pending.sort(key=lambda t: (-t[1].tp, t[0]))
+
+    free = list(gpu_ids)
+    running: dict = {}
+
+    def _launch(i, s) -> None:
+        assign = [free.pop(0) for _ in range(s.tp)]
+        env = dict(os.environ)
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(assign)
+        env[_WORKER_INDEX_ENV] = str(i)
+        log_path = log_dir / f"{_scenario_log_name(s, i)}.log"
+        logf = open(log_path, "w")
+        proc = subprocess.Popen(
+            _worker_command(args), stdout=logf,
+            stderr=subprocess.STDOUT, env=env,
+        )
+        running[proc] = {
+            "index": i, "scenario": s, "gpus": assign,
+            "log": log_path, "logf": logf,
+        }
+        print(
+            f"  -> [GPU {env['CUDA_VISIBLE_DEVICES']}] scenario[{i}] "
+            f"{s.hf_name} (tp={s.tp}) started; log {log_path}"
+        )
+
+    try:
+        while pending or running:
+            # Greedily launch every pending scenario that fits the free pool.
+            made_progress = True
+            while made_progress:
+                made_progress = False
+                for pos, (i, s) in enumerate(pending):
+                    if s.tp <= len(free):
+                        _launch(i, s)
+                        pending.pop(pos)
+                        made_progress = True
+                        break
+
+            if not running:
+                # Nothing running and nothing launchable: cannot happen after the
+                # tp>total filter, but never spin forever.
+                for i, s in pending:
+                    results[i] = ("skipped", "could not be scheduled")
+                break
+
+            for proc in _wait_any(running):
+                info = running.pop(proc)
+                info["logf"].close()
+                free.extend(info["gpus"])
+                i, s, rc = info["index"], info["scenario"], proc.returncode
+                if rc == 0:
+                    results[i] = ("ok", "")
+                elif rc == 1:
+                    results[i] = ("verify-failed", str(info["log"]))
+                else:
+                    results[i] = ("error", f"exit={rc}; {info['log']}")
+                print(
+                    f"  <- [{results[i][0].upper()}] scenario[{i}] {s.hf_name} "
+                    f"(rc={rc}); freed GPU {','.join(info['gpus'])}"
+                )
+                if rc != 0:
+                    _print_log_tail(info["log"])
+    finally:
+        # Never leave orphaned GPU processes behind on interrupt/error.
+        for proc, info in list(running.items()):
+            proc.terminate()
+            info["logf"].close()
+
+    print("\nCapture summary:")
+    ok_all = True
+    for i, s in enumerate(scenarios):
+        state, detail = results.get(i, ("unknown", ""))
+        if state != "ok":
+            ok_all = False
+        line = f"  [{state.upper()}] scenario[{i}] {s.hf_name} (tp={s.tp})"
+        if detail:
+            line += f" -- {detail}"
+        print(line)
+    return 0 if ok_all else 1
+
+
+def _setup_capture():
+    """Shared per-process setup: stub optional deps, import the engine, then
+    discover + instrument every operator once. Returns the engine classes and
+    the instrumented-operator set used by ``_capture_scenario``.
+    """
+    # 0) Stub out optional GPU kernel libs (deep_gemm) if missing so the engine
+    #    and the DeepSeek operator chain can be imported.
+    stubbed = _install_optional_dependency_stubs()
+    if stubbed:
+        print(f"  Stubbed missing optional deps: {', '.join(stubbed)}")
+
+    # 1) Import the engine module FIRST so transformers and the LLM path load in
+    #    the correct order (avoids torch.library/collective registration clashes
+    #    that happen if unrelated operator modules import ahead of it).
+    print("Importing fastkernels engine ...")
+    from .infra.engine import LlamaEngine, SamplingParams
+
+    # 2) Discover & instrument every operator ONCE, before any engine builds a
+    #    model, so __init__ calls are captured too.
+    print(f"Discovering operators in {_BASELINE_PACKAGE} ...")
+    classes = _discover_operator_classes()
+    instrumented = _instrument(classes)
+    n_instrumented = len(instrumented)
+    print(f"  Instrumented {n_instrumented} operator class(es).")
+    return LlamaEngine, SamplingParams, instrumented, n_instrumented
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="fastkernels capture",
@@ -1155,23 +1392,10 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
-        "--num-requests", type=int, default=100,
-        help="Prompts to load per scenario workload (capped by the workload's "
-             "row count). Enough to observe representative shapes without "
-             "running the full throughput dataset.",
-    )
-    parser.add_argument(
-        "--max-tokens", type=int, default=256,
-        help="Fallback max new tokens, used ONLY for ad-hoc --prompt runs. "
-             "Scenario workloads instead set a per-request budget from each "
-             "sample's HF dataset response length (like bench_vllm.py).",
-    )
-    parser.add_argument(
-        "--no-chat-template", action="store_true",
-        help="Feed --prompt overrides as raw text instead of the instruct chat "
-             "template. (The chat template makes an instruct model reliably "
-             "emit EOS.) Ignored for the scenario workload, whose prompts are "
-             "already chat-templated.",
+        "--num-requests", type=int, default=1_000_000,
+        help="Max prompts to load per scenario workload. The default is large "
+             "enough to use every row of each workload's dataset (each loader "
+             "returns all available rows, capped at this value).",
     )
     parser.add_argument(
         "--output", default=None,
@@ -1181,12 +1405,15 @@ def main(argv: list[str] | None = None) -> int:
              "this base to keep the paths distinct.",
     )
     parser.add_argument(
-        "--prompt", action="append", dest="prompts", default=None,
-        help="Override the scenario workload with ad-hoc raw prompts (repeatable).",
-    )
-    parser.add_argument(
         "--selftest", action="store_true",
         help="Run the offline mock-scheduler self-check and exit (no model).",
+    )
+    parser.add_argument(
+        "--gpus", default=None,
+        help="Comma-separated physical GPU ids to schedule across (default: all "
+             "visible GPUs / CUDA_VISIBLE_DEVICES). Scenarios are packed onto "
+             "these by their TP degree and captured in parallel, each in its own "
+             "GPU-pinned subprocess, launching more as GPUs free up.",
     )
     args = parser.parse_args(argv)
 
@@ -1195,49 +1422,66 @@ def main(argv: list[str] | None = None) -> int:
 
     # CAPTURE_SCENARIOS is the source of truth for the models and engine
     # configuration (model, dtype, TP, max_num_seqs) and the capture workloads;
-    # --num-requests/--max-tokens/--output/--prompt stay run-level knobs. Each
-    # scenario gets its own engine and each workload its own report.
+    # --num-requests/--output stay run-level knobs. Each scenario gets its own
+    # engine and each workload its own report.
     scenarios = CAPTURE_SCENARIOS
 
-    # 0) Stub out optional GPU kernel libs (deep_gemm) if missing so the
-    #    engine and the DeepSeek operator chain can be imported.
-    stubbed = _install_optional_dependency_stubs()
-    if stubbed:
-        print(f"  Stubbed missing optional deps: {', '.join(stubbed)}")
-
-    # 1) Import the engine module FIRST. This pulls in transformers and every
-    #    module on the LLM path in the correct order, which avoids global
-    #    torch.library / functional-collective registration conflicts that
-    #    happen if unrelated operator modules are imported ahead of it. Only
-    #    the class *definitions* run here; construction happens later.
-    print(f"Importing fastkernels engine ...")
-    from .infra.engine import LlamaEngine, SamplingParams
-
-    # 2) Discover & instrument every operator ONCE, before any engine builds a
-    #    model, so __init__ calls are captured too. The instrumentation persists
-    #    across scenarios (the monkey-patches stay installed); modules with
-    #    conflicting global registrations fail to import and are skipped.
-    print(f"Discovering operators in {_BASELINE_PACKAGE} ...")
-    classes = _discover_operator_classes()
-    instrumented = _instrument(classes)
-    n_instrumented = len(instrumented)
-    print(f"  Instrumented {n_instrumented} operator class(es).")
-
-    # A "run" is one (scenario, workload) pair; with --prompt each scenario is a
-    # single ad-hoc "custom" run. ``multi`` decides whether an explicit --output
-    # gets a per-run suffix (default paths are always unique per scenario slug).
+    # A "run" is one (scenario, workload) pair. ``multi`` decides whether an
+    # explicit --output gets a per-run suffix (default paths are always unique
+    # per scenario slug). Computed over ALL scenarios so a per-scenario worker
+    # suffixes identically.
     runs_per_scenario = [
-        [("custom", None)] if args.prompts else [(w.value, w) for w in s.workloads]
+        [(w.value, w) for w in s.workloads]
         for s in scenarios
     ]
     multi = sum(len(r) for r in runs_per_scenario) > 1
 
+    # --- Worker mode: when the parent scheduler set _WORKER_INDEX_ENV, capture
+    #     exactly that one scenario in-process. The parent has already pinned
+    #     this process to its GPUs via CUDA_VISIBLE_DEVICES. This is internal
+    #     (env-driven), so there is no user-facing scenario-selection flag. ---
+    worker_index = os.environ.get(_WORKER_INDEX_ENV)
+    if worker_index is not None:
+        try:
+            idx = int(worker_index)
+        except ValueError:
+            print(f"  !! invalid {_WORKER_INDEX_ENV}={worker_index!r}")
+            return 2
+        if not 0 <= idx < len(scenarios):
+            print(f"  !! {_WORKER_INDEX_ENV}={idx} out of range "
+                  f"(have {len(scenarios)} scenario(s))")
+            return 2
+        LlamaEngine, SamplingParams, instrumented, n_instrumented = _setup_capture()
+        scenario = scenarios[idx]
+        runs = runs_per_scenario[idx]
+        try:
+            _, ok = _capture_scenario(
+                scenario, runs, args, LlamaEngine, SamplingParams,
+                instrumented, n_instrumented, multi,
+            )
+        except Exception as exc:  # noqa: BLE001
+            traceback.print_exc()
+            print(f"\n  !! Scenario {scenario.hf_name} failed to capture: {exc!r}")
+            return 2
+        return 0 if ok else 1
+
+    # --- Parent: GPU-aware parallel scheduling (default). Each scenario runs in
+    #     its own subprocess so a crash/OOM/verification failure is isolated. ---
+    gpu_ids = _detect_gpu_ids(args.gpus)
+    if len(scenarios) > 1 and len(gpu_ids) >= 1:
+        print(
+            f"Scheduling {len(scenarios)} scenario(s) across {len(gpu_ids)} "
+            f"GPU(s) [{', '.join(gpu_ids)}] by TP degree ..."
+        )
+        return _run_scenarios_parallel(scenarios, args, gpu_ids)
+
+    # --- In-process fallback (single scenario or no GPU detected). A
+    #     per-scenario failure is reported and the loop continues with the next
+    #     scenario. ---
+    LlamaEngine, SamplingParams, instrumented, n_instrumented = _setup_capture()
     exit_code = 0
     written: list[Path] = []
     for scenario, runs in zip(scenarios, runs_per_scenario):
-        # Capture the scenario. A failure to build the engine or run a workload
-        # (e.g. an unsupported model kernel) is reported and the batch continues
-        # with the next scenario instead of aborting the whole run.
         try:
             paths, ok = _capture_scenario(
                 scenario, runs, args, LlamaEngine, SamplingParams,
