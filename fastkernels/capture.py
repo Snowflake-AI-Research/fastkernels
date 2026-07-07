@@ -60,7 +60,7 @@ import torch
 import torch.nn as nn
 
 from .registry import FULL_BENCHMARK
-from .workloads import load_real_prompt_workload
+from .workloads import Purpose, load_real_prompt_workload, spec_for
 
 # Default directory for capture reports (override per-run with ``--output``).
 CAPTURE_DIR = Path.home() / ".fastkernels" / "captures"
@@ -430,14 +430,25 @@ def _verify_forward_capture() -> dict:
 #
 # The engine runs every GPU step as a *unified* batch: it decodes one token for
 # each running sequence and (chunk-)prefills waiting sequences in the very same
-# forward pass, subject to two budgets -- at most ``max_num_seqs`` concurrent
-# sequences and at most ``max_num_batched_tokens`` tokens per step. Given only
-# each request's prompt length and generated length (plus those two budgets) we
-# can replay that policy analytically and predict, for every step, how many
-# prefill tokens / prefill sequences / decode sequences it processes.
+# forward pass, subject to three limits -- at most ``max_num_seqs`` concurrent
+# sequences, at most ``max_num_batched_tokens`` tokens per step, and the paged
+# KV-cache block pool (a waiting sequence is only admitted while its blocks --
+# plus a watermark, and its ``ceil((prompt+max_tokens)/block_size)`` peak
+# reservation across all active sequences -- fit in the pool). Given each
+# request's prompt length, generated length and decode budget plus those limits
+# and the block-pool geometry we can replay the policy analytically and predict,
+# for every step, how many prefill tokens / prefill sequences / decode sequences
+# it processes.
 #
-# Those three numbers fully determine the leading ("sequence length" / batch)
-# dimension of every forward tensor:
+# The KV-cache limit is what caps concurrency for *long* prompts: the token/seq
+# budgets alone let dozens of sequences run at once, but a handful of 8K-128K
+# prompts exhaust the block pool first, so an accurate replay must model it (an
+# earlier budget-only model over-predicted long-context concurrency). When the
+# block pool is unknown the replay falls back to budget-only (the ``num_blocks
+# is None`` path), which is exact for short-prompt workloads.
+#
+# Those three per-step counts fully determine the leading ("sequence length" /
+# batch) dimension of every forward tensor:
 #   * whole-batch ops (LlamaModel, RMSNorm, ...) see ``prefill_tokens +
 #     decode_seqs`` rows;
 #   * the prefill attention kernel sees ``prefill_tokens`` rows across
@@ -449,82 +460,176 @@ def _verify_forward_capture() -> dict:
 # sum of generated-minus-one, nothing exceeds the two budgets).
 # ---------------------------------------------------------------------------
 class _MockSeq:
-    __slots__ = ("prompt_len", "gen_len", "remaining_prefill", "generated")
+    __slots__ = ("prompt_len", "gen_len", "max_tokens",
+                 "num_computed", "nblocks", "generated")
 
-    def __init__(self, prompt_len: int, gen_len: int):
+    def __init__(self, prompt_len: int, gen_len: int, max_tokens: int):
         self.prompt_len = prompt_len
-        self.gen_len = gen_len
-        self.remaining_prefill = prompt_len
-        self.generated = 0
+        self.gen_len = gen_len          # tokens actually generated (ground truth)
+        self.max_tokens = max_tokens    # decode budget (drives peak reservation)
+        self.num_computed = 0           # prompt tokens prefilled so far
+        self.nblocks = 0                # KV blocks currently held
+        self.generated = 0              # decode tokens produced so far
 
 
 def _simulate_continuous_batching(prompt_lens, gen_lens, max_num_seqs,
-                                  max_num_batched_tokens) -> list[dict]:
+                                  max_num_batched_tokens, *,
+                                  max_tokens=None, num_blocks=None,
+                                  block_size: int = 256,
+                                  watermark_blocks: int = 0) -> list[dict]:
     """Replay the engine's unified chunked-prefill schedule analytically.
 
     Returns one dict per GPU step with the token/sequence composition the
-    engine's forward pass would see that step.
+    engine's forward pass would see that step. This mirrors the scheduler in
+    ``LlamaEngine.generate``: (1) decode every running sequence (allocating a
+    fresh block when it crosses a block boundary, recompute-preempting when the
+    pool is empty); (2) continue in-flight prefills FIFO within the token +
+    block budgets; (3) admit waiting sequences while they fit the token budget,
+    the block pool (+ watermark) and the total peak-block reservation.
+
+    ``max_tokens`` is the per-request decode budget used for the peak-block
+    reservation (defaults to ``gen_lens`` when unknown). When ``num_blocks`` is
+    ``None`` the KV-cache accounting is skipped entirely and the replay reduces
+    to the token/seq-budget-only model (exact for short-prompt workloads).
     """
     from collections import deque
 
-    waiting = deque(_MockSeq(p, g) for p, g in zip(prompt_lens, gen_lens))
-    prefilling: list[_MockSeq] = []   # admitted, prefill not yet complete
-    running: list[_MockSeq] = []      # prefilled, still generating
+    if max_tokens is None:
+        max_tokens = list(gen_lens)
+    bounded = num_blocks is not None
+    free = int(num_blocks) if bounded else 0
+
+    def _cdiv(a: int, b: int) -> int:
+        return (a + b - 1) // b
+
+    waiting: deque[_MockSeq] = deque(
+        _MockSeq(p, g, m) for p, g, m in zip(prompt_lens, gen_lens, max_tokens)
+    )
+    prefilling: deque[_MockSeq] = deque()  # admitted, prefill not yet complete
+    running: deque[_MockSeq] = deque()     # prefilled, still generating
     steps: list[dict] = []
 
-    # Safety bound: a correct schedule needs one step per generated token plus
-    # a bounded number of prefill steps; anything past this signals a bug.
+    # Safety bound: every recorded step advances >=1 prefill or decode token,
+    # so a correct schedule needs at most sum(prompt)+sum(gen) of them; anything
+    # past this (or a no-progress deadlock) signals a bug and is cut short.
     max_steps = sum(gen_lens) + sum(prompt_lens) + len(prompt_lens) + 16
 
     while waiting or prefilling or running:
         if len(steps) > max_steps:
             break
 
-        num_decode = len(running)
-        token_budget = max_num_batched_tokens - num_decode
-        chunks: list[tuple[_MockSeq, int]] = []
+        token_budget = max_num_batched_tokens
 
-        # 1) continue in-flight (partially prefilled) sequences first, FIFO.
-        for seq in prefilling:
-            if token_budget <= 0:
-                break
-            chunk = min(seq.remaining_prefill, token_budget)
-            if chunk <= 0:
+        # --- 1) decode scheduling: one token per running seq, up to
+        #        max_num_seqs, allocating a block when it crosses a boundary. ---
+        decode_seqs: list[_MockSeq] = []
+        new_running: deque[_MockSeq] = deque()
+        while running:
+            seq = running.popleft()
+            if len(decode_seqs) >= max_num_seqs:
+                new_running.append(seq)
                 continue
-            chunks.append((seq, chunk))
+            if bounded and (seq.prompt_len + seq.generated) % block_size == 1:
+                if free == 0:
+                    # Recompute-preempt: free blocks, re-prefill from scratch.
+                    free += seq.nblocks
+                    seq.nblocks = 0
+                    seq.num_computed = 0
+                    seq.generated = 0
+                    waiting.appendleft(seq)
+                    continue
+                seq.nblocks += 1
+                free -= 1
+            decode_seqs.append(seq)
+        running = new_running
+        token_budget -= len(decode_seqs)
+
+        # --- 2) continue in-flight (partially prefilled) sequences, FIFO. ---
+        prefill_seqs: list[_MockSeq] = []
+        prefill_chunks: list[int] = []
+        still: deque[_MockSeq] = deque()
+        while prefilling and token_budget > 0:
+            seq = prefilling.popleft()
+            remaining = seq.prompt_len - seq.num_computed
+            chunk = min(remaining, token_budget)
+            if bounded:
+                need = _cdiv(seq.num_computed + chunk, block_size) - seq.nblocks
+                if need > 0:
+                    if free < need:
+                        still.append(seq)
+                        continue
+                    seq.nblocks += need
+                    free -= need
+            prefill_seqs.append(seq)
+            prefill_chunks.append(chunk)
+            token_budget -= chunk
+        while prefilling:
+            still.append(prefilling.popleft())
+        prefilling = still
+
+        # --- 3) admit new waiting sequences (token + block + peak budgets). ---
+        total_peak = 0
+        if bounded:
+            for seq in (*decode_seqs, *running, *prefilling):
+                total_peak += _cdiv(seq.prompt_len + seq.max_tokens, block_size)
+        while waiting and token_budget > 0:
+            seq = waiting[0]
+            chunk = min(seq.prompt_len, token_budget)
+            if bounded:
+                need = _cdiv(chunk, block_size)  # num_computed == 0 (fresh)
+                if free < need + watermark_blocks:
+                    break
+                seq_peak = _cdiv(seq.prompt_len + seq.max_tokens, block_size)
+                if total_peak + seq_peak > num_blocks:
+                    break
+            if len(prefill_seqs) + len(decode_seqs) >= max_num_seqs:
+                break
+            waiting.popleft()
+            if bounded:
+                seq.nblocks += need
+                free -= need
+                total_peak += seq_peak
+            prefill_seqs.append(seq)
+            prefill_chunks.append(chunk)
             token_budget -= chunk
 
-        # 2) admit new waiting sequences up to the concurrency + token budgets.
-        live = num_decode + len(prefilling)
-        while waiting and live < max_num_seqs and token_budget > 0:
-            seq = waiting.popleft()
-            chunk = min(seq.remaining_prefill, token_budget)
-            chunks.append((seq, chunk))
-            token_budget -= chunk
-            prefilling.append(seq)
-            live += 1
+        if not decode_seqs and not prefill_seqs:
+            # Nothing schedulable (empty, or every prefill blocked with no decode
+            # to free blocks) -- terminal, so stop rather than spin.
+            break
 
-        prefill_tokens = sum(c for _, c in chunks)
+        prefill_tokens = sum(prefill_chunks)
         steps.append({
             "prefill_tokens": prefill_tokens,
-            "num_prefill_seqs": len(chunks),
-            "prefill_seq_lens": sorted((c for _, c in chunks), reverse=True),
-            "decode_seqs": num_decode,
-            "total_tokens": prefill_tokens + num_decode,
+            "num_prefill_seqs": len(prefill_seqs),
+            "prefill_seq_lens": sorted(prefill_chunks, reverse=True),
+            "decode_seqs": len(decode_seqs),
+            "total_tokens": prefill_tokens + len(decode_seqs),
         })
 
         # ---- apply the step's effects ----
-        for seq in running:               # each running seq emits one token
-            seq.generated += 1
-        for seq, chunk in chunks:         # advance prefill cursors
-            seq.remaining_prefill -= chunk
-        completed = [s for s in prefilling if s.remaining_prefill == 0]
-        if completed:
-            for seq in completed:
+        # Prefill advances; a sequence that completes emits its first token.
+        for seq, chunk in zip(prefill_seqs, prefill_chunks):
+            seq.num_computed += chunk
+            if seq.num_computed >= seq.prompt_len:
                 seq.generated = 1         # first token comes from the prefill
-            prefilling = [s for s in prefilling if s.remaining_prefill > 0]
-            running.extend(completed)
-        running = [s for s in running if s.generated < s.gen_len]
+                if seq.generated >= seq.gen_len:
+                    if bounded:           # finished at prefill: free its blocks
+                        free += seq.nblocks
+                        seq.nblocks = 0
+                else:
+                    running.append(seq)
+            else:
+                prefilling.append(seq)
+        # Each decoded sequence emitted one token this step.
+        for seq in decode_seqs:
+            seq.generated += 1
+            if seq.generated >= seq.gen_len:
+                if bounded:
+                    free += seq.nblocks
+                    seq.nblocks = 0
+            else:
+                running.append(seq)
 
     return steps
 
@@ -670,10 +775,15 @@ def _multiset_diff(predicted: dict[int, int], actual: dict[int, int]) -> str:
 
 
 def _verify_batch_schedule(prompt_lens, gen_lens, max_num_seqs,
-                           max_num_batched_tokens, num_layers) -> dict:
+                           max_num_batched_tokens, num_layers, *,
+                           max_tokens=None, num_blocks=None,
+                           block_size: int = 256,
+                           watermark_blocks: int = 0) -> dict:
     """Cross-check the captured forward shapes against a mock scheduler."""
     steps = _simulate_continuous_batching(
         prompt_lens, gen_lens, max_num_seqs, max_num_batched_tokens,
+        max_tokens=max_tokens, num_blocks=num_blocks,
+        block_size=block_size, watermark_blocks=watermark_blocks,
     )
 
     pred_combined: dict[int, int] = {}
@@ -757,6 +867,9 @@ def _verify_batch_schedule(prompt_lens, gen_lens, max_num_seqs,
         "max_num_seqs": max_num_seqs,
         "max_num_batched_tokens": max_num_batched_tokens,
         "num_layers": num_layers,
+        "kv_cache_modeled": num_blocks is not None,
+        "num_kv_blocks": num_blocks,
+        "kv_block_size": block_size if num_blocks is not None else None,
         "num_requests": len(prompt_lens),
         "simulated_steps": len(steps),
         "simulated_prefill_steps": sum(
@@ -914,6 +1027,35 @@ def _report_path(output_arg, scenario, workload: str, multi: bool, num_requests:
 #     return list(prompts), False
 
 
+def _reset_engine_runtime_state(engine) -> None:
+    """Return the engine to a pristine per-run state between workloads.
+
+    Capture loads each model exactly once and reuses the same engine for every
+    one of that scenario's workloads (never reloading it). To keep those
+    workloads from interfering, the *runtime* state that accumulates per
+    ``generate`` -- the paged KV-cache block pool -- is returned to empty before
+    each run. A cleanly finished ``generate`` already frees every block as its
+    sequences finish, so this is normally a no-op; making it explicit guarantees
+    the next workload starts from a full pool (which the schedule replay assumes)
+    and surfaces, rather than silently carries over, any leftover allocation.
+
+    (Mamba/SSM recurrent state needs no reset here: its manager zeroes each slot
+    on both allocate and free, so stale state can never leak into a later run.)
+    """
+    bm = getattr(engine, "block_manager", None)
+    reset = getattr(bm, "reset", None)
+    if reset is None:
+        return
+    total = getattr(bm, "_num_blocks", None)
+    free = getattr(bm, "free_block_ids", None)
+    if total and free is not None and len(free) != total:
+        print(
+            f"  (note: {total - len(free)} KV block(s) still allocated from a "
+            f"prior workload; resetting the pool before this run)"
+        )
+    reset()
+
+
 def _capture_scenario(scenario, runs, args, LlamaEngine, SamplingParams,
                       instrumented, n_instrumented, multi):
     """Build one scenario's engine and capture each of its workloads.
@@ -985,10 +1127,32 @@ def _capture_scenario(scenario, runs, args, LlamaEngine, SamplingParams,
             # The loader returns every available row up to ``--num-requests``
             # (the default is large enough to use them all); curated sets return
             # fewer if they have fewer rows (e.g. long-context has 64).
-            n_req = args.num_requests
+            #
+            # Resolve the request count / dataset / decode budget from the
+            # workload's own spec instead of the loader's ``DEFAULT_WORKLOAD_
+            # DATASETS`` map, which only knows the two *throughput* workloads
+            # (mixed, long-context). The *latency* probes (single-request,
+            # fixed-batch-32) carry their real-prompt dataset + decode budget on
+            # the LatencyWorkload spec, so looking them up by name in that map
+            # raised KeyError and aborted the whole scenario.
+            spec = spec_for(wl)
+            params = spec.params
+            wl_dataset = getattr(params, "dataset_name", "") or None
+            if spec.purpose is Purpose.LATENCY:
+                # Latency probe: submit a fixed-size batch of real prompts with a
+                # bounded per-request decode budget.
+                n_req = min(args.num_requests, getattr(params, "batch_size", 1))
+                wl_decode_cap = getattr(params, "output_len", None)
+            else:
+                n_req = min(
+                    args.num_requests,
+                    getattr(params, "num_requests", args.num_requests),
+                )
+                wl_decode_cap = getattr(params, "decode_cap", None)
             print(f"Loading '{wl_label}' workload prompts ({n_req}) ...")
             samples = load_real_prompt_workload(
                 wl_label, engine.tokenizer, num_requests=n_req,
+                dataset_name=wl_dataset, decode_cap=wl_decode_cap,
             )
             gen_prompts = [list(s.prompt_token_ids) for s in samples]
             # Per-request generation budget from the HF dataset's own
@@ -1032,10 +1196,16 @@ def _capture_scenario(scenario, runs, args, LlamaEngine, SamplingParams,
                 entry["forward"] = None
             _HOOK_RECORDS.clear()
 
-            outputs = engine.generate(gen_prompts, sampling, use_tqdm=False)
-
-            for handle in hook_handles:
-                handle.remove()
+            # Same engine/model as every other workload of this scenario (loaded
+            # once, never reloaded). Clear the per-run KV state so workloads run
+            # independently, then remove this run's hooks in a finally so a
+            # failed generate can't leak them into anything that follows.
+            _reset_engine_runtime_state(engine)
+            try:
+                outputs = engine.generate(gen_prompts, sampling, use_tqdm=False)
+            finally:
+                for handle in hook_handles:
+                    handle.remove()
 
             # 6) Summarize generation: how many sequences stopped at EOS vs. the
             #    request's own token budget, and keep the decoded responses so
@@ -1103,12 +1273,24 @@ def _capture_scenario(scenario, runs, args, LlamaEngine, SamplingParams,
                 print(f"    ! {issue}")
 
             # 7b) Verify the captured shapes against a mock continuous-batching /
-            #     chunked-prefill replay driven only by the per-request prompt
-            #     and generated lengths plus the engine's batch/token budgets.
+            #     chunked-prefill replay driven by the per-request prompt and
+            #     generated lengths, the engine's batch/token budgets, AND its
+            #     KV-cache block pool (block granularity + total blocks + a 1%
+            #     admission watermark, mirroring LlamaEngine.generate). The KV
+            #     pool is what bounds concurrency for long prompts; without it
+            #     the replay over-predicts long-context batch sizes.
+            from .infra.engine import BLOCK_SIZE
+            _bm = getattr(engine, "block_manager", None)
+            num_kv_blocks = getattr(_bm, "_num_blocks", None)
+            watermark = max(int(num_kv_blocks * 0.01), 1) if num_kv_blocks else 0
             schedule_verification = _verify_batch_schedule(
                 prompt_lens, gen_lengths,
                 engine.max_num_seqs, engine.max_num_batched_tokens,
                 _infer_num_layers(engine),
+                max_tokens=max_new_tokens,
+                num_blocks=num_kv_blocks or None,
+                block_size=BLOCK_SIZE,
+                watermark_blocks=watermark,
             )
             status = "PASS" if schedule_verification["passed"] else "FAIL"
             n_ok = sum(1 for c in schedule_verification["checks"] if c["passed"])
@@ -1522,7 +1704,10 @@ def _selftest_simulator(trials: int = 2000, seed: int = 0) -> int:
       * no step exceeds ``max_num_batched_tokens``;
       * no step runs more than ``max_num_seqs`` concurrent sequences;
       * a single prompt longer than the token budget is chunked (never dropped)
-        and still sums back to its prompt length.
+        and still sums back to its prompt length;
+      * the KV-cache-aware replay, given an amply-sized block pool (so blocks
+        never bind), makes the exact same scheduling decisions as the
+        budget-only replay -- exercising the block-accounting bookkeeping.
 
     Run with ``python -m fastkernels.capture --selftest``.
     """
@@ -1558,6 +1743,23 @@ def _selftest_simulator(trials: int = 2000, seed: int = 0) -> int:
                 s["num_prefill_seqs"] + s["decode_seqs"] for s in steps
         ) > max_num_seqs:
             problems.append("a step exceeded max_num_seqs")
+
+        # KV-cache-aware replay with an amply-sized block pool must make the
+        # exact same decisions as the budget-only replay (blocks never bind),
+        # which exercises the block bookkeeping added to model the long-context
+        # concurrency limit.
+        block_size = rng.choice([16, 64, 256])
+        max_toks = [g + rng.randint(0, 20) for g in gen_lens]
+        peak_blocks = sum((p + m + block_size - 1) // block_size
+                          for p, m in zip(prompt_lens, max_toks))
+        bounded_steps = _simulate_continuous_batching(
+            prompt_lens, gen_lens, max_num_seqs, max_batched,
+            max_tokens=max_toks, num_blocks=peak_blocks + rng.randint(0, 32),
+            block_size=block_size, watermark_blocks=0)
+        if bounded_steps != steps:
+            problems.append(
+                "ample-pool KV replay diverged from budget-only replay")
+
         if problems:
             failures.append(
                 f"trial {t} (seqs={max_num_seqs}, budget={max_batched}, "
