@@ -11,7 +11,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import vllm._C  # noqa: F401  -- registers torch.ops._C.gelu*_and_mul
+try:
+    import vllm._C  # noqa: F401  -- registers torch.ops._C.gelu*_and_mul
+    # Importing the extension does not guarantee the ops are registered in the
+    # ``_C`` namespace (varies by vLLM build). Verify before binding, otherwise
+    # fall back to the pure-PyTorch path (there is no fastkernels csrc gelu
+    # kernel, unlike silu_and_mul).
+    _VLLM_GELU_AVAILABLE = hasattr(torch.ops._C, "gelu_and_mul") and hasattr(
+        torch.ops._C, "gelu_tanh_and_mul"
+    )
+except ImportError:
+    _VLLM_GELU_AVAILABLE = False
 
 
 class GeluAndMul(nn.Module):
@@ -22,11 +32,14 @@ class GeluAndMul(nn.Module):
         self.approximate = approximate
         if approximate not in ("none", "tanh"):
             raise ValueError(f"Unsupported GELU approximation: {approximate}")
-        self.op = (
-            torch.ops._C.gelu_tanh_and_mul
-            if approximate == "tanh"
-            else torch.ops._C.gelu_and_mul
-        )
+        if _VLLM_GELU_AVAILABLE:
+            self.op = (
+                torch.ops._C.gelu_tanh_and_mul
+                if approximate == "tanh"
+                else torch.ops._C.gelu_and_mul
+            )
+        else:
+            self.op = None
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
@@ -39,6 +52,6 @@ class GeluAndMul(nn.Module):
         return out
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if torch.compiler.is_compiling():
+        if self.op is None or torch.compiler.is_compiling():
             return self.forward_native(x)
         return self.forward_cuda(x)

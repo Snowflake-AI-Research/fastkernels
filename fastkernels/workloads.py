@@ -2,12 +2,12 @@
 
 Single source of truth for everything workload-related. It holds:
 
-* the per-family workload *identity* enums (e.g. ``LLM.prefill_heavy``) used in
+* the per-family workload *identity* enums (e.g. ``LLM.mixed``) used in
   ``registry.py``;
 * the per-workload throughput/latency *parameter* specs and model configs
   consumed by the eval pipeline and the ``tests/`` benchmarks;
 * the real chat-prompt loader (``load_real_prompt_workload``) used to run the
-  LLM prefill-heavy / balanced / decode-heavy workloads; and
+  LLM mixed (WildChat) and long-context (LongBench-v2) workloads; and
 * a thin, lazily-imported adapter over vLLM's dataset infrastructure.
 
 Kept import-light on purpose: importing this module must not pull in ``vllm``
@@ -32,10 +32,15 @@ class Workload(Enum):
 
 
 class LLM(Workload):
-    """Text LLMs (also used by linear-attention / hybrid LLMs)."""
-    prefill_heavy = "prefill-heavy"
-    balanced = "balanced"
-    decode_heavy = "decode-heavy"
+    """Text LLMs (also used by linear-attention / hybrid LLMs).
+
+    ``mixed`` and ``long_context`` are the two real-prompt *throughput* regimes
+    (backed by the wildchat-mixed-1k and longbench-longctx datasets);
+    ``single_request`` and ``fixed_batch_32`` are the standardized *latency*
+    probes.
+    """
+    mixed = "mixed"
+    long_context = "long-context"
     single_request = "single-request"
     fixed_batch_32 = "fixed-batch-32"
 
@@ -166,6 +171,35 @@ class PointCloudPolicy(Workload):
     batch_8 = "batch-8"
 
 
+class PointCloudSeg(Workload):
+    """Point-cloud understanding / segmentation (e.g. PointTransformerV3)."""
+    scanobjectnn = "scanobjectnn"
+    single_cloud = "single-cloud"
+    batch_8 = "batch-8"
+
+
+class Rendering(Workload):
+    """Neural scene rendering (e.g. 3DGS, InstantNGP)."""
+    render = "render"
+    single_render = "single-render"
+
+
+class Recsys(Workload):
+    """Recommendation / ranking (e.g. DLRMv2 CTR, LightGCN graph recommend)."""
+    ctr_batch = "ctr-batch"
+    recommend_batch = "recommend-batch"
+    single_request = "single-request"
+    fixed_batch_32 = "fixed-batch-32"
+
+
+class VideoRepresentation(Workload):
+    """Video world-model / representation forwards (e.g. V-JEPA 2)."""
+    predictor = "predictor"
+    encoder = "encoder"
+    classification = "classification"
+    single_video = "single-video"
+
+
 # ===========================================================================
 # Real chat-prompt workloads (LLM)
 #
@@ -175,15 +209,17 @@ class PointCloudPolicy(Workload):
 # ===========================================================================
 
 DEFAULT_WORKLOAD_DATASETS: dict[str, str] = {
-    "prefill-heavy": "sfc-gh-goliaro/wildchat-fastkernels-prefill-heavy-1k",
-    "balanced": "sfc-gh-goliaro/wildchat-fastkernels-balanced-1k",
-    "decode-heavy": "sfc-gh-goliaro/wildchat-fastkernels-decode-heavy-1k",
+    "mixed": "sfc-gh-goliaro/wildchat-mixed-1k",
+    "long-context": "sfc-gh-goliaro/longbench-longctx",
 }
 
-LEGACY_WORKLOAD_DATASETS: dict[str, str] = {
-    "prefill-heavy": "sfc-gh-goliaro/wildchat-prefill-heavy-1k",
-    "balanced": "sfc-gh-goliaro/kb-nano-balanced",
-    "decode-heavy": "sfc-gh-goliaro/wildchat-decode-heavy-1k",
+# Canonical per-request generation budget applied when a caller does not pass an
+# explicit ``decode_cap``. ``mixed`` caps WildChat responses at 1024 tokens (the
+# calibrated Scenario A budget); ``long-context`` carries an authoritative
+# per-row ``output_len``, so no cap is applied there.
+DEFAULT_DECODE_CAPS: dict[str, int | None] = {
+    "mixed": 1024,
+    "long-context": None,
 }
 
 
@@ -191,6 +227,10 @@ LEGACY_WORKLOAD_DATASETS: dict[str, str] = {
 class RealPromptSample:
     prompt_token_ids: list[int]
     output_len: int
+    # Raw chat-templated prompt turns (role/content dicts). Populated for
+    # consumers that need the un-tokenized prompt, e.g. the online serving
+    # benchmark that posts chat messages to an OpenAI-compatible endpoint.
+    messages: list[dict[str, str]] | None = None
 
 
 def _normalize_messages(row: dict[str, Any]) -> tuple[list[dict[str, str]], str]:
@@ -275,20 +315,24 @@ def load_real_prompt_workload(
 ) -> list[RealPromptSample]:
     """Load, chat-template, and tokenize a real LLM workload.
 
-    ``decode_cap`` caps the per-request generation budget after tokenizing the
-    source assistant response with the same tokenizer.
+    Prompts are stored as raw chat turns and are chat-templated + tokenized here
+    with the *target model's* tokenizer, so every model sees the same requests
+    tokenized as it expects. The per-request generation budget (``output_len``)
+    is taken from an authoritative per-row ``output_len`` when present (the
+    long-context set), otherwise derived from the stored assistant response.
+
+    ``decode_cap`` bounds ``output_len``; when ``None`` it falls back to the
+    scenario's canonical cap (``DEFAULT_DECODE_CAPS``). Curated fixed-size sets
+    (e.g. long-context, 64 rows) may hold fewer than ``num_requests`` rows, in
+    which case every available row is returned.
     """
     from datasets import load_dataset
 
     dataset_id = dataset_name or DEFAULT_WORKLOAD_DATASETS[scenario_name]
-    try:
-        ds = load_dataset(dataset_id, split=split)
-    except Exception:
-        legacy_id = LEGACY_WORKLOAD_DATASETS.get(scenario_name)
-        if legacy_id is None or legacy_id == dataset_id:
-            raise
-        ds = load_dataset(legacy_id, split=split)
+    if decode_cap is None:
+        decode_cap = DEFAULT_DECODE_CAPS.get(scenario_name)
 
+    ds = load_dataset(dataset_id, split=split)
     if seed is not None:
         ds = ds.shuffle(seed=seed)
 
@@ -297,8 +341,11 @@ def load_real_prompt_workload(
         messages, assistant_text = _normalize_messages(row)
         prompt_ids = _apply_chat_template(tokenizer, messages)
 
-        response_ids = _tokenize_response(tokenizer, assistant_text)
-        output_len = len(response_ids)
+        stored_output_len = row.get("output_len")
+        if stored_output_len is not None:
+            output_len = int(stored_output_len)
+        else:
+            output_len = len(_tokenize_response(tokenizer, assistant_text))
         if decode_cap is not None:
             output_len = min(output_len, decode_cap)
         output_len = max(1, output_len)
@@ -306,15 +353,13 @@ def load_real_prompt_workload(
         samples.append(RealPromptSample(
             prompt_token_ids=prompt_ids,
             output_len=output_len,
+            messages=messages,
         ))
         if len(samples) >= num_requests:
             break
 
-    if len(samples) < num_requests:
-        raise ValueError(
-            f"{dataset_id} yielded only {len(samples)} requests; "
-            f"needed {num_requests}"
-        )
+    if not samples:
+        raise ValueError(f"{dataset_id} yielded no requests")
     return samples
 
 
@@ -326,44 +371,58 @@ def load_real_prompt_workload(
 # the specs below carry the *parameters* keyed by those same names.
 # ===========================================================================
 
-# --- LLM (text-only, real WildChat-derived requests) -----------------------
+# --- LLM (text-only, real WildChat / LongBench-v2 requests) ----------------
 
 @dataclass(frozen=True)
 class ThroughputWorkload:
     name: str
     num_requests: int = 1000
     dataset_name: str = ""
+    decode_cap: int | None = None
 
 
 @dataclass(frozen=True)
 class LatencyWorkload:
     name: str
     batch_size: int
-    input_len: int
-    output_len: int
+    output_len: int = 128        # decode budget (ignore_eos); real prompt drives prefill
+    dataset_name: str = ""       # real prompt source (WildChat mixed)
     num_warmup: int = 3
     num_iters: int = 5
 
 
+# Two real-prompt throughput regimes:
+#   * mixed        -- WildChat-1M, N=1000, natural short/long prompt+decode mix
+#                     (decode capped at 1024); saturates continuous batching.
+#   * long-context -- LongBench-v2, N=64, 8K..128K prefill buckets, fixed decode;
+#                     exercises long-sequence attention + large-KV decode.
 THROUGHPUT_WORKLOADS: list[ThroughputWorkload] = [
-    ThroughputWorkload("prefill-heavy", dataset_name=DEFAULT_WORKLOAD_DATASETS["prefill-heavy"]),
-    ThroughputWorkload("balanced", dataset_name=DEFAULT_WORKLOAD_DATASETS["balanced"]),
-    ThroughputWorkload("decode-heavy", dataset_name=DEFAULT_WORKLOAD_DATASETS["decode-heavy"]),
+    ThroughputWorkload("mixed", num_requests=1000,
+        dataset_name=DEFAULT_WORKLOAD_DATASETS["mixed"], decode_cap=DEFAULT_DECODE_CAPS["mixed"]),
+    ThroughputWorkload("long-context", num_requests=64,
+        dataset_name=DEFAULT_WORKLOAD_DATASETS["long-context"], decode_cap=DEFAULT_DECODE_CAPS["long-context"]),
 ]
 
+# Latency probes draw REAL prompts from the same WildChat `mixed` set as
+# throughput (batch 1 and batch 32); the prompt length is therefore
+# data-dependent, not a fixed shape. ``output_len`` bounds the decode so
+# per-token latency stays comparable across models.
 LATENCY_WORKLOADS: list[LatencyWorkload] = [
-    LatencyWorkload(name="single-request", batch_size=1,  input_len=128, output_len=128),
-    LatencyWorkload(name="fixed-batch-32", batch_size=32, input_len=128, output_len=128),
+    LatencyWorkload(name="single-request", batch_size=1,  output_len=128,
+        dataset_name=DEFAULT_WORKLOAD_DATASETS["mixed"]),
+    LatencyWorkload(name="fixed-batch-32", batch_size=32, output_len=128,
+        dataset_name=DEFAULT_WORKLOAD_DATASETS["mixed"]),
 ]
 
 
 def get_max_seq_len() -> int:
-    """Max static sequence length for standardized LLM latency workloads.
+    """Decode-budget floor for latency workloads.
 
-    Throughput decode lengths are data-dependent for real-prompt workloads, so
-    eval computes their max sequence length after loading the dataset.
+    Latency now draws real prompts, so the prompt (and full sequence) length is
+    data-dependent and computed after the dataset is loaded. This returns only
+    the max decode budget as a static floor.
     """
-    return max((w.input_len + w.output_len for w in LATENCY_WORKLOADS), default=0)
+    return max((w.output_len for w in LATENCY_WORKLOADS), default=0)
 
 
 # --- ASR (audio transcription, e.g. Whisper) -------------------------------
@@ -424,7 +483,8 @@ class VLMLatencyWorkload:
 
 
 VLM_THROUGHPUT_WORKLOADS: list[VLMThroughputWorkload] = [
-    VLMThroughputWorkload("text-only", "text", input_len=512, output_len=1024),
+    VLMThroughputWorkload("text-only", "text", input_len=None, output_len=512,
+        dataset_name=DEFAULT_WORKLOAD_DATASETS["mixed"], dataset_split="train"),
     VLMThroughputWorkload("image", "image", input_len=None, output_len=512,
         dataset_name="lmarena-ai/VisionArena-Chat", dataset_split="train"),
     VLMThroughputWorkload("video", "video", input_len=None, output_len=512,
@@ -443,7 +503,7 @@ VLM_LATENCY_WORKLOADS: list[VLMLatencyWorkload] = [
 
 QWEN_OMNI_THROUGHPUT_WORKLOADS: list[VLMThroughputWorkload] = [
     VLMThroughputWorkload("text", "text", input_len=None, output_len=512,
-        dataset_name=DEFAULT_WORKLOAD_DATASETS["balanced"], dataset_split="train"),
+        dataset_name=DEFAULT_WORKLOAD_DATASETS["mixed"], dataset_split="train"),
     VLMThroughputWorkload("image", "image", input_len=None, output_len=512,
         dataset_name="lmarena-ai/VisionArena-Chat", dataset_split="train"),
     VLMThroughputWorkload("video", "video", input_len=None, output_len=512,
@@ -454,7 +514,7 @@ QWEN_OMNI_THROUGHPUT_WORKLOADS: list[VLMThroughputWorkload] = [
 
 QWEN_OMNI_LATENCY_WORKLOADS: list[VLMLatencyWorkload] = [
     VLMLatencyWorkload("single-text", "text", output_len=128,
-        dataset_name=DEFAULT_WORKLOAD_DATASETS["balanced"], dataset_split="train"),
+        dataset_name=DEFAULT_WORKLOAD_DATASETS["mixed"], dataset_split="train"),
     VLMLatencyWorkload("single-image", "image", output_len=128,
         dataset_name="lmarena-ai/VisionArena-Chat", dataset_split="train"),
     VLMLatencyWorkload("single-video", "video", output_len=128,
@@ -689,7 +749,11 @@ class DetectionLatencyWorkload:
 
 
 DETECTION_THROUGHPUT_WORKLOADS: list[DetectionThroughputWorkload] = [
-    DetectionThroughputWorkload("coco-val", image_size=640, num_images=5000, batch_size=32),
+    # 5000 unique COCO val2017 images cycled 6x (see bench_detection tiling):
+    # shape-bound throughput so tiling only lengthens the timing window, giving
+    # duration parity (~20-30s on fast detectors) with the other families while
+    # the reported img/s rate is unchanged.
+    DetectionThroughputWorkload("coco-val", image_size=640, num_images=30000, batch_size=32),
 ]
 
 DETECTION_LATENCY_WORKLOADS: list[DetectionLatencyWorkload] = [
@@ -911,22 +975,144 @@ DP3_LATENCY_WORKLOADS: list[DP3LatencyWorkload] = [
 
 
 # ===========================================================================
-# vLLM dataset adapter (lazy)
+# Unified workload registry (identity + purpose + params)
 #
-# Re-exports vLLM's dataset types/helpers so benchmarks reuse the exact same
-# dataset CLI, loading and sampling logic. Resolved lazily via ``__getattr__``
-# so that ``import fastkernels.workloads`` never imports ``vllm``; the cost is
-# paid only by the e2e runners that actually access these names.
+# Single source of truth linking every workload *identity* enum member to its
+# *purpose* (throughput vs latency) and its *parameter* spec. The per-family
+# ``*_THROUGHPUT_WORKLOADS`` / ``*_LATENCY_WORKLOADS`` lists above remain the
+# canonical parameter definitions (and stay importable for the bench scripts);
+# this section joins them to their enum members exactly once so callers resolve
+# a workload with ``spec_for(member)`` / ``spec_by_name(Family, name)`` instead
+# of rebuilding ad-hoc ``{w.name: w}`` dicts.
 # ===========================================================================
 
-_VLLM_DATASET_EXPORTS = ("SampleRequest", "add_dataset_parser", "get_samples")
+class Purpose(Enum):
+    """What a workload is measured for."""
+    THROUGHPUT = "throughput"
+    LATENCY = "latency"
 
 
-def __getattr__(name: str) -> Any:  # PEP 562: supports `from ... import SampleRequest`
-    if name in _VLLM_DATASET_EXPORTS:
-        from vllm.benchmarks import datasets as _vllm_datasets
+@dataclass(frozen=True)
+class WorkloadSpec:
+    """A workload identity plus its purpose and (optional) parameter spec."""
+    workload: Workload
+    purpose: Purpose
+    params: Any = None
 
-        for export in _VLLM_DATASET_EXPORTS:
-            globals()[export] = getattr(_vllm_datasets, export)
-        return globals()[name]
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    @property
+    def name(self) -> str:
+        return self.workload.value
+
+
+# (family enum, throughput param specs, latency param specs). Segmentation's
+# separate video-throughput list is folded into its throughput entry.
+_SPEC_SOURCES: tuple[tuple[type[Workload], list[Any], list[Any]], ...] = (
+    (LLM, THROUGHPUT_WORKLOADS, LATENCY_WORKLOADS),
+    (VLM, VLM_THROUGHPUT_WORKLOADS, VLM_LATENCY_WORKLOADS),
+    (OmniModal, QWEN_OMNI_THROUGHPUT_WORKLOADS, QWEN_OMNI_LATENCY_WORKLOADS),
+    (ASR, ASR_THROUGHPUT_WORKLOADS, ASR_LATENCY_WORKLOADS),
+    (TTS, TTS_THROUGHPUT_WORKLOADS, TTS_LATENCY_WORKLOADS),
+    (Diffusion, DIFFUSION_THROUGHPUT_WORKLOADS, DIFFUSION_LATENCY_WORKLOADS),
+    (VideoDiffusion, VIDEO_DIFFUSION_THROUGHPUT_WORKLOADS, VIDEO_DIFFUSION_LATENCY_WORKLOADS),
+    (WorldModel, OASIS_THROUGHPUT_WORKLOADS, OASIS_LATENCY_WORKLOADS),
+    (Segmentation, [*SEGMENTATION_THROUGHPUT_WORKLOADS, *SEGMENTATION_VIDEO_WORKLOADS], SEGMENTATION_LATENCY_WORKLOADS),
+    (Detection, DETECTION_THROUGHPUT_WORKLOADS, DETECTION_LATENCY_WORKLOADS),
+    (VisionEncoder, VISION_ENCODER_THROUGHPUT_WORKLOADS, VISION_ENCODER_LATENCY_WORKLOADS),
+    (Embedding, EMBEDDING_THROUGHPUT_WORKLOADS, EMBEDDING_LATENCY_WORKLOADS),
+    (StructurePrediction, STRUCTURE_PREDICTION_THROUGHPUT_WORKLOADS, STRUCTURE_PREDICTION_LATENCY_WORKLOADS),
+    (PointCloudPolicy, DP3_THROUGHPUT_WORKLOADS, DP3_LATENCY_WORKLOADS),
+)
+
+# Families benchmarked by bespoke scripts that carry no parameter specs yet;
+# purpose is assigned by intent (batched runs -> throughput, single/latency
+# probes -> latency).
+_PARAMLESS_PURPOSES: dict[Workload, Purpose] = {
+    Robotics.libero_1cam: Purpose.THROUGHPUT,
+    Robotics.libero_3cam: Purpose.THROUGHPUT,
+    Robotics.single_3cam: Purpose.LATENCY,
+    Robotics.single_1cam: Purpose.LATENCY,
+    PointCloudSeg.scanobjectnn: Purpose.THROUGHPUT,
+    PointCloudSeg.single_cloud: Purpose.LATENCY,
+    PointCloudSeg.batch_8: Purpose.THROUGHPUT,
+    Rendering.render: Purpose.THROUGHPUT,
+    Rendering.single_render: Purpose.LATENCY,
+    Recsys.ctr_batch: Purpose.THROUGHPUT,
+    Recsys.recommend_batch: Purpose.THROUGHPUT,
+    Recsys.single_request: Purpose.LATENCY,
+    Recsys.fixed_batch_32: Purpose.LATENCY,
+    VideoRepresentation.predictor: Purpose.THROUGHPUT,
+    VideoRepresentation.encoder: Purpose.THROUGHPUT,
+    VideoRepresentation.classification: Purpose.THROUGHPUT,
+    VideoRepresentation.single_video: Purpose.LATENCY,
+}
+
+_ALL_FAMILIES: tuple[type[Workload], ...] = (
+    LLM, VLM, OmniModal, ASR, TTS, Diffusion, VideoDiffusion, WorldModel,
+    Segmentation, Detection, VisionEncoder, Embedding, StructurePrediction,
+    Robotics, PointCloudPolicy, PointCloudSeg, Rendering, Recsys,
+    VideoRepresentation,
+)
+
+
+def _build_workload_specs() -> dict[Workload, WorkloadSpec]:
+    specs: dict[Workload, WorkloadSpec] = {}
+    for family, throughput, latency in _SPEC_SOURCES:
+        by_name = {member.value: member for member in family}
+        for params, purpose in (
+            *((p, Purpose.THROUGHPUT) for p in throughput),
+            *((p, Purpose.LATENCY) for p in latency),
+        ):
+            member = by_name.get(params.name)
+            if member is None:
+                raise ValueError(
+                    f"{family.__name__}: workload {params.name!r} has no matching enum member"
+                )
+            if member in specs:
+                raise ValueError(f"{family.__name__}: duplicate spec for {member}")
+            specs[member] = WorkloadSpec(member, purpose, params)
+    for member, purpose in _PARAMLESS_PURPOSES.items():
+        specs[member] = WorkloadSpec(member, purpose)
+    # Every enum member must be classified, or resolution silently loses one.
+    unclassified = [m for fam in _ALL_FAMILIES for m in fam if m not in specs]
+    if unclassified:
+        raise RuntimeError(f"Workloads missing a purpose/spec: {unclassified}")
+    return specs
+
+
+# member -> WorkloadSpec, the canonical resolution table.
+WORKLOAD_SPECS: dict[Workload, WorkloadSpec] = _build_workload_specs()
+
+
+def spec_for(workload: Workload) -> WorkloadSpec:
+    """The WorkloadSpec (purpose + params) for a workload identity."""
+    return WORKLOAD_SPECS[workload]
+
+
+def purpose_of(workload: Workload) -> Purpose:
+    """Whether *workload* is a throughput or latency measurement."""
+    return WORKLOAD_SPECS[workload].purpose
+
+
+def spec_by_name(family: type[Workload], name: str) -> WorkloadSpec | None:
+    """Resolve a workload by its family enum and canonical name; ``None`` if unknown."""
+    try:
+        member = family(name)
+    except ValueError:
+        return None
+    return WORKLOAD_SPECS.get(member)
+
+
+def throughput_params(family: type[Workload], name: str) -> Any:
+    """Parameter spec for a *throughput* workload named *name* in *family*.
+
+    Returns ``None`` when the name is unknown to the family or is not a
+    throughput workload -- the exact acceptance rule the tracing entry points
+    previously encoded with per-call ``{w.name: w}`` dicts over the family's
+    throughput list.
+    """
+    spec = spec_by_name(family, name)
+    if spec is None or spec.purpose is not Purpose.THROUGHPUT:
+        return None
+    return spec.params
+
+

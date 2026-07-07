@@ -2242,7 +2242,9 @@ def main():
                         help="Checkpoint for LIBERO (overrides --model; use pi0_libero converted checkpoint)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-steps", type=int, default=10)
-    parser.add_argument("--num-requests", type=int, default=100)
+    # Calibrated on H200: 100 req/scenario ran ~4.9s (10-step flow matching);
+    # 600 lands each throughput scenario in the ~30s band for suite balance.
+    parser.add_argument("--num-requests", type=int, default=600)
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--datasets", nargs="+", choices=["aloha", "droid", "libero"],
                         default=["aloha", "droid", "libero"],

@@ -72,6 +72,22 @@ def add_cli_args(parser: argparse.ArgumentParser):
         help="Output length in tokens (default: 128)",
     )
     parser.add_argument(
+        "--dataset-name", type=str, default="fastkernels",
+        choices=["fastkernels", "random"],
+        help="Prompt source: 'fastkernels' (real WildChat/LongBench prompts, "
+             "default) or 'random' (synthetic token IDs; uses --input-len).",
+    )
+    parser.add_argument(
+        "--fastkernels-scenario", type=str, default="mixed",
+        choices=["mixed", "long-context"],
+        help="Real-prompt scenario when --dataset-name=fastkernels "
+             "(mixed=WildChat, long-context=LongBench-v2).",
+    )
+    parser.add_argument(
+        "--trust-remote-code", action="store_true", default=False,
+        help="Trust remote code when loading the tokenizer.",
+    )
+    parser.add_argument(
         "--temperature", type=float, default=1.0,
         help="Sampling temperature (default: 1.0, matching vLLM. "
              "Use 0.0 for greedy/deterministic)",
@@ -115,6 +131,33 @@ def main(args: argparse.Namespace):
     random.seed(args.seed)
     np.random.seed(args.seed)
 
+    dataset_name = getattr(args, "dataset_name", "fastkernels")
+    if dataset_name == "fastkernels":
+        from transformers import AutoTokenizer
+
+        from fastkernels.workloads import load_real_prompt_workload
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.model, trust_remote_code=getattr(args, "trust_remote_code", False),
+        )
+        samples = load_real_prompt_workload(
+            args.fastkernels_scenario,
+            tokenizer,
+            num_requests=args.batch_size,
+            decode_cap=args.output_len,
+            seed=args.seed,
+        )
+        prompt_token_ids = [s.prompt_token_ids for s in samples]
+        prompt_source = f"fastkernels:{args.fastkernels_scenario} (real prompts)"
+    else:
+        prompt_token_ids = np.random.randint(
+            10000, size=(args.batch_size, args.input_len)
+        ).tolist()
+        prompt_source = f"random (input_len={args.input_len})"
+    effective_bs = len(prompt_token_ids)
+    input_lens = [len(p) for p in prompt_token_ids]
+    max_input_len = max(input_lens) if input_lens else 0
+
     undo_info = None
     if not args.no_candidate_kernels:
         candidates = discover_candidates()
@@ -129,8 +172,10 @@ def main(args: argparse.Namespace):
     print("=" * 70)
     print(f"  Model          : {args.model}")
     print(f"  TP             : {args.tp}")
-    print(f"  Batch size     : {args.batch_size}")
-    print(f"  Input length   : {args.input_len}")
+    print(f"  Batch size     : {effective_bs}")
+    print(f"  Prompt source  : {prompt_source}")
+    print(f"  Input length   : {max_input_len} (max; real, variable)"
+          if dataset_name == "fastkernels" else f"  Input length   : {args.input_len}")
     print(f"  Output length  : {args.output_len}")
     print(f"  Temperature    : {args.temperature}")
     print(f"  Top-p          : {args.top_p}")
@@ -147,10 +192,6 @@ def main(args: argparse.Namespace):
         tensor_parallel_size=args.tp,
     )
 
-    dummy_prompt_token_ids = np.random.randint(
-        10000, size=(args.batch_size, args.input_len)
-    ).tolist()
-
     sp = SamplingParams(
         temperature=args.temperature,
         top_p=args.top_p,
@@ -162,7 +203,7 @@ def main(args: argparse.Namespace):
     def run_once():
         torch.cuda.synchronize()
         start = time.perf_counter()
-        outputs = engine.generate(dummy_prompt_token_ids, sp)
+        outputs = engine.generate(prompt_token_ids, sp)
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - start
         return elapsed, outputs
@@ -195,8 +236,12 @@ def main(args: argparse.Namespace):
         "timestamp": datetime.now().isoformat(),
         "model": args.model,
         "tp": args.tp,
-        "batch_size": args.batch_size,
-        "input_len": args.input_len,
+        "batch_size": effective_bs,
+        "dataset_name": dataset_name,
+        "fastkernels_scenario": (
+            args.fastkernels_scenario if dataset_name == "fastkernels" else None
+        ),
+        "input_len": max_input_len if dataset_name == "fastkernels" else args.input_len,
         "output_len": args.output_len,
         "seed": args.seed,
         "temperature": args.temperature,

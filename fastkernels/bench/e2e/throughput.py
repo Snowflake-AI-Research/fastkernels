@@ -4,16 +4,19 @@ Modeled after ``vllm bench throughput``. Runs ``LlamaEngine`` in offline mode
 with batched generation and measures requests/s, total tokens/s, and output
 tokens/s.
 
+Prompts come from the calibrated real-prompt scenarios (WildChat / LongBench-v2)
+via ``load_real_prompt_workload``.
+
 Usage (standalone):
     python -m fastkernels.bench.e2e throughput \\
         --model meta-llama/Llama-3.1-8B-Instruct \\
-        --dataset-name fastkernels \\
+        --fastkernels-scenario mixed \\
         --num-prompts 100
 
 Usage (with subprocess isolation):
     python -m fastkernels.bench.e2e throughput \\
         --model meta-llama/Llama-3.1-8B-Instruct \\
-        --dataset-name fastkernels \\
+        --fastkernels-scenario long-context \\
         --subprocess
 """
 
@@ -23,23 +26,15 @@ import argparse
 import json
 import os
 import random
-import sys
 import time
-import warnings
+from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 import torch
 from transformers import AutoTokenizer
 
-from fastkernels.workloads import (
-    SampleRequest,
-    add_dataset_parser,
-    get_samples,
-    load_real_prompt_workload,
-)
+from fastkernels.workloads import load_real_prompt_workload
 from fastkernels.bench.utils.worker import FASTKERNELS_WORKER, run_worker
 from fastkernels.infra.kernel_swapper import (
     apply_candidates,
@@ -48,8 +43,16 @@ from fastkernels.infra.kernel_swapper import (
 )
 
 
+@dataclass
+class PromptRequest:
+    """One offline throughput request: a pre-tokenized prompt + decode budget."""
+    prompt: list[int]
+    prompt_len: int
+    expected_output_len: int
+
+
 def run_fastkernels(
-    requests: list[SampleRequest],
+    requests: list[PromptRequest],
     model: str,
     tp: int,
     seed: int,
@@ -118,7 +121,7 @@ def run_fastkernels(
 
 
 def run_fastkernels_subprocess(
-    requests: list[SampleRequest],
+    requests: list[PromptRequest],
     model: str,
     tp: int,
     seed: int,
@@ -177,45 +180,6 @@ def validate_args(args: argparse.Namespace):
     if not getattr(args, "tokenizer", None):
         args.tokenizer = args.model
 
-    dataset_name = getattr(args, "dataset_name", "random")
-    dataset_path = getattr(args, "dataset_path", None)
-
-    if dataset_name == "fastkernels":
-        return
-
-    if dataset_name in ("random", "random-mm", "random-rerank"):
-        random_input_len = getattr(args, "random_input_len", None)
-        input_len = getattr(args, "input_len", None)
-        if random_input_len is None and input_len is None:
-            raise ValueError(
-                "Either --input-len or --random-input-len must be provided "
-                "for a random dataset"
-            )
-        if input_len is not None and random_input_len is not None:
-            warnings.warn(
-                "Both --input-len and --random-input-len are specified. "
-                "The random version (--random-input-len) will be preferred.",
-                stacklevel=2,
-            )
-        random_output_len = getattr(args, "random_output_len", None)
-        output_len = getattr(args, "output_len", None)
-        if output_len is not None and random_output_len is not None:
-            warnings.warn(
-                "Both --output-len and --random-output-len are specified. "
-                "The random version (--random-output-len) will be preferred.",
-                stacklevel=2,
-            )
-
-    if (
-        dataset_name not in ("random", "random-mm", "random-rerank", None)
-        and dataset_path is None
-        and dataset_name not in ("prefix_repetition",)
-    ):
-        print(
-            f"WARNING: --dataset-name={dataset_name} typically requires "
-            "--dataset-path to be set."
-        )
-
 
 def add_cli_args(parser: argparse.ArgumentParser):
     """Add throughput-specific CLI arguments."""
@@ -249,13 +213,21 @@ def add_cli_args(parser: argparse.ArgumentParser):
         help="Run the engine in a clean subprocess for isolation",
     )
     parser.add_argument(
-        "--input-len", type=int, default=None,
-        help="Input prompt length for each request",
+        "--num-prompts", type=int, default=1000,
+        help="Number of real prompts to sample from the scenario dataset",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Random seed for dataset sampling (default: 42)",
+    )
+    parser.add_argument(
+        "--trust-remote-code", action="store_true", default=False,
+        help="Allow custom tokenizer code from the model repo",
     )
     parser.add_argument(
         "--output-len", type=int, default=None,
-        help="Output length for each request. Overrides the "
-             "output length from the dataset.",
+        help="Per-request decode budget. Caps the dataset's own output "
+             "length when set; otherwise the scenario's calibrated cap is used.",
     )
     parser.add_argument(
         "--output-json", type=str, default=None,
@@ -270,14 +242,11 @@ def add_cli_args(parser: argparse.ArgumentParser):
         help="Disable candidate kernel auto-detection; use only baseline kernels",
     )
     parser.add_argument(
-        "--fastkernels-scenario", type=str, default="balanced",
-        choices=["prefill-heavy", "balanced", "decode-heavy"],
-        help="fastkernels WildChat-derived scenario to use with "
-             "--dataset-name=fastkernels.",
+        "--fastkernels-scenario", type=str, default="mixed",
+        choices=["mixed", "long-context"],
+        help="Real-prompt scenario: mixed=WildChat throughput, "
+             "long-context=LongBench-v2.",
     )
-
-    add_dataset_parser(parser)
-    parser.set_defaults(seed=42)
 
 
 def main(args: argparse.Namespace):
@@ -294,48 +263,24 @@ def main(args: argparse.Namespace):
 
     tokenizer_name = args.tokenizer or args.model
     tokenizer = AutoTokenizer.from_pretrained(
-        tokenizer_name, trust_remote_code=getattr(args, "trust_remote_code", False),
+        tokenizer_name, trust_remote_code=args.trust_remote_code,
     )
 
-    if args.input_len is not None:
-        args.random_input_len = args.input_len
-        args.sonnet_input_len = args.input_len
-    if args.output_len is not None:
-        args.random_output_len = args.output_len
-        args.sonnet_output_len = args.output_len
-        args.sharegpt_output_len = args.output_len
-        args.custom_output_len = args.output_len
-        args.hf_output_len = args.output_len
-        args.spec_bench_output_len = args.output_len
-        args.prefix_repetition_output_len = args.output_len
-
-    if not hasattr(args, "backend"):
-        args.backend = "vllm"
-    if not hasattr(args, "request_id_prefix"):
-        args.request_id_prefix = ""
-
-    dataset_name = getattr(args, "dataset_name", "random")
-    use_real_workload = dataset_name == "fastkernels"
-
-    if use_real_workload:
-        scenario_name = args.fastkernels_scenario
-        samples = load_real_prompt_workload(
-            scenario_name,
-            tokenizer,
-            num_requests=args.num_prompts,
-            decode_cap=args.output_len,
-            seed=args.seed,
+    samples = load_real_prompt_workload(
+        args.fastkernels_scenario,
+        tokenizer,
+        num_requests=args.num_prompts,
+        decode_cap=args.output_len,
+        seed=args.seed,
+    )
+    requests = [
+        PromptRequest(
+            prompt=s.prompt_token_ids,
+            prompt_len=len(s.prompt_token_ids),
+            expected_output_len=s.output_len,
         )
-        requests = [
-            SimpleNamespace(
-                prompt=s.prompt_token_ids,
-                prompt_len=len(s.prompt_token_ids),
-                expected_output_len=s.output_len,
-            )
-            for s in samples
-        ]
-    else:
-        requests = get_samples(args, tokenizer)
+        for s in samples
+    ]
     total_input_tokens = sum(r.prompt_len for r in requests)
     total_expected_output = sum(r.expected_output_len for r in requests)
 

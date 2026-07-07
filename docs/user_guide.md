@@ -64,7 +64,7 @@ A benchmark is **PASS** if the candidate output's max error ratio is <= 1.0 agai
 
 ### vLLM Alignment Test
 
-`tests/bench_vllm.py` runs fastkernels and vLLM side-by-side across three workload scenarios (prefill-heavy, balanced, decode-heavy) plus latency benchmarks, comparing throughput and per-token alignment:
+`tests/bench_vllm.py` runs fastkernels and vLLM side-by-side across the real-prompt throughput scenarios (mixed, long-context) plus latency benchmarks, comparing throughput and per-token alignment:
 
 ```bash
 python tests/bench_vllm.py --model meta-llama/Llama-3.1-8B-Instruct

@@ -171,7 +171,10 @@ _JAX_WORKER = Path(__file__).resolve().parent / "bench_ttt_e2e_jax_worker.py"
 
 def _run_jax_worker(args_list: list[str]) -> dict:
     """Run the JAX subprocess worker and return a dict of stdout lines + return code."""
-    cmd = [sys.executable, str(_JAX_WORKER)] + args_list
+    # Allow running JAX in an isolated interpreter (e.g. a venv with jax[cuda12])
+    # so its bundled CUDA wheels don't clash with the torch environment.
+    jax_python = os.environ.get("TTT_JAX_PYTHON", "").strip() or sys.executable
+    cmd = [jax_python, str(_JAX_WORKER)] + args_list
     # Stream stdout to keep visibility on the long-running JAX compile.
     print(f"[bench] running: {' '.join(cmd)}", flush=True)
     t0 = time.time()

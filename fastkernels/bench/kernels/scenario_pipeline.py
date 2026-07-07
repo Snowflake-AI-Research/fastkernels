@@ -779,14 +779,13 @@ def trace_diffusion_model(
 ) -> Path:
     if tp != 1:
         raise ValueError(f"DiffusionEngine only supports tp=1, got tp={tp}")
-    from fastkernels.workloads import DIFFUSION_THROUGHPUT_WORKLOADS, FLUX_CONFIG
+    from fastkernels.workloads import Diffusion, FLUX_CONFIG, throughput_params
     from fastkernels.infra.diffusion_engine import DiffusionEngine
     from fastkernels.tasks.baseline.L4.flux import DiffusionSamplingParams
 
-    by_name = {w.name: w for w in DIFFUSION_THROUGHPUT_WORKLOADS}
-    if workload not in by_name:
+    spec = throughput_params(Diffusion, workload)
+    if spec is None:
         raise ValueError(f"Unsupported diffusion workload {workload!r}")
-    spec = by_name[workload]
     n = num_requests if num_requests is not None else spec.num_requests
     key = model_key or _short_model_key(model_name)
     trace_path = trace_dir / key / f"tp{tp}" / dtype / f"{workload}.jsonl"
@@ -845,13 +844,12 @@ def trace_embedding_model(
 ) -> Path:
     if tp != 1:
         raise ValueError(f"EmbeddingEngine only supports tp=1, got tp={tp}")
-    from fastkernels.workloads import EMBEDDING_THROUGHPUT_WORKLOADS
+    from fastkernels.workloads import Embedding, throughput_params
     from fastkernels.infra.embedding_engine import EmbeddingEngine
 
-    by_name = {w.name: w for w in EMBEDDING_THROUGHPUT_WORKLOADS}
-    if workload not in by_name:
+    spec = throughput_params(Embedding, workload)
+    if spec is None:
         raise ValueError(f"Unsupported embedding workload {workload!r}")
-    spec = by_name[workload]
     n = num_requests if num_requests is not None else spec.num_requests
     key = model_key or _short_model_key(model_name)
     trace_path = trace_dir / key / f"tp{tp}" / dtype / f"{workload}.jsonl"
@@ -897,14 +895,13 @@ def trace_oasis_model(
 ) -> Path:
     if tp != 1:
         raise ValueError(f"OasisEngine only supports tp=1, got tp={tp}")
-    from fastkernels.workloads import OASIS_THROUGHPUT_WORKLOADS
+    from fastkernels.workloads import WorldModel, throughput_params
     from fastkernels.infra.oasis_engine import OasisEngine
     from fastkernels.tasks.baseline.L4.oasis import OasisSamplingParams
 
-    by_name = {w.name: w for w in OASIS_THROUGHPUT_WORKLOADS}
-    if workload not in by_name:
+    spec = throughput_params(WorldModel, workload)
+    if spec is None:
         raise ValueError(f"Unsupported Oasis workload {workload!r}")
-    spec = by_name[workload]
     n = num_requests if num_requests is not None else 1
     key = model_key or _short_model_key(model_name)
     trace_path = trace_dir / key / f"tp{tp}" / dtype / f"{workload}.jsonl"
@@ -958,13 +955,12 @@ def trace_detection_model(
 ) -> Path:
     if tp != 1:
         raise ValueError(f"Detection tracing only supports tp=1, got tp={tp}")
-    from fastkernels.workloads import DETECTION_THROUGHPUT_WORKLOADS
+    from fastkernels.workloads import Detection, throughput_params
     from fastkernels.infra.detection_loader import load_ours_detector
 
-    by_name = {w.name: w for w in DETECTION_THROUGHPUT_WORKLOADS}
-    if workload not in by_name:
+    spec = throughput_params(Detection, workload)
+    if spec is None:
         raise ValueError(f"Unsupported detection workload {workload!r}")
-    spec = by_name[workload]
     n = num_requests if num_requests is not None else spec.num_images
     key = model_key or _short_model_key(model_name)
     trace_path = trace_dir / key / f"tp{tp}" / dtype / f"{workload}.jsonl"
@@ -1013,13 +1009,12 @@ def trace_vlm_model(
     num_requests: int | None = None,
     decode_cap: int | None = None,
 ) -> Path:
-    from fastkernels.workloads import VLM_THROUGHPUT_WORKLOADS
+    from fastkernels.workloads import VLM, throughput_params
     from fastkernels.infra.engine import LlamaEngine, SamplingParams
 
-    by_name = {w.name: w for w in VLM_THROUGHPUT_WORKLOADS}
-    if workload not in by_name:
+    spec = throughput_params(VLM, workload)
+    if spec is None:
         raise ValueError(f"Unsupported VLM workload {workload!r}")
-    spec = by_name[workload]
     key = model_key or _short_model_key(model_name)
     trace_path = trace_dir / key / f"tp{tp}" / dtype / f"{workload}.jsonl"
     print(f"Tracing {key}/{workload} with LlamaEngine VLM path: model={model_name}, dtype={dtype}")
@@ -1177,37 +1172,40 @@ def _load_standard_workload(
     seed: int,
 ) -> tuple[list[list[int]], list[int]]:
     from fastkernels.workloads import (
-        THROUGHPUT_WORKLOADS,
-        VLM_THROUGHPUT_WORKLOADS,
+        LLM,
+        VLM,
+        Purpose,
         load_real_prompt_workload,
+        purpose_of,
+        throughput_params,
     )
 
-    by_name = {w.name: w for w in THROUGHPUT_WORKLOADS}
-    if workload not in by_name:
-        vlm_by_name = {w.name: w for w in VLM_THROUGHPUT_WORKLOADS}
-        if workload in vlm_by_name and vlm_by_name[workload].modality == "text":
-            spec = vlm_by_name[workload]
-            n = num_requests if num_requests is not None else spec.num_requests
-            output_len = min(spec.output_len, decode_cap) if decode_cap else spec.output_len
+    spec = throughput_params(LLM, workload)
+    if spec is None:
+        vlm_spec = throughput_params(VLM, workload)
+        if vlm_spec is not None and vlm_spec.modality == "text":
+            n = num_requests if num_requests is not None else vlm_spec.num_requests
+            output_len = min(vlm_spec.output_len, decode_cap) if decode_cap else vlm_spec.output_len
             vocab_size = int(getattr(tokenizer, "vocab_size", 32000) or 32000)
             generator = torch.Generator().manual_seed(seed)
             prompts = [
                 torch.randint(
                     low=0,
                     high=max(vocab_size, 1),
-                    size=(int(spec.input_len or 512),),
+                    size=(int(vlm_spec.input_len or 512),),
                     generator=generator,
                     dtype=torch.long,
                 ).tolist()
                 for _ in range(n)
             ]
             return prompts, [output_len for _ in range(n)]
-        available = ", ".join(sorted(by_name))
+        available = ", ".join(
+            sorted(m.value for m in LLM if purpose_of(m) is Purpose.THROUGHPUT)
+        )
         raise ValueError(
             f"Workload {workload!r} does not provide prompts/output_lens and "
             f"is not a standardized throughput workload. Available: {available}"
         )
-    spec = by_name[workload]
     n = num_requests if num_requests is not None else spec.num_requests
     samples = load_real_prompt_workload(
         spec.name,

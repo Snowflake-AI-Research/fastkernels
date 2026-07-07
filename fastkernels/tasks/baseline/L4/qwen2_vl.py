@@ -207,6 +207,7 @@ class Qwen2VLForConditionalGeneration(nn.Module):
         image_offsets: list[int] | None = None,
         video_offsets: list[int] | None = None,
         video_second_per_grid: list[float] | None = None,
+        **kwargs,  # tolerate engine-passed extras (e.g. audio_feature_lengths)
     ) -> tuple[torch.Tensor, int]:
         return self._mrope_positions(
             input_tokens, self.config.vision.spatial_merge_size,

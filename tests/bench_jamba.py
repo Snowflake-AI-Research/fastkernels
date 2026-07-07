@@ -79,7 +79,7 @@ SCENARIOS = [
 LATENCY_SCENARIOS = [
     {
         "name": w.name,
-        "input_len": w.input_len,
+        "dataset": w.dataset_name,
         "output_len": w.output_len,
         "batch_size": w.batch_size,
     }
@@ -621,7 +621,7 @@ def main():
     parser.add_argument(
         "--scenario", type=str, default=None,
         help="Run only the throughput scenario with this name "
-             "(e.g. 'balanced'). Default: all scenarios.",
+             "(e.g. 'mixed'). Default: all scenarios.",
     )
     parser.add_argument("--output-dir", type=str, default=None)
     args = parser.parse_args()
@@ -681,10 +681,11 @@ def main():
         for j, ls in enumerate(latency_scenarios):
             bs = ls["batch_size"]
             samples = load_real_prompt_workload(
-                "balanced",
+                "mixed",
                 tokenizer,
                 num_requests=bs,
                 decode_cap=ls["output_len"],
+                dataset_name=ls.get("dataset") or None,
                 seed=args.seed + 100 + j,
             )
             fitted = []
@@ -697,9 +698,10 @@ def main():
                 fitted.append((p, ol))
             prompt_token_ids = [p for p, _ in fitted]
             output_lens = [ol for _, ol in fitted]
+            real_input_len = max((len(p) for p in prompt_token_ids), default=0)
             latency_data.append({
                 "name": ls["name"],
-                "input_len": ls["input_len"],
+                "input_len": real_input_len,
                 "output_len": ls["output_len"],
                 "batch_size": bs,
                 "prompt_token_ids": prompt_token_ids,

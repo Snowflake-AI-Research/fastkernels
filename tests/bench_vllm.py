@@ -36,7 +36,6 @@ import socket
 import sys
 import time
 from pathlib import Path
-from random import randint
 
 import subprocess
 
@@ -215,7 +214,7 @@ SCENARIOS = [
 LATENCY_SCENARIOS = [
     {
         "name": w.name,
-        "input_len": w.input_len,
+        "dataset": w.dataset_name,
         "output_len": w.output_len,
         "batch_size": w.batch_size,
     }
@@ -1782,7 +1781,7 @@ def main():
     parser.add_argument(
         "--scenario", type=str, default=None,
         help="Run only the throughput scenario with this name (e.g. "
-             "'balanced'). Default: run all scenarios for the model type.",
+             "'mixed'). Default: run all scenarios for the model type.",
     )
     parser.add_argument(
         "--pytorch-reference", action="store_true", default=False,
@@ -1908,16 +1907,11 @@ def main():
                     prompt_token_ids = [s.prompt_token_ids for s in samples]
                     output_lens = [s.output_len for s in samples]
                 else:
-                    input_len = scenario["input_len"]
-                    output_len = scenario["output_len"]
-                    rng_seed = args.seed + i
-                    random.seed(rng_seed)
-                    np.random.seed(rng_seed)
-                    prompt_token_ids = [
-                        [randint(0, 10000) for _ in range(input_len)]
-                        for _ in range(args.num_seqs)
-                    ]
-                    output_lens = [output_len] * args.num_seqs
+                    raise ValueError(
+                        f"text throughput scenario '{scenario['name']}' has no "
+                        "dataset; all text workloads must use a real prompt "
+                        "dataset (synthetic random-token prompts are not allowed)"
+                    )
                 max_seq_len = max(
                     len(p) + ol
                     for p, ol in zip(prompt_token_ids, output_lens)
@@ -1968,14 +1962,16 @@ def main():
             if modality == "text":
                 bs = ls["batch_size"]
                 samples = load_real_prompt_workload(
-                    "balanced",
+                    "mixed",
                     tokenizer,
                     num_requests=bs,
-                    decode_cap=None,
+                    decode_cap=ls["output_len"],
+                    dataset_name=ls.get("dataset") or None,
                     seed=args.seed + 100 + j,
                 )
                 prompt_token_ids = [s.prompt_token_ids for s in samples]
                 output_lens = [s.output_len for s in samples]
+                real_input_len = max((len(p) for p in prompt_token_ids), default=0)
                 seq_len = max(
                     len(p) + ol
                     for p, ol in zip(prompt_token_ids, output_lens)
@@ -1985,7 +1981,7 @@ def main():
                 latency_data.append({
                     "name": ls["name"],
                     "modality": "text",
-                    "input_len": ls["input_len"],
+                    "input_len": real_input_len,
                     "output_len": ls["output_len"],
                     "batch_size": bs,
                     "prompt_token_ids": prompt_token_ids,

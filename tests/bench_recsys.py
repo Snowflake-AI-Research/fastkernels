@@ -66,6 +66,8 @@ ADULT_LABEL_COLUMN = "income"
 
 def _bootstrap_local_package() -> None:
     root = Path(__file__).resolve().parent.parent
+    if not (root / "__init__.py").exists() and (root / "fastkernels" / "__init__.py").exists():
+        root = root / "fastkernels"
     spec = importlib.util.spec_from_file_location(
         "fastkernels",
         root / "__init__.py",
@@ -484,6 +486,7 @@ def _load_dlrm_models(
     config: DLRMv2Config,
     checkpoint_path: Path,
     device: torch.device,
+    skip_reference: bool = False,
 ):
     checkpoint = _load_compatible_checkpoint(
         checkpoint_path,
@@ -496,6 +499,10 @@ def _load_dlrm_models(
 
     ours = DLRMv2(config).to(device).eval()
     ours.load_state_dict(checkpoint["state_dict"], strict=True)
+    if skip_reference:
+        # fastkernels-only: don't build the torchrec reference (avoids the
+        # torchrec / fbgemm_gpu optional dependency entirely).
+        return None, ours.eval(), checkpoint
     ref = _build_torchrec_dlrm_reference(config, device)
     _copy_dlrm_weights_to_torchrec(ours, ref)
     return ref.eval(), ours.eval(), checkpoint
@@ -611,15 +618,16 @@ def _run_dlrm_throughput(
     prepared_inputs: dict[str, Any],
     warmup_iters: int,
     measure_iters: int,
+    skip_reference: bool = False,
 ) -> dict[str, Any]:
     config: DLRMv2Config = prepared_inputs["config"]
     ref, ours, checkpoint = _load_dlrm_models(
         config=config,
         checkpoint_path=prepared_inputs["checkpoint_path"],
         device=device,
+        skip_reference=skip_reference,
     )
     dense_features, sparse_indices = prepared_inputs["throughput_batch"]
-    kjt = _build_torchrec_kjt(sparse_indices)
     batch_size = dense_features.shape[0]
 
     with torch.inference_mode():
@@ -631,19 +639,22 @@ def _run_dlrm_throughput(
             items_per_iter=batch_size,
             metric_name="samples_per_second",
         )
-        ref_metrics = _benchmark_forward(
-            lambda: ref(dense_features, kjt),
-            device=device,
-            warmup_iters=warmup_iters,
-            measure_iters=measure_iters,
-            items_per_iter=batch_size,
-            metric_name="samples_per_second",
-        )
+        ref_metrics = None
+        if ref is not None:
+            kjt = _build_torchrec_kjt(sparse_indices)
+            ref_metrics = _benchmark_forward(
+                lambda: ref(dense_features, kjt),
+                device=device,
+                warmup_iters=warmup_iters,
+                measure_iters=measure_iters,
+                items_per_iter=batch_size,
+                metric_name="samples_per_second",
+            )
 
     ours_sps = ours_metrics["samples_per_second"]
-    ref_sps = ref_metrics["samples_per_second"]
+    ref_sps = ref_metrics["samples_per_second"] if ref_metrics else 0.0
     return {
-        "reference": "torchrec.models.dlrm.DLRM",
+        "reference": None if ref is None else "torchrec.models.dlrm.DLRM",
         "checkpoint": str(prepared_inputs["checkpoint_path"]),
         "checkpoint_objective": checkpoint["metadata"]["objective"],
         "ours": ours_metrics,
@@ -761,6 +772,7 @@ def _load_lightgcn_models(
     config: LightGCNConfig,
     checkpoint_path: Path,
     device: torch.device,
+    skip_reference: bool = False,
 ):
     checkpoint = _load_compatible_checkpoint(
         checkpoint_path,
@@ -771,9 +783,12 @@ def _load_lightgcn_models(
     if checkpoint is None:
         raise RuntimeError(f"missing or incompatible LightGCN checkpoint: {checkpoint_path}")
 
-    PyGLightGCN = _load_pyg_lightgcn()
     ours = LightGCN(config).to(device).eval()
     ours.load_state_dict(checkpoint["state_dict"], strict=True)
+    if skip_reference:
+        # fastkernels-only: skip the torch_geometric reference dependency.
+        return None, ours.eval(), checkpoint
+    PyGLightGCN = _load_pyg_lightgcn()
     ref = PyGLightGCN(
         num_nodes=config.num_users + config.num_items,
         embedding_dim=config.embedding_dim,
@@ -988,12 +1003,14 @@ def _run_lightgcn_throughput(
     prepared_inputs: dict[str, Any],
     warmup_iters: int,
     measure_iters: int,
+    skip_reference: bool = False,
 ) -> dict[str, Any]:
     config: LightGCNConfig = prepared_inputs["config"]
     ref, ours, checkpoint = _load_lightgcn_models(
         config=config,
         checkpoint_path=prepared_inputs["checkpoint_path"],
         device=device,
+        skip_reference=skip_reference,
     )
 
     _edge_users, _edge_items, user_ids, item_ids, adjacency = prepared_inputs["throughput_batch"]
@@ -1008,19 +1025,21 @@ def _run_lightgcn_throughput(
             items_per_iter=user_ids.numel(),
             metric_name="pairs_per_second",
         )
-        ref_metrics = _benchmark_forward(
-            lambda: ref(adjacency, edge_label_index=edge_label_index),
-            device=device,
-            warmup_iters=warmup_iters,
-            measure_iters=measure_iters,
-            items_per_iter=user_ids.numel(),
-            metric_name="pairs_per_second",
-        )
+        ref_metrics = None
+        if ref is not None:
+            ref_metrics = _benchmark_forward(
+                lambda: ref(adjacency, edge_label_index=edge_label_index),
+                device=device,
+                warmup_iters=warmup_iters,
+                measure_iters=measure_iters,
+                items_per_iter=user_ids.numel(),
+                metric_name="pairs_per_second",
+            )
 
     ours_pps = ours_metrics["pairs_per_second"]
-    ref_pps = ref_metrics["pairs_per_second"]
+    ref_pps = ref_metrics["pairs_per_second"] if ref_metrics else 0.0
     return {
-        "reference": "torch_geometric.nn.models.LightGCN",
+        "reference": None if ref is None else "torch_geometric.nn.models.LightGCN",
         "checkpoint": str(prepared_inputs["checkpoint_path"]),
         "checkpoint_objective": checkpoint["metadata"]["objective"],
         "ours": ours_metrics,
@@ -1066,11 +1085,15 @@ def _summarize_model_result(name: str, result: dict[str, Any]) -> None:
     if throughput:
         metric_name = "samples_per_second" if name == "dlrmv2" else "pairs_per_second"
         ours = throughput["ours"][metric_name]
-        ref = throughput["reference_metrics"][metric_name]
-        print(
-            f"  throughput: ours={ours:.2f}, reference={ref:.2f}, "
-            f"ratio={throughput['ratio_vs_reference']:.2f}x"
-        )
+        ref_metrics = throughput.get("reference_metrics")
+        if ref_metrics:
+            print(
+                f"  throughput: ours={ours:.2f}, "
+                f"reference={ref_metrics[metric_name]:.2f}, "
+                f"ratio={throughput['ratio_vs_reference']:.2f}x"
+            )
+        else:
+            print(f"  throughput: ours={ours:.2f} (fastkernels-only)")
 
 
 def _run_model(args: argparse.Namespace, model_name: str, device: torch.device) -> dict[str, Any]:
@@ -1092,6 +1115,7 @@ def _run_model(args: argparse.Namespace, model_name: str, device: torch.device) 
                 prepared_inputs=prepared_inputs,
                 warmup_iters=args.warmup_iters,
                 measure_iters=args.measure_iters,
+                skip_reference=args.skip_reference,
             )
     elif model_name == "lightgcn":
         prepared_inputs = _prepare_lightgcn_inputs(args, device)
@@ -1107,6 +1131,7 @@ def _run_model(args: argparse.Namespace, model_name: str, device: torch.device) 
                 prepared_inputs=prepared_inputs,
                 warmup_iters=args.warmup_iters,
                 measure_iters=args.measure_iters,
+                skip_reference=args.skip_reference,
             )
     else:
         raise ValueError(f"unsupported model: {model_name}")
@@ -1148,6 +1173,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-iters", type=int, default=100, help="Warmup iterations")
     parser.add_argument("--measure-iters", type=int, default=11000, help="Measured iterations")
     parser.add_argument("--skip-alignment", action="store_true", help="Skip numerical alignment")
+    parser.add_argument(
+        "--skip-reference", action="store_true",
+        help="fastkernels-only: skip the torchrec/torch_geometric reference "
+             "models entirely (implies --skip-alignment).",
+    )
     parser.add_argument("--skip-throughput", action="store_true", help="Skip throughput benchmark")
     parser.add_argument(
         "--output-dir",
@@ -1196,6 +1226,10 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+    if args.skip_reference:
+        # Alignment always compares against the reference; there is nothing to
+        # align to in fastkernels-only mode.
+        args.skip_alignment = True
     torch.manual_seed(args.seed)
 
     device = _auto_device() if args.device == "auto" else torch.device(args.device)

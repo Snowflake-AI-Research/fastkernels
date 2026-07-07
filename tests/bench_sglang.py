@@ -91,7 +91,7 @@ PROMPTS = [
     "Human: Write a Bash one-liner to find the 10 largest files under the current directory and explain it.\n\nAssistant:",
 ]
 
-WILDCHAT_SCENARIOS = ("prefill-heavy", "balanced", "decode-heavy")
+WILDCHAT_SCENARIOS = ("mixed", "long-context")
 
 
 def _build_prompt_set(num_seqs: int, seed: int) -> list[str]:
@@ -508,8 +508,8 @@ def main():
     parser.add_argument(
         "--scenario",
         choices=[*WILDCHAT_SCENARIOS, "all"],
-        default="balanced",
-        help="WildChat throughput scenario to run. Ignored for --workload=fixed.",
+        default="mixed",
+        help="Real-prompt throughput scenario to run. Ignored for --workload=fixed.",
     )
     parser.add_argument("--max-model-len", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=42)

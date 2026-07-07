@@ -77,32 +77,82 @@ def _slugify(value: str) -> str:
     return re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip()).strip("-") or "value"
 
 
+def _load_task_requests_direct(
+    task: str, spec: dict[str, Any], max_samples: int | None
+) -> list[dict[str, Any]]:
+    """Load task prompts straight from the HF dataset (0-shot).
+
+    Fallback for lm_eval builds whose task index no longer registers a task
+    (e.g. ``humaneval`` was dropped from the default registry). The diffusion-LM
+    throughput protocol only needs realistic prompts + gen-length, so a 0-shot
+    prompt from the underlying dataset is sufficient and fully reproducible.
+    """
+    from datasets import load_dataset
+
+    ds = load_dataset(spec["dataset"], spec["config"], split=spec["split"])
+    if max_samples is not None:
+        ds = ds.select(range(min(max_samples, len(ds))))
+
+    requests: list[dict[str, Any]] = []
+    for idx, doc in enumerate(ds):
+        if task == "humaneval":
+            prompt = doc["prompt"]
+            task_id = doc.get("task_id", f"HumanEval/{idx}")
+            stop_tokens = ["\nclass ", "\ndef ", "\n#", "\nif __name__", "\nprint("]
+        elif task == "gsm8k":
+            prompt = doc["question"]
+            task_id = f"gsm8k-{idx}"
+            stop_tokens = ["\n\n", "Question:"]
+        else:
+            raise ValueError(f"No direct loader for task: {task}")
+        requests.append(
+            {
+                "prompt": prompt,
+                "task_id": task_id,
+                "stop_tokens": stop_tokens,
+                "count_mode": spec["count_mode"],
+            }
+        )
+    return requests
+
+
 def _load_task_requests(task: str, max_samples: int | None) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     os.environ.setdefault("HF_ALLOW_CODE_EVAL", "1")
     os.environ.setdefault("HF_DATASETS_TRUST_REMOTE_CODE", "true")
 
-    from lm_eval.tasks import TaskManager, get_task_dict
-
     if task not in TASK_SPECS:
         raise ValueError(f"Unsupported task: {task}")
     spec = TASK_SPECS[task]
-    manager = TaskManager()
-    task_obj = get_task_dict([task], task_manager=manager)[task]
-    task_obj.set_fewshot_seed(DEFAULT_FEWSHOT_SEED)
-    task_obj.build_all_requests(limit=max_samples)
 
-    requests: list[dict[str, Any]] = []
-    for inst in task_obj.instances:
-        prompt = inst.args[0]
-        gen_args = inst.args[1] if len(inst.args) > 1 and isinstance(inst.args[1], dict) else {}
-        requests.append(
-            {
-                "prompt": prompt,
-                "task_id": inst.doc.get("task_id", f"{task}-{inst.doc_id}"),
-                "stop_tokens": list(gen_args.get("until", [])),
-                "count_mode": spec["count_mode"],
-            }
-        )
+    num_fewshot: int | None = None
+    source = "lm_eval"
+    try:
+        from lm_eval.tasks import TaskManager, get_task_dict
+
+        manager = TaskManager()
+        task_obj = get_task_dict([task], task_manager=manager)[task]
+        task_obj.set_fewshot_seed(DEFAULT_FEWSHOT_SEED)
+        task_obj.build_all_requests(limit=max_samples)
+
+        requests: list[dict[str, Any]] = []
+        for inst in task_obj.instances:
+            prompt = inst.args[0]
+            gen_args = inst.args[1] if len(inst.args) > 1 and isinstance(inst.args[1], dict) else {}
+            requests.append(
+                {
+                    "prompt": prompt,
+                    "task_id": inst.doc.get("task_id", f"{task}-{inst.doc_id}"),
+                    "stop_tokens": list(gen_args.get("until", [])),
+                    "count_mode": spec["count_mode"],
+                }
+            )
+        num_fewshot = getattr(task_obj._config, "num_fewshot", None)
+    except (KeyError, ImportError):
+        # lm_eval doesn't register this task in the installed build -> load the
+        # underlying HF dataset directly (0-shot).
+        requests = _load_task_requests_direct(task, spec, max_samples)
+        num_fewshot = 0
+        source = "direct"
 
     return requests, {
         "mode": "task",
@@ -110,7 +160,8 @@ def _load_task_requests(task: str, max_samples: int | None) -> tuple[list[dict[s
         "task_label": spec["label"],
         "dataset": spec["dataset"],
         "split": spec["split"],
-        "num_fewshot": getattr(task_obj._config, "num_fewshot", None),
+        "source": source,
+        "num_fewshot": num_fewshot,
         "fewshot_seed": DEFAULT_FEWSHOT_SEED,
         "num_samples": len(requests),
         "examples": [req["prompt"] for req in requests[:2]],
@@ -128,6 +179,8 @@ with open(sys.argv[1]) as f:
 sys.path.insert(0, cfg["project_root"])
 
 pkg_root = Path(cfg["project_root"])
+if not (pkg_root / "__init__.py").exists() and (pkg_root / "fastkernels" / "__init__.py").exists():
+    pkg_root = pkg_root / "fastkernels"
 spec = importlib.util.spec_from_file_location(
     "fastkernels", pkg_root / "__init__.py",
     submodule_search_locations=[str(pkg_root)],

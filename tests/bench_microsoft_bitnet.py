@@ -161,11 +161,17 @@ def _build_real_token_prompts(
     if pad_id is None:
         pad_id = 1
 
+    # The Microsoft BitNet GPU kernel captures one CUDA graph per fixed prompt
+    # length, so each scenario is a fixed (input_len, output_len) regime. The
+    # underlying tokens are drawn from the real WildChat ``mixed`` set and then
+    # normalized to the scenario length (suffix-keep / left-pad).
+    dataset_id = DEFAULT_WORKLOAD_DATASETS["mixed"]
     samples = load_real_prompt_workload(
         scenario_name,
         tokenizer,
         num_requests=num_prompts,
         decode_cap=output_len,
+        dataset_name=dataset_id,
         split=split,
         seed=seed,
     )
@@ -175,7 +181,7 @@ def _build_real_token_prompts(
         for sample in samples
     ]
     length_stats = (raw_lens[0], raw_lens[len(raw_lens) // 2], raw_lens[-1])
-    return prompts, DEFAULT_WORKLOAD_DATASETS[scenario_name], length_stats
+    return prompts, dataset_id, length_stats
 
 
 # ---------------------------------------------------------------------------

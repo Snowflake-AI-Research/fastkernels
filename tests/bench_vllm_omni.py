@@ -181,6 +181,47 @@ def _get_tts_samples(seed: int = 42, max_samples: int = 200) -> list[dict]:
     return _TTS_SAMPLES
 
 
+def _load_tts_reference(samples: list[dict]) -> tuple[np.ndarray, int, str]:
+    """Load a real voice-cloning reference clip from SEED-TTS-Eval.
+
+    CosyVoice3 conditions synthesis on the reference speaker's audio + its
+    transcript, so a real clip (not white noise) is required for representative
+    kernels and meaningful audio correctness. Reference wavs live under
+    ``en/prompt-wavs/`` in the source repo; we use the first sample whose wav
+    downloads and decodes successfully as the shared reference speaker.
+    """
+    from huggingface_hub import hf_hub_download
+    try:
+        import soundfile as sf
+    except ImportError:
+        sf = None
+
+    last_err: Exception | None = None
+    for s in samples:
+        rel = s.get("prompt_wav_rel")
+        if not rel:
+            continue
+        try:
+            wav_path = hf_hub_download(
+                _SEED_TTS_EVAL_REPO, filename=f"en/{rel}", repo_type="dataset",
+            )
+            if sf is not None:
+                audio, sr = sf.read(wav_path, dtype="float32", always_2d=False)
+            else:
+                import librosa
+                audio, sr = librosa.load(wav_path, sr=None, mono=True)
+            audio = np.asarray(audio, dtype=np.float32)
+            if audio.ndim > 1:
+                audio = audio.mean(axis=1).astype(np.float32)
+            return audio, int(sr), s.get("prompt_text", "")
+        except Exception as e:  # network/codec issues -> try next sample
+            last_err = e
+            continue
+    raise RuntimeError(
+        f"could not load any SEED-TTS-Eval reference wav: {last_err}"
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # FLUX workers
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2116,10 +2157,11 @@ def _run_tts(args, gpu_name: str):
     run_vllm = not args.skip_vllm_omni
     os.makedirs(args.output_dir, exist_ok=True)
 
-    rng = np.random.RandomState(args.seed)
-    ref_audio = rng.randn(24000 * 3).astype(np.float32)
-    ref_sr = 24000
-    prompt_text = "Testing my voice."
+    ref_audio, ref_sr, prompt_text = _load_tts_reference(tts_samples)
+    print(
+        f"Reference voice: real SEED-TTS-Eval clip "
+        f"({len(ref_audio) / ref_sr:.1f}s @ {ref_sr} Hz)"
+    )
 
     kb_audio_dir = os.path.join(args.output_dir, "audio", "fastkernels")
     vllm_audio_dir = os.path.join(args.output_dir, "audio", "vllm_omni")

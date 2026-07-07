@@ -207,8 +207,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--workload", choices=["fixed", "wildchat"], default="wildchat")
     p.add_argument(
         "--scenario",
-        choices=["prefill-heavy", "balanced", "decode-heavy"],
-        default="balanced",
+        choices=["mixed", "long-context"],
+        default="mixed",
     )
     p.add_argument("--num-seqs", type=int, default=1000)
     p.add_argument("--output-len", type=int, default=128)

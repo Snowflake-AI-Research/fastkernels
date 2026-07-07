@@ -598,6 +598,10 @@ class AlwaysHitShapeEnv:
 
     def __init__(self) -> None:
         self.guards: list[Any] = []
+        # Newer PyTorch (>=2.6) Inductor codecache reads this off the ShapeEnv
+        # when building the FxGraph cache key. The real ShapeEnv defaults it to
+        # an empty dict; mirror that so cache-key construction stays a no-op.
+        self.var_to_hint_override: dict[Any, Any] = {}
 
     def evaluate_guards_expression(self, *args: Any, **kwargs: Any) -> bool:
         return True

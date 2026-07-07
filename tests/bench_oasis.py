@@ -44,6 +44,8 @@ from tqdm import tqdm
 
 def _bootstrap_local_package() -> None:
     root = Path(__file__).resolve().parent.parent
+    if not (root / "__init__.py").exists() and (root / "fastkernels" / "__init__.py").exists():
+        root = root / "fastkernels"
     spec = importlib.util.spec_from_file_location(
         "fastkernels",
         root / "__init__.py",

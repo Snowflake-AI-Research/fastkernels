@@ -235,6 +235,9 @@ mlruns/
 
 data/
 
+# Vendored external checkouts / build trees (e.g. instant-ngp for the NeRF bench)
+third_party/
+
 .codex
 
 # Local IDE / agent state — not part of the project

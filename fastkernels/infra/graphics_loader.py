@@ -292,7 +292,7 @@ def load_reference_3dgs(scene: GaussianScene):
 
 
 def load_ours_3dgs(scene: GaussianScene):
-    from tasks.baseline.L4.gaussian_splatting import GaussianSplatting
+    from fastkernels.tasks.baseline.L4.gaussian_splatting import GaussianSplatting
 
     return GaussianSplatting(
         means=scene.means,

@@ -970,6 +970,7 @@ def test_section_4():
     print(f"{'=' * 60}")
 
     from fastkernels.workloads import (
+        DEFAULT_WORKLOAD_DATASETS,
         LATENCY_WORKLOADS,
         THROUGHPUT_WORKLOADS,
         get_max_seq_len,
@@ -977,42 +978,39 @@ def test_section_4():
 
     # 4a. Throughput workload constants
     with _Timeout(30):
-        check(len(THROUGHPUT_WORKLOADS) == 3, "4a. exactly 3 throughput workloads")
+        check(len(THROUGHPUT_WORKLOADS) == 2, "4a. exactly 2 throughput workloads")
         names = [w.name for w in THROUGHPUT_WORKLOADS]
         check(
-            names == ["prefill-heavy", "balanced", "decode-heavy"],
+            names == ["mixed", "long-context"],
             f"4a. correct names: {names}",
         )
-        ph = THROUGHPUT_WORKLOADS[0]
+        mixed = THROUGHPUT_WORKLOADS[0]
         check(
-            ph.dataset_name.endswith("prefill-heavy-1k"),
-            "4a. prefill-heavy dataset configured",
+            mixed.dataset_name.endswith("wildchat-mixed-1k") and mixed.decode_cap == 1024,
+            "4a. mixed dataset configured (decode cap 1024)",
         )
-        bal = THROUGHPUT_WORKLOADS[1]
+        longctx = THROUGHPUT_WORKLOADS[1]
         check(
-            bal.dataset_name.endswith("balanced-1k"),
-            "4a. balanced dataset configured",
-        )
-        dh = THROUGHPUT_WORKLOADS[2]
-        check(
-            dh.dataset_name.endswith("decode-heavy-1k"),
-            "4a. decode-heavy dataset configured",
+            longctx.dataset_name.endswith("longbench-longctx")
+            and longctx.num_requests == 64 and longctx.decode_cap is None,
+            "4a. long-context dataset configured (N=64, per-row output_len)",
         )
 
     # 4b. Latency workload constants
     with _Timeout(30):
         check(len(LATENCY_WORKLOADS) == 2, "4b. exactly 2 latency workloads")
+        mixed_repo = DEFAULT_WORKLOAD_DATASETS["mixed"]
         sr = LATENCY_WORKLOADS[0]
         check(
             sr.name == "single-request" and sr.batch_size == 1
-            and sr.input_len == 128 and sr.output_len == 128,
-            "4b. single-request: bs=1, 128/128",
+            and sr.output_len == 128 and sr.dataset_name == mixed_repo,
+            "4b. single-request: bs=1, real mixed prompts, decode<=128",
         )
         fb = LATENCY_WORKLOADS[1]
         check(
             fb.name == "fixed-batch-32" and fb.batch_size == 32
-            and fb.input_len == 128 and fb.output_len == 128,
-            "4b. fixed-batch-32: bs=32, 128/128",
+            and fb.output_len == 128 and fb.dataset_name == mixed_repo,
+            "4b. fixed-batch-32: bs=32, real mixed prompts, decode<=128",
         )
 
     # 4c. Immutability (frozen dataclasses)
@@ -1032,8 +1030,8 @@ def test_section_4():
     with _Timeout(30):
         max_len = get_max_seq_len()
         check(
-            max_len == 256,
-            f"4d. static max_seq_len = {max_len} (expected 256 = 128+128)",
+            max_len == 128,
+            f"4d. latency decode-budget floor = {max_len} (expected 128)",
         )
 
 

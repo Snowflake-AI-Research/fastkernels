@@ -134,7 +134,7 @@ def _install_optional_dependency_stubs(names=_OPTIONAL_KERNEL_DEPS) -> list[str]
 # Capture scenarios: each entry is loaded into its own engine and every workload
 # it lists is captured to a separate report. Here we run the first two
 # standardized benchmark scenarios from the registry (Llama-3.1-8B-Instruct and
-# gpt-oss-120b), each with its prefill_heavy/decode_heavy workloads.
+# gpt-oss-120b), each with its mixed/long-context workloads.
 CAPTURE_SCENARIOS = DEFAULT_BENCHMARK[:2]
 
 # qualified_name -> {"init": {...}, "forward": {...}}
@@ -821,24 +821,20 @@ def _dumps(obj, indent: int = 2, level: int = 0) -> str:
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-def _scenario_slug(scenario, workload: str) -> str:
+def _scenario_slug(scenario, workload: str, num_requests: int) -> str:
     """Report-filename stem encoding the distinguishing scenario fields for a
     single ``workload``.
 
     Two runs that differ in any of these values write to different files (no
-    timestamp needed); re-running the same scenario/workload overwrites its
-    report. ``None`` limits render as ``full`` (num_requests) / ``auto``
-    (max_num_seqs).
+    timestamp needed); re-running the same scenario/workload/``--num-requests``
+    overwrites its report. ``None`` max_num_seqs renders as ``auto``; capture
+    always runs eager, so the mode tag is fixed.
     """
     model = scenario.hf_name.replace("/", "__")
-    num_requests = scenario.num_requests if scenario.num_requests is not None else "full"
     max_num_seqs = scenario.max_num_seqs if scenario.max_num_seqs is not None else "auto"
-    # Capture always runs eager (the instrumentation is incompatible with CUDA
-    # graph capture), so the mode tag is fixed regardless of enforce_eager.
-    mode = "eager"
     return (
         f"{model}_tp{scenario.tp}_{scenario.dtype}_{workload}"
-        f"_req{num_requests}_seqs{max_num_seqs}_{mode}"
+        f"_req{num_requests}_seqs{max_num_seqs}_eager"
     )
 
 
@@ -855,14 +851,14 @@ def _engine_dtype(dtype_str: str) -> torch.dtype | None:
     return dt if isinstance(dt, torch.dtype) else None
 
 
-def _report_path(output_arg, scenario, workload: str, multi: bool) -> Path:
+def _report_path(output_arg, scenario, workload: str, multi: bool, num_requests: int) -> Path:
     """Resolve the report path for one workload run.
 
     Default: ``CAPTURE_DIR/<scenario-slug>.json``. An explicit ``--output`` is
     honored verbatim for a single run, or has the (model-qualified) scenario
     slug suffixed onto its stem when several runs share one ``--output`` base.
     """
-    slug = _scenario_slug(scenario, workload)
+    slug = _scenario_slug(scenario, workload, num_requests)
     if output_arg is not None:
         p = Path(output_arg)
         return p.with_name(f"{p.stem}_{slug}{p.suffix}") if multi else p
@@ -960,16 +956,14 @@ def _capture_scenario(scenario, runs, args, LlamaEngine, SamplingParams,
                 # fixed --max-tokens cap for every request.
                 max_new_tokens = [args.max_tokens] * len(gen_prompts)
             else:
-                # ``num_requests`` may be unset on the scenario -> load the
-                # workload's default count (the full standardized workload).
-                n_req = scenario.num_requests
-                print(
-                    f"Loading '{wl_label}' workload prompts "
-                    f"({n_req if n_req is not None else 'full workload'}) ..."
-                )
-                load_kwargs = {} if n_req is None else {"num_requests": n_req}
+                # Cap capture at ``--num-requests`` prompts per workload (enough
+                # to see the representative shapes without running the full
+                # throughput dataset); the loader returns fewer if the workload
+                # has fewer rows (e.g. long-context has 64).
+                n_req = args.num_requests
+                print(f"Loading '{wl_label}' workload prompts ({n_req}) ...")
                 samples = load_real_prompt_workload(
-                    wl_label, engine.tokenizer, **load_kwargs,
+                    wl_label, engine.tokenizer, num_requests=n_req,
                 )
                 gen_prompts = [list(s.prompt_token_ids) for s in samples]
                 # Per-request generation budget from the HF dataset's own
@@ -1119,7 +1113,7 @@ def _capture_scenario(scenario, runs, args, LlamaEngine, SamplingParams,
                 engine.max_num_seqs, n_instrumented,
                 generation, verification,
             )
-            out_path = _report_path(args.output, scenario, wl_label, multi)
+            out_path = _report_path(args.output, scenario, wl_label, multi, args.num_requests)
             out_path.parent.mkdir(parents=True, exist_ok=True)
             with open(out_path, "w") as f:
                 f.write(_dumps(report))
@@ -1154,10 +1148,17 @@ def main(argv: list[str] | None = None) -> int:
         description=(
             "Run one or more models through fastkernels and capture the "
             "dtype/shape of every operator's init/forward arguments. The models, "
-            "dtypes, tensor-parallel degrees, eager modes, max_num_seqs and "
-            "workloads are taken from CAPTURE_SCENARIOS (one report per "
-            "scenario workload)."
+            "dtypes, tensor-parallel degrees, max_num_seqs and workloads are "
+            "taken from CAPTURE_SCENARIOS (one report per scenario workload). "
+            "Capture always runs eager (the instrumentation is incompatible with "
+            "CUDA graphs)."
         ),
+    )
+    parser.add_argument(
+        "--num-requests", type=int, default=100,
+        help="Prompts to load per scenario workload (capped by the workload's "
+             "row count). Enough to observe representative shapes without "
+             "running the full throughput dataset.",
     )
     parser.add_argument(
         "--max-tokens", type=int, default=256,
@@ -1193,8 +1194,8 @@ def main(argv: list[str] | None = None) -> int:
         return _selftest_simulator()
 
     # CAPTURE_SCENARIOS is the source of truth for the models and engine
-    # configuration (model, dtype, TP, eager mode, max_num_seqs) and the capture
-    # workloads; --max-tokens/--output/--prompt stay run-level knobs. Each
+    # configuration (model, dtype, TP, max_num_seqs) and the capture workloads;
+    # --num-requests/--max-tokens/--output/--prompt stay run-level knobs. Each
     # scenario gets its own engine and each workload its own report.
     scenarios = CAPTURE_SCENARIOS
 

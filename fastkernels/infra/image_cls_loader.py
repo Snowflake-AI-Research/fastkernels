@@ -100,7 +100,7 @@ def load_ours_model(model_name: str, device: str = "cuda", dtype: torch.dtype = 
         try:
             from fastkernels.tasks.baseline.L4.convnextv2 import ConvNextV2ForImageClassification
         except ModuleNotFoundError:
-            from tasks.baseline.L4.convnextv2 import ConvNextV2ForImageClassification
+            from fastkernels.tasks.baseline.L4.convnextv2 import ConvNextV2ForImageClassification
 
         config = ConvNextV2Config.from_pretrained(model_name)
         model = ConvNextV2ForImageClassification(config)
@@ -114,7 +114,7 @@ def load_ours_model(model_name: str, device: str = "cuda", dtype: torch.dtype = 
         try:
             from fastkernels.tasks.baseline.L4.efficientnetv2 import EfficientNetV2ForImageClassification
         except ModuleNotFoundError:
-            from tasks.baseline.L4.efficientnetv2 import EfficientNetV2ForImageClassification
+            from fastkernels.tasks.baseline.L4.efficientnetv2 import EfficientNetV2ForImageClassification
 
         reference = timm.create_model(_strip_timm_prefix(model_name), pretrained=True)
         stage_specs = _extract_efficientnetv2_stage_specs(reference)

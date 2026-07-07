@@ -16,8 +16,8 @@ try:
 except ImportError as exc:
     if "attempted relative import beyond top-level package" not in str(exc):
         raise
-    from tasks.baseline.L4.bge_m3 import BGEM3Config, BgeM3EmbeddingModel
-    from tasks.baseline.L4.colbertv2 import ColBERTModel, ColBERTv2Config
+    from fastkernels.tasks.baseline.L4.bge_m3 import BGEM3Config, BgeM3EmbeddingModel
+    from fastkernels.tasks.baseline.L4.colbertv2 import ColBERTModel, ColBERTv2Config
 
 
 _EMBEDDING_WEIGHT_RE = re.compile(

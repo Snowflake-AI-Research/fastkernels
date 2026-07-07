@@ -366,7 +366,7 @@ def load_wrapped_instantngp(
     height: int | None = None,
     spp: int = 1,
 ):
-    from tasks.baseline.L4.instant_ngp import InstantNGP
+    from fastkernels.tasks.baseline.L4.instant_ngp import InstantNGP
 
     scene, testbed = _load_instantngp_testbed(
         scene_name=scene_name,

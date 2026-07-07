@@ -21,7 +21,6 @@ from ..L1.conv1d import Conv1d
 from ..L1.gelu import GELU
 from ..L1.layer_norm import LayerNorm
 from ..L1.embedding import Embedding
-from ..L1.linear import Linear
 from ..L2.parallel_embedding import ParallelLMHead
 from ..L3.whisper_encoder_layer import WhisperEncoderLayer
 from ..L3.whisper_decoder_layer import WhisperDecoderLayer
@@ -184,7 +183,6 @@ class WhisperForConditionalGeneration(nn.Module):
         self.encoder = WhisperEncoder(config)
         self.decoder = WhisperDecoder(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.d_model)
-        self._linear_op = Linear()
 
     def get_multimodal_embeddings(
         self, input_features: torch.Tensor,

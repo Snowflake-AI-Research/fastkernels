@@ -8,11 +8,14 @@ Prerequisites:
     Start the server first:
         python -m fastkernels.infra.server --model meta-llama/Llama-3.1-8B-Instruct
 
+Prompts come from the calibrated real-prompt scenarios (WildChat / LongBench-v2)
+via ``load_real_prompt_workload`` and are posted as chat messages.
+
 Usage:
     python -m fastkernels.bench.e2e serve \\
         --model meta-llama/Llama-3.1-8B-Instruct \\
         --base-url http://localhost:8000 \\
-        --dataset-name random --random-input-len 512 --random-output-len 128 \\
+        --fastkernels-scenario mixed \\
         --num-prompts 100 --request-rate 10
 """
 
@@ -33,12 +36,16 @@ import numpy as np
 from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer
 
-from fastkernels.workloads import (
-    SampleRequest,
-    add_dataset_parser,
-    get_samples,
-)
+from fastkernels.workloads import load_real_prompt_workload
 from fastkernels.infra.kernel_swapper import discover_candidates, print_candidate_summary
+
+
+@dataclass
+class ServeRequest:
+    """One online-serving request: chat messages + decode budget."""
+    prompt: list[dict[str, str]] | str
+    prompt_len: int
+    expected_output_len: int
 
 
 @dataclass
@@ -102,7 +109,7 @@ async def send_request(
     session: aiohttp.ClientSession,
     api_url: str,
     model: str,
-    request: SampleRequest,
+    request: ServeRequest,
     sampling_params: dict,
     ignore_eos: bool,
     pbar: tqdm | None = None,
@@ -116,32 +123,6 @@ async def send_request(
         messages = request.prompt
     else:
         messages = [{"role": "user", "content": str(request.prompt)}]
-
-    if request.multi_modal_data and isinstance(request.multi_modal_data, dict):
-        images = request.multi_modal_data.get("image", [])
-        if images:
-            content_parts = []
-            if isinstance(messages[-1].get("content"), str):
-                content_parts.append({
-                    "type": "text",
-                    "text": messages[-1]["content"],
-                })
-            for img in (images if isinstance(images, list) else [images]):
-                if hasattr(img, "tobytes"):
-                    import base64
-                    import io
-                    from PIL import Image
-                    buf = io.BytesIO()
-                    if not isinstance(img, Image.Image):
-                        img = Image.fromarray(np.array(img))
-                    img.save(buf, format="PNG")
-                    b64 = base64.b64encode(buf.getvalue()).decode()
-                    content_parts.append({
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{b64}"},
-                    })
-            if content_parts:
-                messages[-1] = {**messages[-1], "content": content_parts}
 
     payload = {
         "model": model,
@@ -221,7 +202,7 @@ async def send_request(
 
 
 async def get_request_schedule(
-    requests: list[SampleRequest],
+    requests: list[ServeRequest],
     request_rate: float,
 ) -> list[float]:
     """Compute send times for requests following a Poisson process."""
@@ -305,7 +286,7 @@ def calculate_metrics(
 async def run_benchmark(
     api_url: str,
     model: str,
-    requests: list[SampleRequest],
+    requests: list[ServeRequest],
     request_rate: float,
     sampling_params: dict,
     ignore_eos: bool,
@@ -441,13 +422,26 @@ def add_cli_args(parser: argparse.ArgumentParser):
     )
 
     parser.add_argument(
-        "--input-len", type=int, default=None,
-        help="Input prompt length for each request",
+        "--fastkernels-scenario", type=str, default="mixed",
+        choices=["mixed", "long-context"],
+        help="Real-prompt scenario: mixed=WildChat, long-context=LongBench-v2.",
+    )
+    parser.add_argument(
+        "--num-prompts", type=int, default=1000,
+        help="Number of real prompts to sample from the scenario dataset",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42,
+        help="Random seed for dataset sampling (default: 42)",
+    )
+    parser.add_argument(
+        "--trust-remote-code", action="store_true", default=False,
+        help="Allow custom tokenizer code from the model repo",
     )
     parser.add_argument(
         "--output-len", type=int, default=None,
-        help="Output length for each request. Overrides the "
-             "output length from the dataset.",
+        help="Per-request decode budget. Caps the dataset's own output "
+             "length when set; otherwise the scenario's calibrated cap is used.",
     )
     parser.add_argument(
         "--output-json", type=str, default=None,
@@ -461,9 +455,6 @@ def add_cli_args(parser: argparse.ArgumentParser):
         "--no-candidate-kernels", action="store_true", default=False,
         help="Disable candidate kernel auto-detection; use only baseline kernels",
     )
-
-    add_dataset_parser(parser)
-    parser.set_defaults(seed=42)
 
 
 async def _fetch_model_from_server(base_url: str) -> str:
@@ -503,27 +494,24 @@ async def main_async(args: argparse.Namespace):
 
     tokenizer_name = args.tokenizer or args.model
     tokenizer = AutoTokenizer.from_pretrained(
-        tokenizer_name, trust_remote_code=getattr(args, "trust_remote_code", False),
+        tokenizer_name, trust_remote_code=args.trust_remote_code,
     )
 
-    if args.input_len is not None:
-        args.random_input_len = args.input_len
-        args.sonnet_input_len = args.input_len
-    if args.output_len is not None:
-        args.random_output_len = args.output_len
-        args.sonnet_output_len = args.output_len
-        args.sharegpt_output_len = args.output_len
-        args.custom_output_len = args.output_len
-        args.hf_output_len = args.output_len
-        args.spec_bench_output_len = args.output_len
-        args.prefix_repetition_output_len = args.output_len
-
-    if not hasattr(args, "backend"):
-        args.backend = "openai-chat"
-    if not hasattr(args, "request_id_prefix"):
-        args.request_id_prefix = ""
-
-    requests = get_samples(args, tokenizer)
+    samples = load_real_prompt_workload(
+        args.fastkernels_scenario,
+        tokenizer,
+        num_requests=args.num_prompts,
+        decode_cap=args.output_len,
+        seed=args.seed,
+    )
+    requests = [
+        ServeRequest(
+            prompt=s.messages if s.messages is not None else "",
+            prompt_len=len(s.prompt_token_ids),
+            expected_output_len=s.output_len,
+        )
+        for s in samples
+    ]
 
     api_url = f"{args.base_url}{args.endpoint}"
     sampling_params = _build_sampling_payload(args)

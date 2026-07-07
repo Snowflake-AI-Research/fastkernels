@@ -22,7 +22,7 @@ from .registry import FAMILIES, FASTKERNELS_ARCHITECTURES, DEFAULT_BENCHMARK, Be
 
 def print_benchmark_set(benchmarks: list[BenchmarkScenario], title: str = "BENCHMARK SCENARIOS") -> None:
     """Print a benchmark set in a tabular format with line-wrapping for long columns."""
-    header = f"{'Module':<12} | {'Family':<12} | {'HF Name':<38} | {'TP':<2} | {'dtype':<8} | {'#req':<4} | {'Workloads'}"
+    header = f"{'Module':<12} | {'Family':<12} | {'HF Name':<38} | {'TP':<2} | {'dtype':<8} | {'Workloads'}"
     width = 118  # Fixed width that easily fits in standard terminals
     
     print("\n")
@@ -30,14 +30,13 @@ def print_benchmark_set(benchmarks: list[BenchmarkScenario], title: str = "BENCH
     print(f"{title:^{width}}")
     print("=" * width)
     print(header)
-    print("-" * 12 + "-+-" + "-" * 12 + "-+-" + "-" * 38 + "-+-" + "-" * 2 + "-+-" + "-" * 8 + "-+-" + "-" * 4 + "-+-" + "-" * 23)
+    print("-" * 12 + "-+-" + "-" * 12 + "-+-" + "-" * 38 + "-+-" + "-" * 2 + "-+-" + "-" * 8 + "-+-" + "-" * 23)
     
     for bs in benchmarks:
         module = module_for(bs.hf_name)  # inferred from the HF model's model_type
         arch = FASTKERNELS_ARCHITECTURES.get(module)
         family = arch.family if arch else "Unknown"
         module_disp = module if module is not None else "?"
-        num_req = str(bs.num_requests) if bs.num_requests is not None else "-"
         wloads = ", ".join(w.value for w in bs.workloads)
         
         # Wrap the workloads column so it doesn't blow out the terminal width
@@ -47,9 +46,9 @@ def print_benchmark_set(benchmarks: list[BenchmarkScenario], title: str = "BENCH
             
         for i, line in enumerate(wrapped_wloads):
             if i == 0:
-                print(f"{module_disp:<12} | {family:<12} | {bs.hf_name:<38} | {bs.tp:<2} | {bs.dtype:<8} | {num_req:<4} | {line}")
+                print(f"{module_disp:<12} | {family:<12} | {bs.hf_name:<38} | {bs.tp:<2} | {bs.dtype:<8} | {line}")
             else:
-                print(f"{'':<12} | {'':<12} | {'':<38} | {'':<2} | {'':<8} | {'':<4} | {line}")
+                print(f"{'':<12} | {'':<12} | {'':<38} | {'':<2} | {'':<8} | {line}")
     print("=" * width)
 
 

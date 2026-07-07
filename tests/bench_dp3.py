@@ -249,6 +249,115 @@ def materialize_shared_checkpoint(
     return ckpt_path
 
 
+def materialize_fastkernels_checkpoint(
+    ckpt_dir: str, variant: str, seed: int,
+    action_dim: int, state_dim: int, num_points: int,
+) -> str:
+    """Reference-free checkpoint builder for fastkernels-only calibration.
+
+    The fastkernels ``DP3Pipeline`` deliberately mirrors the reference DP3
+    submodule names, so its *own* ``state_dict`` round-trips through the
+    engine's ``load_weights``. This lets us calibrate throughput without a
+    clone of the 3D-Diffusion-Policy source. Weight *values* are irrelevant
+    for throughput timing (identical FLOPs regardless of init); the normalizer
+    is registered as identity (scale=1, offset=0).
+    """
+    import pickle
+
+    import torch
+    from omegaconf import OmegaConf
+
+    from fastkernels.infra.dp3_engine import _config_from_payload
+    from fastkernels.tasks.baseline.L4.dp3 import DP3Pipeline
+
+    down_dims = [128, 256, 384] if variant == "simple_dp3" else [512, 1024, 2048]
+    diffusion_step_embed_dim = 128
+    encoder_output_dim = 64
+    horizon = 16
+    n_obs_steps = 2
+    n_action_steps = 8
+
+    sched = OmegaConf.create({
+        "_target_": "diffusers.schedulers.scheduling_ddim.DDIMScheduler",
+        "num_train_timesteps": 100,
+        "beta_start": 1e-4,
+        "beta_end": 0.02,
+        "beta_schedule": "squaredcos_cap_v2",
+        "clip_sample": True,
+        "set_alpha_to_one": True,
+        "steps_offset": 0,
+        "prediction_type": "sample",
+    })
+    pcfg = OmegaConf.create({
+        "in_channels": 3,
+        "out_channels": encoder_output_dim,
+        "use_layernorm": True,
+        "final_norm": "layernorm",
+        "normal_channel": False,
+    })
+    policy_cfg = OmegaConf.create({
+        "condition_type": "film",
+        "use_down_condition": True,
+        "use_mid_condition": True,
+        "use_up_condition": True,
+        "diffusion_step_embed_dim": diffusion_step_embed_dim,
+        "down_dims": down_dims,
+        "encoder_output_dim": encoder_output_dim,
+        "horizon": horizon,
+        "kernel_size": 5,
+        "n_action_steps": n_action_steps,
+        "n_groups": 8,
+        "n_obs_steps": n_obs_steps,
+        "noise_scheduler": sched,
+        "num_inference_steps": 10,
+        "obs_as_global_cond": True,
+        "use_pc_color": False,
+        "pointnet_type": "pointnet",
+        "pointcloud_encoder_cfg": pcfg,
+    })
+    shape_meta = OmegaConf.create({
+        "obs": {
+            "point_cloud": {"shape": [num_points, 3], "type": "point_cloud"},
+            "agent_pos":   {"shape": [state_dim], "type": "low_dim"},
+        },
+        "action": {"shape": [action_dim]},
+    })
+    full_cfg = OmegaConf.create({
+        "horizon": horizon,
+        "n_obs_steps": n_obs_steps,
+        "n_action_steps": n_action_steps,
+        "shape_meta": shape_meta,
+        "policy": policy_cfg,
+        "task_name": "fastkernels_synthetic_init",
+    })
+    full_cfg.policy.shape_meta = shape_meta
+
+    torch.manual_seed(seed)
+    config = _config_from_payload({"cfg": full_cfg})
+    pipeline = DP3Pipeline(config)
+    pipeline.register_normalizer_keys(
+        ["action", "agent_pos", "point_cloud"],
+        {
+            "action": action_dim,
+            "agent_pos": state_dim,
+            "point_cloud": (6 if config.use_pc_color else 3),
+        },
+    )
+    state_dict = pipeline.state_dict()
+
+    payload = {"cfg": full_cfg, "state_dicts": {"model": state_dict}}
+    os.makedirs(ckpt_dir, exist_ok=True)
+    ckpt_path = os.path.join(ckpt_dir, "latest.ckpt")
+    with open(ckpt_path, "wb") as f:
+        pickle.dump(payload, f)
+    print(
+        f"  fastkernels-native checkpoint saved: {ckpt_path}  "
+        f"({len(state_dict)} state-dict entries from fastkernels DP3)",
+        flush=True,
+    )
+    return ckpt_path
+
+
 def _load_normalizer_fit_data(num_points: int, state_dim: int, action_dim: int):
     """Load ~1000 frames of real xarm data to fit per-channel normalizer
     statistics. Falls back to standard-normal samples if the dataset can't
@@ -965,21 +1074,36 @@ def main():
         ckpt_path = args.checkpoint
         print(f"  Using user-supplied checkpoint: {ckpt_path}")
     else:
-        if not os.path.isdir(args.dp3_repo):
+        ckpt_dir = os.path.join(args.output_dir, "shared_ckpt")
+        if os.path.isdir(args.dp3_repo):
+            ckpt_path = materialize_shared_checkpoint(
+                ckpt_dir, args.variant, args.seed,
+                action_dim=real_action_dim,
+                state_dim=real_state_dim,
+                num_points=real_num_points,
+                dp3_repo=args.dp3_repo,
+            )
+        elif args.skip_reference:
             print(
-                f"ERROR: --dp3-repo {args.dp3_repo} not found; cannot build "
-                "shared checkpoint without the reference DP3 source.",
+                f"  --dp3-repo {args.dp3_repo} not found; building a "
+                "fastkernels-native random-init checkpoint (fastkernels-only).",
+                flush=True,
+            )
+            ckpt_path = materialize_fastkernels_checkpoint(
+                ckpt_dir, args.variant, args.seed,
+                action_dim=real_action_dim,
+                state_dim=real_state_dim,
+                num_points=real_num_points,
+            )
+        else:
+            print(
+                f"ERROR: --dp3-repo {args.dp3_repo} not found; cannot build a "
+                "reference-comparable checkpoint without the reference DP3 "
+                "source. Re-run with --skip-reference for a fastkernels-only "
+                "throughput/latency measurement.",
                 file=sys.stderr,
             )
             return 1
-        ckpt_dir = os.path.join(args.output_dir, "shared_ckpt")
-        ckpt_path = materialize_shared_checkpoint(
-            ckpt_dir, args.variant, args.seed,
-            action_dim=real_action_dim,
-            state_dim=real_state_dim,
-            num_points=real_num_points,
-            dp3_repo=args.dp3_repo,
-        )
 
     scenarios = [
         {"name": w.name, "batch_size": w.batch_size, "num_requests": min(args.num_requests, w.num_requests)}

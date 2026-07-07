@@ -117,17 +117,19 @@ class EvalPlanner:
         latency_data = []
         for j, w in enumerate(LATENCY_WORKLOADS):
             samples = load_real_prompt_workload(
-                "balanced",
+                "mixed",
                 tokenizer,
                 num_requests=w.batch_size,
-                decode_cap=None,
+                decode_cap=w.output_len,
+                dataset_name=w.dataset_name or None,
                 seed=seed + 100 + j,
             )
             prompt_token_ids = [s.prompt_token_ids for s in samples]
             output_lens = [s.output_len for s in samples]
+            real_input_len = max((len(p) for p in prompt_token_ids), default=0)
             latency_data.append({
                 "name": w.name,
-                "input_len": w.input_len,
+                "input_len": real_input_len,
                 "output_len": w.output_len,
                 "batch_size": w.batch_size,
                 "prompt_token_ids": prompt_token_ids,

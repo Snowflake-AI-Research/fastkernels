@@ -145,6 +145,8 @@ def main():
     sys.path.insert(0, cfg["project_root"])
 
     pkg_root = Path(cfg["project_root"])
+    if not (pkg_root / "__init__.py").exists() and (pkg_root / "fastkernels" / "__init__.py").exists():
+        pkg_root = pkg_root / "fastkernels"
     spec = importlib.util.spec_from_file_location(
         "fastkernels", pkg_root / "__init__.py",
         submodule_search_locations=[str(pkg_root)],
@@ -209,17 +211,25 @@ def main():
     throughput_results = []
     for scenario in cfg["throughput_scenarios"]:
         name = scenario["name"]
-        num_images = min(scenario["num_images"], all_images_cpu.shape[0])
+        available = all_images_cpu.shape[0]
+        num_images = scenario["num_images"]
         batch_size = scenario["batch_size"]
         num_warmup = scenario.get("num_warmup", 3)
         num_measure = scenario.get("num_measure", 3)
 
-        images_cpu = all_images_cpu[:num_images]
+        # COCO val2017 is a fixed 5000-image set; detection throughput is
+        # shape-bound (every input is image_size x image_size), so requesting
+        # more images tiles the real ones via wrap-around indexing. This
+        # lengthens the timing window for duration parity across families
+        # without changing kernel shapes, the img/s rate, or the ours-vs-ref
+        # correctness comparison. Materialising indices (not pixels) keeps host
+        # memory flat regardless of the requested count.
+        cycle_idx = torch.arange(num_images) % available
 
         with torch.no_grad():
             for _ in range(num_warmup):
                 for start in range(0, num_images, batch_size):
-                    batch = images_cpu[start:start + batch_size].to(device=device)
+                    batch = all_images_cpu[cycle_idx[start:start + batch_size]].to(device=device)
                     _run_model(model, backend, model_name, batch, image_size, max_detections)
             torch.cuda.synchronize()
 
@@ -233,7 +243,7 @@ def main():
                 torch.cuda.synchronize()
                 t0 = time.perf_counter()
                 for start in range(0, num_images, batch_size):
-                    batch = images_cpu[start:start + batch_size].to(device=device)
+                    batch = all_images_cpu[cycle_idx[start:start + batch_size]].to(device=device)
                     det = _run_model(model, backend, model_name, batch, image_size, max_detections)
                     if is_last:
                         all_boxes.append(det["boxes"].float().cpu())
@@ -457,7 +467,7 @@ def main():
     ap.add_argument("--model", type=str, required=True)
     ap.add_argument("--image-size", type=int, default=0,
                     help="Input resolution (0 = infer from model)")
-    ap.add_argument("--num-images", type=int, default=5000,
+    ap.add_argument("--num-images", type=int, default=30000,
                     help="Number of COCO images for throughput + correctness (default: 5000)")
     ap.add_argument("--max-detections", type=int, default=100)
     ap.add_argument("--use-fp16", action="store_true", default=True)

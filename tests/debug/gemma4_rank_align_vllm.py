@@ -172,7 +172,7 @@ def main() -> None:
 
     args = parse_args()
     result_dir = Path(args.result_dir)
-    scenarios = ["prefill-heavy", "balanced", "decode-heavy"]
+    scenarios = ["mixed"]
     indices = [
         round(i * (args.num_requests - 1) / (args.sample - 1))
         for i in range(args.sample)
