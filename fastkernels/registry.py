@@ -231,7 +231,7 @@ FULL_BENCHMARK: list[BenchmarkScenario] = [
     BenchmarkScenario("fla-hub/rwkv7-1.5B-world", 1, "bfloat16", _LLM_ALL),
     BenchmarkScenario("fla-hub/gla-2.7B-100B", 1, "bfloat16", _LLM_ALL),
     BenchmarkScenario("fla-hub/retnet-2.7B-100B", 1, "bfloat16", _LLM_ALL),
-    BenchmarkScenario("Qwen/Qwen3-Next-80B-A3B-Instruct", 4, "bfloat16", _LLM_ALL),
+    BenchmarkScenario("Qwen/Qwen3-Next-80B-A3B-Instruct", 2, "bfloat16", _LLM_ALL),
     BenchmarkScenario("moonshotai/Kimi-Linear-48B-A3B-Instruct", 2, "bfloat16", _LLM_ALL),
     BenchmarkScenario("ttt_e2e", 1, "bfloat16", _LLM_ALL),                      # TTT-E2E (Project Gutenberg contiguous text; random-init weights, no public ckpt)
     BenchmarkScenario("ai21labs/AI21-Jamba-Mini-1.7", 2, "bfloat16", _LLM_ALL),

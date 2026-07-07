@@ -48,6 +48,7 @@ import json
 import os
 import pkgutil
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -59,7 +60,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from .registry import FULL_BENCHMARK
+from .registry import FULL_BENCHMARK, _module_from_name
 from .workloads import Purpose, load_real_prompt_workload, spec_for
 
 # Default directory for capture reports (override per-run with ``--output``).
@@ -83,6 +84,51 @@ _BASELINE_PACKAGE = "fastkernels.tasks.baseline"
 # only affect linear-attention operators, and stubbing them makes their
 # submodule imports partially succeed and pollute global torch state.)
 _OPTIONAL_KERNEL_DEPS = ("deep_gemm",)
+
+# Base TCP port for the engine's tensor-parallel c10d rendezvous. Each scheduled
+# scenario is handed a *distinct* port (base + its scenario index) via the
+# ``FASTKERNELS_NCCL_PORT`` env var so that concurrently-running multi-GPU
+# scenarios never collide on a single fixed port -- a collision makes rank 0's
+# TCPStore bind fail with ``EADDRINUSE`` and kills every-but-one TP scenario.
+# Overridable so a back-to-back re-run can step around a lingering TIME_WAIT.
+_NCCL_PORT_BASE = int(os.environ.get("FASTKERNELS_NCCL_PORT_BASE", "29500"))
+
+# Architectures whose fastkernels operator chain hard-imports (and, at forward
+# time, actually calls) an optional GPU kernel library. When that library is not
+# installed the spawned tensor-parallel workers die at import and rank 0 then
+# blocks forever on the c10d rendezvous, wedging the whole GPU pool -- so such
+# scenarios are skipped up front (with a clear message) instead of downloading
+# their (often enormous) checkpoint only to hang.
+_ARCH_REQUIRED_KERNEL_DEPS = {"deepseek": "deep_gemm"}
+
+# --- Scenario watchdog -------------------------------------------------------
+# A tensor-parallel scenario runs as rank 0 (the child the scheduler launches)
+# plus ``tp - 1`` worker processes it spawns. When a rank hits an OOM, an
+# illegal-memory fault, or a kernel that aborts, it does NOT cleanly exit -- the
+# whole group wedges: the healthy ranks spin forever inside a NCCL collective
+# waiting for the faulted peer, or the faulted rank gets stuck unwinding a
+# corrupt CUDA context. Either way rank 0 never returns and its GPUs are never
+# reclaimed, which would stall the entire pool for the rest of the run.
+#
+# The one trait every wedge shares is that the scenario stops making progress,
+# and progress is directly observable: a live scenario keeps writing to its log
+# (per-workload banners, generation summaries, verification results), whereas a
+# wedged one goes silent. So the watchdog force-kills a scenario's whole process
+# group when its log has been idle for too long -- with a generous threshold so
+# a legitimately long (but silent) generation is never mistaken for a hang -- and
+# backstops that with an absolute wall-clock cap. Each scenario is launched in
+# its own session so the group can be killed without touching its siblings.
+_SCENARIO_TIMEOUT_SEC = int(os.environ.get("FASTKERNELS_SCENARIO_TIMEOUT_SEC", "3600"))
+# Kill a scenario whose log has produced no new output for this long. Must
+# comfortably exceed the longest *silent* stretch of a healthy scenario -- model
+# load emits shard progress and each workload prints at its boundaries; only a
+# single workload's generation (tqdm disabled) is quiet, and that stays well
+# under this bound for the workload sizes here.
+_SCENARIO_STALL_SEC = int(os.environ.get("FASTKERNELS_SCENARIO_STALL_SEC", "1200"))
+# How often (seconds) the scheduler runs the watchdog checks.
+_WATCHDOG_CHECK_INTERVAL_SEC = 15.0
+# Seconds to wait after SIGTERM before escalating a group kill to SIGKILL.
+_WATCHDOG_TERM_GRACE_SEC = 8.0
 
 
 class _MissingDependencyStub(types.ModuleType):
@@ -124,6 +170,28 @@ def _install_optional_dependency_stubs(names=_OPTIONAL_KERNEL_DEPS) -> list[str]
         sys.modules[name] = _MissingDependencyStub(name)
         stubbed.append(name)
     return stubbed
+
+
+def _missing_kernel_dep(scenario) -> str | None:
+    """Optional kernel lib required by this scenario's architecture but missing.
+
+    The architecture is inferred from the HF name alone (no config, no network).
+    Returns the dependency name (e.g. ``"deep_gemm"``) when it is required but
+    not importable, otherwise ``None``. A previously-installed *stub* counts as
+    missing, since the stub raises the moment the real kernel is called.
+    """
+    dep = _ARCH_REQUIRED_KERNEL_DEPS.get(_module_from_name(scenario.hf_name))
+    if dep is None:
+        return None
+    existing = sys.modules.get(dep)
+    if isinstance(existing, _MissingDependencyStub):
+        return dep
+    if existing is not None:
+        return None
+    try:
+        return None if importlib.util.find_spec(dep) is not None else dep
+    except (ImportError, ValueError, ModuleNotFoundError):
+        return dep
 
 # NOTE: The capture prompts come from standardized BenchmarkScenario workloads
 # (``CAPTURE_SCENARIOS`` below). The old ``DEFAULT_PROMPTS`` list (and the
@@ -1396,12 +1464,74 @@ def _scenario_log_name(scenario, index: int) -> str:
     return f"{index:02d}_{model}_tp{scenario.tp}_{scenario.dtype}"
 
 
+def _kill_process_group(proc: "subprocess.Popen", pgid: int) -> None:
+    """Terminate an entire scenario process group (rank 0 + spawned workers).
+
+    SIGTERM first (lets Python finalizers/atexit run), escalating to SIGKILL if
+    the group is still alive after a short grace -- a rank wedged in a NCCL
+    busy-wait may ignore the polite signal.
+    """
+    for sig, grace in ((signal.SIGTERM, _WATCHDOG_TERM_GRACE_SEC), (signal.SIGKILL, 5.0)):
+        try:
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, PermissionError):
+            return
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                return
+            time.sleep(0.2)
+
+
+def _watchdog_kill_reason(info: dict, now_wall: float, now_mono: float) -> str | None:
+    """Return a reason string if this running scenario should be force-killed.
+
+    A scenario is considered wedged when its log has gone silent for longer than
+    ``_SCENARIO_STALL_SEC`` (no forward progress -- a hung NCCL collective or a
+    stuck post-fault CUDA teardown), with an absolute wall-clock cap as a
+    backstop. Returns ``None`` when the scenario still looks healthy.
+    """
+    elapsed = now_mono - info["start"]
+    if elapsed > _SCENARIO_TIMEOUT_SEC:
+        return (f"exceeded {_SCENARIO_TIMEOUT_SEC}s wall-clock timeout "
+                f"(elapsed {int(elapsed)}s)")
+    try:
+        idle = now_wall - os.stat(info["log"]).st_mtime
+    except OSError:
+        return None
+    if idle > _SCENARIO_STALL_SEC:
+        return (f"no log output for {int(idle)}s (>{_SCENARIO_STALL_SEC}s) "
+                f"-- appears wedged/hung")
+    return None
+
+
 def _wait_any(running: dict, poll: float = 1.0) -> list:
-    """Block until at least one running child exits; return the finished procs."""
+    """Block until at least one running child exits; return the finished procs.
+
+    While waiting, periodically runs the scenario watchdog and force-kills (and
+    reports) any scenario whose log has gone silent past the stall threshold or
+    which has blown the wall-clock cap, so a single hang can never wedge the pool.
+    """
+    last_check = time.monotonic()
     while True:
         done = [proc for proc in running if proc.poll() is not None]
         if done:
             return done
+        now = time.monotonic()
+        if now - last_check >= _WATCHDOG_CHECK_INTERVAL_SEC:
+            last_check = now
+            now_wall = time.time()
+            for proc, info in list(running.items()):
+                if proc.poll() is not None:
+                    continue
+                reason = _watchdog_kill_reason(info, now_wall, now)
+                if reason:
+                    info["killed_reason"] = reason
+                    print(
+                        f"  !! WATCHDOG scenario[{info['index']}] "
+                        f"{info['scenario'].hf_name}: {reason}; killing group"
+                    )
+                    _kill_process_group(proc, info["pgid"])
         time.sleep(poll)
 
 
@@ -1421,8 +1551,11 @@ def _worker_command(args) -> list[str]:
     via the ``_WORKER_INDEX_ENV`` environment variable (set by ``_launch``), so
     there is no user-facing scenario-selection flag.
     """
+    # ``-u`` keeps the child's stdout unbuffered so its log advances in real
+    # time -- both for live monitoring and so the watchdog's log-idle check
+    # measures true progress rather than a stuck output buffer.
     cmd = [
-        sys.executable, "-m", "fastkernels.capture",
+        sys.executable, "-u", "-m", "fastkernels.capture",
         "--num-requests", str(args.num_requests),
     ]
     if args.output:
@@ -1445,7 +1578,12 @@ def _run_scenarios_parallel(scenarios, args, gpu_ids: list[str]) -> int:
     results: dict[int, tuple[str, str]] = {}
     pending: list[tuple[int, object]] = []
     for i, s in enumerate(scenarios):
-        if s.tp > total:
+        dep = _missing_kernel_dep(s)
+        if dep is not None:
+            detail = f"requires optional kernel lib '{dep}' (not installed)"
+            results[i] = ("skipped", detail)
+            print(f"  !! SKIP scenario[{i}] {s.hf_name}: {detail}")
+        elif s.tp > total:
             detail = f"needs tp={s.tp} > {total} GPU(s) available"
             results[i] = ("skipped", detail)
             print(f"  !! SKIP scenario[{i}] {s.hf_name}: {detail}")
@@ -1463,15 +1601,22 @@ def _run_scenarios_parallel(scenarios, args, gpu_ids: list[str]) -> int:
         env = dict(os.environ)
         env["CUDA_VISIBLE_DEVICES"] = ",".join(assign)
         env[_WORKER_INDEX_ENV] = str(i)
+        # Distinct rendezvous port per scenario so concurrent TP scenarios don't
+        # collide on one fixed port (EADDRINUSE on rank 0's TCPStore bind).
+        env["FASTKERNELS_NCCL_PORT"] = str(_NCCL_PORT_BASE + i)
         log_path = log_dir / f"{_scenario_log_name(s, i)}.log"
         logf = open(log_path, "w")
+        # ``start_new_session`` puts this scenario (rank 0 + the workers it
+        # spawns) in its own process group so the watchdog can size it and, if
+        # it hangs, kill the whole group without touching sibling scenarios.
         proc = subprocess.Popen(
             _worker_command(args), stdout=logf,
-            stderr=subprocess.STDOUT, env=env,
+            stderr=subprocess.STDOUT, env=env, start_new_session=True,
         )
         running[proc] = {
             "index": i, "scenario": s, "gpus": assign,
             "log": log_path, "logf": logf,
+            "pgid": proc.pid, "start": time.monotonic(),
         }
         print(
             f"  -> [GPU {env['CUDA_VISIBLE_DEVICES']}] scenario[{i}] "
@@ -1503,7 +1648,10 @@ def _run_scenarios_parallel(scenarios, args, gpu_ids: list[str]) -> int:
                 info["logf"].close()
                 free.extend(info["gpus"])
                 i, s, rc = info["index"], info["scenario"], proc.returncode
-                if rc == 0:
+                killed_reason = info.get("killed_reason")
+                if killed_reason:
+                    results[i] = ("error", f"{killed_reason}; {info['log']}")
+                elif rc == 0:
                     results[i] = ("ok", "")
                 elif rc == 1:
                     results[i] = ("verify-failed", str(info["log"]))
@@ -1513,12 +1661,13 @@ def _run_scenarios_parallel(scenarios, args, gpu_ids: list[str]) -> int:
                     f"  <- [{results[i][0].upper()}] scenario[{i}] {s.hf_name} "
                     f"(rc={rc}); freed GPU {','.join(info['gpus'])}"
                 )
-                if rc != 0:
+                if results[i][0] == "error":
                     _print_log_tail(info["log"])
     finally:
-        # Never leave orphaned GPU processes behind on interrupt/error.
+        # Never leave orphaned GPU processes behind on interrupt/error: kill the
+        # whole group so spawned tensor-parallel workers go too.
         for proc, info in list(running.items()):
-            proc.terminate()
+            _kill_process_group(proc, info["pgid"])
             info["logf"].close()
 
     print("\nCapture summary:")
