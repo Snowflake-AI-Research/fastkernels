@@ -224,7 +224,7 @@ FULL_BENCHMARK: list[BenchmarkScenario] = [
     BenchmarkScenario("1bitLLM/bitnet_b1_58-3B", 1, "bfloat16", _LLM_ALL),
     BenchmarkScenario("openai/gpt-oss-120b", 2, "mxfp4", _LLM_ALL),
     BenchmarkScenario("yuhuili/EAGLE3-LLaMA3.1-Instruct-8B", 1, "bfloat16", _LLM_ALL),
-    BenchmarkScenario("google/gemma-4-E4B-it", 1, "bfloat16", _LLM_ALL),
+    BenchmarkScenario("google/gemma-4-26B-A4B-it", 1, "bfloat16", _LLM_ALL),
     # --- Linear Attention & New Archs ---
     BenchmarkScenario("state-spaces/mamba-2.8b-hf", 1, "bfloat16", _LLM_ALL),
     BenchmarkScenario("mistralai/Mamba-Codestral-7B-v0.1", 1, "bfloat16", _LLM_ALL),
@@ -244,7 +244,7 @@ FULL_BENCHMARK: list[BenchmarkScenario] = [
     BenchmarkScenario("FunAudioLLM/Fun-CosyVoice3-0.5B-2512", 1, "bfloat16", _TTS_ALL),
     # --- Multimodal & Encoders ---
     BenchmarkScenario("Qwen/Qwen2-VL-7B-Instruct", 1, "bfloat16", _VLM_ALL),
-    BenchmarkScenario("Qwen/Qwen3-VL-235B-A22B-Instruct", 4, "fp8", _VLM_ALL),
+    BenchmarkScenario("Qwen/Qwen3-VL-235B-A22B-Instruct-FP8", 4, "fp8", _VLM_ALL),
     BenchmarkScenario("Qwen/Qwen2.5-Omni-7B", 1, "bfloat16", _OMNI_ALL),
     BenchmarkScenario("google/siglip2-so400m-patch16-naflex", 1, "bfloat16", _VISION_ENCODER_ALL),
     BenchmarkScenario("facebook/dinov3-vit7b16-pretrain-lvd1689m", 1, "bfloat16", _VISION_ENCODER_ALL),

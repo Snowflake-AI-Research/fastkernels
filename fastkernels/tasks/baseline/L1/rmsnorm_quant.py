@@ -18,10 +18,14 @@ _FP8_GROUP_SIZE = 128
 
 # ---------------------------------------------------------------------------
 # Register fused ops in fastkernels_norm namespace for Inductor fusion passes.
-# These use the same Library as rms_norm.py (IMPL mode to extend it).
+# ``rms_norm.py`` already owns this namespace via a "DEF" registration, so we
+# extend it with a "FRAGMENT" -- a namespace may have one DEF plus any number of
+# FRAGMENTs. FRAGMENT also creates the namespace on its own when this module is
+# imported without ``rms_norm`` first, so it is order-independent. Using "DEF"
+# here would be a second owner of ``fastkernels_norm`` and raise at import time.
 # ---------------------------------------------------------------------------
 
-_fused_lib = torch.library.Library("fastkernels_norm", "DEF")
+_fused_lib = torch.library.Library("fastkernels_norm", "FRAGMENT")
 
 _fused_lib.define(
     "rmsnorm_fp8_quant(Tensor! output_fp8, Tensor! output_scales, "

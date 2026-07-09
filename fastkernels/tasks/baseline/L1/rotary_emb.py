@@ -208,6 +208,7 @@ class Gemma4ProportionalRotaryEmbedding(RotaryEmbedding):
     ):
         nn.Module.__init__(self)
         self.head_dim = head_dim
+        self.is_neox_style = True
         rope_angles = rotary_dim // 2
         nope_angles = (head_dim // 2) - rope_angles
 

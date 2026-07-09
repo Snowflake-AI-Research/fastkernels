@@ -29,6 +29,7 @@ class Gemma4GateLinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if (
             vllm_ops is not None
+            and hasattr(vllm_ops, "router_gemm_bf16_fp32")
             and x.is_cuda
             and x.dtype == torch.bfloat16
             and self.weight.dtype == torch.bfloat16

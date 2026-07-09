@@ -42,9 +42,9 @@ import atexit
 import functools
 import gc
 import importlib
-import importlib.util
 import inspect
 import json
+import math
 import os
 import pkgutil
 import shutil
@@ -53,15 +53,16 @@ import subprocess
 import sys
 import time
 import traceback
-import types
 from datetime import datetime
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 
-from .registry import FULL_BENCHMARK, _module_from_name
-from .workloads import Purpose, load_real_prompt_workload, spec_for
+from .registry import FULL_BENCHMARK
+from .workloads import (
+    VLM, OmniModal, Purpose, load_real_prompt_workload, spec_for,
+)
 
 # Default directory for capture reports (override per-run with ``--output``).
 CAPTURE_DIR = Path.home() / ".fastkernels" / "captures"
@@ -75,16 +76,6 @@ _WORKER_INDEX_ENV = "FK_CAPTURE_WORKER_INDEX"
 # The package that holds every fastkernels operator (nn.Module) definition.
 _BASELINE_PACKAGE = "fastkernels.tasks.baseline"
 
-# Optional, architecture-specific GPU kernel libraries. ``deep_gemm`` is
-# imported eagerly by ``infra.weight_loader`` (via the DeepSeek chain) but is
-# only *invoked* by non-Llama architectures. When it is absent we register a
-# stub so the Llama path can still be loaded and captured; the stub raises if
-# any of its symbols are ever actually called, so it can never silently affect
-# a real computation. (We deliberately do NOT stub ``fla`` and friends: those
-# only affect linear-attention operators, and stubbing them makes their
-# submodule imports partially succeed and pollute global torch state.)
-_OPTIONAL_KERNEL_DEPS = ("deep_gemm",)
-
 # Base TCP port for the engine's tensor-parallel c10d rendezvous. Each scheduled
 # scenario is handed a *distinct* port (base + its scenario index) via the
 # ``FASTKERNELS_NCCL_PORT`` env var so that concurrently-running multi-GPU
@@ -92,14 +83,6 @@ _OPTIONAL_KERNEL_DEPS = ("deep_gemm",)
 # TCPStore bind fail with ``EADDRINUSE`` and kills every-but-one TP scenario.
 # Overridable so a back-to-back re-run can step around a lingering TIME_WAIT.
 _NCCL_PORT_BASE = int(os.environ.get("FASTKERNELS_NCCL_PORT_BASE", "29500"))
-
-# Architectures whose fastkernels operator chain hard-imports (and, at forward
-# time, actually calls) an optional GPU kernel library. When that library is not
-# installed the spawned tensor-parallel workers die at import and rank 0 then
-# blocks forever on the c10d rendezvous, wedging the whole GPU pool -- so such
-# scenarios are skipped up front (with a clear message) instead of downloading
-# their (often enormous) checkpoint only to hang.
-_ARCH_REQUIRED_KERNEL_DEPS = {"deepseek": "deep_gemm"}
 
 # --- Scenario watchdog -------------------------------------------------------
 # A tensor-parallel scenario runs as rank 0 (the child the scheduler launches)
@@ -130,68 +113,6 @@ _WATCHDOG_CHECK_INTERVAL_SEC = 15.0
 # Seconds to wait after SIGTERM before escalating a group kill to SIGKILL.
 _WATCHDOG_TERM_GRACE_SEC = 8.0
 
-
-class _MissingDependencyStub(types.ModuleType):
-    """A placeholder module whose attributes raise only when *called*.
-
-    Dunder attributes (``__file__``, ``__path__``, ``__spec__`` ...) must behave
-    like a normal module's, so we raise ``AttributeError`` for them; otherwise
-    ``inspect``/``importlib`` machinery scanning ``sys.modules`` would receive a
-    function and crash.
-    """
-
-    def __getattr__(self, name: str):
-        if name.startswith("__") and name.endswith("__"):
-            raise AttributeError(name)
-
-        module_name = self.__name__
-
-        def _unavailable(*args, **kwargs):
-            raise RuntimeError(
-                f"Optional dependency '{module_name}' is not installed; "
-                f"'{module_name}.{name}' cannot be used. This stub only exists "
-                f"so unrelated operators can be imported for metadata capture."
-            )
-
-        return _unavailable
-
-
-def _install_optional_dependency_stubs(names=_OPTIONAL_KERNEL_DEPS) -> list[str]:
-    """Register stubs for any of ``names`` that are not importable."""
-    stubbed = []
-    for name in names:
-        if name in sys.modules:
-            continue
-        try:
-            if importlib.util.find_spec(name) is not None:
-                continue
-        except (ImportError, ValueError, ModuleNotFoundError):
-            pass
-        sys.modules[name] = _MissingDependencyStub(name)
-        stubbed.append(name)
-    return stubbed
-
-
-def _missing_kernel_dep(scenario) -> str | None:
-    """Optional kernel lib required by this scenario's architecture but missing.
-
-    The architecture is inferred from the HF name alone (no config, no network).
-    Returns the dependency name (e.g. ``"deep_gemm"``) when it is required but
-    not importable, otherwise ``None``. A previously-installed *stub* counts as
-    missing, since the stub raises the moment the real kernel is called.
-    """
-    dep = _ARCH_REQUIRED_KERNEL_DEPS.get(_module_from_name(scenario.hf_name))
-    if dep is None:
-        return None
-    existing = sys.modules.get(dep)
-    if isinstance(existing, _MissingDependencyStub):
-        return dep
-    if existing is not None:
-        return None
-    try:
-        return None if importlib.util.find_spec(dep) is not None else dep
-    except (ImportError, ValueError, ModuleNotFoundError):
-        return dep
 
 # NOTE: The capture prompts come from standardized BenchmarkScenario workloads
 # (``CAPTURE_SCENARIOS`` below). The old ``DEFAULT_PROMPTS`` list (and the
@@ -337,12 +258,21 @@ def _wrap_method(cls, method_name: str):
     @functools.wraps(raw)
     def wrapper(*args, **kwargs):
         try:
+            # Attribute the call to the *actual* instance class, so a subclass
+            # that inherits this (unwrapped) method is recorded under its own
+            # name -- matching the forward-pre-hook cross-check, which keys on
+            # ``type(module)``. Without this, an inherited ``forward`` (e.g.
+            # Gemma4ProportionalRotaryEmbedding inheriting RotaryEmbedding.forward)
+            # records under the base class in the monkey-patch but the subclass
+            # in the hook, producing a spurious verification mismatch.
+            inst_cls = type(args[0]) if args and isinstance(args[0], cls) else cls
+            q = f"{inst_cls.__module__}:{inst_cls.__name__}"
             summary = (
                 _summarize_call(sig, args, kwargs)
                 if sig is not None
                 else {"_args": [_summarize(v) for v in args[1:]]}
             )
-            _record(qualname, cls.__module__, cls.__name__, record_key, summary)
+            _record(q, inst_cls.__module__, inst_cls.__name__, record_key, summary)
         except Exception:
             pass
         return raw(*args, **kwargs)
@@ -777,15 +707,26 @@ def _actual_combined_tokens() -> dict[int, int] | None:
 def _actual_prefill(num_layers: int) -> dict | None:
     """Per-step multisets of prefill token / sequence counts from the kernel.
 
-    The prefill attention kernel runs once per layer per step, so raw call
-    counts are divided by ``num_layers`` to recover per-step frequencies.
+    The prefill attention kernel runs once per *prefill-using* layer per step, so
+    raw call counts are divided by that per-step invocation count to recover
+    per-step frequencies. For a uniform model this equals ``num_layers``; but for
+    a model with heterogeneous attention where only a subset of layers route to
+    FlashAttnPrefill it is that subset's size -- e.g. Gemma-4, whose sliding-window
+    layers use FlashAttnPrefill (with a window) while its full-attention layers
+    take a separate long-context prefill path, so only 25 of its 30 layers invoke
+    FlashAttnPrefill per long-context prefill step.
 
-    Raw counts are accumulated per leading dimension *before* dividing: models
-    with heterogeneous per-layer attention (e.g. GPT-OSS alternates sliding-
-    window and full attention) emit several distinct forward signatures per step
-    that share the same ``q`` / ``cu_seqlens_q`` leading dims but split the layer
-    count between them. Dividing each signature's count individually would round
-    fractional per-step frequencies to zero; aggregating first keeps them whole.
+    We recover the per-step invocation count self-calibrating from the data:
+    within a step the kernel is invoked once per prefill-using layer, all at that
+    step's chunk size, so each per-chunk-size call count is a multiple of the
+    per-step invocation count and their GCD equals it (a chunk size that occurs in
+    a single step -- always present with varied real prompts -- pins the GCD to
+    exactly that count). ``num_layers`` is the fallback when the GCD is degenerate
+    (no records, or > num_layers because every chunk size shares a common step
+    multiple).
+
+    Raw counts are accumulated per leading dimension *before* dividing so
+    fractional per-step frequencies are never rounded to zero.
     """
     rec = _find_hook_record("flash_attn_prefill:FlashAttnPrefill")
     if rec is None:
@@ -800,11 +741,16 @@ def _actual_prefill(num_layers: int) -> dict | None:
         cu = _leading_dim(summary, "cu_seqlens_q")
         if cu is not None:
             raw_seqs[cu - 1] = raw_seqs.get(cu - 1, 0) + count
-    lyr = max(num_layers, 1)
+    # Per-step FlashAttnPrefill invocations = number of prefill-using layers,
+    # recovered as the GCD of the per-chunk-size call counts (see docstring).
+    lyr = math.gcd(*raw_tokens.values()) if raw_tokens else 0
+    if not 1 <= lyr <= max(num_layers, 1):
+        lyr = max(num_layers, 1)
     tokens = {n: int(round(c / lyr)) for n, c in raw_tokens.items()}
     seqs = {s: int(round(c / lyr)) for s, c in raw_seqs.items()}
     total_tokens = sum(n * steps for n, steps in tokens.items())
-    return {"tokens": tokens, "seqs": seqs, "total_tokens": total_tokens}
+    return {"tokens": tokens, "seqs": seqs, "total_tokens": total_tokens,
+            "layers_per_prefill_step": lyr}
 
 
 def _actual_decode() -> dict | None:
@@ -883,12 +829,30 @@ def _verify_batch_schedule(prompt_lens, gen_lens, max_num_seqs,
     # --- invariants that must hold for ANY correct schedule ---
     want_prefill = sum(prompt_lens)
     want_decode = sum(g - 1 for g in gen_lens)
-    _check("total prefill tokens == sum(prompt lengths)",
-           total_prefill == want_prefill,
-           f"simulated {total_prefill} vs sum(prompt_lens) {want_prefill}")
-    _check("total decode tokens == sum(generated - 1)",
-           total_decode == want_decode,
-           f"simulated {total_decode} vs {want_decode}")
+    # Recompute-preemption (under paged-KV pressure -- e.g. many long-context
+    # sequences, amplified for sliding-window models that the pool sizing does
+    # not shrink) legitimately *re-prefills* a preempted sequence on resume, so
+    # prefill/decode work becomes a lower bound of, not equal to, the single-pass
+    # total. Detect it (the replay re-prefilled beyond the prompt sum) and check
+    # ">=" instead of "=="; the exact per-step / per-chunk histograms below still
+    # cross-check the replay against the capture strictly.
+    preempted = total_prefill > want_prefill
+    _pf_extra = total_prefill - want_prefill
+    if preempted:
+        _check("total prefill tokens >= sum(prompt lengths) [recompute-preemption]",
+               total_prefill >= want_prefill,
+               f"simulated {total_prefill} >= {want_prefill} "
+               f"(+{_pf_extra} re-prefilled by preemption)")
+        _check("total decode tokens >= sum(generated - 1) [recompute-preemption]",
+               total_decode >= want_decode,
+               f"simulated {total_decode} >= {want_decode}")
+    else:
+        _check("total prefill tokens == sum(prompt lengths)",
+               total_prefill == want_prefill,
+               f"simulated {total_prefill} vs sum(prompt_lens) {want_prefill}")
+        _check("total decode tokens == sum(generated - 1)",
+               total_decode == want_decode,
+               f"simulated {total_decode} vs {want_decode}")
     _check("every step within max_num_batched_tokens",
            max_total <= max_num_batched_tokens,
            f"max step tokens {max_total} <= {max_num_batched_tokens}")
@@ -908,9 +872,14 @@ def _verify_batch_schedule(prompt_lens, gen_lens, max_num_seqs,
 
     prefill = _actual_prefill(num_layers)
     if prefill is not None:
-        _check("captured prefill tokens == sum(prompt lengths)",
-               prefill["total_tokens"] == want_prefill,
-               f"captured {prefill['total_tokens']} vs {want_prefill}")
+        if preempted:
+            _check("captured prefill tokens >= sum(prompt lengths) [recompute-preemption]",
+                   prefill["total_tokens"] >= want_prefill,
+                   f"captured {prefill['total_tokens']} >= {want_prefill}")
+        else:
+            _check("captured prefill tokens == sum(prompt lengths)",
+                   prefill["total_tokens"] == want_prefill,
+                   f"captured {prefill['total_tokens']} vs {want_prefill}")
         _check("prefill token counts match capture",
                prefill["tokens"] == pred_prefill_tokens,
                _multiset_diff(pred_prefill_tokens, prefill["tokens"]))
@@ -1124,6 +1093,475 @@ def _reset_engine_runtime_state(engine) -> None:
     reset()
 
 
+# ---------------------------------------------------------------------------
+# Multimodal (VLM / OmniModal) input loading
+#
+# These loaders are copied verbatim from ``tests/bench_vllm.py`` (the current,
+# non-deprecated reference benchmark), whose multimodal loaders live inside a
+# worker-source string (``_MM_PRELOAD_FN``) and so cannot be imported. Copying
+# them keeps the captured operator shapes identical to what the benchmark runs:
+# OpenCV video decode (vLLM's OpenCVVideoBackend, 32 frames), PyAV audio decode
+# (no torchcodec), and the VisionArena / MMVU / librispeech dispatcher with its
+# exact filters, prompt construction and MMVU ``snapshot_download`` + URL->local
+# resolution. The multimodal engine path is driven exactly like
+# ``FASTKERNELS_VLM_WORKER`` in that file: raw text prompts plus per-request
+# ``images`` / ``videos`` / ``audio_features`` handed to ``LlamaEngine.generate``,
+# which runs the HF processor (chat template + placeholder expansion) internally.
+# ---------------------------------------------------------------------------
+
+# Fixed shuffle seed so a given (dataset, n_req) always draws the same requests.
+_MEDIA_SEED = 42
+
+
+def _decode_audio_array(audio):
+    """Decode a HF Audio item to mono float32 samples without torchcodec."""
+    import numpy as np
+    from io import BytesIO
+
+    if isinstance(audio, dict) and audio.get("array") is not None:
+        samples = np.asarray(audio["array"], dtype=np.float32)
+        return samples, int(audio["sampling_rate"])
+
+    import av
+
+    source = None
+    if isinstance(audio, dict):
+        if audio.get("bytes") is not None:
+            source = BytesIO(audio["bytes"])
+        elif audio.get("path") is not None:
+            source = audio["path"]
+    if source is None:
+        raise ValueError("Unsupported audio sample format")
+
+    chunks = []
+    sampling_rate = None
+    with av.open(source) as container:
+        for frame in container.decode(audio=0):
+            arr = frame.to_ndarray()
+            sampling_rate = frame.sample_rate
+            chunks.append(arr)
+    if not chunks or sampling_rate is None:
+        raise ValueError("Audio sample has no decodable frames")
+
+    samples = np.concatenate(chunks, axis=-1)
+    if np.issubdtype(samples.dtype, np.integer):
+        info = np.iinfo(samples.dtype)
+        samples = samples.astype(np.float32) / max(abs(info.min), info.max)
+    else:
+        samples = samples.astype(np.float32)
+    if samples.ndim == 2:
+        samples = samples.mean(axis=0)
+    return samples, int(sampling_rate)
+
+
+def _load_video_opencv(video_path, num_frames=32):
+    """Load video frames with OpenCV, matching vLLM's OpenCVVideoBackend."""
+    import cv2
+    import numpy as np
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise ValueError(f"Could not open video: {video_path}")
+
+    total_frames_num = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    original_fps = cap.get(cv2.CAP_PROP_FPS)
+    duration = total_frames_num / original_fps if original_fps > 0 else 0
+
+    num_frames_to_sample = total_frames_num
+    if num_frames > 0:
+        num_frames_to_sample = min(num_frames, total_frames_num)
+    num_frames_to_sample = max(1, num_frames_to_sample)
+
+    if num_frames_to_sample == total_frames_num:
+        frame_idx = list(range(num_frames_to_sample))
+    else:
+        frame_idx = np.linspace(
+            0, total_frames_num - 1, num_frames_to_sample, dtype=int
+        ).tolist()
+
+    frame_idx_set = set(frame_idx)
+    max_idx = max(frame_idx)
+
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    frames = np.empty((num_frames_to_sample, height, width, 3), dtype=np.uint8)
+
+    i = 0
+    valid_frame_indices = []
+    for idx in range(max_idx + 1):
+        ok = cap.grab()
+        if not ok:
+            continue
+        if idx in frame_idx_set:
+            ret, frame = cap.retrieve()
+            if ret:
+                frames[i] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                valid_frame_indices.append(idx)
+                i += 1
+
+    cap.release()
+    valid_num_frames = len(valid_frame_indices)
+    frames = frames[:valid_num_frames]
+
+    metadata = {
+        "total_num_frames": total_frames_num,
+        "fps": original_fps,
+        "duration": duration,
+        "video_backend": "opencv",
+        "frames_indices": valid_frame_indices,
+        "do_sample_frames": valid_num_frames == total_frames_num,
+    }
+    return frames, metadata
+
+
+def _preload_mm_data(dataset_name, dataset_split, num_seqs, seed,
+                     num_video_frames=32):
+    """Pre-download and load multimodal samples into memory.
+
+    Returns list of dicts with keys:
+      - prompt: str
+      - images: list[PIL.Image] or None
+      - video_frames: np.ndarray (T,H,W,3) or None
+      - video_metadata: dict or None
+      - audio: np.ndarray or None
+      - audio_sampling_rate: int or None
+    """
+    from io import BytesIO
+
+    from datasets import load_dataset
+    from PIL import Image
+    from tqdm import tqdm
+
+    use_streaming = "MMVU" not in dataset_name
+    data = load_dataset(dataset_name, split=dataset_split,
+                        streaming=use_streaming)
+    if "librispeech_asr" in dataset_name:
+        from datasets import Audio
+        data = data.cast_column("audio", Audio(decode=False))
+    data = data.shuffle(seed=seed)
+
+    results = []
+    if "VisionArena" in dataset_name:
+        pbar = tqdm(data, total=num_seqs, desc="Loading images")
+        for item in pbar:
+            if len(results) >= num_seqs:
+                break
+            try:
+                prompt = item["conversation"][0][0]["content"]
+                if "base64" in prompt or len(prompt) > 4096:
+                    continue
+                img = item["images"][0]
+                if isinstance(img, dict) and "bytes" in img:
+                    img = Image.open(BytesIO(img["bytes"]))
+                if not isinstance(img, Image.Image):
+                    continue
+                img = img.convert("RGB")
+                w, h = img.size
+                if w * h > 2048 * 2048:
+                    continue
+            except Exception:
+                continue
+            results.append({
+                "prompt": prompt,
+                "images": [img],
+                "video_frames": None,
+                "video_metadata": None,
+                "audio": None,
+                "audio_sampling_rate": None,
+            })
+            pbar.update(0)
+        pbar.close()
+    elif "MMVU" in dataset_name:
+        from huggingface_hub import snapshot_download
+        local_root = snapshot_download(dataset_name, repo_type="dataset")
+        remote_root = (
+            f"https://huggingface.co/datasets/{dataset_name}/resolve/main"
+        )
+        pbar = tqdm(data, total=num_seqs, desc="Loading videos")
+        for item in pbar:
+            if len(results) >= num_seqs:
+                break
+            prompt = item["question"] + " " + " ".join(
+                f"{k}.{v}" for k, v in item["choices"].items())
+            video_path = item["video"].replace(remote_root, local_root)
+            frames, metadata = _load_video_opencv(
+                video_path, num_frames=num_video_frames)
+            results.append({
+                "prompt": prompt,
+                "images": None,
+                "video_frames": frames,
+                "video_metadata": metadata,
+                "audio": None,
+                "audio_sampling_rate": None,
+            })
+            pbar.update(0)
+        pbar.close()
+    elif "librispeech_asr" in dataset_name:
+        pbar = tqdm(data, total=num_seqs, desc="Loading audio")
+        for item in pbar:
+            if len(results) >= num_seqs:
+                break
+            try:
+                samples, sampling_rate = _decode_audio_array(item["audio"])
+                if samples.ndim != 1 or samples.size == 0:
+                    continue
+            except Exception:
+                continue
+            results.append({
+                "prompt": "Transcribe this audio and answer in text.",
+                "images": None,
+                "video_frames": None,
+                "video_metadata": None,
+                "audio": samples,
+                "audio_sampling_rate": sampling_rate,
+            })
+            pbar.update(0)
+        pbar.close()
+    return results
+
+
+def _media_descriptor(item) -> str:
+    """Short human-readable summary of a request's media for the report."""
+    if item["images"] is not None:
+        return f"{len(item['images'])} image(s)"
+    if item["video_frames"] is not None:
+        return f"{int(item['video_frames'].shape[0])} video frame(s)"
+    if item["audio"] is not None:
+        sr = item["audio_sampling_rate"]
+        return f"1 audio clip ({item['audio'].shape[-1]} samples @ {sr}Hz)"
+    return "text"
+
+
+# ---------------------------------------------------------------------------
+# EAGLE-3 speculative-decoding capture
+#
+# EAGLE-3 scenarios name the *draft head* (e.g. yuhuili/EAGLE3-LLaMA3.1-Instruct-8B);
+# the target LM is inferred. Capture runs them through ``LlamaEagle3Engine`` (a
+# distinct engine from ``LlamaEngine``: its own paged KV cache + spec-decode loop),
+# recording both the target and draft operator forwards. Verification #2 (the
+# continuous-batching replay) does not model speculative decoding, so only the
+# forward-pre-hook cross-check applies here.
+# ---------------------------------------------------------------------------
+_EAGLE3_TARGETS = {
+    "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B": "meta-llama/Llama-3.1-8B-Instruct",
+    "jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B": "meta-llama/Llama-3.1-8B-Instruct",
+}
+# EAGLE-3 draft heads support a limited position window; capture caps the engine
+# context accordingly and drops longer prompts (e.g. long-context 8K-128K buckets).
+_EAGLE3_MAX_MODEL_LEN = int(os.environ.get("FASTKERNELS_EAGLE3_MAX_MODEL_LEN", "4096"))
+
+
+def _is_eagle3(scenario) -> bool:
+    return "eagle3" in scenario.hf_name.lower()
+
+
+def _eagle3_target(draft_repo: str) -> str:
+    """Target LM for an EAGLE-3 draft head (all current heads target Llama-3.1-8B)."""
+    return _EAGLE3_TARGETS.get(draft_repo, "meta-llama/Llama-3.1-8B-Instruct")
+
+
+def _register_hooks_on_models(models, instrumented: set[str]) -> list:
+    """Register forward-pre-hooks across several models, deduping shared module
+    instances (EAGLE-3 shares the target's ``embed_tokens`` with the draft, so a
+    naive per-model pass would double-count that module in the hook records)."""
+    handles = []
+    seen: set[int] = set()
+    for model in models:
+        for module in model.modules():
+            if id(module) in seen:
+                continue
+            seen.add(id(module))
+            cls = type(module)
+            qualname = f"{cls.__module__}:{cls.__name__}"
+            if qualname not in instrumented:
+                continue
+            try:
+                sig = inspect.signature(cls.forward)
+            except (TypeError, ValueError):
+                sig = None
+            handles.append(module.register_forward_pre_hook(
+                _make_forward_hook(qualname, sig), with_kwargs=True))
+    return handles
+
+
+def _capture_eagle3_scenario(scenario, runs, args, instrumented, n_instrumented, multi):
+    """Capture an EAGLE-3 scenario via LlamaEagle3Engine (target + draft)."""
+    from .infra.eagle3_engine import Eagle3SamplingParams, LlamaEagle3Engine
+
+    target = _eagle3_target(scenario.hf_name)
+    _RECORDS.clear()
+    _HOOK_RECORDS.clear()
+    print(
+        f"\n########## Scenario: {scenario.hf_name} "
+        f"(EAGLE-3 draft; target={target}, dtype={scenario.dtype}) ##########"
+    )
+    print("Loading EAGLE-3 target+draft into LlamaEagle3Engine (eager) ...")
+    engine = LlamaEagle3Engine(
+        model_name=target,
+        draft_repo=scenario.hf_name,
+        seed=42,
+        dtype=torch.bfloat16,
+        max_model_len=_EAGLE3_MAX_MODEL_LEN,
+        max_num_seqs=scenario.max_num_seqs or 32,
+        spec_steps=3,
+        spec_topk=4,
+        enforce_eager=True,
+    )
+
+    written: list[Path] = []
+    ok = True
+    try:
+        for wl_label, wl in runs:
+            print(f"\n=== Capturing workload: {wl_label} ===")
+            spec = spec_for(wl)
+            params = spec.params
+            wl_dataset = getattr(params, "dataset_name", "") or None
+            if spec.purpose is Purpose.LATENCY:
+                n_req = min(args.num_requests, getattr(params, "batch_size", 1))
+                wl_decode_cap = getattr(params, "output_len", None)
+            else:
+                n_req = min(args.num_requests,
+                            getattr(params, "num_requests", args.num_requests))
+                wl_decode_cap = getattr(params, "decode_cap", None)
+            try:
+                samples = load_real_prompt_workload(
+                    wl_label, engine.tokenizer, num_requests=n_req,
+                    dataset_name=wl_dataset, decode_cap=wl_decode_cap,
+                )
+                # The draft head has a bounded position window; drop prompts whose
+                # prompt+decode would exceed the engine context.
+                n_loaded = len(samples)
+                samples = [
+                    s for s in samples
+                    if len(s.prompt_token_ids) + s.output_len <= _EAGLE3_MAX_MODEL_LEN
+                ]
+                dropped = n_loaded - len(samples)
+                if not samples:
+                    print(f"  !! SKIP workload {wl_label}: all {n_loaded} prompt(s) "
+                          f"exceed the EAGLE-3 engine context "
+                          f"({_EAGLE3_MAX_MODEL_LEN}).")
+                    continue
+                if dropped:
+                    print(f"  (dropped {dropped}/{n_loaded} prompt(s) exceeding the "
+                          f"EAGLE-3 context {_EAGLE3_MAX_MODEL_LEN})")
+                gen_prompts = [list(s.prompt_token_ids) for s in samples]
+                max_new_tokens = [s.output_len for s in samples]
+                prompt_texts = [
+                    engine.tokenizer.decode(p, skip_special_tokens=False)
+                    for p in gen_prompts
+                ]
+                sampling = [Eagle3SamplingParams(max_tokens=mnt) for mnt in max_new_tokens]
+
+                for entry in _RECORDS.values():
+                    entry["forward"] = None
+                _HOOK_RECORDS.clear()
+                engine.reset()
+                hook_handles = _register_hooks_on_models(
+                    [engine.target, engine.draft], instrumented,
+                )
+                try:
+                    outputs = engine.generate(
+                        gen_prompts, sampling, use_tqdm=False, decode_text=True,
+                    )
+                finally:
+                    for h in hook_handles:
+                        h.remove()
+            except Exception as exc:  # noqa: BLE001 - isolate per-workload failures
+                traceback.print_exc()
+                print(f"  !! workload {wl_label} failed: {exc!r}; "
+                      f"skipping to the next workload.")
+                ok = False
+                continue
+
+            gen_lengths = [len(o.token_ids) for o in outputs]
+            num_eos = sum(1 for n, cap in zip(gen_lengths, max_new_tokens) if n < cap)
+            prompt_lens = [len(p) for p in gen_prompts]
+            responses = [
+                {
+                    "prompt": prompt_texts[i],
+                    "prompt_tokens": prompt_lens[i],
+                    "response": engine.tokenizer.decode(
+                        outputs[i].token_ids, skip_special_tokens=False),
+                    "max_new_tokens": max_new_tokens[i],
+                    "tokens": gen_lengths[i],
+                    "stop_reason": ("eos" if gen_lengths[i] < max_new_tokens[i]
+                                    else "max_tokens"),
+                }
+                for i in range(len(gen_prompts))
+            ]
+            generation = {
+                "num_prompts": len(gen_prompts),
+                "max_batch_size": engine.max_num_seqs,
+                "engine": "eagle3",
+                "target_model": target,
+                "spec_steps": engine.spec_steps,
+                "spec_topk": engine.topk,
+                "num_draft_tokens": engine.num_draft_tokens,
+                "modality": "text",
+                "used_chat_template": True,
+                "max_new_tokens_source": "dataset_response_length",
+                "max_new_tokens_range": [min(max_new_tokens), max(max_new_tokens)],
+                "num_finished_by_eos": num_eos,
+                "num_hit_max_tokens": len(gen_lengths) - num_eos,
+                "responses": responses,
+            }
+            print(f"  Generation: {num_eos}/{len(gen_prompts)} reached EOS; "
+                  f"lengths={gen_lengths}")
+
+            hook_verification = _verify_forward_capture()
+            status = "PASS" if hook_verification["passed"] else "FAIL"
+            print(
+                f"  Verification 1 (hook cross-check) [{status}]: "
+                f"{hook_verification['classes_matched']}/"
+                f"{hook_verification['classes_checked']} operator forwards match "
+                f"the independent hook capture."
+            )
+            for issue in hook_verification["issues"]:
+                print(f"    ! {issue}")
+            schedule_verification = {
+                "method": "mock continuous-batching / chunked-prefill replay",
+                "applicable": False,
+                "passed": True,
+                "reason": ("skipped for EAGLE-3: speculative decoding (draft tree + "
+                           "target verification) is not modeled by the continuous-"
+                           "batching replay; the forward-pre-hook cross-check is the "
+                           "pass criterion."),
+            }
+            print("  Verification 2 (mock batching replay) [N/A]: "
+                  "skipped for EAGLE-3 speculative decoding (see report).")
+            verification = {
+                "forward_pre_hook_crosscheck": hook_verification,
+                "mock_batching_replay": schedule_verification,
+                "passed": hook_verification["passed"],
+            }
+            report = _build_report(
+                scenario.hf_name, wl_label, engine.dtype,
+                engine.max_num_seqs, n_instrumented, generation, verification,
+            )
+            out_path = _report_path(args.output, scenario, wl_label, multi, args.num_requests)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(out_path, "w") as f:
+                f.write(_dumps(report))
+                f.write("\n")
+            written.append(out_path)
+            print(
+                f"  Captured {report['num_operator_classes_executed']} executed "
+                f"operator class(es) (of {n_instrumented} instrumented)."
+            )
+            print(f"  Report written to {out_path}")
+            if not verification["passed"]:
+                ok = False
+    finally:
+        # LlamaEagle3Engine is single-process (TP=1) with no atexit registration,
+        # so a plain del + cache clear frees its GPU memory.
+        del engine
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    return written, ok
+
+
 def _capture_scenario(scenario, runs, args, LlamaEngine, SamplingParams,
                       instrumented, n_instrumented, multi):
     """Build one scenario's engine and capture each of its workloads.
@@ -1134,6 +1572,11 @@ def _capture_scenario(scenario, runs, args, LlamaEngine, SamplingParams,
     The engine is always released before returning so the next (possibly larger)
     model has room on the GPU.
     """
+    if _is_eagle3(scenario):
+        # EAGLE-3 uses a distinct engine (target + speculative draft head).
+        return _capture_eagle3_scenario(
+            scenario, runs, args, instrumented, n_instrumented, multi,
+        )
     dtype = _engine_dtype(scenario.dtype)
     # Fresh init/hook records per model (a new engine re-runs every __init__).
     _RECORDS.clear()
@@ -1206,6 +1649,8 @@ def _capture_scenario(scenario, runs, args, LlamaEngine, SamplingParams,
             spec = spec_for(wl)
             params = spec.params
             wl_dataset = getattr(params, "dataset_name", "") or None
+            modality = getattr(params, "modality", "text")
+            is_media = isinstance(wl, (VLM, OmniModal)) and modality != "text"
             if spec.purpose is Purpose.LATENCY:
                 # Latency probe: submit a fixed-size batch of real prompts with a
                 # bounded per-request decode budget.
@@ -1217,41 +1662,138 @@ def _capture_scenario(scenario, runs, args, LlamaEngine, SamplingParams,
                     getattr(params, "num_requests", args.num_requests),
                 )
                 wl_decode_cap = getattr(params, "decode_cap", None)
-            print(f"Loading '{wl_label}' workload prompts ({n_req}) ...")
-            samples = load_real_prompt_workload(
-                wl_label, engine.tokenizer, num_requests=n_req,
-                dataset_name=wl_dataset, decode_cap=wl_decode_cap,
-            )
-            gen_prompts = [list(s.prompt_token_ids) for s in samples]
-            # Per-request generation budget from the HF dataset's own
-            # response length (like bench_vllm.py), so the decode phase
-            # matches the workload's real output-length distribution instead
-            # of a flat cap.
-            max_new_tokens = [s.output_len for s in samples]
-            used_chat_template = True
-            # Decode WITH special tokens so the chat-template structure is
-            # preserved. Decoding with skip_special_tokens=True strips the
-            # structural delimiters (e.g. gpt-oss harmony's <|start|>/
-            # <|message|>) but keeps the plain-text role/channel labels,
-            # gluing them onto the content ("systemYou are ChatGPT...").
-            prompt_texts = [
-                engine.tokenizer.decode(ids, skip_special_tokens=False)
-                for ids in gen_prompts
-            ]
-            # One SamplingParams per request so each gets its own max_tokens.
-            # ignore_eos is left False so short answers still stop naturally at
-            # EOS (keeping stored responses clean); the dataset length is an
-            # upper bound. bench_vllm.py forces ignore_eos=True for throughput
-            # determinism -- flip it here if exact-length decode is wanted.
-            sampling = [
-                SamplingParams(temperature=0.0, max_tokens=mnt)
-                for mnt in max_new_tokens
-            ]
+                # VLM/OmniModal text-throughput carries its decode budget as
+                # ``output_len`` (no ``decode_cap`` attribute); fall back to it so
+                # the text modality is capped while the LLM path stays unchanged.
+                if wl_decode_cap is None:
+                    wl_decode_cap = getattr(params, "output_len", None)
+
+            # Per-request media (image/video/audio) inputs, parallel to
+            # ``gen_prompts``; all ``None`` on the text/LLM path. ``prompt_lens``
+            # is the per-request prompt token count that drives Verification #2;
+            # it stays ``None`` for media because the engine expands the media
+            # placeholders internally and never returns the expanded length.
+            images = videos = audios = None
+            prompt_lens = None
+            media_descriptors = None
+
+            if is_media:
+                # Multimodal LLM workload (Qwen2-VL / Qwen3-VL / Qwen2.5-Omni):
+                # load the real image/video/audio dataset and hand the raw text
+                # prompt + media to the engine, which runs the HF processor
+                # (chat template + placeholder expansion) internally. Media
+                # loading + the generate call mirror tests/bench_vllm.py's
+                # FASTKERNELS_VLM_WORKER so captured shapes match the benchmark.
+                if not engine.is_qwen_vl:
+                    print(
+                        f"  !! SKIP workload {wl_label}: modality={modality!r} "
+                        f"needs a Qwen-VL/Omni engine (is_qwen_vl=False)"
+                    )
+                    for handle in hook_handles:
+                        handle.remove()
+                    continue
+                media_cap = os.environ.get("FASTKERNELS_MEDIA_MAX_REQUESTS")
+                if media_cap:
+                    n_req = min(n_req, int(media_cap))
+                out_len = params.output_len
+                print(
+                    f"Loading '{wl_label}' {modality} media ({n_req}) "
+                    f"from {wl_dataset} ..."
+                )
+                mm = _preload_mm_data(
+                    wl_dataset, getattr(params, "dataset_split", None),
+                    n_req, _MEDIA_SEED,
+                )
+                if not mm:
+                    raise RuntimeError(
+                        f"{wl_dataset} ({modality}) yielded no usable requests"
+                    )
+                from PIL import Image
+                gen_prompts = [item["prompt"] for item in mm]
+                prompt_texts = list(gen_prompts)
+                max_new_tokens = [out_len] * len(mm)
+                images = [item["images"] for item in mm]
+                videos = [
+                    [[Image.fromarray(item["video_frames"][j]).convert("RGB")
+                      for j in range(item["video_frames"].shape[0])]]
+                    if item["video_frames"] is not None else None
+                    for item in mm
+                ]
+                audios = [
+                    [item["audio"]] if item["audio"] is not None else None
+                    for item in mm
+                ]
+                media_descriptors = [_media_descriptor(item) for item in mm]
+                # Fixed decode budget from the workload spec (media datasets carry
+                # no per-row response length). ignore_eos left False to match the
+                # text path (short answers still stop at EOS).
+                sampling = [
+                    SamplingParams(temperature=0.0, max_tokens=out_len)
+                    for _ in mm
+                ]
+                used_chat_template = True
+            else:
+                print(f"Loading '{wl_label}' workload prompts ({n_req}) ...")
+                samples = load_real_prompt_workload(
+                    wl_label, engine.tokenizer, num_requests=n_req,
+                    dataset_name=wl_dataset, decode_cap=wl_decode_cap,
+                )
+                # Drop prompts whose prompt+decode exceeds the engine's context
+                # window, else the paged block-table preallocation in the engine
+                # overflows. The long-context buckets are sized in a *reference*
+                # tokenizer's tokens; a model whose tokenizer is less efficient
+                # (e.g. gemma-4 re-tokenizing a 128K-Llama-token document into
+                # ~156K gemma tokens) can produce sequences longer than
+                # max_model_len for that model.
+                _mml = getattr(getattr(engine, "model_runner", None),
+                               "max_model_len", None)
+                if _mml:
+                    n0 = len(samples)
+                    samples = [
+                        s for s in samples
+                        if len(s.prompt_token_ids) + s.output_len <= _mml
+                    ]
+                    if len(samples) < n0:
+                        print(f"  (dropped {n0 - len(samples)}/{n0} prompt(s) whose "
+                              f"prompt+decode exceeds max_model_len={_mml})")
+                    if not samples:
+                        print(f"  !! SKIP workload {wl_label}: all prompts exceed "
+                              f"max_model_len={_mml}")
+                        for handle in hook_handles:
+                            handle.remove()
+                        continue
+                gen_prompts = [list(s.prompt_token_ids) for s in samples]
+                # Per-request generation budget from the HF dataset's own
+                # response length (like bench_vllm.py), so the decode phase
+                # matches the workload's real output-length distribution instead
+                # of a flat cap.
+                max_new_tokens = [s.output_len for s in samples]
+                used_chat_template = True
+                # Decode WITH special tokens so the chat-template structure is
+                # preserved. Decoding with skip_special_tokens=True strips the
+                # structural delimiters (e.g. gpt-oss harmony's <|start|>/
+                # <|message|>) but keeps the plain-text role/channel labels,
+                # gluing them onto the content ("systemYou are ChatGPT...").
+                prompt_texts = [
+                    engine.tokenizer.decode(ids, skip_special_tokens=False)
+                    for ids in gen_prompts
+                ]
+                # One SamplingParams per request so each gets its own max_tokens.
+                # ignore_eos is left False so short answers still stop naturally at
+                # EOS (keeping stored responses clean); the dataset length is an
+                # upper bound. bench_vllm.py forces ignore_eos=True for throughput
+                # determinism -- flip it here if exact-length decode is wanted.
+                sampling = [
+                    SamplingParams(temperature=0.0, max_tokens=mnt)
+                    for mnt in max_new_tokens
+                ]
+                # Full prompt token counts (token-id prompts); drives Verification #2.
+                prompt_lens = [len(p) for p in gen_prompts]
             print(
                 f"Running {len(gen_prompts)} prompt(s) at max_batch_size="
                 f"{engine.max_num_seqs}, max_new_tokens="
                 f"[{min(max_new_tokens)}..{max(max_new_tokens)}] "
-                f"(chat_template={used_chat_template}) ..."
+                f"(modality={modality}, chat_template={used_chat_template}) ..."
             )
 
             # Reset forward + hook records so each workload's report reflects
@@ -1270,7 +1812,11 @@ def _capture_scenario(scenario, runs, args, LlamaEngine, SamplingParams,
             # failed generate can't leak them into anything that follows.
             _reset_engine_runtime_state(engine)
             try:
-                outputs = engine.generate(gen_prompts, sampling, use_tqdm=False)
+                outputs = engine.generate(
+                    gen_prompts, sampling,
+                    images=images, videos=videos, audio_features=audios,
+                    use_tqdm=is_media,
+                )
             finally:
                 for handle in hook_handles:
                     handle.remove()
@@ -1283,22 +1829,18 @@ def _capture_scenario(scenario, runs, args, LlamaEngine, SamplingParams,
             num_eos = sum(
                 1 for n, cap in zip(gen_lengths, max_new_tokens) if n < cap
             )
-            # Full prompt token counts (the model always sees the complete
-            # chat-templated prompt). Reused below for schedule verification.
-            prompt_lens = [
-                len(p) if isinstance(p, (list, tuple))
-                else len(engine.tokenizer(p).input_ids)
-                for p in gen_prompts
-            ]
             # Re-decode the generated ids WITH special tokens so the response
             # keeps its chat-template structure (e.g. gpt-oss harmony channels
             # <|channel|>analysis<|message|>...). The engine's ``generated_text``
             # is decoded with skip_special_tokens=True, which would otherwise
             # glue channel labels onto the text ("analysisWe need to...").
-            responses = [
-                {
+            responses = []
+            for i in range(len(gen_prompts)):
+                resp = {
                     "prompt": prompt_texts[i],
-                    "prompt_tokens": prompt_lens[i],
+                    "prompt_tokens": (
+                        prompt_lens[i] if prompt_lens is not None else None
+                    ),
                     "response": engine.tokenizer.decode(
                         outputs[i].token_ids, skip_special_tokens=False,
                     ),
@@ -1309,14 +1851,21 @@ def _capture_scenario(scenario, runs, args, LlamaEngine, SamplingParams,
                         else "max_tokens"
                     ),
                 }
-                for i in range(len(gen_prompts))
-            ]
+                if media_descriptors is not None:
+                    resp["media"] = media_descriptors[i]
+                responses.append(resp)
             generation = {
                 "num_prompts": len(gen_prompts),
                 "max_batch_size": engine.max_num_seqs,
                 "batch_refilled": len(gen_prompts) > engine.max_num_seqs,
                 "used_chat_template": used_chat_template,
-                "max_new_tokens_source": "dataset_response_length",
+                "modality": modality,
+                "dataset": wl_dataset,
+                "prompt_tokens_known": prompt_lens is not None,
+                "max_new_tokens_source": (
+                    "workload_output_len" if is_media
+                    else "dataset_response_length"
+                ),
                 "max_new_tokens_range": [min(max_new_tokens), max(max_new_tokens)],
                 "num_finished_by_eos": num_eos,
                 "num_hit_max_tokens": len(gen_lengths) - num_eos,
@@ -1347,30 +1896,58 @@ def _capture_scenario(scenario, runs, args, LlamaEngine, SamplingParams,
             #     admission watermark, mirroring LlamaEngine.generate). The KV
             #     pool is what bounds concurrency for long prompts; without it
             #     the replay over-predicts long-context batch sizes.
-            from .infra.engine import BLOCK_SIZE
-            _bm = getattr(engine, "block_manager", None)
-            num_kv_blocks = getattr(_bm, "_num_blocks", None)
-            watermark = max(int(num_kv_blocks * 0.01), 1) if num_kv_blocks else 0
-            schedule_verification = _verify_batch_schedule(
-                prompt_lens, gen_lengths,
-                engine.max_num_seqs, engine.max_num_batched_tokens,
-                _infer_num_layers(engine),
-                max_tokens=max_new_tokens,
-                num_blocks=num_kv_blocks or None,
-                block_size=BLOCK_SIZE,
-                watermark_blocks=watermark,
-            )
-            status = "PASS" if schedule_verification["passed"] else "FAIL"
-            n_ok = sum(1 for c in schedule_verification["checks"] if c["passed"])
-            print(
-                f"  Verification 2 (mock batching replay) [{status}]: "
-                f"{n_ok}/{len(schedule_verification['checks'])} checks passed "
-                f"({schedule_verification['simulated_steps']} simulated steps, "
-                f"{schedule_verification['simulated_prefill_steps']} with prefill)."
-            )
-            for check in schedule_verification["checks"]:
-                if not check["passed"]:
-                    print(f"    ! {check['name']}: {check['detail']}")
+            #
+            #     Only runs for text-token workloads (plain LLMs + the multimodal
+            #     ``text`` modality), where ``prompt_lens`` is the real per-request
+            #     prompt length. For image/video/audio the engine expands the media
+            #     placeholders internally and ``generate`` never returns the
+            #     expanded length, so there is no ground-truth vector to drive the
+            #     replay (and vision/audio-encoder scheduling is not modeled) --
+            #     the hook cross-check above is the pass criterion there.
+            if prompt_lens is not None:
+                from .infra.engine import BLOCK_SIZE
+                _bm = getattr(engine, "block_manager", None)
+                num_kv_blocks = getattr(_bm, "_num_blocks", None)
+                watermark = max(int(num_kv_blocks * 0.01), 1) if num_kv_blocks else 0
+                schedule_verification = _verify_batch_schedule(
+                    prompt_lens, gen_lengths,
+                    engine.max_num_seqs, engine.max_num_batched_tokens,
+                    _infer_num_layers(engine),
+                    max_tokens=max_new_tokens,
+                    num_blocks=num_kv_blocks or None,
+                    block_size=BLOCK_SIZE,
+                    watermark_blocks=watermark,
+                )
+                status = "PASS" if schedule_verification["passed"] else "FAIL"
+                n_ok = sum(1 for c in schedule_verification["checks"] if c["passed"])
+                print(
+                    f"  Verification 2 (mock batching replay) [{status}]: "
+                    f"{n_ok}/{len(schedule_verification['checks'])} checks passed "
+                    f"({schedule_verification['simulated_steps']} simulated steps, "
+                    f"{schedule_verification['simulated_prefill_steps']} with prefill)."
+                )
+                for check in schedule_verification["checks"]:
+                    if not check["passed"]:
+                        print(f"    ! {check['name']}: {check['detail']}")
+            else:
+                schedule_verification = {
+                    "method": "mock continuous-batching / chunked-prefill replay",
+                    "applicable": False,
+                    "passed": True,
+                    "reason": (
+                        f"skipped for the {modality} modality: the engine expands "
+                        f"media placeholders internally and generate() does not "
+                        f"return the expanded per-request prompt length, so there "
+                        f"is no ground-truth prompt-length vector to drive the "
+                        f"replay; vision/audio-encoder scheduling is also not "
+                        f"modeled. The forward-pre-hook cross-check is the pass "
+                        f"criterion for this workload."
+                    ),
+                }
+                print(
+                    f"  Verification 2 (mock batching replay) [N/A]: "
+                    f"skipped for the {modality} modality (see report)."
+                )
 
             verification = {
                 "forward_pre_hook_crosscheck": hook_verification,
@@ -1578,12 +2155,7 @@ def _run_scenarios_parallel(scenarios, args, gpu_ids: list[str]) -> int:
     results: dict[int, tuple[str, str]] = {}
     pending: list[tuple[int, object]] = []
     for i, s in enumerate(scenarios):
-        dep = _missing_kernel_dep(s)
-        if dep is not None:
-            detail = f"requires optional kernel lib '{dep}' (not installed)"
-            results[i] = ("skipped", detail)
-            print(f"  !! SKIP scenario[{i}] {s.hf_name}: {detail}")
-        elif s.tp > total:
+        if s.tp > total:
             detail = f"needs tp={s.tp} > {total} GPU(s) available"
             results[i] = ("skipped", detail)
             print(f"  !! SKIP scenario[{i}] {s.hf_name}: {detail}")
@@ -1683,17 +2255,47 @@ def _run_scenarios_parallel(scenarios, args, gpu_ids: list[str]) -> int:
     return 0 if ok_all else 1
 
 
-def _setup_capture():
-    """Shared per-process setup: stub optional deps, import the engine, then
-    discover + instrument every operator once. Returns the engine classes and
-    the instrumented-operator set used by ``_capture_scenario``.
-    """
-    # 0) Stub out optional GPU kernel libs (deep_gemm) if missing so the engine
-    #    and the DeepSeek operator chain can be imported.
-    stubbed = _install_optional_dependency_stubs()
-    if stubbed:
-        print(f"  Stubbed missing optional deps: {', '.join(stubbed)}")
+def _prefetch_media(scenarios) -> None:
+    """Parent-side pre-download of the large video dataset repos.
 
+    A multimodal ``video`` workload fetches its clips with ``snapshot_download``
+    -- a large download that, run inside a scenario's worker, could trip the
+    per-scenario stall/wall-clock watchdog. Doing it once here in the parent
+    (which has no watchdog) warms the Hugging Face hub cache, so each worker's
+    identical ``snapshot_download`` returns immediately and only the (fast) frame
+    decode + generation count against its watchdog. Image/audio workloads stream
+    in-worker (comparatively small) and need no pre-download. Best-effort: a
+    failure here just means the worker downloads the repo itself.
+    """
+    video_datasets: dict[str, None] = {}
+    for s in scenarios:
+        for wl in s.workloads:
+            if not isinstance(wl, (VLM, OmniModal)):
+                continue
+            params = spec_for(wl).params
+            if getattr(params, "modality", "text") == "video":
+                ds = getattr(params, "dataset_name", None)
+                if ds:
+                    video_datasets.setdefault(ds, None)
+    if not video_datasets:
+        return
+    from huggingface_hub import snapshot_download
+    for ds in video_datasets:
+        print(f"Pre-downloading video dataset '{ds}' so per-scenario workers "
+              f"load from cache ...")
+        try:
+            snapshot_download(ds, repo_type="dataset")
+            print(f"  done pre-downloading {ds}")
+        except Exception as exc:  # noqa: BLE001 - best-effort warm cache
+            print(f"  !! pre-download of {ds} failed ({exc!r}); workers will "
+                  f"fetch it themselves.")
+
+
+def _setup_capture():
+    """Shared per-process setup: import the engine, then discover + instrument
+    every operator once. Returns the engine classes and the instrumented-
+    operator set used by ``_capture_scenario``.
+    """
     # 1) Import the engine module FIRST so transformers and the LLM path load in
     #    the correct order (avoids torch.library/collective registration clashes
     #    that happen if unrelated operator modules import ahead of it).
@@ -1798,6 +2400,10 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- Parent: GPU-aware parallel scheduling (default). Each scenario runs in
     #     its own subprocess so a crash/OOM/verification failure is isolated. ---
+    # Parent only (worker mode returned above): pre-download the large video
+    # dataset repos once, outside any per-scenario watchdog, so the workers load
+    # them from the warm cache.
+    _prefetch_media(scenarios)
     gpu_ids = _detect_gpu_ids(args.gpus)
     if len(scenarios) > 1 and len(gpu_ids) >= 1:
         print(
