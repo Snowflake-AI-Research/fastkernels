@@ -215,16 +215,33 @@ class GatedLinearAttention(nn.Module):
             offsets = None
             if past_key_values is not None:
                 offsets = getattr(past_key_values, "seq_offsets", None)
-            local = torch.arange(T, device=q.device, dtype=torch.int64)
-            if offsets is None:
-                positions = local.repeat(B)
-            elif isinstance(offsets, int):
-                positions = (local + offsets).repeat(B)
-            else:
-                # [B] int64 tensor of per-row prefix lengths
-                positions = (offsets.to(device=q.device, dtype=torch.int64)
-                             .unsqueeze(1) + local.unsqueeze(0)).reshape(-1)
+            if cu_seqlens is not None:
+                # Packed varlen [1, total_T]: positions restart at each
+                # sequence boundary. token t's position = its per-sequence local
+                # index + that sequence's global start offset (seq_offsets, or
+                # 0). This must be a flat [total_T] vector -- the dense branch
+                # below builds [B*T], which is wrong for a packed batch and
+                # feeds the RoPE kernel a positions length != query rows.
+                lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+                seg_start = torch.repeat_interleave(cu_seqlens[:-1], lengths)
+                positions = torch.arange(T, device=q.device, dtype=torch.int64) - seg_start
+                if isinstance(offsets, int):
+                    positions = positions + offsets
+                elif offsets is not None:
+                    positions = positions + torch.repeat_interleave(
+                        offsets.to(device=q.device, dtype=torch.int64), lengths)
                 positions = positions.contiguous()
+            else:
+                local = torch.arange(T, device=q.device, dtype=torch.int64)
+                if offsets is None:
+                    positions = local.repeat(B)
+                elif isinstance(offsets, int):
+                    positions = (local + offsets).repeat(B)
+                else:
+                    # [B] int64 tensor of per-row prefix lengths
+                    positions = (offsets.to(device=q.device, dtype=torch.int64)
+                                 .unsqueeze(1) + local.unsqueeze(0)).reshape(-1)
+                    positions = positions.contiguous()
             q_flat = q.reshape(B * T, self.num_heads * self.head_k_dim).contiguous()
             k_flat = k.reshape(B * T, self.num_heads * self.head_k_dim).contiguous()
             q_flat, k_flat = self.rotary_emb(positions, q_flat, k_flat)

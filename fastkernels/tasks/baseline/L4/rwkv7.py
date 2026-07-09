@@ -93,6 +93,7 @@ class RWKV7Model(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         past_key_values: RecurrentCache | None = None,
         use_cache: bool = False,
+        cu_seqlens: torch.Tensor | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, RecurrentCache | None]:
         if inputs_embeds is None:
@@ -109,6 +110,7 @@ class RWKV7Model(nn.Module):
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
+                cu_seqlens=cu_seqlens,
             )
 
         return self.norm(hidden_states), past_key_values
@@ -132,6 +134,8 @@ class RWKV7ForCausalLM(nn.Module):
         labels: torch.Tensor | None = None,
         use_cache: bool = False,
         num_logits_to_keep: int = 0,
+        logits_indices: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         hidden_states, past_key_values = self.model(
@@ -140,13 +144,17 @@ class RWKV7ForCausalLM(nn.Module):
             inputs_embeds=inputs_embeds,
             past_key_values=past_key_values,
             use_cache=use_cache,
+            cu_seqlens=cu_seqlens,
         )
-        # When the engine only needs the last token's logits (every
-        # generation call), restrict the lm_head + fp32 upcast to a
-        # single position. For batched prefill at B=200, T=1024 with
-        # vocab=65k this saves ~50 GB of fp32 logits memory and the
-        # corresponding compute.
-        if num_logits_to_keep > 0:
+        # Generation-time fast path: cap the lm_head + fp32 upcast to just the
+        # requested positions. ``logits_indices`` selects per-sequence last
+        # tokens from a packed varlen batch (-> [N, 1, V]); ``num_logits_to_keep``
+        # handles the dense [B, T] path. For batched prefill this saves ~50 GB of
+        # fp32 logits at large B*T with vocab=65k.
+        if logits_indices is not None:
+            hidden_states = hidden_states.reshape(-1, hidden_states.size(-1))
+            hidden_states = hidden_states.index_select(0, logits_indices).unsqueeze(1)
+        elif num_logits_to_keep > 0:
             hidden_states = hidden_states[:, -num_logits_to_keep:, :]
         logits = self.lm_head(hidden_states).float()
         loss = None

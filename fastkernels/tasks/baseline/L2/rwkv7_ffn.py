@@ -33,6 +33,7 @@ class RWKV7FeedForward(nn.Module):
         x: torch.Tensor,
         past_key_values=None,
         use_cache: bool = False,
+        cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, T, _ = x.shape
         prev_shift = None
@@ -41,18 +42,29 @@ class RWKV7FeedForward(nn.Module):
             if cs is not None:
                 prev_shift = cs.get(id(self))
         shifted = torch.empty_like(x)
-        if prev_shift is not None:
-            shifted[:, 0] = prev_shift
-        else:
-            shifted[:, 0].zero_()
         if T > 1:
             shifted[:, 1:] = x[:, :-1]
+        if cu_seqlens is not None:
+            # Packed varlen [1, total_T, d]: token-shift must not cross
+            # sequence boundaries. Each sequence's first token shifts in that
+            # sequence's own previous token (its stored conv_state), or zero.
+            starts = cu_seqlens[:-1].to(torch.long)
+            if prev_shift is not None:
+                shifted[0].index_copy_(0, starts, prev_shift.to(shifted.dtype))
+            else:
+                shifted[0, starts] = 0
+        else:
+            shifted[:, 0] = prev_shift if prev_shift is not None else 0
         delta = shifted - x
         xk = torch.addcmul(x, delta, self.x_k)
 
         if use_cache and past_key_values is not None:
             if not hasattr(past_key_values, "conv_states"):
                 past_key_values.conv_states = {}
-            past_key_values.conv_states[id(self)] = x[:, -1].detach()
+            if cu_seqlens is not None:
+                ends = (cu_seqlens[1:] - 1).to(torch.long)
+                past_key_values.conv_states[id(self)] = x[0].index_select(0, ends).detach()
+            else:
+                past_key_values.conv_states[id(self)] = x[:, -1].detach()
 
         return self.value(self.act(self.key(xk)))

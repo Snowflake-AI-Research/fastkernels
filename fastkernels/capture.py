@@ -142,6 +142,9 @@ _WATCHDOG_TERM_GRACE_SEC = 8.0
 # Capture scenarios: each entry is loaded into its own engine and every workload
 # it lists is captured to a separate report. We capture the full standardized
 # benchmark set from the registry, each scenario with its own workloads.
+# Capture scenarios: each entry is loaded into its own engine and every workload
+# it lists is captured to a separate report. We capture the full standardized
+# benchmark set from the registry, each scenario with its own workloads.
 CAPTURE_SCENARIOS = FULL_BENCHMARK[:]
 
 # qualified_name -> {"init": {...}, "forward": {...}}
@@ -1562,6 +1565,250 @@ def _capture_eagle3_scenario(scenario, runs, args, instrumented, n_instrumented,
     return written, ok
 
 
+# ---------------------------------------------------------------------------
+# Recurrent / hybrid alternate-engine capture (FLA + Jamba)
+#
+# GLA / RetNet / RWKV-7 (``FLAEngine``) carry per-sequence recurrent *state*
+# and Jamba (``JambaEngine``) is a hybrid transformer+Mamba+MoE model; neither
+# plugs into ``LlamaEngine``'s paged-KV ``model_runner``, so they run through
+# their own single-process engines. Both drive a plain autoregressive text
+# workload (token-id prompts -> ``generate``), so capture reuses the text
+# LLM input prep. Verification #2 (the paged-KV continuous-batching replay)
+# does not model recurrent state / hybrid slot pools, so -- as for EAGLE-3 --
+# only the forward-pre-hook cross-check (#1) applies.
+# ---------------------------------------------------------------------------
+# JambaEngine has no tensor-parallel support, so a tp>1 Jamba scenario still
+# loads the full model onto a single GPU (~96 GB for Jamba-Mini-1.7). That
+# leaves little room for the attention KV cache, so cap the context + batch
+# modestly for capture (long-context prompts beyond this are dropped). Both
+# are env-overridable.
+_JAMBA_MAX_MODEL_LEN = int(os.environ.get("FASTKERNELS_JAMBA_MAX_MODEL_LEN", "16384"))
+_JAMBA_MAX_NUM_SEQS = int(os.environ.get("FASTKERNELS_JAMBA_MAX_NUM_SEQS", "16"))
+
+
+def _is_fla(scenario) -> bool:
+    """FLA recurrent LLMs (GLA / RetNet / RWKV-7) are all published under the
+    ``fla-hub/`` org and run through ``FLAEngine``."""
+    return scenario.hf_name.startswith("fla-hub/")
+
+
+def _is_jamba(scenario) -> bool:
+    return "jamba" in scenario.hf_name.lower()
+
+
+def _capture_altengine_scenario(scenario, runs, args, instrumented, n_instrumented,
+                                multi, *, engine, sampling_cls, engine_label,
+                                engine_meta, max_model_len=None):
+    """Capture a single-model text-LLM scenario through an alternate engine
+    (``FLAEngine`` / ``JambaEngine``) that has no paged-KV ``model_runner``.
+
+    ``engine`` is already constructed and owned by the caller (which also frees
+    it). The per-workload loop mirrors ``_capture_eagle3_scenario``: real
+    chat-templated prompts as token-id lists, forward-pre-hooks on the single
+    model, Verification #1 as the pass criterion, Verification #2 recorded
+    N/A. When ``max_model_len`` is set, prompts whose prompt+decode exceed it
+    are dropped (and a workload with none left is skipped).
+    """
+    written: list[Path] = []
+    ok = True
+    for wl_label, wl in runs:
+        print(f"\n=== Capturing workload: {wl_label} ===")
+        spec = spec_for(wl)
+        params = spec.params
+        wl_dataset = getattr(params, "dataset_name", "") or None
+        if spec.purpose is Purpose.LATENCY:
+            n_req = min(args.num_requests, getattr(params, "batch_size", 1))
+            wl_decode_cap = getattr(params, "output_len", None)
+        else:
+            n_req = min(args.num_requests,
+                        getattr(params, "num_requests", args.num_requests))
+            wl_decode_cap = getattr(params, "decode_cap", None)
+        try:
+            samples = load_real_prompt_workload(
+                wl_label, engine.tokenizer, num_requests=n_req,
+                dataset_name=wl_dataset, decode_cap=wl_decode_cap,
+            )
+            n_loaded = len(samples)
+            if max_model_len is not None:
+                samples = [
+                    s for s in samples
+                    if len(s.prompt_token_ids) + s.output_len <= max_model_len
+                ]
+                dropped = n_loaded - len(samples)
+                if not samples:
+                    print(f"  !! SKIP workload {wl_label}: all {n_loaded} prompt(s) "
+                          f"exceed the {engine_label} engine context "
+                          f"({max_model_len}).")
+                    continue
+                if dropped:
+                    print(f"  (dropped {dropped}/{n_loaded} prompt(s) exceeding the "
+                          f"{engine_label} context {max_model_len})")
+            gen_prompts = [list(s.prompt_token_ids) for s in samples]
+            max_new_tokens = [s.output_len for s in samples]
+            prompt_texts = [
+                engine.tokenizer.decode(p, skip_special_tokens=False)
+                for p in gen_prompts
+            ]
+            sampling = [sampling_cls(temperature=0.0, max_tokens=mnt)
+                        for mnt in max_new_tokens]
+
+            for entry in _RECORDS.values():
+                entry["forward"] = None
+            _HOOK_RECORDS.clear()
+            hook_handles = _register_hooks_on_models([engine.model], instrumented)
+            try:
+                outputs = engine.generate(gen_prompts, sampling, use_tqdm=False)
+            finally:
+                for h in hook_handles:
+                    h.remove()
+        except Exception as exc:  # noqa: BLE001 - isolate per-workload failures
+            traceback.print_exc()
+            print(f"  !! workload {wl_label} failed: {exc!r}; "
+                  f"skipping to the next workload.")
+            ok = False
+            continue
+
+        gen_lengths = [len(o.token_ids) for o in outputs]
+        num_eos = sum(1 for n, cap in zip(gen_lengths, max_new_tokens) if n < cap)
+        prompt_lens = [len(p) for p in gen_prompts]
+        responses = [
+            {
+                "prompt": prompt_texts[i],
+                "prompt_tokens": prompt_lens[i],
+                "response": engine.tokenizer.decode(
+                    outputs[i].token_ids, skip_special_tokens=False),
+                "max_new_tokens": max_new_tokens[i],
+                "tokens": gen_lengths[i],
+                "stop_reason": ("eos" if gen_lengths[i] < max_new_tokens[i]
+                                else "max_tokens"),
+            }
+            for i in range(len(gen_prompts))
+        ]
+        generation = {
+            "num_prompts": len(gen_prompts),
+            "max_batch_size": engine.max_num_seqs,
+            "engine": engine_label,
+            "modality": "text",
+            "used_chat_template": True,
+            "max_new_tokens_source": "dataset_response_length",
+            "max_new_tokens_range": [min(max_new_tokens), max(max_new_tokens)],
+            "num_finished_by_eos": num_eos,
+            "num_hit_max_tokens": len(gen_lengths) - num_eos,
+            "responses": responses,
+            **engine_meta,
+        }
+        print(f"  Generation: {num_eos}/{len(gen_prompts)} reached EOS; "
+              f"lengths={gen_lengths}")
+
+        hook_verification = _verify_forward_capture()
+        status = "PASS" if hook_verification["passed"] else "FAIL"
+        print(
+            f"  Verification 1 (hook cross-check) [{status}]: "
+            f"{hook_verification['classes_matched']}/"
+            f"{hook_verification['classes_checked']} operator forwards match "
+            f"the independent hook capture."
+        )
+        for issue in hook_verification["issues"]:
+            print(f"    ! {issue}")
+        schedule_verification = {
+            "method": "mock continuous-batching / chunked-prefill replay",
+            "applicable": False,
+            "passed": True,
+            "reason": (f"skipped for {engine_label}: recurrent-state / hybrid slot "
+                       "pools are not modeled by the paged-KV continuous-batching "
+                       "replay; the forward-pre-hook cross-check is the pass "
+                       "criterion."),
+        }
+        print(f"  Verification 2 (mock batching replay) [N/A]: "
+              f"skipped for {engine_label} (see report).")
+        verification = {
+            "forward_pre_hook_crosscheck": hook_verification,
+            "mock_batching_replay": schedule_verification,
+            "passed": hook_verification["passed"],
+        }
+        report = _build_report(
+            scenario.hf_name, wl_label, engine.dtype,
+            engine.max_num_seqs, n_instrumented, generation, verification,
+        )
+        out_path = _report_path(args.output, scenario, wl_label, multi, args.num_requests)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(out_path, "w") as f:
+            f.write(_dumps(report))
+            f.write("\n")
+        written.append(out_path)
+        print(
+            f"  Captured {report['num_operator_classes_executed']} executed "
+            f"operator class(es) (of {n_instrumented} instrumented)."
+        )
+        print(f"  Report written to {out_path}")
+        if not verification["passed"]:
+            ok = False
+    return written, ok
+
+
+def _capture_fla_scenario(scenario, runs, args, instrumented, n_instrumented, multi):
+    """Capture a GLA / RetNet / RWKV-7 scenario via ``FLAEngine``."""
+    from .infra.fla_engine import FLAEngine, SamplingParams as FLASamplingParams
+
+    _RECORDS.clear()
+    _HOOK_RECORDS.clear()
+    print(
+        f"\n########## Scenario: {scenario.hf_name} "
+        f"(FLA recurrent LLM, dtype={scenario.dtype}) ##########"
+    )
+    print("Loading FLA model into FLAEngine (eager) ...")
+    engine = FLAEngine(
+        model_name=scenario.hf_name,
+        dtype=_engine_dtype(scenario.dtype),
+        seed=42,
+        max_num_seqs=scenario.max_num_seqs or 256,
+    )
+    try:
+        return _capture_altengine_scenario(
+            scenario, runs, args, instrumented, n_instrumented, multi,
+            engine=engine, sampling_cls=FLASamplingParams, engine_label="fla",
+            engine_meta={"recurrent_state": True}, max_model_len=None,
+        )
+    finally:
+        del engine
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+def _capture_jamba_scenario(scenario, runs, args, instrumented, n_instrumented, multi):
+    """Capture an AI21 Jamba (hybrid transformer+Mamba+MoE) scenario via
+    ``JambaEngine``."""
+    from .infra.jamba_engine import JambaEngine, SamplingParams as JambaSamplingParams
+
+    _RECORDS.clear()
+    _HOOK_RECORDS.clear()
+    print(
+        f"\n########## Scenario: {scenario.hf_name} "
+        f"(Jamba hybrid, dtype={scenario.dtype}, tp={scenario.tp}) ##########"
+    )
+    print("Loading Jamba into JambaEngine (eager) ...")
+    engine = JambaEngine(
+        model_name=scenario.hf_name,
+        dtype=_engine_dtype(scenario.dtype),
+        seed=42,
+        max_num_seqs=scenario.max_num_seqs or _JAMBA_MAX_NUM_SEQS,
+        max_model_len=_JAMBA_MAX_MODEL_LEN,
+    )
+    try:
+        return _capture_altengine_scenario(
+            scenario, runs, args, instrumented, n_instrumented, multi,
+            engine=engine, sampling_cls=JambaSamplingParams, engine_label="jamba",
+            engine_meta={"hybrid_attn_mamba_moe": True},
+            max_model_len=_JAMBA_MAX_MODEL_LEN,
+        )
+    finally:
+        del engine
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
 def _capture_scenario(scenario, runs, args, LlamaEngine, SamplingParams,
                       instrumented, n_instrumented, multi):
     """Build one scenario's engine and capture each of its workloads.
@@ -1575,6 +1822,16 @@ def _capture_scenario(scenario, runs, args, LlamaEngine, SamplingParams,
     if _is_eagle3(scenario):
         # EAGLE-3 uses a distinct engine (target + speculative draft head).
         return _capture_eagle3_scenario(
+            scenario, runs, args, instrumented, n_instrumented, multi,
+        )
+    if _is_fla(scenario):
+        # GLA / RetNet / RWKV-7 carry recurrent state (FLAEngine, not paged-KV).
+        return _capture_fla_scenario(
+            scenario, runs, args, instrumented, n_instrumented, multi,
+        )
+    if _is_jamba(scenario):
+        # Jamba is a hybrid transformer+Mamba+MoE model (JambaEngine).
+        return _capture_jamba_scenario(
             scenario, runs, args, instrumented, n_instrumented, multi,
         )
     dtype = _engine_dtype(scenario.dtype)
@@ -1904,7 +2161,10 @@ def _capture_scenario(scenario, runs, args, LlamaEngine, SamplingParams,
             #     expanded length, so there is no ground-truth vector to drive the
             #     replay (and vision/audio-encoder scheduling is not modeled) --
             #     the hook cross-check above is the pass criterion there.
-            if prompt_lens is not None:
+            _mr_cfg = getattr(getattr(engine, "model_runner", None), "config", None)
+            pure_ssm = (getattr(_mr_cfg, "model_type", "") in ("mamba", "mamba2")
+                        if _mr_cfg is not None else False)
+            if prompt_lens is not None and not pure_ssm:
                 from .infra.engine import BLOCK_SIZE
                 _bm = getattr(engine, "block_manager", None)
                 num_kv_blocks = getattr(_bm, "_num_blocks", None)
@@ -1929,6 +2189,29 @@ def _capture_scenario(scenario, runs, args, LlamaEngine, SamplingParams,
                 for check in schedule_verification["checks"]:
                     if not check["passed"]:
                         print(f"    ! {check['name']}: {check['detail']}")
+            elif pure_ssm:
+                # Pure-SSM (Mamba / Mamba2) has no paged-attention KV cache:
+                # sequences hold fixed-size SSM state slots, so the paged-KV
+                # continuous-batching replay does not model their per-step
+                # admission (aggregate token/concurrency totals match, but the
+                # step-by-step schedule diverges). As for EAGLE-3 / FLA / Jamba,
+                # the forward-pre-hook cross-check is the pass criterion.
+                schedule_verification = {
+                    "method": "mock continuous-batching / chunked-prefill replay",
+                    "applicable": False,
+                    "passed": True,
+                    "reason": (
+                        "skipped for pure-SSM (mamba/mamba2): no paged-attention KV "
+                        "cache -- sequences occupy fixed SSM state slots, so the "
+                        "paged-KV continuous-batching replay does not model per-step "
+                        "admission. The forward-pre-hook cross-check is the pass "
+                        "criterion."
+                    ),
+                }
+                print(
+                    "  Verification 2 (mock batching replay) [N/A]: "
+                    "skipped for pure-SSM mamba (see report)."
+                )
             else:
                 schedule_verification = {
                     "method": "mock continuous-batching / chunked-prefill replay",

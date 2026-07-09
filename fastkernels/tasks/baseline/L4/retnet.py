@@ -91,6 +91,7 @@ class RetNetModel(nn.Module):
                 attention_mask=attention_mask,
                 past_key_values=past_key_values,
                 use_cache=use_cache,
+                **kwargs,
             )
 
         norm_dtype = self.norm.weight.dtype
@@ -118,6 +119,7 @@ class RetNetForCausalLM(nn.Module):
         labels: torch.Tensor | None = None,
         use_cache: bool = False,
         num_logits_to_keep: int = 0,
+        logits_indices: torch.Tensor | None = None,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         hidden_states, past_key_values = self.model(
@@ -126,11 +128,16 @@ class RetNetForCausalLM(nn.Module):
             inputs_embeds=inputs_embeds,
             past_key_values=past_key_values,
             use_cache=use_cache,
+            **kwargs,
         )
-        # Generation-time fast path: cap lm_head + fp32 upcast to the
-        # last ``num_logits_to_keep`` positions. Saves several GB of
-        # transient fp32 logits at large prefill batch sizes.
-        if num_logits_to_keep > 0:
+        # Generation-time fast path: cap lm_head + fp32 upcast to just the
+        # requested positions. ``logits_indices`` selects per-sequence last
+        # tokens from a packed varlen batch (-> [N, 1, V]); ``num_logits_to_keep``
+        # handles the dense [B, T] path.
+        if logits_indices is not None:
+            hidden_states = hidden_states.reshape(-1, hidden_states.size(-1))
+            hidden_states = hidden_states.index_select(0, logits_indices).unsqueeze(1)
+        elif num_logits_to_keep > 0:
             hidden_states = hidden_states[:, -num_logits_to_keep:, :]
         logits = self.lm_head(hidden_states).float()
         loss = None
