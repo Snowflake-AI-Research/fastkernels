@@ -232,8 +232,15 @@ void rmsnorm(
   int hidden_size = input.size(-1);
   int num_tokens = input.numel() / hidden_size;
   dim3 grid(num_tokens);
-  const int max_block_size = (num_tokens < 256) ? 1024 : 256;
-  dim3 block(std::min(hidden_size, max_block_size));
+  // cub::BlockReduce<float, 1024> REQUIRES blockDim.x == 1024: its shared temp
+  // storage is sized/indexed for exactly 1024 threads, so a smaller block
+  // leaves the missing threads' slots uninitialized and the reduction reads
+  // garbage -> NaN (non-deterministic, depends on whatever occupied that shared
+  // memory before this launch). The old ``(num_tokens < 256) ? 1024 : 256``
+  // heuristic launched 256 threads for >=256-token batches, silently corrupting
+  // the norm. Launch exactly 1024; threads past hidden_size/VEC do no work and
+  // contribute 0 to the sum.
+  dim3 block(1024);
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -340,8 +347,15 @@ void fused_add_rmsnorm(
   int hidden_size = input.size(-1);
   int num_tokens = input.numel() / hidden_size;
   dim3 grid(num_tokens);
-  const int max_block_size = (num_tokens < 256) ? 1024 : 256;
-  dim3 block(std::min(hidden_size, max_block_size));
+  // cub::BlockReduce<float, 1024> REQUIRES blockDim.x == 1024: its shared temp
+  // storage is sized/indexed for exactly 1024 threads, so a smaller block
+  // leaves the missing threads' slots uninitialized and the reduction reads
+  // garbage -> NaN (non-deterministic, depends on whatever occupied that shared
+  // memory before this launch). The old ``(num_tokens < 256) ? 1024 : 256``
+  // heuristic launched 256 threads for >=256-token batches, silently corrupting
+  // the norm. Launch exactly 1024; threads past hidden_size/VEC do no work and
+  // contribute 0 to the sum.
+  dim3 block(1024);
   const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
