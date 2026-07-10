@@ -481,60 +481,59 @@ def build_chunk_metadata(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute Mamba2 chunk-aligned varlen metadata.
 
-    Direct port of vLLM ``BaseMambaAttentionMetadataBuilder._compute_chunk_metadata``.
+    Faithful port of vLLM ``compute_varlen_chunk_metadata``
+    (``vllm/v1/attention/backends/mamba2_attn.py``): each sequence is split at
+    BOTH sequence boundaries AND *flat packed* physical ``chunk_size``
+    boundaries, so every logical chunk lies within a single ``chunk_size`` tile
+    of the packed prefill array. The SSD kernel processes the flat array in
+    ``chunk_size`` tiles, so a chunk that straddled a tile boundary (which
+    happens whenever a sequence crosses a flat ``chunk_size`` boundary, i.e.
+    total packed tokens > ``chunk_size``) corrupts the scan -- the previous
+    per-sequence-local chunking did exactly that and produced all-zero output.
 
     Args:
       query_start_loc_p: int32 tensor [num_prefills+1] cumulative token
-        starts in the *prefill* sub-batch.
+        starts in the *prefill* sub-batch (flat packed positions).
       chunk_size: physical chunk size (e.g. 256 for Codestral).
-      num_computed_tokens_p: int32 tensor [num_prefills] of already-computed
-        tokens per request (for chunked prefill resumption).  If ``None``,
-        treated as all zeros (fresh prefill).
+      num_computed_tokens_p: accepted for API compatibility. Chunk boundaries
+        depend only on the flat packed layout; cross-step continuations are
+        kept ``chunk_size``-aligned by the scheduler and carried via the
+        mixer's ``initial_states`` / ``has_initial_states``, so it is not needed
+        here.
 
     Returns ``(cu_chunk_seqlen_p, seq_idx_p, last_chunk_indices_p)`` on the
     same device as ``query_start_loc_p``.
     """
     device = query_start_loc_p.device
-    qsl = query_start_loc_p.to("cpu").tolist()
-    num_prefills = len(qsl) - 1
-    if num_computed_tokens_p is None:
-        nct = [0] * num_prefills
-    else:
-        nct = num_computed_tokens_p.to("cpu").tolist()
+    qsl = query_start_loc_p.to("cpu").to(torch.int64).tolist()
+    starts = qsl[:-1]
+    ends = qsl[1:]
+    total = qsl[-1]
 
-    cu_chunk_seqlen: list[int] = []
+    chunk_lens: list[int] = []
     seq_idx: list[int] = []
-    last_chunk_indices: list[int] = []
-    seqlen_pos = 0
+    last_chunk_indices: list[int] = [-1] * len(starts)
 
-    for req_idx in range(num_prefills):
-        this_num_computed = nct[req_idx]
-        this_new_tokens = qsl[req_idx + 1] - qsl[req_idx]
+    for b, (s, e) in enumerate(zip(starts, ends)):
+        if e <= s:
+            continue  # empty sequence (not expected in prefill)
+        pos = s
+        while pos < e:
+            # Split at both sequence boundaries and physical chunk boundaries
+            # so every chunk stays inside one chunk_size tile of the flat array.
+            room = chunk_size - (pos % chunk_size)
+            take = min(room, e - pos)
+            chunk_lens.append(int(take))
+            seq_idx.append(b)
+            last_chunk_indices[b] = len(chunk_lens) - 1
+            pos += take
 
-        # Finish off a partially-filled chunk if computed isn't chunk aligned.
-        if this_num_computed % chunk_size != 0:
-            seq_idx.append(req_idx)
-            cu_chunk_seqlen.append(seqlen_pos)
-            chunk_len = (
-                ((this_num_computed + chunk_size - 1) // chunk_size) * chunk_size
-                - this_num_computed
-            )
-            chunk_len = min(chunk_len, this_new_tokens)
-            seqlen_pos += chunk_len
-            this_new_tokens -= chunk_len
-
-        n_chunks = (this_new_tokens + chunk_size - 1) // chunk_size
-        for _ in range(n_chunks):
-            seq_idx.append(req_idx)
-            cu_chunk_seqlen.append(seqlen_pos)
-            chunk_len = min(chunk_size, this_new_tokens)
-            seqlen_pos += chunk_len
-            this_new_tokens -= chunk_len
-
-        assert this_new_tokens == 0
-        last_chunk_indices.append(len(cu_chunk_seqlen) - 1)
-
-    cu_chunk_seqlen.append(seqlen_pos)
+    cu_chunk_seqlen = [0]
+    acc = 0
+    for cl in chunk_lens:
+        acc += cl
+        cu_chunk_seqlen.append(acc)
+    assert cu_chunk_seqlen[-1] == total
 
     cu_chunk_seqlen_p = torch.tensor(cu_chunk_seqlen, device=device, dtype=torch.int32)
     seq_idx_p = torch.tensor(seq_idx, device=device, dtype=torch.int32)
