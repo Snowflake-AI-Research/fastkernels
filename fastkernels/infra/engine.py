@@ -2638,9 +2638,17 @@ class ModelRunner:
             desc = ", ".join(f"{n}x{l}" for n, l in warmed)
             print(f"  Qwen3-Next prefill warmup: {desc}", flush=True)
 
-    def _mamba_prepare_tensors(self, prefill_seqs, decode_seqs, chunk_size):
+    def _mamba_prepare_tensors(self, prefill_seqs, decode_seqs, chunk_size,
+                               prefill_chunk_lens=None):
         """Build flat input_ids / positions and the Mamba(2)Metadata for a
         mixed batch of prefill + decode sequences.
+
+        ``prefill_chunk_lens`` (optional, one entry per prefill seq) caps how
+        many tokens of each prefill sequence are processed this step, enabling
+        chunked prefill: a long prompt is split across steps and the SSM/conv
+        state is carried via ``has_initial_states_p`` + ``num_computed_tokens_p``
+        (matching vLLM). When ``None`` each prefill seq processes all remaining
+        prompt tokens in one step (the original single-shot behavior).
 
         Mixed layout is model-specific:
         - Mamba v1 keeps decode tokens first, then prefill tokens.
@@ -2657,23 +2665,29 @@ class ModelRunner:
         has_mixed = bool(prefill_seqs) and bool(decode_seqs)
         mixed_decode_first = has_mixed and not self.is_mamba2
 
+        def _chunk_len(i, seq):
+            start = seq.num_computed_tokens
+            if prefill_chunk_lens is not None:
+                return min(prefill_chunk_lens[i], len(seq.token_ids) - start)
+            return len(seq.token_ids) - start
+
         if mixed_decode_first:
             for seq in decode_seqs:
                 input_ids.append(seq.last_token)
                 positions.append(len(seq) - 1)
                 decode_state_indices.append(seq.state_slot)
-            for seq in prefill_seqs:
+            for i, seq in enumerate(prefill_seqs):
                 start = seq.num_computed_tokens
-                chunk = len(seq.token_ids) - start
+                chunk = _chunk_len(i, seq)
                 input_ids.extend(seq.token_ids[start:start + chunk])
                 positions.extend(range(start, start + chunk))
                 query_start_loc.append(query_start_loc[-1] + chunk)
                 prefill_state_indices.append(seq.state_slot)
                 prefill_has_initial.append(start > 0)
         else:
-            for seq in prefill_seqs:
+            for i, seq in enumerate(prefill_seqs):
                 start = seq.num_computed_tokens
-                chunk = len(seq.token_ids) - start
+                chunk = _chunk_len(i, seq)
                 input_ids.extend(seq.token_ids[start:start + chunk])
                 positions.extend(range(start, start + chunk))
                 query_start_loc.append(query_start_loc[-1] + chunk)
@@ -2751,9 +2765,12 @@ class ModelRunner:
         chunk_size = getattr(self.config, "chunk_size", 256)
         return self._mamba_prepare_tensors([], seqs, chunk_size)
 
-    def prepare_mamba_mixed(self, prefill_seqs, decode_seqs):
+    def prepare_mamba_mixed(self, prefill_seqs, decode_seqs, prefill_chunk_lens=None):
         chunk_size = getattr(self.config, "chunk_size", 256)
-        return self._mamba_prepare_tensors(prefill_seqs, decode_seqs, chunk_size)
+        return self._mamba_prepare_tensors(
+            prefill_seqs, decode_seqs, chunk_size,
+            prefill_chunk_lens=prefill_chunk_lens,
+        )
 
     @torch.inference_mode()
     def run_mamba(self, seqs, is_prefill: bool):
@@ -2787,10 +2804,15 @@ class ModelRunner:
         return logits
 
     @torch.inference_mode()
-    def run_mamba_mixed(self, prefill_seqs, decode_seqs):
-        """Run a mixed prefill+decode batch through the Mamba model."""
+    def run_mamba_mixed(self, prefill_seqs, decode_seqs, prefill_chunk_lens=None):
+        """Run a mixed prefill+decode batch through the Mamba model.
+
+        ``prefill_chunk_lens`` (optional) caps each prefill seq's tokens this
+        step for chunked prefill; the returned logits are still one row per
+        prefill seq (its chunk's last token) followed by one per decode seq.
+        """
         input_ids, positions, meta, num_actual = self.prepare_mamba_mixed(
-            prefill_seqs, decode_seqs,
+            prefill_seqs, decode_seqs, prefill_chunk_lens=prefill_chunk_lens,
         )
         set_mamba_context(
             is_prefill=True,
@@ -5788,6 +5810,10 @@ class LlamaEngine:
 
         waiting: deque[Sequence] = deque(all_seqs)
         running: list[Sequence] = []
+        # Sequences whose prompt is being consumed across multiple steps
+        # (chunked prefill). Each holds a Mamba state slot; its SSM/conv state
+        # is carried between chunks via has_initial_states + num_computed_tokens.
+        prefilling: list[Sequence] = []
 
         pbar = None
         if use_tqdm:
@@ -5804,46 +5830,31 @@ class LlamaEngine:
         )
 
         def _admit():
-            """Allocate state slots for as many waiting seqs as fit.
+            """Move waiting seqs into ``prefilling`` (allocating one Mamba state
+            slot each) while the slot pool and ``max_num_seqs`` allow.
 
-            Respects both the slot pool (``can_allocate_mamba_state``)
-            and a per-step token budget (sum of admitted prompt lengths
-            plus one decode token per already-running seq).  Token
-            budgeting prevents a single forward pass from ballooning
-            into kernel OOM at large batch sizes.
+            Token budgeting is handled per step by the chunk planner below -- a
+            single prompt may span many steps (chunked prefill), so admission is
+            gated only by slot availability, not prompt length.
 
             Allocation must happen on every TP rank so each rank's local
-            ``MambaStateManager`` agrees on slot ownership; ``call``
-            broadcasts via SHM and runs locally on rank 0.
+            ``MambaStateManager`` agrees on slot ownership; ``mr.call``
+            broadcasts via SHM and runs locally on rank 0. Batched into a single
+            message to avoid ``_pickle.UnpicklingError`` race conditions.
             """
             admitted: list[Sequence] = []
-            token_budget = max(
-                getattr(mr, "max_num_batched_tokens", 16384), 1,
-            )
-            tokens_used = len(running)
             max_seqs = self.max_num_seqs
             while (
                 waiting
                 and mr.can_allocate_mamba_state()
-                and len(running) + len(admitted) < max_seqs
+                and len(running) + len(prefilling) + len(admitted) < max_seqs
             ):
-                s = waiting[0]
-                seq_tokens = len(s.token_ids) - s.num_computed_tokens
-                if admitted and tokens_used + seq_tokens > token_budget:
-                    break
-                waiting.popleft()
-                admitted.append(s)
-                tokens_used += seq_tokens
+                admitted.append(waiting.popleft())
             if admitted:
-                # Allocation must happen on every TP rank so each rank's
-                # local ``MambaStateManager`` agrees on slot ownership;
-                # ``mr.call`` broadcasts via SHM and runs locally on
-                # rank 0.  Batched into a single message to avoid
-                # ``_pickle.UnpicklingError`` race conditions seen with
-                # per-seq ``mr.call`` invocations.
                 slots = mr.call("allocate_mamba_state_batch", len(admitted))
                 for s, slot in zip(admitted, slots):
                     s.state_slot = slot
+                prefilling.extend(admitted)
             return admitted
 
         def _sample(logits_row: torch.Tensor, sp) -> int:
@@ -5866,11 +5877,48 @@ class LlamaEngine:
                 done = done or tok_id == eos
             return done
 
-        while waiting or running:
+        while waiting or running or prefilling:
             _t0 = time.perf_counter() if _profile else 0.0
-            new_seqs = _admit()
-            prefill_seqs = list(new_seqs)
+            _admit()
             decode_seqs = list(running)
+
+            # Chunk planner: fill the per-step token budget
+            # (max_num_batched_tokens, minus one token per running decode) with
+            # prefill chunks in FIFO order over the ``prefilling`` queue. A
+            # prompt longer than the budget is split across steps; its SSM/conv
+            # state continues via has_initial_states + num_computed_tokens
+            # (matching vLLM's chunked-prefill scheduler), so a single long
+            # prefill never materializes a full-sequence chunk-scan transient.
+            token_budget = max(
+                getattr(mr, "max_num_batched_tokens", 16384) - len(decode_seqs), 0,
+            )
+            # Mamba2 SSD chunk size: a *continuing* (non-final) prefill chunk
+            # must end on a chunk_size boundary, else the carried SSM state
+            # diverges from a single-shot prefill (verified: sub-chunk_size steps
+            # mismatch, >=chunk_size match). vLLM enforces the same alignment.
+            ssd_chunk = getattr(getattr(mr, "config", None), "chunk_size", 256) or 256
+            prefill_seqs: list[Sequence] = []
+            prefill_chunk_lens: list[int] = []
+            budget_left = token_budget
+            for s in prefilling:
+                remaining = s.num_remaining_prefill
+                if remaining <= 0:
+                    continue
+                if remaining <= budget_left:
+                    chunk = remaining                       # final chunk: exact
+                else:
+                    # Continuing chunk: largest chunk_size-aligned block that fits.
+                    aligned = (budget_left // ssd_chunk) * ssd_chunk
+                    if aligned <= 0:
+                        if prefill_seqs:
+                            break                           # no room; next step
+                        aligned = ssd_chunk                 # guarantee progress
+                    chunk = aligned
+                prefill_seqs.append(s)
+                prefill_chunk_lens.append(chunk)
+                budget_left -= chunk
+                if budget_left <= 0:
+                    break
             _t_admit = (time.perf_counter() - _t0) if _profile else 0.0
 
             if not prefill_seqs and not decode_seqs:
@@ -5950,7 +5998,7 @@ class LlamaEngine:
             # =========================================================
             _t1 = time.perf_counter() if _profile else 0.0
             logits = mr.call(
-                "run_mamba_mixed", prefill_seqs, decode_seqs,
+                "run_mamba_mixed", prefill_seqs, decode_seqs, prefill_chunk_lens,
             )
             _t_call = (time.perf_counter() - _t1) if _profile else 0.0
 
@@ -5958,7 +6006,28 @@ class LlamaEngine:
             row = 0
             new_running: list[Sequence] = []
             finished_now: list[Sequence] = []
-            for s in prefill_seqs + decode_seqs:
+            still_prefilling: list[Sequence] = []
+            # Prefill rows come first (one per prefill seq's chunk last token).
+            # Advance each seq by its chunk; only a seq whose prompt is now fully
+            # consumed produces a real token (its chunk's last token is the final
+            # prompt token). Partial seqs keep their carried state and continue.
+            for s, chunk in zip(prefill_seqs, prefill_chunk_lens):
+                s.num_computed_tokens += chunk
+                if s.num_remaining_prefill == 0:
+                    logit_row = logits[row]
+                    sp = seq_sp[id(s)]
+                    tok_id = _sample(logit_row, sp)
+                    if collect_logits:
+                        seq_logits[id(s)].append(logit_row.detach().cpu())
+                    if _finalize(s, tok_id):
+                        finished_now.append(s)
+                    else:
+                        new_running.append(s)
+                else:
+                    still_prefilling.append(s)
+                row += 1
+            # Decode rows follow.
+            for s in decode_seqs:
                 logit_row = logits[row]
                 sp = seq_sp[id(s)]
                 tok_id = _sample(logit_row, sp)
@@ -5970,6 +6039,7 @@ class LlamaEngine:
                 else:
                     new_running.append(s)
 
+            prefilling[:] = still_prefilling
             if finished_now:
                 slot_ids = [s.state_slot for s in finished_now]
                 mr.call("deallocate_mamba_state_batch", slot_ids)
@@ -5992,10 +6062,7 @@ class LlamaEngine:
                 _stats["slow_call"] += _t_call
                 _stats["slow_finalize"] += _t_finalize_slow
                 _stats["slow_pbar"] += _t_pbar
-                _stats["total_prefill_tokens"] += sum(
-                    len(s.token_ids) - s.num_computed_tokens
-                    for s in prefill_seqs
-                )
+                _stats["total_prefill_tokens"] += sum(prefill_chunk_lens)
                 _stats["total_decode_tokens"] += len(decode_seqs)
 
         if pbar is not None:
