@@ -341,6 +341,84 @@ def _is_qwen_omni_model(model_name: str) -> bool:
     return "qwen" in lower and "omni" in lower
 
 
+def _get_model_max_context_len(model_name: str) -> int | None:
+    """Return the model's maximum context length (``max_position_embeddings``).
+
+    vLLM (>=0.24.0) strictly rejects a user-specified ``max_model_len`` that
+    exceeds the value it derives from the HF config, so the benchmark must cap
+    ``global_max_seq_len`` at this length. Returns ``None`` when the config
+    cannot be read or does not advertise a positional limit.
+    """
+    try:
+        from transformers import AutoConfig
+
+        config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    except Exception:
+        return None
+    # Some multimodal configs nest the LM settings under ``text_config``.
+    for cfg in (config, getattr(config, "text_config", None)):
+        if cfg is None:
+            continue
+        max_pos = getattr(cfg, "max_position_embeddings", None)
+        if isinstance(max_pos, (int, float)) and max_pos > 0:
+            return int(max_pos)
+    return None
+
+
+def _chat_template_ids(tokenizer, messages) -> list[int]:
+    """Tokenize chat ``messages`` (with generation prompt), normalizing the
+    various return types HF tokenizers use (list / Encoding / dict / tensor)."""
+    token_ids = tokenizer.apply_chat_template(
+        messages, tokenize=True, add_generation_prompt=True,
+    )
+    if hasattr(token_ids, "input_ids"):
+        token_ids = token_ids.input_ids
+    elif isinstance(token_ids, dict):
+        token_ids = token_ids["input_ids"]
+    if hasattr(token_ids, "tolist"):
+        token_ids = token_ids.tolist()
+    if token_ids and isinstance(token_ids[0], list):
+        token_ids = token_ids[0]
+    return list(token_ids)
+
+
+def _fit_messages_to_context(tokenizer, messages, max_prompt_tokens: int) -> list[int]:
+    """Chat-template ``messages`` into token ids that fit ``max_prompt_tokens``.
+
+    When the templated prompt is too long, only the *tail of the prompt
+    content* is trimmed — the end of the last message that carries real
+    content — and the chat template is then re-applied. Because truncation
+    happens on the raw content *before* templating, no special/template tokens
+    are ever dropped: the BOS, the role headers before the content, and the
+    trailing generation prompt (``<|end_header_id|>`` …) are all preserved.
+    """
+    ids = _chat_template_ids(tokenizer, messages)
+    if max_prompt_tokens < 1 or len(ids) <= max_prompt_tokens:
+        return ids
+    # Trim the last message that actually has content (the tail of the prompt).
+    target = None
+    for i in range(len(messages) - 1, -1, -1):
+        if (messages[i].get("content") or "").strip():
+            target = i
+            break
+    if target is None:
+        return ids  # nothing trimmable (all-empty content) -- leave as-is
+    messages = [dict(m) for m in messages]  # don't mutate the caller's list
+    content_ids = tokenizer.encode(
+        messages[target]["content"], add_special_tokens=False,
+    )
+    keep = max(0, len(content_ids) - (len(ids) - max_prompt_tokens))
+    # Re-template and shrink until it fits; a few iterations absorb the token
+    # drift from BPE re-merging at the cut point and per-turn template overhead.
+    for _ in range(8):
+        messages[target]["content"] = tokenizer.decode(content_ids[:keep])
+        ids = _chat_template_ids(tokenizer, messages)
+        if len(ids) <= max_prompt_tokens or keep == 0:
+            break
+        keep = max(0, keep - (len(ids) - max_prompt_tokens) - 8)
+    return ids
+
+
 # ---------------------------------------------------------------------------
 # Multi-scenario vLLM subprocess worker (LLM, text-only)
 # ---------------------------------------------------------------------------
@@ -1874,6 +1952,34 @@ def main():
     tokenizer = None
     if not is_whisper:
         tokenizer = _load_tokenizer(args.model)
+    # vLLM (>=0.24.0) rejects a max_model_len exceeding the model's derived
+    # context window, and real long-context prompts can land a few tokens over
+    # (e.g. LongBench rows whose prompt+decode slightly exceeds 128K). Trim the
+    # tail of the raw prompt content of such rows (re-applying the chat template
+    # so no special tokens are dropped) to keep every request valid.
+    model_max_ctx = None if is_whisper else _get_model_max_context_len(args.model)
+
+    def _fit_prompts_to_ctx(samples):
+        """Prompt token ids for ``samples``, trimming the tail of the raw
+        prompt *content* (never the chat template / special tokens) so each
+        prompt plus its decode budget fits the model context window."""
+        prompt_token_ids = []
+        n_trunc = 0
+        for s in samples:
+            ids = list(s.prompt_token_ids)
+            if model_max_ctx is not None and s.messages is not None:
+                budget = model_max_ctx - s.output_len
+                if budget >= 1 and len(ids) > budget:
+                    ids = _fit_messages_to_context(
+                        tokenizer, s.messages, budget)
+                    n_trunc += 1
+            prompt_token_ids.append(ids)
+        if n_trunc:
+            print(f"  NOTE: trimmed prompt content of {n_trunc} request(s) to "
+                  f"fit {model_max_ctx}-token model context "
+                  f"(chat template preserved)")
+        return prompt_token_ids
+
     if not args.skip_throughput:
         for i, scenario in enumerate(throughput_scenarios):
             if is_whisper:
@@ -1904,7 +2010,7 @@ def main():
                         dataset_name=scenario["dataset"],
                         seed=args.seed + i,
                     )
-                    prompt_token_ids = [s.prompt_token_ids for s in samples]
+                    prompt_token_ids = _fit_prompts_to_ctx(samples)
                     output_lens = [s.output_len for s in samples]
                 else:
                     raise ValueError(
@@ -1969,7 +2075,7 @@ def main():
                     dataset_name=ls.get("dataset") or None,
                     seed=args.seed + 100 + j,
                 )
-                prompt_token_ids = [s.prompt_token_ids for s in samples]
+                prompt_token_ids = _fit_prompts_to_ctx(samples)
                 output_lens = [s.output_len for s in samples]
                 real_input_len = max((len(p) for p in prompt_token_ids), default=0)
                 seq_len = max(
@@ -2003,6 +2109,16 @@ def main():
                     "num_warmup": 3,
                     "num_iters": args.latency_iters,
                 })
+
+    # Safety net: if any scenario path still produced a length beyond the
+    # model's context window (e.g. the multimodal token estimate), cap it so
+    # vLLM (>=0.24.0) does not reject the run.
+    if model_max_ctx is not None and global_max_seq_len > model_max_ctx:
+        print(
+            f"  NOTE: capping max seq len {global_max_seq_len} -> "
+            f"{model_max_ctx} (model context limit)"
+        )
+        global_max_seq_len = model_max_ctx
 
     print("=" * 70)
     print("  fastkernels Baseline vs vLLM -- Multi-Scenario Benchmark")
