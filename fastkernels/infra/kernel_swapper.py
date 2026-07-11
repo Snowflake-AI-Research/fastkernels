@@ -1,9 +1,7 @@
 """
 Kernel target discovery, class monkey-patching, and candidate hot-swapping.
 
-This module consolidates three concerns that were previously split across
-bench/kernels/discovery.py, bench/kernels/replacement.py, and
-infra/kernel_swapper.py:
+This module consolidates three concerns:
 
 1. **Target discovery** -- scans tasks/baseline/L{1-4}/ via static import
    analysis to build BenchTarget objects mapping operators to models.
@@ -16,7 +14,6 @@ infra/kernel_swapper.py:
    them in bulk.
 
 Used by:
-  - bench/kernels/{runner,__main__}.py             (kernel-level benchmarking)
   - bench/e2e/{throughput,latency,serve}.py       (auto-detect all candidates)
   - infra/server.py                               (auto-detect all candidates)
   - agent/{agent,create_stubs}.py               (target introspection)

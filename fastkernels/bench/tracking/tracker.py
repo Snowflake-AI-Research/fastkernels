@@ -18,7 +18,6 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from fastkernels.bench.eval.aggregator import EvalReport
-    from fastkernels.bench.kernels.result import KernelBenchResult
 
 # ---------------------------------------------------------------------------
 # Lazy mlflow handle
@@ -146,52 +145,6 @@ def log_kernel(
         _mlflow.log_text(code, f"kernels/{op_name}.py")
     if error:
         _mlflow.log_text(error[:4000], f"errors/{op_name}.txt")
-
-
-# ---------------------------------------------------------------------------
-# Benchmark logging — kernel tier
-# ---------------------------------------------------------------------------
-@_safe
-def log_kernel_bench(result: KernelBenchResult) -> None:
-    """Log a ``KernelBenchResult`` (from ``fastkernels kernels``).
-
-    Logs per-operator and per-scenario metrics, plus aggregate totals.
-    Candidate kernel source files are stored as artifacts.
-    """
-    from fastkernels import CANDIDATE_DIR
-
-    for op in result.operators:
-        _mlflow.log_metric(f"{op.target}_avg_speedup", op.avg_speedup)
-        _mlflow.log_metric(f"{op.target}_passed", op.passed)
-        _mlflow.log_metric(f"{op.target}_failed", op.failed)
-        _mlflow.log_metric(
-            f"{op.target}_avg_max_error_ratio", op.avg_max_error_ratio
-        )
-        _mlflow.log_metric(
-            f"{op.target}_avg_mean_abs_diff", op.avg_mean_abs_diff
-        )
-        for s in op.scenarios:
-            key = f"{op.target}.{s.name}"
-            # Truncate metric keys to 250 chars (MLflow limit)
-            if len(key) > 240:
-                key = key[:240]
-            _mlflow.log_metric(f"{key}_speedup", s.speedup)
-            _mlflow.log_metric(f"{key}_correct", int(s.correct))
-            _mlflow.log_metric(f"{key}_max_error_ratio", s.max_error_ratio)
-
-        # Store candidate kernel source as artifact
-        candidate_file = CANDIDATE_DIR / f"L{op.level}" / f"{op.target}.py"
-        if candidate_file.is_file():
-            _mlflow.log_artifact(str(candidate_file), artifact_path="kernels")
-
-    # Aggregates
-    _mlflow.log_metric("avg_speedup", result.avg_speedup)
-    _mlflow.log_metric("total_passed", result.passed)
-    _mlflow.log_metric("total_failed", result.failed)
-    _mlflow.log_metric("total_operators", result.total_operators)
-    _mlflow.log_metric("total_scenarios", result.total_scenarios)
-    _mlflow.log_metric("avg_max_error_ratio", result.avg_max_error_ratio)
-    _mlflow.log_metric("avg_mean_abs_diff", result.avg_mean_abs_diff)
 
 
 # ---------------------------------------------------------------------------

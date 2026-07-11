@@ -10,7 +10,6 @@ Quick start::
 
     with tracker.start_run("my-run", params={"model": "llama", "level": 1}):
         tracker.log_kernel("rms_norm", level=1, code=src)
-        tracker.log_kernel_bench(bench_result)
         tracker.log_metrics({"custom_score": 0.95})
 """
 

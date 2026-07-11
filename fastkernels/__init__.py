@@ -31,23 +31,6 @@ REFERENCE_DIR = Path(
 )
 PREV_ATTEMPTS_DIR = CANDIDATE_DIR / "prev-attempts"
 
-# --- Benchmark input data ---
-INPUT_REGISTRY_DIR = Path(
-    os.environ.get(
-        "FASTKERNELS_INPUT_REGISTRY_DIR",
-        str(KB_ROOT / "bench" / "kernels" / "benchmark_scenarios" / "small"),
-    )
-)
-INPUTS_DIR = Path(
-    os.environ.get("FASTKERNELS_INPUTS_DIR", str(INPUT_REGISTRY_DIR))
-)
-GOLDEN_DIR = Path(
-    os.environ.get("FASTKERNELS_GOLDEN_DIR", str(INPUT_REGISTRY_DIR / "captured_inputs"))
-)
-TRACE_DIR = Path(
-    os.environ.get("FASTKERNELS_TRACE_DIR", str(INPUT_REGISTRY_DIR / "traces"))
-)
-
 # --- Benchmark results ---
 RESULTS_DIR = Path(
     os.environ.get("FASTKERNELS_RESULTS_DIR", str(KB_ROOT / "bench" / "results"))
