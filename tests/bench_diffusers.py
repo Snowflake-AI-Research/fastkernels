@@ -236,17 +236,6 @@ def main():
     sys.path.insert(0, cfg["project_root"])
     pkg = cfg["package_name"]
 
-    if cfg.get("pytorch_reference", False):
-        from fastkernels.infra.kernel_swapper import (
-            apply_candidates,
-            discover_references,
-            print_reference_summary,
-        )
-        references = discover_references()
-        if references:
-            print_reference_summary(references)
-            apply_candidates(references)
-
     eng_mod = __import__(
         f"{pkg}.infra.sdxl_engine",
         fromlist=["SDXLEngine"],
@@ -545,10 +534,6 @@ def main():
     parser.add_argument("--skip-diffusers", action="store_true",
                         help="Skip diffusers and only benchmark fastkernels")
     parser.add_argument(
-        "--pytorch-reference", action="store_true", default=False,
-        help="Patch semantic PyTorch references from tasks/reference/L*/ into fastkernels.",
-    )
-    parser.add_argument(
         "--output-dir", type=str, default=None,
         help="Directory to save results (default: tests/results/<gpu>/<model>)",
     )
@@ -597,7 +582,6 @@ def main():
         **base_config,
         "scenarios": scenarios,
         "latency_scenarios": latency_scenarios,
-        "pytorch_reference": args.pytorch_reference,
     }
     if kb_latent_dir:
         kb_config["latent_dir"] = kb_latent_dir

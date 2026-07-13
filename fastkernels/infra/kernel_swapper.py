@@ -32,11 +32,10 @@ from pathlib import Path
 
 import torch.nn as nn
 
-from fastkernels import BASELINE_DIR, CANDIDATE_DIR, KB_ROOT, REFERENCE_DIR
+from fastkernels import BASELINE_DIR, CANDIDATE_DIR, KB_ROOT
 
 _KB_ROOT = KB_ROOT
 _CANDIDATE_DIR = CANDIDATE_DIR
-_REFERENCE_DIR = REFERENCE_DIR
 
 _L4_MODEL_KEYS: dict[str, str] = {
     "bitnet": "bitnet",
@@ -340,38 +339,6 @@ def load_candidate(target_name: str) -> type | None:
     return cls
 
 
-def load_reference(target_name: str) -> type | None:
-    """Load a semantic PyTorch reference for *target_name* from tasks/reference/.
-
-    References are specification implementations used for prompting and
-    correctness validation. They intentionally share the baseline class name
-    and public signatures, but are not production-speed baselines.
-    """
-    target = get(target_name)
-    reference_file = _REFERENCE_DIR / f"L{target.level}" / f"{target_name}.py"
-    if not reference_file.is_file():
-        return None
-    class_name = target.target_cls.__name__
-    module_name = f"_reference_impl_L{target.level}_{target_name}"
-    spec = importlib.util.spec_from_file_location(module_name, str(reference_file))
-    if spec is None or spec.loader is None:
-        return None
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = mod
-    try:
-        spec.loader.exec_module(mod)
-    except Exception:
-        sys.modules.pop(module_name, None)
-        raise
-    cls = getattr(mod, class_name, None)
-    if cls is None:
-        for v in vars(mod).values():
-            if isinstance(v, type) and issubclass(v, nn.Module) and v is not nn.Module:
-                cls = v
-                break
-    return cls
-
-
 def discover_candidates() -> list[tuple[BenchTarget, type]]:
     """Scan tasks/candidate/ and return all valid (target, candidate_class) pairs."""
     targets = discover_targets()
@@ -383,23 +350,6 @@ def discover_candidates() -> list[tuple[BenchTarget, type]]:
         if not candidate_file.is_file():
             continue
         cls = load_candidate(target.name)
-        if cls is not None:
-            results.append((target, cls))
-
-    return results
-
-
-def discover_references() -> list[tuple[BenchTarget, type]]:
-    """Scan tasks/reference/ and return valid semantic reference classes."""
-    targets = discover_targets()
-    results: list[tuple[BenchTarget, type]] = []
-
-    for target in targets:
-        level_dir = _REFERENCE_DIR / f"L{target.level}"
-        reference_file = level_dir / f"{target.name}.py"
-        if not reference_file.is_file():
-            continue
-        cls = load_reference(target.name)
         if cls is not None:
             results.append((target, cls))
 
@@ -513,18 +463,5 @@ def print_candidate_summary(candidates: list[tuple[BenchTarget, type]]) -> None:
     print(f"{'=' * 70}")
     sorted_candidates = _sort_by_level(candidates)
     for target, cls in sorted_candidates:
-        print(f"    L{target.level}  {target.name:<25} -> {cls.__name__}")
-    print(f"{'=' * 70}\n")
-
-
-def print_reference_summary(references: list[tuple[BenchTarget, type]]) -> None:
-    """Print a human-readable summary of semantic references being used."""
-    if not references:
-        return
-    print(f"\n{'=' * 70}")
-    print("  SEMANTIC PYTORCH REFERENCES")
-    print(f"{'=' * 70}")
-    sorted_references = _sort_by_level(references)
-    for target, cls in sorted_references:
         print(f"    L{target.level}  {target.name:<25} -> {cls.__name__}")
     print(f"{'=' * 70}\n")

@@ -26,9 +26,6 @@ BASELINE_DIR = TASKS_DIR / "baseline"
 CANDIDATE_DIR = Path(
     os.environ.get("FASTKERNELS_CANDIDATE_DIR", str(TASKS_DIR / "candidate"))
 )
-REFERENCE_DIR = Path(
-    os.environ.get("FASTKERNELS_REFERENCE_DIR", str(TASKS_DIR / "reference"))
-)
 PREV_ATTEMPTS_DIR = CANDIDATE_DIR / "prev-attempts"
 
 # --- Benchmark results ---

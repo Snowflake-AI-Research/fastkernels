@@ -698,7 +698,9 @@ class ModelRunner:
         """
         import os
         try:
-            from ..tasks.baseline.L1.fp8_linear import Fp8Linear, _Fp8PrefillBufs
+            from ..tasks.baseline.L1.fp8_linear import (
+                Fp8Linear, _Fp8PrefillBufs, _alloc_colmajor_scale,
+            )
         except ImportError:
             return
 
@@ -744,21 +746,30 @@ class ModelRunner:
             seen_shapes.add(key)
 
             a_fp8 = linear_op._a_buf
-            a_scale = linear_op._s_buf
             out = linear_op._o_buf
+            # The activation scale factor must be column-major with its minor
+            # (group) stride equal to the row count M -- DeepGEMM's SM100
+            # ``fp8_gemm_nt`` asserts ``batched_sf.stride(2) == mn``. Slicing the
+            # leading dim of a pre-allocated ``(max_tokens, num_groups)``
+            # column-major buffer leaves that stride at ``max_tokens``, so we
+            # allocate a fresh exact-M scale per size, mirroring ``Fp8Linear.
+            # forward`` (which likewise never reuses ``_s_buf``).
+            num_groups = (K + Fp8Linear.BLOCK_SIZE - 1) // Fp8Linear.BLOCK_SIZE
             for num_tokens in decode_bs:
                 if num_tokens > max_decode:
                     break
+                a_scale = _alloc_colmajor_scale(num_tokens, num_groups, device)
                 deep_gemm.fp8_gemm_nt(
-                    (a_fp8[:num_tokens], a_scale[:num_tokens]),
+                    (a_fp8[:num_tokens], a_scale),
                     (w, ws),
                     out[:num_tokens],
                 )
 
             pf = prefill_bufs[key]
             for num_tokens in prefill_bs:
+                a_scale = _alloc_colmajor_scale(num_tokens, num_groups, device)
                 deep_gemm.fp8_gemm_nt(
-                    (pf.a[:num_tokens], pf.s[:num_tokens]),
+                    (pf.a[:num_tokens], a_scale),
                     (w, ws),
                     pf.o[:num_tokens],
                 )

@@ -411,17 +411,6 @@ def main():
     pkg = cfg["package_name"]
     sys.path.insert(0, cfg["project_root"])
 
-    if cfg.get("pytorch_reference", False):
-        from fastkernels.infra.kernel_swapper import (
-            apply_candidates,
-            discover_references,
-            print_reference_summary,
-        )
-        references = discover_references()
-        if references:
-            print_reference_summary(references)
-            apply_candidates(references)
-
     try:
         eng_mod = __import__(f"{pkg}.infra.diffusion_engine", fromlist=["DiffusionEngine"])
     except (ImportError, ModuleNotFoundError):
@@ -548,17 +537,6 @@ def main():
     with open(sys.argv[1]) as f:
         cfg = json.load(f)
     sys.path.insert(0, cfg["project_root"])
-
-    if cfg.get("pytorch_reference", False):
-        from fastkernels.infra.kernel_swapper import (
-            apply_candidates,
-            discover_references,
-            print_reference_summary,
-        )
-        references = discover_references()
-        if references:
-            print_reference_summary(references)
-            apply_candidates(references)
 
     try:
         from fastkernels.infra.diffusion_engine import DiffusionEngine
@@ -1078,17 +1056,6 @@ def main():
         cfg = json.load(f)
     pkg = cfg["package_name"]
     sys.path.insert(0, cfg["project_root"])
-
-    if cfg.get("pytorch_reference", False):
-        from fastkernels.infra.kernel_swapper import (
-            apply_candidates,
-            discover_references,
-            print_reference_summary,
-        )
-        references = discover_references()
-        if references:
-            print_reference_summary(references)
-            apply_candidates(references)
 
     try:
         cosyvoice_mod = __import__(
@@ -1954,10 +1921,6 @@ def main():
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--skip-vllm-omni", action="store_true",
                         help="Skip vllm-omni (no correctness comparison)")
-    parser.add_argument(
-        "--pytorch-reference", action="store_true", default=False,
-        help="Patch semantic PyTorch references from tasks/reference/L*/ into fastkernels.",
-    )
     parser.add_argument("--skip-throughput", action="store_true",
                         help="Skip throughput phase (run latency only)")
     parser.add_argument("--skip-latency", action="store_true",
@@ -2023,7 +1986,6 @@ def _run_flux(args, gpu_name: str):
         **base_config,
         "scenarios": scenarios,
         "latency_scenarios": latency_scenarios,
-        "pytorch_reference": args.pytorch_reference,
     }
     if kb_latent_dir:
         kb_config["latent_dir"] = kb_latent_dir
@@ -2105,7 +2067,6 @@ def _run_hunyuan(args, gpu_name: str):
         **base_config,
         "scenarios": scenarios,
         "latency_scenarios": latency_scenarios,
-        "pytorch_reference": args.pytorch_reference,
     }
     if kb_frames_dir:
         kb_config["frames_dir"] = kb_frames_dir
@@ -2194,7 +2155,6 @@ def _run_tts(args, gpu_name: str):
         "scenarios": scenarios,
         "latency_scenarios": latency_scenarios,
         "audio_dir": kb_audio_dir,
-        "pytorch_reference": args.pytorch_reference,
     }
     kb_data = run_worker(
         FASTKERNELS_TTS_WORKER, kb_config,

@@ -600,17 +600,6 @@ def main():
     sys.path.insert(0, cfg["project_root"])
     pkg = cfg["package_name"]
 
-    if cfg.get("pytorch_reference", False):
-        from fastkernels.infra.kernel_swapper import (
-            apply_candidates,
-            discover_references,
-            print_reference_summary,
-        )
-        references = discover_references()
-        if references:
-            print_reference_summary(references)
-            apply_candidates(references)
-
     mod = __import__(
         f"{pkg}.infra.fla_engine",
         fromlist=["FLAEngine", "SamplingParams"],
@@ -773,10 +762,6 @@ def main():
                         help="Max tokens per batched prefill forward.")
     parser.add_argument("--skip-fla", action="store_true",
                         help="Skip the FLA reference (fastkernels only)")
-    parser.add_argument(
-        "--pytorch-reference", action="store_true", default=False,
-        help="Patch semantic PyTorch references from tasks/reference/L*/ into fastkernels.",
-    )
     parser.add_argument("--skip-throughput", action="store_true")
     parser.add_argument("--skip-latency", action="store_true")
     parser.add_argument("--latency-iters", type=int, default=5,
@@ -920,7 +905,6 @@ def main():
     kb_cfg["package_name"] = _PACKAGE_DIR.name
     kb_cfg["max_num_seqs"] = args.max_num_seqs
     kb_cfg["chunked_prefill_size"] = args.chunked_prefill_size
-    kb_cfg["pytorch_reference"] = args.pytorch_reference
     kb_raw = run_worker(
         FASTKERNELS_FLA_WORKER, kb_cfg,
         f"fastkernels FLAEngine [{short_name}] all scenarios",

@@ -362,17 +362,6 @@ def main():
     sys.path.insert(0, cfg["project_root"])
     pkg = cfg["package_name"]
 
-    if cfg.get("pytorch_reference", False):
-        from fastkernels.infra.kernel_swapper import (
-            apply_candidates,
-            discover_references,
-            print_reference_summary,
-        )
-        references = discover_references()
-        if references:
-            print_reference_summary(references)
-            apply_candidates(references)
-
     kb_module = cfg["kb_module"]
     kb_class = cfg["kb_class"]
     timm_name = cfg["timm_name"]
@@ -597,10 +586,6 @@ def main():
         "--skip-timm", action="store_true",
         help="Skip timm reference; only benchmark fastkernels (no correctness)",
     )
-    parser.add_argument(
-        "--pytorch-reference", action="store_true", default=False,
-        help="Patch semantic PyTorch references from tasks/reference/L*/ into fastkernels.",
-    )
     parser.add_argument("--skip-throughput", action="store_true")
     parser.add_argument("--skip-latency", action="store_true")
     parser.add_argument(
@@ -715,7 +700,6 @@ def main():
         **base_config,
         "scenarios": scenarios,
         "latency_scenarios": latency_scenarios,
-        "pytorch_reference": args.pytorch_reference,
     }
     if kb_embed_dir:
         kb_config["embed_dir"] = kb_embed_dir

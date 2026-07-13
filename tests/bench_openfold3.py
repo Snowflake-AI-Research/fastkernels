@@ -640,17 +640,6 @@ def main():
     pkg = cfg["package_name"]
     engine_label = cfg.get("engine_label", "engine")
 
-    if cfg.get("pytorch_reference", False):
-        from fastkernels.infra.kernel_swapper import (
-            apply_candidates,
-            discover_references,
-            print_reference_summary,
-        )
-        references = discover_references()
-        if references:
-            print_reference_summary(references)
-            apply_candidates(references)
-
     seed = cfg.get("seed", 42)
     import random as _random
     _random.seed(seed)
@@ -943,10 +932,6 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--skip-reference", action="store_true",
                         help="Skip reference openfold3 (fastkernels only)")
-    parser.add_argument(
-        "--pytorch-reference", action="store_true", default=False,
-        help="Patch semantic PyTorch references from tasks/reference/L*/ into fastkernels.",
-    )
     parser.add_argument("--skip-throughput", action="store_true")
     parser.add_argument("--skip-latency", action="store_true")
     parser.add_argument("--latency-iters", type=int, default=3)
@@ -1044,7 +1029,6 @@ def main():
     kb_config = {
         **base_config,
         "engine_label": "fastkernels",
-        "pytorch_reference": args.pytorch_reference,
     }
     kb_raw = run_worker(
         FASTKERNELS_OF3_WORKER, kb_config,

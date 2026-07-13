@@ -244,6 +244,7 @@ FULL_BENCHMARK: list[BenchmarkScenario] = [
     BenchmarkScenario("FunAudioLLM/Fun-CosyVoice3-0.5B-2512", 1, "bfloat16", _TTS_ALL),
     # --- Multimodal & Encoders ---
     BenchmarkScenario("Qwen/Qwen2-VL-7B-Instruct", 1, "bfloat16", _VLM_ALL),
+    BenchmarkScenario("Qwen/Qwen3-VL-8B-Instruct-FP8", 1, "fp8", _VLM_ALL),
     BenchmarkScenario("Qwen/Qwen3-VL-235B-A22B-Instruct-FP8", 4, "fp8", _VLM_ALL),
     BenchmarkScenario("Qwen/Qwen2.5-Omni-7B", 1, "bfloat16", _OMNI_ALL),
     BenchmarkScenario("google/siglip2-so400m-patch16-naflex", 1, "bfloat16", _VISION_ENCODER_ALL),
