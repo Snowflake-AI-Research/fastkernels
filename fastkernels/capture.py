@@ -179,6 +179,15 @@ def _summarize(value, depth: int = 0):
         desc = {"shape": list(value.shape), "dtype": _dtype_name(value.dtype)}
         if value.device.type != "cuda" or value.device.index not in (0, None):
             desc["device"] = str(value.device)
+        # Record the stride only when the tensor is *not* contiguous, so a
+        # non-standard memory layout (e.g. a column-major / TMA-aligned FP8
+        # scale, a transposed weight) can be faithfully re-materialized by a
+        # consumer. Contiguous tensors omit it and are assumed row-major.
+        try:
+            if not value.is_contiguous():
+                desc["stride"] = list(value.stride())
+        except (RuntimeError, NotImplementedError):
+            pass
         return desc
     if isinstance(value, torch.dtype):
         return {"dtype": _dtype_name(value)}

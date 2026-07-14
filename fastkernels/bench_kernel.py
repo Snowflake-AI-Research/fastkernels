@@ -408,18 +408,37 @@ def _iter_tensor_specs(obj):
 # ---------------------------------------------------------------------------
 # Input materialization.
 # ---------------------------------------------------------------------------
-def _materialize_tensor(name: str, shape, dtype_str: str, device: str, init_args: dict):
+def _contiguous_stride(shape: tuple) -> tuple:
+    stride, acc = [], 1
+    for s in reversed(shape):
+        stride.append(acc)
+        acc *= s
+    return tuple(reversed(stride))
+
+
+def _materialize_tensor(name: str, shape, dtype_str: str, device: str, init_args: dict,
+                        stride=None):
     dt = getattr(torch, dtype_str, None)
     if not isinstance(dt, torch.dtype):
         raise _UnsupportedInput(f"{name}: unknown dtype {dtype_str!r}")
     shape = tuple(int(s) for s in shape)
     if dt in _FP8_TYPES:
-        return torch.randn(shape, device=device, dtype=torch.float32).clamp_(-2, 2).to(dt)
-    if dt.is_floating_point:
-        return torch.randn(shape, device=device, dtype=dt)
-    if dt == torch.bool:
-        return torch.randint(0, 2, shape, device=device, dtype=torch.bool)
-    return _materialize_int(name, shape, dt, device, init_args)
+        t = torch.randn(shape, device=device, dtype=torch.float32).clamp_(-2, 2).to(dt)
+    elif dt.is_floating_point:
+        t = torch.randn(shape, device=device, dtype=dt)
+    elif dt == torch.bool:
+        t = torch.randint(0, 2, shape, device=device, dtype=torch.bool)
+    else:
+        t = _materialize_int(name, shape, dt, device, init_args)
+    # Honor a captured non-contiguous layout (e.g. a column-major FP8 scale):
+    # allocate with the recorded strides and copy the values in.
+    if stride is not None:
+        stride = tuple(int(s) for s in stride)
+        if stride != _contiguous_stride(shape):
+            strided = torch.empty_strided(shape, stride, dtype=t.dtype, device=device)
+            strided.copy_(t)
+            return strided
+    return t
 
 
 def _materialize_int(name: str, shape, dt: torch.dtype, device: str, init_args: dict):
@@ -460,7 +479,8 @@ def _materialize_value(name: str, v, device: str, init_args: dict):
                 for i, x in enumerate(v)]
     if isinstance(v, dict):
         if isinstance(v.get("dtype"), str) and isinstance(v.get("shape"), list):
-            return _materialize_tensor(name, v["shape"], v["dtype"], device, init_args)
+            return _materialize_tensor(name, v["shape"], v["dtype"], device, init_args,
+                                       stride=v.get("stride"))
         # A bare torch.dtype summary, e.g. {"dtype": "bfloat16"}.
         if set(v) == {"dtype"} and isinstance(v["dtype"], str):
             dt = getattr(torch, v["dtype"], None)
@@ -541,6 +561,85 @@ def _build_call(cls: type, fwd_args: dict, device: str, init_args: dict):
             call_kwargs[p.name] = val
     _fix_structured_inputs(call_kwargs)
     return call_args, call_kwargs
+
+
+# ---------------------------------------------------------------------------
+# Per-operator input builders (registry).
+#
+# Some operators take *pre-quantized* tensors whose values, dtype AND memory
+# layout are tied together by a quantization scheme -- e.g. a block-scaled FP8
+# GEMM wants an fp8 weight plus a UE8M0, column-major (``stride(-2)==1``) scale.
+# The generic shape/dtype materializer cannot synthesize a valid (weight, scale)
+# pair, so for those ops we register a builder that generates a fresh reference
+# bf16 weight and quantizes it with the *same* routine the model uses. Weights
+# stay fresh-random and are shared identically by baseline + candidate (built
+# once per round, cloned to each). Everything else falls through to the generic
+# ``_build_call``.
+# ---------------------------------------------------------------------------
+def _fp8_block_quant_weight(N: int, K: int, device: str):
+    """Random reference weight -> ``(weight_fp8[N,K], weight_scale_inv)`` in the
+    UE8M0 column-major layout ``deep_gemm.fp8_gemm_nt`` expects. Mirrors
+    ``fp8_linear.postprocess_fp8_weights`` but starting from a bf16 reference
+    rather than a checkpoint's fp8 weight."""
+    import deep_gemm
+    from fastkernels.tasks.baseline.L1.fp8_grouped_gemm_contiguous import (
+        _is_deep_gemm_e8m0_used,
+    )
+    from fastkernels.tasks.baseline.L1.fp8_linear import Fp8Linear
+
+    bs = Fp8Linear.BLOCK_SIZE
+    use_ue8m0 = _is_deep_gemm_e8m0_used()
+    w = torch.randn(N, K, device=device, dtype=torch.float32) * 0.02
+    weight_fp8, scale = deep_gemm.per_block_cast_to_fp8(w, use_ue8m0)
+    weight_scale_inv = deep_gemm.transform_sf_into_required_layout(
+        sf=scale.unsqueeze(0), mn=N, k=K, recipe=(1, bs, bs),
+        num_groups=1, is_sfa=False, disable_ue8m0_cast=not use_ue8m0,
+    ).squeeze(0)
+    return weight_fp8, weight_scale_inv
+
+
+def _build_fp8_linear_inputs(fwd_args, device, init_args):
+    """Inputs for ``Fp8Linear.forward(input_bf16, weight_fp8, weight_scale_inv,
+    bias)``. The captured shapes fix M/K/N; the fp8 weight + scale are derived
+    by quantizing a reference weight (the captured weight_scale_inv shape/dtype
+    is intentionally ignored -- it is a packed, layout-specific artifact)."""
+    def _shape(key):
+        spec = fwd_args.get(key)
+        if not (isinstance(spec, dict) and isinstance(spec.get("shape"), list)):
+            raise _UnsupportedInput(f"Fp8Linear: missing tensor arg {key!r}")
+        return [int(s) for s in spec["shape"]]
+
+    in_shape = _shape("input_bf16")
+    N, wK = _shape("weight_fp8")
+    if wK != in_shape[-1]:
+        raise _UnsupportedInput(f"Fp8Linear: weight K={wK} != input K={in_shape[-1]}")
+    input_bf16 = torch.randn(in_shape, device=device, dtype=torch.bfloat16)
+    weight_fp8, weight_scale_inv = _fp8_block_quant_weight(N, in_shape[-1], device)
+    bias = None
+    bspec = fwd_args.get("bias")
+    if isinstance(bspec, dict) and isinstance(bspec.get("shape"), list):
+        bias = torch.randn([int(s) for s in bspec["shape"]], device=device,
+                           dtype=torch.bfloat16)
+    return [], {"input_bf16": input_bf16, "weight_fp8": weight_fp8,
+                "weight_scale_inv": weight_scale_inv, "bias": bias}
+
+
+# qualname -> builder(fwd_args, device, init_args) -> (args, kwargs).
+_INPUT_BUILDERS = {
+    "fastkernels.tasks.baseline.L1.fp8_linear:Fp8Linear": _build_fp8_linear_inputs,
+    # Grouped-GEMM (Fp8GroupedGemmContiguous / fused_experts) and MLA fp8 ops
+    # slot in here with the same reference-quantize approach; deferred until
+    # there are captures for those models (DeepSeek / Kimi) to validate against.
+}
+
+
+def _make_call(op: "Operator", cls: type, fwd_args: dict, device: str, init_args: dict):
+    """Materialize forward inputs: an operator-specific builder if one is
+    registered for the op, else the generic shape/dtype materializer."""
+    builder = _INPUT_BUILDERS.get(op.qualname)
+    if builder is not None:
+        return builder(fwd_args, device, init_args)
+    return _build_call(cls, fwd_args, device, init_args)
 
 
 # ---------------------------------------------------------------------------
@@ -643,7 +742,7 @@ def _compare(out, ref, check_dtype: bool):
 _CRITICAL_NAMES = [
     "_time_module", "_compare", "_compare_tensor", "_run_forward",
     "_check_monkey_patch", "_check_threads", "_check_lazy_outputs",
-    "_check_integrity", "_build_call", "_materialize_value",
+    "_check_integrity", "_make_call", "_build_call", "_materialize_value",
 ]
 
 
@@ -690,32 +789,43 @@ def _l2_flush_buffer(device: str) -> torch.Tensor:
 class _ShiftingPool:
     """Distinct ``data_ptr`` per iteration with ~1x memory and no in-loop malloc.
 
-    Each source tensor gets one flat pool sized ``span + (iters-1)*step``; call
-    ``i`` copies the (pristine) source into ``pool[i*step : i*step+span]`` and
-    returns a view there, so consecutive iterations only shift the base address.
-    Copying from a private clone means in-place kernels never corrupt later
-    iterations. Adapted from SOL-ExecBench's ``ShiftingMemoryPoolAllocator``.
+    Each *contiguous* source tensor gets one flat pool sized ``span +
+    (iters-1)*step``; call ``i`` copies the (pristine) source into
+    ``pool[i*step : i*step+span]`` and returns a view there, so consecutive
+    iterations only shift the base address. Copying from a private clone means
+    in-place kernels never corrupt later iterations. Adapted from
+    SOL-ExecBench's ``ShiftingMemoryPoolAllocator``.
+
+    Non-contiguous tensors (e.g. a column-major / TMA-aligned FP8 scale) are
+    passed through unchanged -- copying them into a contiguous pool slot would
+    destroy the layout the kernel requires. These are read-only weights/scales,
+    so reusing the same tensor across iterations is correct.
     """
 
     def __init__(self, tensors: list[torch.Tensor], total: int):
-        self.entries = []
+        self.entries = []  # ("pool", pool, src, span, step, shape) | ("keep", tensor)
         self.total = total
         self.i = 0
         for t in tensors:
-            t = t.contiguous()
+            if not t.is_contiguous():
+                self.entries.append(("keep", t))
+                continue
             step = max(1, 256 // t.element_size())
             span = t.numel()
             pool = torch.empty(span + (total - 1) * step, dtype=t.dtype, device=t.device)
             src = t.reshape(-1).clone()
-            self.entries.append((pool, src, span, step, tuple(t.shape)))
+            self.entries.append(("pool", pool, src, span, step, tuple(t.shape)))
 
     def next(self) -> list[torch.Tensor]:
         idx = min(self.i, self.total - 1)
         self.i += 1
         out = []
-        for pool, src, span, step, shape in self.entries:
-            off = idx * step
-            slot = pool.narrow(0, off, span)
+        for entry in self.entries:
+            if entry[0] == "keep":
+                out.append(entry[1])
+                continue
+            _, pool, src, span, step, shape = entry
+            slot = pool.narrow(0, idx * step, span)
             slot.copy_(src)
             out.append(slot.view(shape))
         return out
@@ -906,7 +1016,7 @@ def _bench_one_case(op: Operator, baseline_cls, candidate_cls, case: dict,
     for r in range(rounds):
         torch.manual_seed(seed + r)
         try:
-            base_call = _build_call(baseline_cls, fwd_args, device, init_args)
+            base_call = _make_call(op, baseline_cls, fwd_args, device, init_args)
         except _UnsupportedInput as exc:
             res.detail = f"skip: {exc}"
             return res
@@ -954,7 +1064,7 @@ def _bench_one_case(op: Operator, baseline_cls, candidate_cls, case: dict,
     # 4) Timing: candidate (guarded) and baseline (trusted) -> speedup.
     torch.manual_seed(seed)
     try:
-        base_call = _build_call(baseline_cls, fwd_args, device, init_args)
+        base_call = _make_call(op, baseline_cls, fwd_args, device, init_args)
         threads_before = threading.active_count()
         res.candidate_ms = _time_module(candidate, base_call, warmup, iters, device)
         _check_threads(threads_before, threading.active_count())
