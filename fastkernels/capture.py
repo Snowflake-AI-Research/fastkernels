@@ -39,6 +39,8 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import dataclasses
+import enum
 import functools
 import gc
 import importlib
@@ -222,8 +224,240 @@ def _summarize_call(sig, args, kwargs) -> dict:
         }
 
 
+# ---------------------------------------------------------------------------
+# Construction recipes
+#
+# ``_summarize`` (above) produces compact shape/dtype metadata for the batch-
+# schedule verification; it deliberately collapses a config object to
+# ``{"object": "LlamaConfig"}``. A *recipe* is the complementary representation
+# used to *reconstruct* an operator's ``__init__`` args offline (for a per-
+# operator benchmark): it preserves class identity + values.
+#
+#   dataclass          -> {"$dataclass": "mod:Cls", "fields": {name: recipe}}
+#   torch.dtype        -> {"$dtype": "bfloat16"}
+#   torch.Tensor       -> {"$tensor": {"shape": [...], "dtype": "bfloat16"}}
+#   Enum               -> {"$enum": "mod:Cls", "value": recipe}
+#   list               -> [recipe, ...]        tuple -> {"$tuple": [recipe, ...]}
+#   dict               -> {"$dict": {k: recipe}}
+#   nn.Module (a captured operator) -> {"$op_ref": {"op": "mod:Cls",
+#                                                    "init_variant_id": i}}
+#   int/float/bool/str/None -> stored verbatim
+#   anything else (a runtime handle: process group, quant method, ...)
+#                            -> {"$opaque": "TypeName"}   (a runner skips these)
+#
+# Marker keys are ``$``-prefixed and every plain dict is wrapped in ``$dict``,
+# so a value recipe is unambiguous (a scalar, a list, or a one-``$``-key dict).
+# Reconstruction lives here too (``reconstruct`` / ``reconstruct_op``) so the
+# format and its inverse stay together; a benchmark imports them from
+# ``fastkernels.capture``.
+# ---------------------------------------------------------------------------
+class ReconstructError(RuntimeError):
+    """A recipe could not be turned back into a live value/module."""
+
+
+_RECIPE_MAX_DEPTH = 8
+_RECIPE_MAX_STR = 8192
+
+
+def _type_qual(cls: type) -> str:
+    """Import-resolvable ``module:QualName`` (handles nested class defs)."""
+    return f"{cls.__module__}:{cls.__qualname__}"
+
+
+def _op_qual(cls: type) -> str:
+    """``module:Name`` matching the keys ``_record`` uses for operators."""
+    return f"{cls.__module__}:{cls.__name__}"
+
+
+def _encode_arg(value, depth: int = 0):
+    """Encode one value into a JSON-serializable, reconstructable recipe."""
+    try:
+        if depth > _RECIPE_MAX_DEPTH:
+            return {"$opaque": "depth-exceeded"}
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        if isinstance(value, str):
+            return value if len(value) <= _RECIPE_MAX_STR else {"$opaque": "str-too-long"}
+        if isinstance(value, torch.dtype):
+            return {"$dtype": _dtype_name(value)}
+        if isinstance(value, torch.Tensor):
+            return {"$tensor": {"shape": list(value.shape),
+                                "dtype": _dtype_name(value.dtype)}}
+        if isinstance(value, enum.Enum):
+            return {"$enum": _type_qual(type(value)),
+                    "value": _encode_arg(value.value, depth + 1)}
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            return {"$dataclass": _type_qual(type(value)),
+                    "fields": {f.name: _encode_arg(getattr(value, f.name), depth + 1)
+                               for f in dataclasses.fields(value) if f.init}}
+        if isinstance(value, list):
+            return [_encode_arg(v, depth + 1) for v in value]
+        if isinstance(value, tuple):
+            return {"$tuple": [_encode_arg(v, depth + 1) for v in value]}
+        if isinstance(value, dict):
+            return {"$dict": {str(k): _encode_arg(v, depth + 1)
+                              for k, v in value.items()}}
+        if isinstance(value, nn.Module):
+            # A submodule built by an instrumented operator carries its init
+            # tag; reference it so the runner rebuilds it from its own recipe.
+            init_key = getattr(value, "_fk_init_key", None)
+            if init_key is not None:
+                return {"$op_ref": {"op": _op_qual(type(value)), "init_key": init_key}}
+            return {"$opaque": _op_qual(type(value))}
+        return {"$opaque": _op_qual(type(value))}
+    except Exception:
+        return {"$opaque": "encode-error"}
+
+
+def _encode_init_call(sig, args, kwargs) -> dict:
+    """Encode an ``__init__`` call as ``{param_name: recipe}`` (``self`` dropped)."""
+    if sig is None:
+        return {"_args": [_encode_arg(v) for v in args[1:]]}
+    try:
+        bound = sig.bind(*args, **kwargs)
+        bound.apply_defaults()
+        out: dict = {}
+        for name, val in bound.arguments.items():
+            if name == "self":
+                continue
+            param = sig.parameters.get(name)
+            if param is not None and param.kind is inspect.Parameter.VAR_KEYWORD:
+                out["__varkw__"] = {str(k): _encode_arg(v) for k, v in val.items()}
+            elif param is not None and param.kind is inspect.Parameter.VAR_POSITIONAL:
+                out["__varargs__"] = [_encode_arg(v) for v in val]
+            else:
+                out[name] = _encode_arg(val)
+        return out
+    except Exception:
+        return {"_args": [_encode_arg(v) for v in args[1:]]}
+
+
+def _translate_op_refs(recipe, resolve):
+    """Copy *recipe* with each ``$op_ref`` init_key replaced by the resolved
+    ``init_variant_id`` (``resolve(op_qualname, init_key) -> int``)."""
+    if isinstance(recipe, list):
+        return [_translate_op_refs(x, resolve) for x in recipe]
+    if isinstance(recipe, dict):
+        if "$op_ref" in recipe:
+            ref = recipe["$op_ref"]
+            return {"$op_ref": {"op": ref["op"],
+                                "init_variant_id": resolve(ref["op"], ref.get("init_key"))}}
+        return {k: _translate_op_refs(v, resolve) for k, v in recipe.items()}
+    return recipe
+
+
+def is_reconstructable(recipe, operators=None, _seen=None) -> bool:
+    """True if *recipe* has no ``$opaque`` nodes and every ``$op_ref`` resolves.
+
+    Pass a report's ``operators`` dict to also recurse through op references;
+    without it a resolvable ``$op_ref`` is assumed buildable.
+    """
+    if isinstance(recipe, list):
+        return all(is_reconstructable(x, operators, _seen) for x in recipe)
+    if isinstance(recipe, dict):
+        if "$opaque" in recipe:
+            return False
+        if "$op_ref" in recipe:
+            ref = recipe["$op_ref"]
+            vid = ref.get("init_variant_id", -1)
+            if vid < 0:
+                return False
+            if operators is None:
+                return True
+            seen = _seen or set()
+            tag = (ref["op"], vid)
+            if tag in seen:
+                return True
+            try:
+                sub = operators[ref["op"]]["init"]["variants"][vid]["args"]
+            except (KeyError, IndexError, TypeError):
+                return False
+            return is_reconstructable(sub, operators, seen | {tag})
+        return all(is_reconstructable(v, operators, _seen) for v in recipe.values())
+    return True
+
+
+def _import_symbol(qual: str):
+    module_name, _, name = qual.partition(":")
+    obj = importlib.import_module(module_name)
+    for part in name.split("."):
+        obj = getattr(obj, part)
+    return obj
+
+
+def reconstruct(recipe, *, operators=None, device="cpu"):
+    """Turn a value recipe back into a live value (tensors are zero-filled)."""
+    if recipe is None or isinstance(recipe, (bool, int, float, str)):
+        return recipe
+    if isinstance(recipe, list):
+        return [reconstruct(x, operators=operators, device=device) for x in recipe]
+    if not isinstance(recipe, dict):
+        raise ReconstructError(f"unexpected recipe node: {type(recipe).__name__}")
+    if "$dtype" in recipe:
+        return getattr(torch, recipe["$dtype"])
+    if "$tensor" in recipe:
+        spec = recipe["$tensor"]
+        return torch.zeros(spec["shape"], dtype=getattr(torch, spec["dtype"]),
+                           device=device)
+    if "$tuple" in recipe:
+        return tuple(reconstruct(x, operators=operators, device=device)
+                     for x in recipe["$tuple"])
+    if "$dict" in recipe:
+        return {k: reconstruct(v, operators=operators, device=device)
+                for k, v in recipe["$dict"].items()}
+    if "$enum" in recipe:
+        return _import_symbol(recipe["$enum"])(
+            reconstruct(recipe["value"], operators=operators, device=device))
+    if "$dataclass" in recipe:
+        cls = _import_symbol(recipe["$dataclass"])
+        return cls(**{k: reconstruct(v, operators=operators, device=device)
+                      for k, v in recipe["fields"].items()})
+    if "$op_ref" in recipe:
+        ref = recipe["$op_ref"]
+        vid = ref.get("init_variant_id", -1)
+        if operators is None or vid < 0:
+            raise ReconstructError(f"unresolvable op_ref: {ref!r}")
+        return reconstruct_op(ref["op"], vid, operators, device=device)
+    if "$opaque" in recipe:
+        raise ReconstructError(f"opaque init arg: {recipe['$opaque']}")
+    raise ReconstructError(f"unknown recipe marker: {sorted(recipe)[:1]}")
+
+
+def _reconstruct_init_call(call: dict, *, operators=None, device="cpu"):
+    """Return ``(args, kwargs)`` for a constructor from an encoded init call."""
+    if "_args" in call:
+        return ([reconstruct(v, operators=operators, device=device)
+                 for v in call["_args"]], {})
+    args = [reconstruct(v, operators=operators, device=device)
+            for v in call.get("__varargs__", [])]
+    varkw = {k: reconstruct(v, operators=operators, device=device)
+             for k, v in call.get("__varkw__", {}).items()}
+    named = {k: reconstruct(v, operators=operators, device=device)
+             for k, v in call.items() if k not in ("__varargs__", "__varkw__")}
+    return (args, {**named, **varkw})
+
+
+def reconstruct_op(qualname: str, init_variant_id: int, operators: dict,
+                   *, device: str = "cpu") -> nn.Module:
+    """Instantiate operator *qualname* from its ``init_variant_id`` recipe.
+
+    *operators* is a capture report's ``operators`` dict. Submodule ``$op_ref``
+    args are rebuilt recursively. Raises :class:`ReconstructError` if the recipe
+    is opaque/unresolvable. Tensor args are zero-filled and weights are freshly
+    initialized -- fine for perf benchmarking, not numerical golden checks.
+    """
+    try:
+        recipe = operators[qualname]["init"]["variants"][init_variant_id]["args"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ReconstructError(
+            f"no init variant {init_variant_id} for {qualname}") from exc
+    cls = _import_symbol(qualname)
+    args, kwargs = _reconstruct_init_call(recipe, operators=operators, device=device)
+    return cls(*args, **kwargs)
+
+
 def _record(qualname: str, module_name: str, class_name: str,
-            method: str, call_summary: dict) -> None:
+            method: str, call_summary: dict, init_key: str | None = None) -> str:
     entry = _RECORDS.setdefault(qualname, {"init": None, "forward": None})
     slot = entry[method]
     if slot is None:
@@ -235,9 +469,19 @@ def _record(qualname: str, module_name: str, class_name: str,
     key = json.dumps(call_summary, sort_keys=True, default=str)
     variant = slot["variants"].get(key)
     if variant is None:
-        slot["variants"][key] = {"count": 1, "args": call_summary}
+        variant = slot["variants"][key] = {"count": 1, "args": call_summary}
     else:
         variant["count"] += 1
+    # For a ``forward`` call, remember which ``__init__`` variant built the
+    # instance it ran on (``init_key``, the instance's ``_fk_init_key`` tag set
+    # in ``_wrap_method``). This pairs each forward variant with the init args
+    # needed to construct a benchmarkable module -- ``_build_report`` turns these
+    # keys into ``init_variant_ids``. O(1) per call; ``entry["forward"] = None``
+    # between workloads clears it, so no extra reset bookkeeping is needed.
+    if method == "forward" and init_key is not None:
+        init_keys = variant.setdefault("init_keys", {})
+        init_keys[init_key] = init_keys.get(init_key, 0) + 1
+    return key
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +504,7 @@ def _wrap_method(cls, method_name: str):
 
     @functools.wraps(raw)
     def wrapper(*args, **kwargs):
+        tag_instance = None
         try:
             # Attribute the call to the *actual* instance class, so a subclass
             # that inherits this (unwrapped) method is recorded under its own
@@ -270,15 +515,41 @@ def _wrap_method(cls, method_name: str):
             # in the hook, producing a spurious verification mismatch.
             inst_cls = type(args[0]) if args and isinstance(args[0], cls) else cls
             q = f"{inst_cls.__module__}:{inst_cls.__name__}"
-            summary = (
-                _summarize_call(sig, args, kwargs)
-                if sig is not None
-                else {"_args": [_summarize(v) for v in args[1:]]}
+            # ``init`` is recorded as a reconstructable *recipe* (so distinct
+            # configs become distinct variants and each can be rebuilt offline);
+            # ``forward`` keeps the compact shape/dtype summary the batch-
+            # schedule verification compares against the hook records.
+            if record_key == "init":
+                payload = _encode_init_call(sig, args, kwargs)
+            elif sig is not None:
+                payload = _summarize_call(sig, args, kwargs)
+            else:
+                payload = {"_args": [_summarize(v) for v in args[1:]]}
+            # On ``forward``, look up which ``__init__`` variant built this
+            # instance so the call is attributed to those init args.
+            init_key = (
+                getattr(args[0], "_fk_init_key", None)
+                if record_key == "forward" and args else None
             )
-            _record(q, inst_cls.__module__, inst_cls.__name__, record_key, summary)
+            key = _record(q, inst_cls.__module__, inst_cls.__name__,
+                          record_key, payload, init_key=init_key)
+            if record_key == "init" and args:
+                # Defer tagging until after the real ``__init__`` runs (below):
+                # the instance is then fully constructed, and for a subclass
+                # whose ``super().__init__()`` is itself wrapped this records the
+                # outermost (most-derived) init variant, not the base's.
+                tag_instance = (args[0], key)
         except Exception:
             pass
-        return raw(*args, **kwargs)
+        result = raw(*args, **kwargs)
+        if tag_instance is not None:
+            # A plain str -- not registered as a parameter/buffer/submodule by
+            # ``nn.Module.__setattr__``.
+            try:
+                tag_instance[0]._fk_init_key = tag_instance[1]
+            except Exception:
+                pass
+        return result
 
     wrapper._fk_captured = True
     setattr(cls, method_name, wrapper)
@@ -933,19 +1204,41 @@ def _build_report(model_name: str, workload: str, dtype: torch.dtype,
                   max_batch_size: int, num_classes: int,
                   generation: dict, verification: dict) -> dict:
     operators = {}
+    # Global map ``qualname -> {init variant key -> index}`` used to (a) point
+    # each forward variant at the init variant(s) that built its instances
+    # (``init_variant_ids``) and (b) resolve ``$op_ref`` submodule references to
+    # a concrete ``init_variant_id`` in the referenced operator.
+    init_key_index = {
+        q: {k: i for i, k in enumerate(e["init"]["variants"])}
+        for q, e in _RECORDS.items() if e.get("init")
+    }
+
+    def _resolve_ref(op_qualname, init_key):
+        return init_key_index.get(op_qualname, {}).get(init_key, -1)
+
     for qualname, entry in sorted(_RECORDS.items()):
         out_entry = {}
+        this_index = init_key_index.get(qualname, {})
         for method in ("init", "forward"):
             slot = entry[method]
             if slot is None:
                 continue
-            out_entry[method] = {
-                "calls": slot["calls"],
-                "variants": [
-                    {"count": v["count"], "args": v["args"]}
-                    for v in slot["variants"].values()
-                ],
-            }
+            variants = []
+            for v in slot["variants"].values():
+                if method == "init":
+                    # Emit the reconstruction recipe, resolving submodule
+                    # ``$op_ref``s to concrete init_variant_ids.
+                    out_v = {"count": v["count"],
+                             "args": _translate_op_refs(v["args"], _resolve_ref)}
+                else:
+                    # Pair each forward variant with the init variant(s) that
+                    # built the instances it ran on (empty if init not captured).
+                    out_v = {"count": v["count"], "args": v["args"],
+                             "init_variant_ids": sorted(
+                                 this_index[k] for k in v.get("init_keys", {})
+                                 if k in this_index)}
+                variants.append(out_v)
+            out_entry[method] = {"calls": slot["calls"], "variants": variants}
         operators[qualname] = out_entry
 
     return {
@@ -1034,6 +1327,24 @@ def _report_path(output_arg, scenario, workload: str, multi: bool, num_requests:
         p = Path(output_arg)
         return p.with_name(f"{p.stem}_{slug}{p.suffix}") if multi else p
     return CAPTURE_DIR / f"{slug}.json"
+
+
+def _purge_stale_reports(scenario, runs, args, multi: bool) -> None:
+    """Delete any pre-existing report file for each of this scenario's workloads.
+
+    Called when a scenario's capture starts so that an interrupted or crashing
+    run leaves *no* file for an unfinished workload -- rather than a previous
+    run's file, which could be mistaken for a fresh result. Each workload that
+    completes rewrites its own report afterward.
+    """
+    for wl_label, _wl in runs:
+        path = _report_path(args.output, scenario, wl_label, multi, args.num_requests)
+        try:
+            if path.exists():
+                path.unlink()
+                print(f"  (removed stale report {path.name})")
+        except OSError as exc:  # noqa: BLE001 - a stale file we can't delete is non-fatal
+            print(f"  (warning: could not remove stale report {path}: {exc})")
 
 
 # NOTE: ``_prepare_prompts`` supported the removed ``--prompt`` ad-hoc override
@@ -1819,6 +2130,10 @@ def _capture_scenario(scenario, runs, args, LlamaEngine, SamplingParams,
     The engine is always released before returning so the next (possibly larger)
     model has room on the GPU.
     """
+    # Remove any stale report(s) for this scenario up front: an interrupted or
+    # crashing capture then leaves no file for an unfinished workload, rather
+    # than a previous run's file that could be mistaken for a fresh result.
+    _purge_stale_reports(scenario, runs, args, multi)
     if _is_eagle3(scenario):
         # EAGLE-3 uses a distinct engine (target + speculative draft head).
         return _capture_eagle3_scenario(
