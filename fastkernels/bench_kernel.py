@@ -371,15 +371,61 @@ def _build_modules(op: Operator, baseline_cls: type, candidate_cls: type,
 
 
 def _prepare_module(module: nn.Module, dtype: torch.dtype, device: str) -> nn.Module:
-    """Move to *device*, cast floating parameters to *dtype* (fp16/bf16/fp32
-    only -- never fp8, which the op stores explicitly), and switch to eval."""
+    """Move to *device*, cast **high-precision** floating parameters to *dtype*
+    (fp16/bf16/fp32 only), and switch to eval. FP8 (and other low-bit) params
+    are left untouched -- casting a quantized weight to bf16 would break the
+    kernel that expects it (DeepGEMM asserts the weight is float8_e4m3fn)."""
+    _HIGH_PREC = (torch.float16, torch.bfloat16, torch.float32)
     module = module.to(device)
-    if dtype in (torch.float16, torch.bfloat16, torch.float32):
+    if dtype in _HIGH_PREC:
         for p in module.parameters():
-            if p.is_floating_point() and p.dtype != dtype:
+            if p.dtype in _HIGH_PREC and p.dtype != dtype:
                 p.data = p.data.to(dtype)
     module.eval()
     return module
+
+
+def _init_fp8_module_weights(module: nn.Module) -> None:
+    """Give every FP8 linear submodule a *valid* block-scaled weight.
+
+    Reconstructed fp8 wrapper linears (``ColumnParallelLinear`` etc.) allocate
+    their ``weight``/``weight_scale_inv`` params with ``torch.empty`` and rely on
+    the weight loader to fill + layout-transform them; without that their scale
+    is uninitialized and in the wrong (checkpoint) layout, so the internal
+    DeepGEMM GEMM produces NaN or asserts. Here we regenerate each such param
+    from a reference weight -- exactly like the FP8 input builder does for
+    ``Fp8Linear`` -- so the module runs. Both baseline and candidate are init'd
+    (matching param shapes), then weights are shared via ``load_state_dict``.
+    """
+    from fastkernels.tasks.baseline.L1.fp8_linear import Fp8Linear
+    for sub in module.modules():
+        lin = getattr(sub, "linear_op", None)
+        w = getattr(sub, "weight", None)
+        if (isinstance(lin, Fp8Linear) and isinstance(w, torch.nn.Parameter)
+                and w.dtype == torch.float8_e4m3fn and w.dim() == 2):
+            n, k = w.shape
+            weight_fp8, weight_scale_inv = _fp8_block_quant_weight(n, k, str(w.device))
+            sub.weight = torch.nn.Parameter(weight_fp8, requires_grad=False)
+            sub.weight_scale_inv = torch.nn.Parameter(weight_scale_inv, requires_grad=False)
+
+
+def _sanitize_float_params(module: nn.Module) -> None:
+    """Re-initialize any high-precision float param that is *uninitialized
+    garbage* to a small normal.
+
+    Many modules allocate weights with ``torch.empty`` and rely on a weight
+    loader to fill them; reconstructed fresh, those params hold arbitrary memory
+    (often non-finite or huge), which overflows to NaN once run through e.g.
+    attention. We only touch params that look like garbage (non-finite or
+    extreme magnitude), leaving legitimately-initialized weights (norm ones,
+    embeddings) alone. Applied to baseline + candidate, then shared via
+    ``load_state_dict``."""
+    _HIGH_PREC = (torch.float16, torch.bfloat16, torch.float32)
+    with torch.no_grad():
+        for p in module.parameters():
+            if p.dtype in _HIGH_PREC and p.numel() > 0:
+                if not torch.isfinite(p).all() or p.detach().abs().max().item() > 1e4:
+                    p.normal_(0, 0.02)
 
 
 def _case_dtype(fwd_args: dict) -> torch.dtype:
@@ -514,17 +560,32 @@ def _partition_cu(total: int, nseg: int, device, dtype) -> torch.Tensor:
 def _fix_structured_inputs(kwargs: dict) -> None:
     """Rewrite ``cu_seqlens*`` tensors so they are consistent with the query/key
     row counts of the same call (varlen attention needs a valid partition that
-    sums to the number of tokens). Best-effort, keyed by conventional names.
-    """
-    pairs = [("cu_seqlens_q", "q"), ("cu_seqlens_q", "query"),
-             ("cu_seqlens_k", "k"), ("cu_seqlens_k", "key"),
-             ("cu_seqlens", "q"), ("cu_seqlens", "query"), ("cu_seqlens", "hidden_states")]
-    for cn, qn in pairs:
+    sums to the number of tokens). Best-effort, keyed by conventional activation
+    names -- ``cu_seqlens_q``/``cu_seqlens_k`` pair with q/k, a bare
+    ``cu_seqlens`` pairs with whatever activation is present (``x`` for vision
+    attention, ``hidden_states``/``query`` elsewhere)."""
+    def _activation_for(cu_name: str):
+        if cu_name.endswith("_q"):
+            names = ("q", "query")
+        elif cu_name.endswith("_k"):
+            names = ("k", "key")
+        else:
+            names = ("q", "query", "x", "hidden_states", "key", "k")
+        for n in names:
+            t = kwargs.get(n)
+            if isinstance(t, torch.Tensor) and t.dim() >= 1:
+                return t
+        return None
+
+    for cn in list(kwargs):
+        if cn != "cu_seqlens" and not cn.startswith("cu_seqlens"):
+            continue
         cu = kwargs.get(cn)
-        q = kwargs.get(qn)
-        if (isinstance(cu, torch.Tensor) and cu.dim() == 1 and cu.numel() >= 2
-                and isinstance(q, torch.Tensor) and q.dim() >= 1):
-            kwargs[cn] = _partition_cu(q.shape[0], cu.numel() - 1, cu.device, cu.dtype)
+        if not (isinstance(cu, torch.Tensor) and cu.dim() == 1 and cu.numel() >= 2):
+            continue
+        act = _activation_for(cn)
+        if act is not None:
+            kwargs[cn] = _partition_cu(act.shape[0], cu.numel() - 1, cu.device, cu.dtype)
 
 
 def _build_call(cls: type, fwd_args: dict, device: str, init_args: dict):
@@ -1006,6 +1067,13 @@ def _bench_one_case(op: Operator, baseline_cls, candidate_cls, case: dict,
 
     baseline = _prepare_module(baseline, dtype, device)
     candidate = _prepare_module(candidate, dtype, device)
+    # Give any FP8 linear submodules valid block-scaled weights, and repair any
+    # uninitialized (torch.empty) high-precision weights, on both modules (so
+    # param shapes match) before sharing weights baseline -> candidate.
+    _init_fp8_module_weights(baseline)
+    _init_fp8_module_weights(candidate)
+    _sanitize_float_params(baseline)
+    _sanitize_float_params(candidate)
     try:
         candidate.load_state_dict(baseline.state_dict(), strict=False)
     except Exception:
