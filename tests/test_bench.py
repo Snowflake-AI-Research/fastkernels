@@ -149,155 +149,67 @@ def test_section_4():
 # ===========================================================================
 # Section 5: Multi-level conflict resolution (unit, no GPU)
 # ===========================================================================
-def _can_discover_targets() -> bool:
-    """Check if target discovery works (requires sgl_kernel and other CUDA deps)."""
+def _can_import_baseline() -> bool:
+    """Whether the baseline operator modules import (needs torch + CUDA deps)."""
     try:
-        from fastkernels.infra.kernel_swapper import discover_targets
-        discover_targets()
+        importlib.import_module(f"{PACKAGE_NAME}.tasks.baseline.L1.rms_norm")
         return True
     except Exception as exc:
-        print(f"    SKIP  target discovery unavailable: {exc}")
+        print(f"    SKIP  baseline modules unavailable: {exc}")
         return False
 
 
 def test_section_5():
     print(f"\n{'=' * 60}")
-    print("  SECTION 5: Multi-level conflict resolution")
+    print("  SECTION 5: Candidate operator discovery + swapping")
     print(f"{'=' * 60}")
 
-    from fastkernels.infra.kernel_swapper import (
-        BenchTarget,
-        _detect_subsumption,
-        _sort_by_level,
+    from fastkernels.list import (
+        apply_candidates,
+        discover_candidate_impls,
+        discover_operator_targets,
+        restore_candidates,
     )
 
-    # 5a. Bottom-up ordering
+    # 5a. Static operator discovery (pure ast, no torch needed).
     with _Timeout(30):
-        t1 = BenchTarget("op_a", 3, "tasks.baseline.L3.op_a", ["llama31"], nn.Module)
-        t2 = BenchTarget("op_b", 1, "tasks.baseline.L1.op_b", ["llama31"], nn.Module)
-        t3 = BenchTarget("op_c", 2, "tasks.baseline.L2.op_c", ["llama31"], nn.Module)
+        targets = {t.name: t for t in discover_operator_targets()}
+        check(len(targets) > 0, f"5a. discover_operator_targets() -> {len(targets)} ops")
+        rms = targets.get("rms_norm")
+        check(rms is not None and rms.level == 1, "5a. rms_norm discovered at L1")
+        check(rms is not None and "llama31" in rms.models,
+              '5a. rms_norm attributed to model "llama31"')
 
-        class Fake(nn.Module):
-            pass
-
-        candidates = [(t1, Fake), (t2, Fake), (t3, Fake)]
-        sorted_c = _sort_by_level(candidates)
-        levels = [t.level for t, _ in sorted_c]
-        check(levels == [1, 2, 3], f"5a. sorted levels: {levels} == [1, 2, 3]")
-
-    has_targets = _can_discover_targets()
-
-    # 5b. Subsumption detection
+    # 5b. Candidate discovery: with none present, returns an empty list cleanly.
     with _Timeout(30):
-        if not has_targets:
-            print("    SKIP  5b. sgl_kernel not available, cannot discover targets")
+        pairs = discover_candidate_impls()
+        check(isinstance(pairs, list),
+              f"5b. discover_candidate_impls() -> {len(pairs)} candidate(s)")
+
+    # 5c. Swap + restore round-trip, including propagation into the higher-level
+    #     baseline module that imports the swapped class (L1 -> L3).
+    with _Timeout(60):
+        if not _can_import_baseline():
+            print("    SKIP  5c. baseline modules unavailable")
         else:
-            from fastkernels.infra.kernel_swapper import get
+            name = targets["rms_norm"].class_name
+            rms_mod = importlib.import_module(f"{PACKAGE_NAME}.tasks.baseline.L1.rms_norm")
+            rms_cls = getattr(rms_mod, name)
+            # The L3 decoder imports RMSNorm; loading it binds the reference the
+            # swap must reach.
+            decoder_mod = importlib.import_module(
+                f"{PACKAGE_NAME}.tasks.baseline.L3.llama_decoder")
 
-            rms_target = get("rms_norm")
-            llama_decoder_target = get("llama_decoder")
-
-            class FakeRMS(nn.Module):
+            class FakeRMSNorm(nn.Module):
                 pass
 
-            class FakeDecoder(nn.Module):
-                pass
-
-            candidates = [
-                (rms_target, FakeRMS),
-                (llama_decoder_target, FakeDecoder),
-            ]
-            warnings = _detect_subsumption(candidates)
-            found_subsumption = any(
-                lower_name == "rms_norm" for _, _, lower_name, _ in warnings
-            )
-            check(
-                found_subsumption,
-                f"5b. L3 llama_decoder subsumes L1 rms_norm (found {len(warnings)} warnings)",
-            )
-
-    # 5c. No false positives (mock targets with no import relationship)
-    with _Timeout(30):
-        class FakeA(nn.Module):
-            pass
-        class FakeB(nn.Module):
-            pass
-
-        mock_l1 = BenchTarget("fake_op_alpha", 1, "tasks.baseline.L1.fake_op_alpha", ["llama31"], nn.Module)
-        mock_l2 = BenchTarget("fake_op_beta", 2, "tasks.baseline.L2.fake_op_beta", ["llama31"], nn.Module)
-        candidates_no_overlap = [
-            (mock_l1, FakeA),
-            (mock_l2, FakeB),
-        ]
-        warnings_no = _detect_subsumption(candidates_no_overlap)
-        check(
-            len(warnings_no) == 0,
-            "5c. mock targets with no import chain -> no subsumption (no false positive)",
-        )
-
-    # 5d. Patching order
-    with _Timeout(30):
-        if not has_targets:
-            print("    SKIP  5d. sgl_kernel not available, cannot discover targets")
-        else:
-            from fastkernels.infra.kernel_swapper import get, patch_class, restore
-            rms_target = get("rms_norm")
-            rms_module = importlib.import_module(f"{PACKAGE_NAME}.{rms_target.module_path}")
-            original_cls = rms_target.target_cls
-
-            class PatchedRMSNorm(nn.Module):
-                _is_patched = True
-
-            undo = patch_class(rms_target, PatchedRMSNorm)
-            patched_cls = getattr(rms_module, original_cls.__name__)
-            check(
-                patched_cls is PatchedRMSNorm,
-                "5d. L1 patch applied correctly",
-            )
-
-            decoder_mod = importlib.import_module(f"{PACKAGE_NAME}.tasks.baseline.L3.llama_decoder")
-            decoder_rms = getattr(decoder_mod, original_cls.__name__, None)
-            check(
-                decoder_rms is PatchedRMSNorm,
-                "5d. L3 baseline picks up L1 patch",
-            )
-
-            restore(undo)
-            check(
-                getattr(rms_module, original_cls.__name__) is original_cls,
-                "5d. restore works correctly",
-            )
-
-    # 5e. Discovery convenience functions
-    with _Timeout(30):
-        if not has_targets:
-            print("    SKIP  5e. sgl_kernel not available, cannot discover targets")
-        else:
-            from fastkernels.infra.kernel_swapper import (
-                list_targets, models_for_target, targets_for_model,
-            )
-
-            all_targets = list_targets()
-            check(len(all_targets) > 0, "5e. list_targets() returns non-empty list")
-
-            l1_targets = list_targets(level=1)
-            check(
-                len(l1_targets) > 0 and all(t.level == 1 for t in l1_targets),
-                "5e. list_targets(level=1) returns only L1 targets",
-            )
-
-            rms_models = models_for_target("rms_norm")
-            check(
-                "llama31" in rms_models,
-                '5e. models_for_target("rms_norm") contains "llama31"',
-            )
-
-            llama_targets = targets_for_model("llama31")
-            check(
-                len(llama_targets) > 0
-                and all("llama31" in t.models for t in llama_targets),
-                '5e. targets_for_model("llama31") all include "llama31"',
-            )
+            undo = apply_candidates([(targets["rms_norm"], rms_cls, FakeRMSNorm)])
+            check(getattr(rms_mod, name) is FakeRMSNorm,
+                  "5c. candidate swap applied at L1")
+            check(getattr(decoder_mod, name, None) is FakeRMSNorm,
+                  "5c. L3 baseline picks up the L1 swap")
+            restore_candidates(undo)
+            check(getattr(rms_mod, name) is rms_cls, "5c. restore works")
 
 
 # ===========================================================================
@@ -308,38 +220,7 @@ def test_section_6():
     print("  SECTION 6: CLI argument parsing")
     print(f"{'=' * 60}")
 
-    # 6b. bench.e2e CLI
-    with _Timeout(30):
-        result = subprocess.run(
-            [sys.executable, "-m", "fastkernels.bench.e2e", "--help"],
-            capture_output=True, text=True, timeout=30,
-            cwd=PROJECT_ROOT,
-            env={**os.environ, "PYTHONPATH": PROJECT_ROOT},
-        )
-        if result.returncode != 0:
-            # May fail due to missing sgl_kernel on import - check for import-related vs parse errors
-            if "sgl_kernel" in result.stderr or "ModuleNotFoundError" in result.stderr:
-                print("    SKIP  6b. sgl_kernel not available for subprocess import")
-            else:
-                check(False, f"6b. e2e --help failed: {result.stderr[-200:]}")
-        else:
-            check(
-                "throughput" in result.stdout and "latency" in result.stdout
-                and "serve" in result.stdout,
-                "6b. e2e help shows throughput, latency, serve subcommands",
-            )
-            # Check eval is not in subcommand list (after the header)
-            help_text = result.stdout
-            if "Benchmark type" in help_text:
-                subcommand_section = help_text.split("Benchmark type")[1]
-                check(
-                    "eval" not in subcommand_section,
-                    "6b. eval subcommand removed from e2e",
-                )
-            else:
-                check(True, "6b. eval subcommand not present in e2e help")
-
-    # 6c. eval CLI (fastkernels.eval)
+    # 6b. eval CLI (fastkernels.eval)
     with _Timeout(30):
         result = subprocess.run(
             [sys.executable, "-m", "fastkernels.eval", "--help"],
@@ -380,85 +261,6 @@ def test_section_6():
             and eval_default.suffix == ".json",
             f"6d. eval default output: {eval_default}",
         )
-
-
-# ===========================================================================
-# Section 8: E2E integration (GPU required, single GPU)
-# ===========================================================================
-def test_section_8():
-    print(f"\n{'=' * 60}")
-    print("  SECTION 8: E2E integration (GPU required)")
-    print(f"{'=' * 60}")
-
-    # 8a. Throughput single-run
-    with _Timeout(360):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            json_path = os.path.join(tmpdir, "throughput.json")
-            try:
-                result = subprocess.run(
-                    [sys.executable, "-m", "fastkernels.bench.e2e", "throughput",
-                     "--model", "meta-llama/Llama-3.1-8B-Instruct",
-                     "--tp", "1",
-                     "--dataset-name", "random",
-                     "--random-input-len", "128",
-                     "--random-output-len", "64",
-                     "--num-prompts", "10",
-                     "--output-json", json_path,
-                     "--no-candidate-kernels"],
-                    timeout=300, cwd=PROJECT_ROOT,
-                    capture_output=True, text=True,
-                )
-                if result.returncode != 0:
-                    print(f"    STDERR: {result.stderr[-500:]}")
-                    check(False, "8a. throughput subprocess failed")
-                else:
-                    check(os.path.exists(json_path), "8a. throughput JSON created")
-                    if os.path.exists(json_path):
-                        with open(json_path) as f:
-                            data = json.load(f)
-                        check(
-                            data.get("tokens_per_second", 0) > 0,
-                            f"8a. tokens_per_second={data.get('tokens_per_second', 0):.0f} > 0",
-                        )
-            except subprocess.TimeoutExpired:
-                check(False, "8a. throughput timed out after 300s")
-
-    # 8b. Latency single-run
-    with _Timeout(360):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            json_path = os.path.join(tmpdir, "latency.json")
-            try:
-                result = subprocess.run(
-                    [sys.executable, "-m", "fastkernels.bench.e2e", "latency",
-                     "--model", "meta-llama/Llama-3.1-8B-Instruct",
-                     "--batch-size", "1",
-                     "--input-len", "128",
-                     "--output-len", "64",
-                     "--num-iters-warmup", "1",
-                     "--num-iters", "3",
-                     "--output-json", json_path,
-                     "--no-candidate-kernels"],
-                    timeout=300, cwd=PROJECT_ROOT,
-                    capture_output=True, text=True,
-                )
-                if result.returncode != 0:
-                    print(f"    STDERR: {result.stderr[-500:]}")
-                    check(False, "8b. latency subprocess failed")
-                else:
-                    check(os.path.exists(json_path), "8b. latency JSON created")
-                    if os.path.exists(json_path):
-                        with open(json_path) as f:
-                            data = json.load(f)
-                        check(
-                            data.get("avg_latency", 0) > 0,
-                            f"8b. avg_latency={data.get('avg_latency', 0):.4f} > 0",
-                        )
-            except subprocess.TimeoutExpired:
-                check(False, "8b. latency timed out after 300s")
-
-    # 8c. JSON default save (verify default path works with --output-json)
-    with _Timeout(30):
-        check(True, "8c. default JSON paths verified in section 6d (no redundant GPU run)")
 
 
 # ===========================================================================
@@ -531,7 +333,7 @@ def main():
     )
     parser.add_argument(
         "--section", type=int, default=None,
-        help="Run only a specific section (4, 5, 6, 8, 9)",
+        help="Run only a specific section (4, 5, 6, 9)",
     )
     args = parser.parse_args()
 
@@ -543,7 +345,6 @@ def main():
         4: ("Standardized workloads", test_section_4),
         5: ("Conflict resolution", test_section_5),
         6: ("CLI argument parsing", test_section_6),
-        8: ("E2E integration", test_section_8),
         9: ("Eval integration", test_section_9),
     }
 

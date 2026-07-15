@@ -48,8 +48,6 @@ from __future__ import annotations
 import argparse
 import atexit
 import gc
-import importlib
-import importlib.util
 import json
 import os
 import sys
@@ -59,9 +57,7 @@ from datetime import datetime
 from pathlib import Path
 
 import torch
-import torch.nn as nn
 
-from . import CANDIDATE_DIR
 from .capture import (
     _detect_gpu_ids,
     _engine_dtype,
@@ -74,6 +70,7 @@ from .capture import (
     _wait_any,
     _NCCL_PORT_BASE,
 )
+from .list import apply_candidates, discover_candidate_impls, restore_candidates
 from .workloads import Purpose, load_real_prompt_workload, resolve_benchmark, spec_for
 
 # Default directory for eval reports (override per-run with ``--output``).
@@ -89,121 +86,16 @@ _WORKER_INDEX_ENV = "FK_EVAL_WORKER_INDEX"
 # child sets it only around the *candidate* engine build.
 _APPLY_CANDIDATES_ENV = "FASTKERNELS_EVAL_APPLY_CANDIDATES"
 
-_BASELINE_PACKAGE = "fastkernels.tasks.baseline"
-
-
 # ---------------------------------------------------------------------------
-# Candidate discovery + class swapping (self-contained; no kernel_swapper)
+# Candidate discovery + class swapping
 #
-# ``fastkernels.list.discover_operator_targets`` statically maps every baseline
-# operator to its file (level + module stem) and primary class name. For each
-# operator that has a ``tasks/candidate/L<level>/<stem>.py`` sibling we load its
-# class and monkey-patch every reference to the baseline class (across the
-# already-imported ``fastkernels`` modules) so a subsequently-built engine picks
-# up the candidate -- the mechanism the retired ``kernel_swapper`` provided.
+# The discovery + monkey-patch helpers live in ``fastkernels.list`` (built on
+# its static operator<->class map) so the engine / server / eval all share one
+# implementation. eval imports ``discover_candidate_impls`` / ``apply_candidates``
+# / ``restore_candidates`` above; ``tp>1`` propagation is handled by the
+# sitecustomize below, which calls ``fastkernels.list._apply_candidates_from_env``
+# inside every spawned tensor-parallel worker.
 # ---------------------------------------------------------------------------
-_CANDIDATES_APPLIED = False
-
-
-def _load_candidate_class(path: Path, class_name: str) -> type | None:
-    """Import a candidate file and return its operator class.
-
-    Prefers the class named like the baseline operator; falls back to the last
-    ``nn.Module`` subclass defined in the file.
-    """
-    mod_name = f"_fk_candidate_{path.parent.name}_{path.stem}"
-    spec = importlib.util.spec_from_file_location(mod_name, str(path))
-    if spec is None or spec.loader is None:
-        return None
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = mod
-    try:
-        spec.loader.exec_module(mod)
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
-    cls = getattr(mod, class_name, None)
-    if cls is None:
-        for value in vars(mod).values():
-            if (isinstance(value, type) and issubclass(value, nn.Module)
-                    and value is not nn.Module):
-                cls = value
-    return cls
-
-
-def discover_candidate_impls() -> list[tuple]:
-    """Return ``(op_target, baseline_cls, candidate_cls)`` for every operator
-    that has a candidate implementation under ``tasks/candidate``.
-
-    Sorted L1 -> L4 so lower-level swaps are in place before higher-level
-    baseline code (which imports them) is patched.
-    """
-    from .list import discover_operator_targets
-
-    pairs: list[tuple] = []
-    for target in discover_operator_targets():
-        cand_file = CANDIDATE_DIR / f"L{target.level}" / f"{target.name}.py"
-        if not cand_file.is_file():
-            continue
-        try:
-            base_mod = importlib.import_module(
-                f"{_BASELINE_PACKAGE}.L{target.level}.{target.name}")
-        except Exception as exc:  # noqa: BLE001 - a broken op module just skips
-            print(f"  (skip candidate {target.name}: baseline import failed: "
-                  f"{type(exc).__name__}: {exc})")
-            continue
-        base_cls = getattr(base_mod, target.class_name, None)
-        if not isinstance(base_cls, type):
-            continue
-        try:
-            cand_cls = _load_candidate_class(cand_file, target.class_name)
-        except Exception as exc:  # noqa: BLE001
-            print(f"  (skip candidate {target.name}: {type(exc).__name__}: {exc})")
-            continue
-        if cand_cls is None:
-            continue
-        pairs.append((target, base_cls, cand_cls))
-    pairs.sort(key=lambda p: p[0].level)
-    return pairs
-
-
-def apply_candidates(pairs: list[tuple]) -> list[tuple]:
-    """Monkey-patch each baseline class with its candidate everywhere it is
-    referenced across the loaded ``fastkernels`` modules. Returns undo info."""
-    undo: list[tuple] = []
-    for _target, base_cls, cand_cls in pairs:
-        for mod_name, mod in list(sys.modules.items()):
-            if mod is None or not mod_name.startswith("fastkernels"):
-                continue
-            try:
-                members = list(vars(mod).items())
-            except Exception:
-                continue
-            for attr, value in members:
-                if value is base_cls:
-                    undo.append((mod, attr, base_cls))
-                    setattr(mod, attr, cand_cls)
-    return undo
-
-
-def restore_candidates(undo: list[tuple]) -> None:
-    for mod, attr, base_cls in undo:
-        setattr(mod, attr, base_cls)
-
-
-def _apply_candidates_from_env() -> None:
-    """Entry point the sitecustomize calls in every spawned worker: swap the
-    candidate operators in once, at interpreter startup, before the engine
-    builds the model. Idempotent."""
-    global _CANDIDATES_APPLIED
-    if _CANDIDATES_APPLIED:
-        return
-    pairs = discover_candidate_impls()
-    if pairs:
-        apply_candidates(pairs)
-    _CANDIDATES_APPLIED = True
-
-
 def _install_candidate_sitecustomize() -> None:
     """Install a sitecustomize that re-applies the candidate swap in every
     spawned process (the engine's ``tp>1`` tensor-parallel workers start fresh
@@ -219,8 +111,8 @@ def _install_candidate_sitecustomize() -> None:
         "import os\n"
         f"if os.environ.get({_APPLY_CANDIDATES_ENV!r}):\n"
         "    try:\n"
-        "        import fastkernels.eval as _e\n"
-        "        _e._apply_candidates_from_env()\n"
+        "        import fastkernels.list as _l\n"
+        "        _l._apply_candidates_from_env()\n"
         "    except Exception:\n"
         "        pass\n"
     )

@@ -11,11 +11,12 @@ from __future__ import annotations
 
 import argparse
 import ast
+import sys
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
 
-from fastkernels import KB_ROOT
+from fastkernels import CANDIDATE_DIR, KB_ROOT
 
 from .workloads import FAMILIES, FASTKERNELS_ARCHITECTURES, DEFAULT_BENCHMARK, BenchmarkScenario, module_for
 
@@ -192,6 +193,133 @@ def print_model_operator_map() -> None:
     for t in sorted(targets, key=lambda t: (t.level, t.name)):
         print(f"  L{t.level}  {t.name:<25} {','.join(t.models)}")
     print()
+
+
+# ---------------------------------------------------------------------------
+# Candidate implementations: discovery + class swapping
+#
+# ``fastkernels eval`` (baseline vs candidate comparison) and the inference
+# server run the baseline operators against user-provided *candidate* operators
+# under ``tasks/candidate/L<level>/<name>.py``. Discovery reuses the static
+# operator map above; swapping monkey-patches every reference to a baseline
+# class with its candidate so a subsequently-built engine picks it up, applied
+# bottom-up (L1 -> L4) so higher-level baseline code sees lower-level swaps.
+# This replaces the retired ``infra.kernel_swapper``. torch is imported lazily
+# inside the functions so ``fastkernels list`` itself stays dependency-free.
+# ---------------------------------------------------------------------------
+_CANDIDATE_BASELINE_PACKAGE = "fastkernels.tasks.baseline"
+_candidates_applied = False
+
+
+def _load_candidate_class(path: Path, class_name: str):
+    """Import a candidate file and return its operator class (prefers the class
+    named like the baseline op; falls back to the last ``nn.Module`` defined)."""
+    import importlib.util
+
+    import torch.nn as nn
+
+    mod_name = f"_fk_candidate_{path.parent.name}_{path.stem}"
+    spec = importlib.util.spec_from_file_location(mod_name, str(path))
+    if spec is None or spec.loader is None:
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[mod_name] = mod
+    try:
+        spec.loader.exec_module(mod)
+    except Exception:
+        sys.modules.pop(mod_name, None)
+        raise
+    cls = getattr(mod, class_name, None)
+    if cls is None:
+        for value in vars(mod).values():
+            if (isinstance(value, type) and issubclass(value, nn.Module)
+                    and value is not nn.Module):
+                cls = value
+    return cls
+
+
+def discover_candidate_impls() -> list[tuple]:
+    """Return ``(op_target, baseline_cls, candidate_cls)`` for every operator
+    that has a candidate implementation under ``tasks/candidate``.
+
+    Sorted L1 -> L4 so lower-level swaps land before the higher-level baseline
+    code that imports them is patched.
+    """
+    import importlib
+
+    pairs: list[tuple] = []
+    for target in discover_operator_targets():
+        cand_file = CANDIDATE_DIR / f"L{target.level}" / f"{target.name}.py"
+        if not cand_file.is_file():
+            continue
+        try:
+            base_mod = importlib.import_module(
+                f"{_CANDIDATE_BASELINE_PACKAGE}.L{target.level}.{target.name}")
+        except Exception as exc:  # noqa: BLE001 - a broken op module just skips
+            print(f"  (skip candidate {target.name}: baseline import failed: "
+                  f"{type(exc).__name__}: {exc})")
+            continue
+        base_cls = getattr(base_mod, target.class_name, None)
+        if not isinstance(base_cls, type):
+            continue
+        try:
+            cand_cls = _load_candidate_class(cand_file, target.class_name)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  (skip candidate {target.name}: {type(exc).__name__}: {exc})")
+            continue
+        if cand_cls is None:
+            continue
+        pairs.append((target, base_cls, cand_cls))
+    pairs.sort(key=lambda p: p[0].level)
+    return pairs
+
+
+def apply_candidates(pairs: list[tuple]) -> list[tuple]:
+    """Monkey-patch each baseline class with its candidate everywhere it is
+    referenced across the loaded ``fastkernels`` modules. Returns undo info for
+    :func:`restore_candidates`."""
+    undo: list[tuple] = []
+    for _target, base_cls, cand_cls in pairs:
+        for mod_name, mod in list(sys.modules.items()):
+            if mod is None or not mod_name.startswith("fastkernels"):
+                continue
+            try:
+                members = list(vars(mod).items())
+            except Exception:
+                continue
+            for attr, value in members:
+                if value is base_cls:
+                    undo.append((mod, attr, base_cls))
+                    setattr(mod, attr, cand_cls)
+    return undo
+
+
+def restore_candidates(undo: list[tuple]) -> None:
+    for mod, attr, base_cls in undo:
+        setattr(mod, attr, base_cls)
+
+
+def print_candidate_summary(pairs: list[tuple]) -> None:
+    """Human-readable list of which candidate operators will be used."""
+    if not pairs:
+        return
+    print(f"\n{'=' * 70}\n  CANDIDATE OPERATORS\n{'=' * 70}")
+    for target, _base, cand in sorted(pairs, key=lambda p: p[0].level):
+        print(f"    L{target.level}  {target.name:<25} -> {cand.__name__}")
+    print(f"{'=' * 70}\n")
+
+
+def _apply_candidates_from_env() -> None:
+    """Swap the candidate operators in once, at interpreter startup, before the
+    engine builds the model. Invoked from the eval sitecustomize in every
+    spawned tensor-parallel worker. Idempotent."""
+    global _candidates_applied
+    if _candidates_applied:
+        return
+    pairs = discover_candidate_impls()
+    if pairs:
+        apply_candidates(pairs)
+    _candidates_applied = True
 
 
 def main(argv: list[str] | None = None) -> None:

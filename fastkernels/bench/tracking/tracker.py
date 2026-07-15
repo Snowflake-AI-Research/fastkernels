@@ -145,63 +145,6 @@ def log_kernel(
 
 
 # ---------------------------------------------------------------------------
-# Benchmark logging — e2e tier
-# ---------------------------------------------------------------------------
-@_safe
-def log_e2e(results: dict, bench_type: str) -> None:
-    """Log E2E benchmark results.
-
-    Parameters
-    ----------
-    results : dict
-        The result dictionary produced by throughput/latency/serve benchmarks.
-    bench_type : str
-        One of ``"throughput"``, ``"latency"``, ``"serve"``.
-    """
-    _mlflow.set_tag("bench_type", bench_type)
-
-    if bench_type == "throughput":
-        for key in (
-            "tokens_per_second",
-            "output_tokens_per_second",
-            "requests_per_second",
-            "elapsed_time",
-            "total_input_tokens",
-            "total_output_tokens",
-        ):
-            if key in results:
-                _mlflow.log_metric(key, results[key])
-
-    elif bench_type == "latency":
-        if "avg_latency" in results:
-            _mlflow.log_metric("avg_latency", results["avg_latency"])
-        percentiles = results.get("percentiles", {})
-        for p, val in percentiles.items():
-            _mlflow.log_metric(f"p{p}_latency", val)
-
-    elif bench_type == "serve":
-        for key in (
-            "mean_ttft_ms",
-            "median_ttft_ms",
-            "p99_ttft_ms",
-            "mean_tpot_ms",
-            "median_tpot_ms",
-            "p99_tpot_ms",
-            "mean_itl_ms",
-            "p99_itl_ms",
-            "mean_e2el_ms",
-            "p99_e2el_ms",
-            "request_throughput",
-            "output_throughput",
-            "total_token_throughput",
-        ):
-            val = results.get(key)
-            if val is None and hasattr(results, key):
-                val = getattr(results, key)
-            if val is not None:
-                _mlflow.log_metric(key, val)
-
-
 # ---------------------------------------------------------------------------
 # Custom metrics
 # ---------------------------------------------------------------------------
