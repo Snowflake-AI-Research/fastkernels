@@ -1366,6 +1366,29 @@ def load_benchmark(path: Path) -> list[BenchmarkScenario]:
 
 
 _SCENARIO_DIR = Path(__file__).resolve().parent / "scenarios"
+
+
+def resolve_benchmark(name_or_path: str | Path) -> list[BenchmarkScenario]:
+    """Load a scenario table from a filesystem path or a bare scenario name.
+
+    An existing filesystem path is loaded directly. Otherwise the argument is
+    treated as a name resolved against the packaged ``scenarios/`` directory
+    (e.g. ``"minimal"`` or ``"minimal.yaml"`` -> ``scenarios/minimal.yaml``), so
+    callers get the shipped ``full`` / ``default`` / ``minimal`` tables for free.
+    """
+    p = Path(name_or_path)
+    if p.exists():
+        return load_benchmark(p)
+    stem = p.name[:-5] if p.name.endswith(".yaml") else p.name
+    packaged = _SCENARIO_DIR / f"{stem}.yaml"
+    if packaged.exists():
+        return load_benchmark(packaged)
+    raise FileNotFoundError(
+        f"no scenarios file at {name_or_path!r}, and no packaged {packaged.name} "
+        f"in {_SCENARIO_DIR}"
+    )
+
+
 FULL_BENCHMARK: list[BenchmarkScenario] = load_benchmark(_SCENARIO_DIR / "full.yaml")
 DEFAULT_BENCHMARK: list[BenchmarkScenario] = load_benchmark(_SCENARIO_DIR / "default.yaml")
 

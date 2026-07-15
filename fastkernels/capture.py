@@ -7,9 +7,11 @@ the ``__init__`` and ``forward`` of each ``nn.Module`` subclass defined under
 aggregated per operator class and written to a JSON file.
 
 The model, dtype, tensor-parallel degree, eager mode, ``max_num_seqs`` and the
-capture workloads all come from a list of ``BenchmarkScenario`` objects
-(``CAPTURE_SCENARIOS`` below): each scenario is loaded into its own engine and
-every workload it lists is captured to a separate report.
+capture workloads all come from a list of ``BenchmarkScenario`` objects loaded
+from the scenarios YAML table named by the required ``scenarios`` argument (a
+path, or a packaged name like ``full`` / ``default`` / ``minimal``): each
+scenario is loaded into its own engine and every workload it lists is captured
+to a separate report.
 
 Scenarios are captured in parallel across the available GPUs. Each scenario
 runs in its own child process pinned to a private set of GPUs (a ``tp=N``
@@ -22,10 +24,9 @@ pool (with a single GPU the scenarios simply run one at a time).
 
 Usage::
 
-    python -m fastkernels capture                          # parallel, all GPUs
-    python -m fastkernels capture --gpus 0,1,2,3           # restrict the GPU pool
-    python -m fastkernels capture --output /tmp/llama32_1b_ops.json
-    python -m fastkernels.capture --selftest   # offline scheduler fuzz, no GPU
+    python -m fastkernels capture full                     # parallel, all GPUs
+    python -m fastkernels capture minimal --gpus 0,1,2,3    # restrict the GPU pool
+    python -m fastkernels capture full --output /tmp/llama32_1b_ops.json
 
 The capture is cross-checked two independent ways: (1) a forward-pre-hook that
 re-observes every operator's forward arguments, and (2) a mock continuous-
@@ -62,7 +63,7 @@ import torch
 import torch.nn as nn
 
 from .workloads import (
-    VLM, FULL_BENCHMARK, OmniModal, Purpose, load_real_prompt_workload, spec_for,
+    VLM, OmniModal, Purpose, load_real_prompt_workload, resolve_benchmark, spec_for,
 )
 
 # Default directory for capture reports (override per-run with ``--output``).
@@ -116,7 +117,7 @@ _WATCHDOG_TERM_GRACE_SEC = 8.0
 
 
 # NOTE: The capture prompts come from standardized BenchmarkScenario workloads
-# (``CAPTURE_SCENARIOS`` below). The old ``DEFAULT_PROMPTS`` list (and the
+# (from the scenarios table). The old ``DEFAULT_PROMPTS`` list (and the
 # ad-hoc ``--prompt`` override that consumed it) has been removed; the list is
 # kept here, commented out, for reference only.
 #
@@ -140,13 +141,11 @@ _WATCHDOG_TERM_GRACE_SEC = 8.0
 #     "What color is the sky on a clear day? One word.",
 # ]
 
-# Capture scenarios: each entry is loaded into its own engine and every workload
-# it lists is captured to a separate report. We capture the full standardized
-# benchmark set from the registry, each scenario with its own workloads.
-# Capture scenarios: each entry is loaded into its own engine and every workload
-# it lists is captured to a separate report. We capture the full standardized
-# benchmark set from the registry, each scenario with its own workloads.
-CAPTURE_SCENARIOS = FULL_BENCHMARK[:]
+# Capture scenarios come from a YAML table named by the required ``scenarios``
+# positional argument (a path or a packaged name like ``full`` / ``default`` /
+# ``minimal``), resolved via ``workloads.resolve_benchmark``. Each scenario is
+# loaded into its own engine and every workload it lists is captured to a
+# separate report.
 
 # qualified_name -> {"init": {...}, "forward": {...}}
 _RECORDS: dict[str, dict] = {}
@@ -1298,7 +1297,7 @@ def _scenario_slug(scenario, workload: str, num_requests: int) -> str:
     single ``workload``.
 
     Two runs that differ in any of these values write to different files (no
-    timestamp needed); re-running the same scenario/workload/``--num-requests``
+    timestamp needed); re-running the same scenario/workload/``--max-requests``
     overwrites its report. ``None`` max_num_seqs renders as ``auto``; capture
     always runs eager, so the mode tag is fixed.
     """
@@ -1346,7 +1345,7 @@ def _purge_stale_reports(scenario, runs, args, multi: bool) -> None:
     completes rewrites its own report afterward.
     """
     for wl_label, _wl in runs:
-        path = _report_path(args.output, scenario, wl_label, multi, args.num_requests)
+        path = _report_path(args.output, scenario, wl_label, multi, args.max_requests)
         try:
             if path.exists():
                 path.unlink()
@@ -1739,11 +1738,11 @@ def _capture_eagle3_scenario(scenario, runs, args, instrumented, n_instrumented,
             params = spec.params
             wl_dataset = getattr(params, "dataset_name", "") or None
             if spec.purpose is Purpose.LATENCY:
-                n_req = min(args.num_requests, getattr(params, "batch_size", 1))
+                n_req = min(args.max_requests, getattr(params, "batch_size", 1))
                 wl_decode_cap = getattr(params, "output_len", None)
             else:
-                n_req = min(args.num_requests,
-                            getattr(params, "num_requests", args.num_requests))
+                n_req = min(args.max_requests,
+                            getattr(params, "num_requests", args.max_requests))
                 wl_decode_cap = getattr(params, "decode_cap", None)
             try:
                 samples = load_real_prompt_workload(
@@ -1772,7 +1771,7 @@ def _capture_eagle3_scenario(scenario, runs, args, instrumented, n_instrumented,
                     engine.tokenizer.decode(p, skip_special_tokens=False)
                     for p in gen_prompts
                 ]
-                sampling = [Eagle3SamplingParams(max_tokens=mnt) for mnt in max_new_tokens]
+                sampling = [Eagle3SamplingParams(max_tokens=mnt, ignore_eos=True) for mnt in max_new_tokens]
 
                 for entry in _RECORDS.values():
                     entry["forward"] = None
@@ -1860,7 +1859,7 @@ def _capture_eagle3_scenario(scenario, runs, args, instrumented, n_instrumented,
                 scenario.hf_name, wl_label, engine.dtype,
                 engine.max_num_seqs, n_instrumented, generation, verification,
             )
-            out_path = _report_path(args.output, scenario, wl_label, multi, args.num_requests)
+            out_path = _report_path(args.output, scenario, wl_label, multi, args.max_requests)
             out_path.parent.mkdir(parents=True, exist_ok=True)
             with open(out_path, "w") as f:
                 f.write(_dumps(report))
@@ -1936,11 +1935,11 @@ def _capture_altengine_scenario(scenario, runs, args, instrumented, n_instrument
         params = spec.params
         wl_dataset = getattr(params, "dataset_name", "") or None
         if spec.purpose is Purpose.LATENCY:
-            n_req = min(args.num_requests, getattr(params, "batch_size", 1))
+            n_req = min(args.max_requests, getattr(params, "batch_size", 1))
             wl_decode_cap = getattr(params, "output_len", None)
         else:
-            n_req = min(args.num_requests,
-                        getattr(params, "num_requests", args.num_requests))
+            n_req = min(args.max_requests,
+                        getattr(params, "num_requests", args.max_requests))
             wl_decode_cap = getattr(params, "decode_cap", None)
         try:
             samples = load_real_prompt_workload(
@@ -1968,7 +1967,7 @@ def _capture_altengine_scenario(scenario, runs, args, instrumented, n_instrument
                 engine.tokenizer.decode(p, skip_special_tokens=False)
                 for p in gen_prompts
             ]
-            sampling = [sampling_cls(temperature=0.0, max_tokens=mnt)
+            sampling = [sampling_cls(temperature=0.0, max_tokens=mnt, ignore_eos=True)
                         for mnt in max_new_tokens]
 
             for entry in _RECORDS.values():
@@ -2049,7 +2048,7 @@ def _capture_altengine_scenario(scenario, runs, args, instrumented, n_instrument
             scenario.hf_name, wl_label, engine.dtype,
             engine.max_num_seqs, n_instrumented, generation, verification,
         )
-        out_path = _report_path(args.output, scenario, wl_label, multi, args.num_requests)
+        out_path = _report_path(args.output, scenario, wl_label, multi, args.max_requests)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with open(out_path, "w") as f:
             f.write(_dumps(report))
@@ -2215,7 +2214,7 @@ def _capture_scenario(scenario, runs, args, LlamaEngine, SamplingParams,
             #
             #    Every run is now a real scenario workload.
             #
-            # The loader returns every available row up to ``--num-requests``
+            # The loader returns every available row up to ``--max-requests``
             # (the default is large enough to use them all); curated sets return
             # fewer if they have fewer rows (e.g. long-context has 64).
             #
@@ -2234,12 +2233,12 @@ def _capture_scenario(scenario, runs, args, LlamaEngine, SamplingParams,
             if spec.purpose is Purpose.LATENCY:
                 # Latency probe: submit a fixed-size batch of real prompts with a
                 # bounded per-request decode budget.
-                n_req = min(args.num_requests, getattr(params, "batch_size", 1))
+                n_req = min(args.max_requests, getattr(params, "batch_size", 1))
                 wl_decode_cap = getattr(params, "output_len", None)
             else:
                 n_req = min(
-                    args.num_requests,
-                    getattr(params, "num_requests", args.num_requests),
+                    args.max_requests,
+                    getattr(params, "num_requests", args.max_requests),
                 )
                 wl_decode_cap = getattr(params, "decode_cap", None)
                 # VLM/OmniModal text-throughput carries its decode budget as
@@ -2305,10 +2304,10 @@ def _capture_scenario(scenario, runs, args, LlamaEngine, SamplingParams,
                 ]
                 media_descriptors = [_media_descriptor(item) for item in mm]
                 # Fixed decode budget from the workload spec (media datasets carry
-                # no per-row response length). ignore_eos left False to match the
-                # text path (short answers still stop at EOS).
+                # no per-row response length). ignore_eos=True matches bench_vllm.py
+                # (every request decodes exactly its budget).
                 sampling = [
-                    SamplingParams(temperature=0.0, max_tokens=out_len)
+                    SamplingParams(temperature=0.0, max_tokens=out_len, ignore_eos=True)
                     for _ in mm
                 ]
                 used_chat_template = True
@@ -2359,12 +2358,12 @@ def _capture_scenario(scenario, runs, args, LlamaEngine, SamplingParams,
                     for ids in gen_prompts
                 ]
                 # One SamplingParams per request so each gets its own max_tokens.
-                # ignore_eos is left False so short answers still stop naturally at
-                # EOS (keeping stored responses clean); the dataset length is an
-                # upper bound. bench_vllm.py forces ignore_eos=True for throughput
-                # determinism -- flip it here if exact-length decode is wanted.
+                # ignore_eos=True matches bench_vllm.py: every request decodes
+                # exactly its per-request budget (the dataset response length),
+                # so the captured decode-length distribution matches the benchmark
+                # rather than stopping early at EOS.
                 sampling = [
-                    SamplingParams(temperature=0.0, max_tokens=mnt)
+                    SamplingParams(temperature=0.0, max_tokens=mnt, ignore_eos=True)
                     for mnt in max_new_tokens
                 ]
                 # Full prompt token counts (token-id prompts); drives Verification #2.
@@ -2569,7 +2568,7 @@ def _capture_scenario(scenario, runs, args, LlamaEngine, SamplingParams,
                 engine.max_num_seqs, n_instrumented,
                 generation, verification,
             )
-            out_path = _report_path(args.output, scenario, wl_label, multi, args.num_requests)
+            out_path = _report_path(args.output, scenario, wl_label, multi, args.max_requests)
             out_path.parent.mkdir(parents=True, exist_ok=True)
             with open(out_path, "w") as f:
                 f.write(_dumps(report))
@@ -2732,14 +2731,17 @@ def _print_log_tail(log_path: Path, n: int = 20) -> None:
 def _worker_command(args) -> list[str]:
     """Argv for a worker child. Which scenario it captures is passed out-of-band
     via the ``_WORKER_INDEX_ENV`` environment variable (set by ``_launch``), so
-    there is no user-facing scenario-selection flag.
+    the ``scenarios`` positional selects the table, not the individual scenario.
+    It IS forwarded so the child resolves the exact same scenario table (and thus
+    the same index ordering) as the parent.
     """
     # ``-u`` keeps the child's stdout unbuffered so its log advances in real
     # time -- both for live monitoring and so the watchdog's log-idle check
     # measures true progress rather than a stuck output buffer.
     cmd = [
         sys.executable, "-u", "-m", "fastkernels.capture",
-        "--num-requests", str(args.num_requests),
+        args.scenarios,
+        "--max-requests", str(args.max_requests),
     ]
     if args.output:
         cmd += ["--output", args.output]
@@ -2925,13 +2927,19 @@ def main(argv: list[str] | None = None) -> int:
             "Run one or more models through fastkernels and capture the "
             "dtype/shape of every operator's init/forward arguments. The models, "
             "dtypes, tensor-parallel degrees, max_num_seqs and workloads are "
-            "taken from CAPTURE_SCENARIOS (one report per scenario workload). "
-            "Capture always runs eager (the instrumentation is incompatible with "
-            "CUDA graphs)."
+            "taken from the scenarios YAML given as the positional argument (one "
+            "report per scenario workload). Capture always runs eager (the "
+            "instrumentation is incompatible with CUDA graphs)."
         ),
     )
     parser.add_argument(
-        "--num-requests", type=int, default=1_000_000,
+        "scenarios",
+        help="Path to a scenarios YAML, or a packaged name resolved against "
+             "fastkernels/scenarios/ (e.g. 'full', 'default', 'minimal'). "
+             "Defines the models/dtypes/TP/workloads to capture.",
+    )
+    parser.add_argument(
+        "--max-requests", type=int, default=1_000_000,
         help="Max prompts to load per scenario workload. The default is large "
              "enough to use every row of each workload's dataset (each loader "
              "returns all available rows, capped at this value).",
@@ -2944,10 +2952,6 @@ def main(argv: list[str] | None = None) -> int:
              "this base to keep the paths distinct.",
     )
     parser.add_argument(
-        "--selftest", action="store_true",
-        help="Run the offline mock-scheduler self-check and exit (no model).",
-    )
-    parser.add_argument(
         "--gpus", default=None,
         help="Comma-separated physical GPU ids to schedule across (default: all "
              "visible GPUs / CUDA_VISIBLE_DEVICES). Scenarios are packed onto "
@@ -2956,14 +2960,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    if args.selftest:
-        return _selftest_simulator()
-
-    # CAPTURE_SCENARIOS is the source of truth for the models and engine
+    # The scenarios YAML is the source of truth for the models and engine
     # configuration (model, dtype, TP, max_num_seqs) and the capture workloads;
-    # --num-requests/--output stay run-level knobs. Each scenario gets its own
-    # engine and each workload its own report.
-    scenarios = CAPTURE_SCENARIOS
+    # --max-requests/--output stay run-level knobs. Each scenario gets its own
+    # engine and each workload its own report. Worker children are handed the
+    # same scenarios argument, so their scenario index matches the parent's.
+    try:
+        scenarios = resolve_benchmark(args.scenarios)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"  !! could not load scenarios {args.scenarios!r}: {exc}")
+        return 2
 
     # A "run" is one (scenario, workload) pair. ``multi`` decides whether an
     # explicit --output gets a per-run suffix (default paths are always unique
@@ -3048,93 +3054,6 @@ def main(argv: list[str] | None = None) -> int:
     for p in written:
         print(f"  - {p}")
     return exit_code
-
-
-def _selftest_simulator(trials: int = 2000, seed: int = 0) -> int:
-    """Offline, property-based check of the mock scheduler (no GPU/model).
-
-    Instead of comparing against baked-in numbers (which are meaningless once
-    the prompts come from an arbitrary dataset), this fuzzes the simulator with
-    randomized request sets and asserts the structural invariants that must hold
-    for *any* input and *any* budgets:
-
-      * every prompt token is prefilled exactly once
-        -> sum of prefill tokens == sum(prompt lengths);
-      * every generated token after the first comes from a decode step
-        -> sum of decode participations == sum(generated - 1);
-      * no step exceeds ``max_num_batched_tokens``;
-      * no step runs more than ``max_num_seqs`` concurrent sequences;
-      * a single prompt longer than the token budget is chunked (never dropped)
-        and still sums back to its prompt length;
-      * the KV-cache-aware replay, given an amply-sized block pool (so blocks
-        never bind), makes the exact same scheduling decisions as the
-        budget-only replay -- exercising the block-accounting bookkeeping.
-
-    Run with ``python -m fastkernels.capture --selftest``.
-    """
-    import random
-
-    rng = random.Random(seed)
-    failures: list[str] = []
-    for t in range(trials):
-        n = rng.randint(1, 40)
-        prompt_lens = [rng.randint(1, 200) for _ in range(n)]
-        gen_lens = [rng.randint(1, 60) for _ in range(n)]
-        max_num_seqs = rng.randint(1, 8)
-        # Sometimes force a tiny token budget so chunked prefill actually kicks
-        # in (prompt longer than one step's budget).
-        max_batched = rng.choice([16, 32, max(prompt_lens), 4096, 16384])
-
-        steps = _simulate_continuous_batching(
-            prompt_lens, gen_lens, max_num_seqs, max_batched)
-
-        total_prefill = sum(s["prefill_tokens"] for s in steps)
-        total_decode = sum(s["decode_seqs"] for s in steps)
-        problems = []
-        if total_prefill != sum(prompt_lens):
-            problems.append(
-                f"prefill {total_prefill} != sum(prompt) {sum(prompt_lens)}")
-        if total_decode != sum(g - 1 for g in gen_lens):
-            problems.append(
-                f"decode {total_decode} != sum(gen-1) "
-                f"{sum(g - 1 for g in gen_lens)}")
-        if steps and max(s["total_tokens"] for s in steps) > max_batched:
-            problems.append("a step exceeded the token budget")
-        if steps and max(
-                s["num_prefill_seqs"] + s["decode_seqs"] for s in steps
-        ) > max_num_seqs:
-            problems.append("a step exceeded max_num_seqs")
-
-        # KV-cache-aware replay with an amply-sized block pool must make the
-        # exact same decisions as the budget-only replay (blocks never bind),
-        # which exercises the block bookkeeping added to model the long-context
-        # concurrency limit.
-        block_size = rng.choice([16, 64, 256])
-        max_toks = [g + rng.randint(0, 20) for g in gen_lens]
-        peak_blocks = sum((p + m + block_size - 1) // block_size
-                          for p, m in zip(prompt_lens, max_toks))
-        bounded_steps = _simulate_continuous_batching(
-            prompt_lens, gen_lens, max_num_seqs, max_batched,
-            max_tokens=max_toks, num_blocks=peak_blocks + rng.randint(0, 32),
-            block_size=block_size, watermark_blocks=0)
-        if bounded_steps != steps:
-            problems.append(
-                "ample-pool KV replay diverged from budget-only replay")
-
-        if problems:
-            failures.append(
-                f"trial {t} (seqs={max_num_seqs}, budget={max_batched}, "
-                f"prompts={prompt_lens}, gens={gen_lens}): "
-                + "; ".join(problems))
-
-    ok = not failures
-    print(f"selftest: {trials} randomized trials -> "
-          f"{'PASS' if ok else 'FAIL'}")
-    for msg in failures[:10]:
-        print(f"  ! {msg}")
-    if len(failures) > 10:
-        print(f"  ... and {len(failures) - 10} more")
-    return 0 if ok else 1
 
 
 if __name__ == "__main__":

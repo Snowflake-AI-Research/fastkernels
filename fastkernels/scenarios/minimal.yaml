@@ -1,0 +1,10 @@
+# Minimal benchmark: a single scenario (Llama-3.1-8B) for quick smoke tests of
+# the capture -> bench pipeline. Same schema as full.yaml / default.yaml.
+# Pair with a small `--num-requests` to keep a capture run fast, e.g.
+#   fastkernels capture --scenarios minimal --num-requests 8
+
+scenarios:
+  - model: meta-llama/Llama-3.1-8B-Instruct
+    tp: 1
+    dtype: bfloat16
+    workloads: [LLM.mixed, LLM.long_context]
