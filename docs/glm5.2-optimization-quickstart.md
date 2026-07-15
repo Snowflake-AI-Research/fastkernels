@@ -21,6 +21,7 @@ Run these `/`-skills in a Claude Code session (reference lib = whichever is SOTA
 
 ```
 /fastkernels-add-model     zai-org/GLM-5.2 sglang   # port arch + L1–L3 ops from reference
+/fastkernels-bench-ops     GLM-5.2 sglang           # each op: correct + perf >= reference lib
 /fastkernels-check-parity  GLM-5.2 sglang           # adversarial mismatch/shortcut hunt → fix
 /fastkernels-validate-e2e  zai-org/GLM-5.2          # tests/bench_vllm.py: align + speedup
 ```
@@ -78,12 +79,10 @@ Drop `--max-layers/--max-requests` for the full-fidelity capture.
 fastkernels create-stubs --architecture glm5_2   # arch = L4 stem from step 2
 ```
 
-**Output:** empty candidate modules in `fastkernels/tasks/candidate/L{1..4}/*.py`.
-Then hand them to an agent to implement (fed the step-3 capture as the target shapes):
-
-```
-/fastkernels-bench-ops GLM-5.2 sglang     # agent writes + tunes each candidate vs reference
-```
+**Output:** empty candidate modules in `fastkernels/tasks/candidate/L{1..4}/*.py`, one per
+operator. Hand them to a coding agent to implement — point it at the step-3 capture for the
+exact target shapes/dtypes — then bench each with step 5. (There is no skill for authoring
+candidates; that is the agent's job.)
 
 ## 5. Benchmark at the kernel level (from the capture) — iterate
 
