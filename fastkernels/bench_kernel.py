@@ -80,6 +80,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import gc
 import importlib
 import importlib.util
 import inspect
@@ -1236,7 +1237,16 @@ def _worker_main(args) -> int:
                                  shape=_shape_repr(case["fwd_args"]), dtype="-",
                                  status=RUNTIME_ERROR, detail=f"{exc!r}")
         _emit(res.to_dict())
-        # Reclaim between cases.
+        # Reclaim between cases. A skipped/errored case leaves its two freshly
+        # built modules (for an L4 model that is ~30 GB) alive inside a reference
+        # cycle -- the caught exception's traceback pins the frame that holds
+        # them -- which torch.cuda.empty_cache() alone cannot release. Without a
+        # gc.collect() these cycles pile up case-over-case until the worker OOMs
+        # (verified: allocated stayed at 30 GB after empty_cache, dropped to
+        # ~0 GB after gc.collect). Collect first, then hand the freed blocks
+        # back to the driver.
+        del res
+        gc.collect()
         torch.cuda.empty_cache()
     return 0
 
