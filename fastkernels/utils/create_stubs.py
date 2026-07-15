@@ -10,6 +10,7 @@ Usage:
     fastkernels create-stubs --level 1
     fastkernels create-stubs --architecture llama
     fastkernels create-stubs --level 1 --architecture mixtral
+    fastkernels create-stubs --clear        # remove all stubs/candidates
 
     # equivalently, as a module:
     python -m fastkernels.utils.create_stubs
@@ -275,7 +276,21 @@ def main(argv: list[str] | None = None):
              "matched against the L4 module stem (e.g. 'llama', 'mixtral'); "
              "see 'fastkernels list --map'.",
     )
+    parser.add_argument(
+        "--clear", action="store_true",
+        help="Remove all kernels from tasks/candidate/ (moved to prev-attempts/ "
+             "so they can be recovered) and exit without creating new stubs. "
+             "Clears the whole folder; --level/--architecture are ignored.",
+    )
     args = parser.parse_args(argv)
+
+    if args.clear:
+        if _candidate_has_kernels():
+            _archive_existing_candidates()
+            print(f"Cleared candidate kernels from {_CANDIDATE_DIR}")
+        else:
+            print(f"Nothing to clear: no candidate kernels in {_CANDIDATE_DIR}")
+        return
 
     # Enumerate operators with list.py's pure-static analyzer (ast + filesystem,
     # never imports torch or the operator modules), so discovery never crashes
