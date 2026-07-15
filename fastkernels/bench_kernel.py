@@ -354,11 +354,35 @@ def _scalar_init_args(operators: dict, qualname: str, vid: int | None) -> dict:
     return {k: v for k, v in call.items() if isinstance(v, (int, float, bool, str))}
 
 
+def _resolve_opaque_ops(recipe, operators: dict):
+    """Rewrite ``$opaque`` nodes that name a constructible fastkernels operator
+    into ``$op_ref`` so reconstruction can build them.
+
+    Capture emits ``$opaque`` for a pre-built operator instance passed into
+    another op's ``__init__`` when that instance carries no init tag -- e.g. a
+    stateless ``GELU`` ``act_fn`` handed to ``VisionMLP``/``VisionBlock``. When
+    the named class is present in the report with an init variant, it *is*
+    reconstructable, so point an ``$op_ref`` at its first variant. Opaque nodes
+    that don't resolve are left as-is (the case still SKIPs)."""
+    if isinstance(recipe, list):
+        return [_resolve_opaque_ops(x, operators) for x in recipe]
+    if isinstance(recipe, dict):
+        if "$opaque" in recipe:
+            qual = recipe["$opaque"]
+            entry = operators.get(qual) if isinstance(qual, str) else None
+            if entry and entry.get("init") and entry["init"].get("variants"):
+                return {"$op_ref": {"op": qual, "init_variant_id": 0}}
+            return recipe
+        return {k: _resolve_opaque_ops(v, operators) for k, v in recipe.items()}
+    return recipe
+
+
 def _build_modules(op: Operator, baseline_cls: type, candidate_cls: type,
                    operators: dict, vid: int | None, device: str):
     """Instantiate baseline + candidate with identical (reconstructed) init args."""
     if vid is not None:
         call = operators[op.qualname]["init"]["variants"][vid]["args"]
+        call = _resolve_opaque_ops(call, operators)
         if not capture.is_reconstructable(call, operators):
             raise _UnsupportedInput("unreconstructable __init__ recipe")
         b_args, b_kwargs = capture._reconstruct_init_call(call, operators=operators, device=device)
