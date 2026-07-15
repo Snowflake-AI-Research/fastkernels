@@ -43,7 +43,6 @@ _THIS_DIR = Path(__file__).resolve().parent
 _PACKAGE_DIR = _THIS_DIR.parent
 _PROJECT_ROOT = _PACKAGE_DIR.parent
 
-from fastkernels.bench.eval.config import MODEL_CATEGORY
 from fastkernels.bench.utils.worker import run_worker
 from fastkernels.workloads import (
     COSYVOICE3_CONFIG,
@@ -1895,6 +1894,16 @@ def _print_tts_correctness(audio_check: dict):
 # ═══════════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════════
+
+# Model -> benchmark category, used only to infer the omni benchmark mode
+# (diffusion / TTS / video). Previously imported from the retired
+# ``fastkernels.bench.eval.config``; kept local to this script now.
+MODEL_CATEGORY: dict[str, str] = {
+    "black-forest-labs/FLUX.1-dev": "diffusion",
+    "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v": "diffusion",
+    "FunAudioLLM/Fun-CosyVoice3-0.5B-2512": "tts",
+}
+
 
 def _infer_mode(model: str) -> str:
     """Infer benchmark mode from the model's category."""

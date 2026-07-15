@@ -14,10 +14,7 @@ import os
 import tempfile
 import warnings
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from fastkernels.bench.eval.aggregator import EvalReport
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Lazy mlflow handle
@@ -145,41 +142,6 @@ def log_kernel(
         _mlflow.log_text(code, f"kernels/{op_name}.py")
     if error:
         _mlflow.log_text(error[:4000], f"errors/{op_name}.txt")
-
-
-# ---------------------------------------------------------------------------
-# Benchmark logging — eval tier
-# ---------------------------------------------------------------------------
-@_safe
-def log_eval(report: EvalReport) -> None:
-    """Log an ``EvalReport`` (from ``fastkernels eval``)."""
-    for cat in report.categories:
-        for m in cat.models:
-            if m.status == "FAILED":
-                continue
-            short = m.model.split("/")[-1]
-            prefix = f"{short}_tp{m.tp}"
-            _mlflow.log_metric(
-                f"{prefix}_throughput_speedup", m.throughput_speedup
-            )
-            _mlflow.log_metric(
-                f"{prefix}_latency_speedup", m.latency_speedup
-            )
-            _mlflow.log_metric(
-                f"{prefix}_alignment_rate", m.alignment_rate
-            )
-
-    _mlflow.log_metric(
-        "avg_throughput_speedup", report.avg_throughput_speedup
-    )
-    _mlflow.log_metric("avg_latency_speedup", report.avg_latency_speedup)
-    _mlflow.log_metric("alignment_rate", report.alignment_rate)
-    _mlflow.log_metric("macro_speedup", report.macro_speedup)
-    _mlflow.log_metric("macro_correctness", report.macro_correctness)
-    _mlflow.log_metric("macro_coverage", report.macro_coverage)
-    _mlflow.log_metric("macro_score", report.macro_score)
-    _mlflow.log_metric("wall_clock_seconds", report.wall_clock_seconds)
-    _mlflow.log_metric("failed_jobs", report.failed_jobs)
 
 
 # ---------------------------------------------------------------------------

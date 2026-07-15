@@ -339,10 +339,10 @@ def test_section_6():
             else:
                 check(True, "6b. eval subcommand not present in e2e help")
 
-    # 6c. bench.eval CLI
+    # 6c. eval CLI (fastkernels.eval)
     with _Timeout(30):
         result = subprocess.run(
-            [sys.executable, "-m", "fastkernels.bench.eval", "--help"],
+            [sys.executable, "-m", "fastkernels.eval", "--help"],
             capture_output=True, text=True, timeout=30,
             cwd=PROJECT_ROOT,
             env={**os.environ, "PYTHONPATH": PROJECT_ROOT},
@@ -351,13 +351,14 @@ def test_section_6():
             print("    SKIP  6c. sgl_kernel not available for subprocess import")
         else:
             check(
-                result.returncode == 0 and "--model" in result.stdout,
-                "6c. eval CLI accepts --model",
+                result.returncode == 0 and "scenarios" in result.stdout
+                and "--self-test" in result.stdout,
+                "6c. eval CLI takes a scenarios table and --self-test",
             )
             check(
-                "--tp" in result.stdout and "--category" in result.stdout
-                and "--output-json" in result.stdout,
-                "6c. eval CLI accepts --tp, --category, --output-json",
+                "--max-requests" in result.stdout and "--max-layers" in result.stdout
+                and "--gpus" in result.stdout,
+                "6c. eval CLI accepts --max-requests, --max-layers, --gpus",
             )
 
     # 6d. Default JSON output path
@@ -468,143 +469,56 @@ def test_section_9():
     print("  SECTION 9: Eval integration (GPU required)")
     print(f"{'=' * 60}")
 
-    # 9a. Single-model eval (requires at least one candidate)
+    # 9a. Self-test: eval a scenario with baseline as the candidate. The two
+    #     runs are identical, so correctness must be a perfect match. Capped to
+    #     the first few layers / a handful of requests to keep the run short.
     with _Timeout(660):
-        from fastkernels.infra.kernel_swapper import discover_candidates
-        candidates = discover_candidates()
-        if not candidates:
-            print("    SKIP  9a. no candidate kernels, skipping eval test")
-        else:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                json_path = os.path.join(tmpdir, "eval.json")
-                try:
-                    result = subprocess.run(
-                        [sys.executable, "-m", "fastkernels.bench.eval",
-                         "--model", "meta-llama/Llama-3.1-8B-Instruct",
-                         "--tp", "1",
-                         "--num-prompts", "10",
-                         "--output-json", json_path],
-                        timeout=600, cwd=PROJECT_ROOT,
-                        capture_output=True, text=True,
-                    )
-                    if result.returncode != 0:
-                        print(f"    STDERR: {result.stderr[-500:]}")
-                        check(False, "9a. eval subprocess failed")
-                    else:
-                        check(os.path.exists(json_path), "9a. eval JSON created")
-                        if os.path.exists(json_path):
-                            with open(json_path) as f:
-                                data = json.load(f)
-                            check(
-                                "total_models" in data and "categories" in data,
-                                "9a. eval JSON has expected schema",
-                            )
-                            check(
-                                data.get("total_jobs", 0) >= 1,
-                                f"9a. total_jobs={data.get('total_jobs', 0)} >= 1",
-                            )
-                except subprocess.TimeoutExpired:
-                    check(False, "9a. eval timed out after 600s")
-
-    # 9b. Eval with no candidates
-    with _Timeout(60):
-        try:
-            result = subprocess.run(
-                [sys.executable, "-c", f"""
-import sys, os
-sys.path.insert(0, '{PROJECT_ROOT}')
-import tempfile, shutil
-
-# Temporarily rename candidate dir to simulate no candidates
-from {PACKAGE_NAME}.infra.kernel_swapper import _CANDIDATE_DIR
-backup = str(_CANDIDATE_DIR) + '_backup'
-if _CANDIDATE_DIR.is_dir():
-    shutil.move(str(_CANDIDATE_DIR), backup)
-os.makedirs(str(_CANDIDATE_DIR), exist_ok=True)
-
-try:
-    from {PACKAGE_NAME}.bench.eval.config import EvalConfig
-    from {PACKAGE_NAME}.bench.eval.planner import EvalPlanner
-    config = EvalConfig(models=['meta-llama/Llama-3.1-8B-Instruct'], tp_degrees=[1])
-    planner = EvalPlanner(config)
-    plan = planner.plan()
-    # With explicit models, plan should have jobs even without candidates
-    # The eval runner would just compare baseline vs baseline
-    print('PLAN_JOBS:' + str(plan.num_jobs))
-except Exception as e:
-    print('ERROR:' + str(e))
-finally:
-    import shutil
-    if os.path.exists(backup):
-        shutil.rmtree(str(_CANDIDATE_DIR), ignore_errors=True)
-        shutil.move(backup, str(_CANDIDATE_DIR))
-"""],
-                capture_output=True, text=True, timeout=30,
-                cwd=PROJECT_ROOT,
-            )
-            output = result.stdout.strip()
-            check(
-                result.returncode == 0,
-                f"9b. no-candidates exits cleanly (rc={result.returncode})",
-            )
-        except subprocess.TimeoutExpired:
-            check(False, "9b. no-candidates timed out after 30s (possible hang)")
-
-    # 9c. JSON default save path
-    with _Timeout(30):
-        from fastkernels import RESULTS_DIR, run_output_path
-
-        default_output = run_output_path("eval")
-        check(
-            default_output.parent == RESULTS_DIR
-            and default_output.name.startswith("eval_")
-            and default_output.suffix == ".json",
-            f"9c. eval default output: {default_output}",
-        )
-
-    # 9d. MacroEval report integration schema
-    with _Timeout(30):
-        from fastkernels.bench.eval.aggregator import Aggregator
-        from fastkernels.bench.eval.runner import JobResult
-
-        report = Aggregator.aggregate([
-            JobResult(
-                model="integration-a",
-                tp=1,
-                category="llm",
-                throughput_results=[
-                    {"speedup": 2.0, "aligned_matches": 2, "aligned_total": 2},
-                ],
-                latency_results=[{"speedup": 2.0}],
-            ),
-            JobResult(
-                model="integration-b",
-                tp=1,
-                category="vlm",
-                status="FAILED",
-                error="synthetic failure",
-            ),
-        ])
-
         with tempfile.TemporaryDirectory() as tmpdir:
-            json_path = os.path.join(tmpdir, "eval_macro.json")
-            report.save_json(json_path)
-            with open(json_path) as f:
-                data = json.load(f)
-        check(
-            abs(data["macro_speedup"] - 2.0) < 1e-9,
-            f"9d. macro_speedup={data['macro_speedup']:.2f}",
+            json_path = os.path.join(tmpdir, "eval.json")
+            try:
+                result = subprocess.run(
+                    [sys.executable, "-m", "fastkernels.eval", "minimal",
+                     "--self-test",
+                     "--max-requests", "8",
+                     "--max-layers", "4",
+                     "--gpus", "0",
+                     "--output", json_path],
+                    timeout=600, cwd=PROJECT_ROOT,
+                    capture_output=True, text=True,
+                    env={**os.environ, "PYTHONPATH": PROJECT_ROOT},
+                )
+                if result.returncode != 0:
+                    print(f"    STDERR: {result.stderr[-500:]}")
+                    check(False, "9a. eval --self-test subprocess failed")
+                else:
+                    check(os.path.exists(json_path), "9a. eval JSON created")
+                    if os.path.exists(json_path):
+                        with open(json_path) as f:
+                            data = json.load(f)
+                        check(
+                            data.get("self_test") is True
+                            and "throughput" in data
+                            and "correctness_passed" in data,
+                            "9a. eval JSON has the expected schema",
+                        )
+                        check(
+                            data.get("correctness_passed") is True,
+                            "9a. self-test correctness passes (baseline == baseline)",
+                        )
+            except subprocess.TimeoutExpired:
+                check(False, "9a. eval timed out after 600s")
+
+    # 9b. --max-layers is validated (fast, no GPU work).
+    with _Timeout(30):
+        result = subprocess.run(
+            [sys.executable, "-m", "fastkernels.eval", "minimal", "--max-layers", "0"],
+            capture_output=True, text=True, timeout=30,
+            cwd=PROJECT_ROOT,
+            env={**os.environ, "PYTHONPATH": PROJECT_ROOT},
         )
         check(
-            abs(data["macro_correctness"] - 0.5) < 1e-9
-            and abs(data["macro_coverage"] - 0.5) < 1e-9
-            and abs(data["macro_score"] - 0.5) < 1e-9,
-            "9d. MacroEval correctness/coverage/score persisted",
-        )
-        check(
-            len(data["categories"]) == 2
-            and all("macro_score" in c for c in data["categories"]),
-            "9d. category MacroEval schema persisted",
+            result.returncode != 0 and "--max-layers must be >= 1" in result.stderr,
+            "9b. eval rejects --max-layers < 1",
         )
 
 

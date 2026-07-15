@@ -11,6 +11,10 @@ def main() -> None:
         from .capture import main as capture_main
         raise SystemExit(capture_main(sys.argv[2:]))
 
+    if len(sys.argv) > 1 and sys.argv[1] == "eval":
+        from .eval import main as eval_main
+        raise SystemExit(eval_main(sys.argv[2:]))
+
     if len(sys.argv) > 1 and sys.argv[1] == "list":
         from .list import main as list_main
         list_main(sys.argv[2:])
@@ -37,6 +41,13 @@ def main() -> None:
     subparsers.add_parser(
         "capture",
         help="Capture runtime init/forward type, shape, and dtype metadata",
+    )
+
+    subparsers.add_parser(
+        "eval",
+        help="Evaluate candidate task implementations against the baseline "
+             "end-to-end for correctness and performance across a scenarios "
+             "table (see 'fastkernels eval --help')",
     )
 
     subparsers.add_parser(
