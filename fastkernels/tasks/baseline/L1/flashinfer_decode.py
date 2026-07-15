@@ -28,6 +28,23 @@ class TRTLLMDecode(nn.Module):
                 max_seq_len=None, **kwargs):
         if max_seq_len is None:
             max_seq_len = int(cache_seqlens.max().item())
+        # trtllm-gen requires a contiguous query: with a batched (multi-request)
+        # decode, the query view is non-contiguous and the TMA load reads later
+        # rows at the wrong stride -> only row 0 is correct, the rest are garbage.
+        # vLLM's FlashInfer backend and our own TRTLLMPrefill both do this; the
+        # decode path was missing it.
+        q = q.contiguous()
+        # block_tables / seq_lens MUST be contiguous: the trtllm-gen kernel
+        # reads the page table assuming a dense [batch, max_pages] row-major
+        # layout. The engine's eager/CUDA-graph decode buffers hand us a column
+        # slice (``_eager_block_tables[:n, :bt_cols]``) whose row stride is the
+        # full ``max_num_blocks``, not ``bt_cols`` -> every row > 0 would read
+        # its page ids from the wrong offset (garbage pages), so only row 0
+        # stayed correct and all other sequences in the batch were corrupted.
+        # vLLM likewise asserts is_strictly_contiguous(block_tables/seq_lens).
+        block_table = block_table.contiguous()
+        if cache_seqlens is not None:
+            cache_seqlens = cache_seqlens.contiguous()
         return trtllm_batch_decode_with_kv_cache(
             query=q,
             kv_cache=(k_cache, v_cache),
