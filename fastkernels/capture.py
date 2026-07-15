@@ -1292,20 +1292,23 @@ def _dumps(obj, indent: int = 2, level: int = 0) -> str:
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-def _scenario_slug(scenario, workload: str, num_requests: int) -> str:
+def _scenario_slug(scenario, workload: str, num_requests: int,
+                   max_layers: int | None = None) -> str:
     """Report-filename stem encoding the distinguishing scenario fields for a
     single ``workload``.
 
     Two runs that differ in any of these values write to different files (no
     timestamp needed); re-running the same scenario/workload/``--max-requests``
     overwrites its report. ``None`` max_num_seqs renders as ``auto``; capture
-    always runs eager, so the mode tag is fixed.
+    always runs eager, so the mode tag is fixed. A ``--max-layers`` run adds an
+    ``_L<n>`` tag so a truncated capture never overwrites the full-model report.
     """
     model = scenario.hf_name.replace("/", "__")
     max_num_seqs = scenario.max_num_seqs if scenario.max_num_seqs is not None else "auto"
+    layers_tag = f"_L{max_layers}" if max_layers is not None else ""
     return (
         f"{model}_tp{scenario.tp}_{scenario.dtype}_{workload}"
-        f"_req{num_requests}_seqs{max_num_seqs}_eager"
+        f"_req{num_requests}_seqs{max_num_seqs}{layers_tag}_eager"
     )
 
 
@@ -1322,21 +1325,23 @@ def _engine_dtype(dtype_str: str) -> torch.dtype | None:
     return dt if isinstance(dt, torch.dtype) else None
 
 
-def _report_path(output_arg, scenario, workload: str, multi: bool, num_requests: int) -> Path:
+def _report_path(output_arg, scenario, workload: str, multi: bool, num_requests: int,
+                 max_layers: int | None = None) -> Path:
     """Resolve the report path for one workload run.
 
     Default: ``CAPTURE_DIR/<scenario-slug>.json``. An explicit ``--output`` is
     honored verbatim for a single run, or has the (model-qualified) scenario
     slug suffixed onto its stem when several runs share one ``--output`` base.
     """
-    slug = _scenario_slug(scenario, workload, num_requests)
+    slug = _scenario_slug(scenario, workload, num_requests, max_layers)
     if output_arg is not None:
         p = Path(output_arg)
         return p.with_name(f"{p.stem}_{slug}{p.suffix}") if multi else p
     return CAPTURE_DIR / f"{slug}.json"
 
 
-def _purge_stale_reports(scenario, runs, args, multi: bool) -> None:
+def _purge_stale_reports(scenario, runs, args, multi: bool,
+                         max_layers: int | None = None) -> None:
     """Delete any pre-existing report file for each of this scenario's workloads.
 
     Called when a scenario's capture starts so that an interrupted or crashing
@@ -1345,7 +1350,8 @@ def _purge_stale_reports(scenario, runs, args, multi: bool) -> None:
     completes rewrites its own report afterward.
     """
     for wl_label, _wl in runs:
-        path = _report_path(args.output, scenario, wl_label, multi, args.max_requests)
+        path = _report_path(args.output, scenario, wl_label, multi,
+                            args.max_requests, max_layers)
         try:
             if path.exists():
                 path.unlink()
@@ -2137,10 +2143,25 @@ def _capture_scenario(scenario, runs, args, LlamaEngine, SamplingParams,
     The engine is always released before returning so the next (possibly larger)
     model has room on the GPU.
     """
+    # ``--max-layers`` truncates the transformer decoder stack to its first N
+    # blocks. It is only wired through the standard ``LlamaEngine`` path (below),
+    # which covers plain LLMs and Qwen-VL/Omni; the specialized alt-engines
+    # (EAGLE-3 target/draft coupling, FLA recurrent state, Jamba hybrid layer
+    # pattern) don't funnel through the ``max_layers`` loader path and truncation
+    # is ill-defined for them, so they always capture at full depth. Only the
+    # applied value flavors the report filename / metadata.
+    alt_engine = _is_eagle3(scenario) or _is_fla(scenario) or _is_jamba(scenario)
+    report_max_layers = None if alt_engine else args.max_layers
+    if alt_engine and args.max_layers is not None:
+        print(
+            f"  NOTE: --max-layers={args.max_layers} is not applied for this "
+            f"engine type (EAGLE-3/FLA/Jamba); capturing at full depth."
+        )
+
     # Remove any stale report(s) for this scenario up front: an interrupted or
     # crashing capture then leaves no file for an unfinished workload, rather
     # than a previous run's file that could be mistaken for a fresh result.
-    _purge_stale_reports(scenario, runs, args, multi)
+    _purge_stale_reports(scenario, runs, args, multi, report_max_layers)
     if _is_eagle3(scenario):
         # EAGLE-3 uses a distinct engine (target + speculative draft head).
         return _capture_eagle3_scenario(
@@ -2185,6 +2206,7 @@ def _capture_scenario(scenario, runs, args, LlamaEngine, SamplingParams,
         tensor_parallel_size=scenario.tp,
         enforce_eager=True,
         max_num_seqs=scenario.max_num_seqs,
+        max_layers=args.max_layers,
     )
 
     written: list[Path] = []
@@ -2450,6 +2472,15 @@ def _capture_scenario(scenario, runs, args, LlamaEngine, SamplingParams,
                 "num_hit_max_tokens": len(gen_lengths) - num_eos,
                 "responses": responses,
             }
+            if args.max_layers is not None:
+                # Only the first N transformer decoder layers were built and run
+                # (embeddings / final norm / LM head -- and any vision encoder --
+                # are unaffected). Record both the requested cap and the model's
+                # resulting depth so the truncated report is self-describing.
+                generation["max_layers"] = args.max_layers
+                _cfg = getattr(getattr(engine, "model_runner", None), "config", None)
+                generation["num_hidden_layers"] = getattr(
+                    _cfg, "num_hidden_layers", None)
             print(
                 f"  Generation: {generation['num_finished_by_eos']}/{len(gen_prompts)} "
                 f"reached EOS before their per-request budget; "
@@ -2568,7 +2599,8 @@ def _capture_scenario(scenario, runs, args, LlamaEngine, SamplingParams,
                 engine.max_num_seqs, n_instrumented,
                 generation, verification,
             )
-            out_path = _report_path(args.output, scenario, wl_label, multi, args.max_requests)
+            out_path = _report_path(args.output, scenario, wl_label, multi,
+                                    args.max_requests, report_max_layers)
             out_path.parent.mkdir(parents=True, exist_ok=True)
             with open(out_path, "w") as f:
                 f.write(_dumps(report))
@@ -2745,6 +2777,8 @@ def _worker_command(args) -> list[str]:
     ]
     if args.output:
         cmd += ["--output", args.output]
+    if args.max_layers is not None:
+        cmd += ["--max-layers", str(args.max_layers)]
     return cmd
 
 
@@ -2958,7 +2992,18 @@ def main(argv: list[str] | None = None) -> int:
              "these by their TP degree and captured in parallel, each in its own "
              "GPU-pinned subprocess, launching more as GPUs free up.",
     )
+    parser.add_argument(
+        "--max-layers", type=int, default=None,
+        help="Build and run only the first MAX_LAYERS transformer decoder "
+             "layers of the model. Only those layers are allocated and their "
+             "weights loaded; anything outside the decoder stack (embeddings, "
+             "final norm, LM head, and any vision/audio encoder) is unaffected. "
+             "Applies to the standard LlamaEngine path (plain LLMs and "
+             "Qwen-VL/Omni); ignored for EAGLE-3/FLA/Jamba scenarios.",
+    )
     args = parser.parse_args(argv)
+    if args.max_layers is not None and args.max_layers < 1:
+        parser.error("--max-layers must be >= 1")
 
     # The scenarios YAML is the source of truth for the models and engine
     # configuration (model, dtype, TP, max_num_seqs) and the capture workloads;

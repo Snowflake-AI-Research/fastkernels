@@ -312,7 +312,8 @@ class ModelRunner:
                  gpu_memory_utilization: float = 0.9,
                  max_model_len: int = MAX_MODEL_LEN,
                  max_num_seqs: int | None = None,
-                 max_num_batched_tokens: int | None = None):
+                 max_num_batched_tokens: int | None = None,
+                 max_layers: int | None = None):
         self.model_name = model_name
         self.rank = rank
         self.world_size = world_size
@@ -323,6 +324,7 @@ class ModelRunner:
         self.max_model_len = ((max_model_len + BLOCK_SIZE - 1) // BLOCK_SIZE + 2) * BLOCK_SIZE
         self.max_num_seqs = max_num_seqs if max_num_seqs is not None else _DEFAULT_MAX_NUM_SEQS
         self.max_num_batched_tokens = max_num_batched_tokens if max_num_batched_tokens is not None else _DEFAULT_MAX_NUM_BATCHED_TOKENS
+        self.max_layers = max_layers
 
         torch.cuda.set_device(rank)
         self._dist_initialized = False
@@ -409,6 +411,7 @@ class ModelRunner:
             print(f"  [1/6] Loading model weights...", flush=True)
         self.model, self.config = load_model(
             model_name, torch.device(f"cuda:{rank}"), dtype,
+            max_layers=self.max_layers,
         )
         model_type = getattr(self.config, "model_type", "")
         self.is_kimi_linear = model_type == "kimi_linear"
@@ -4960,6 +4963,7 @@ class LlamaEngine:
         max_model_len: int = MAX_MODEL_LEN,
         max_num_seqs: int | None = None,
         max_num_batched_tokens: int | None = None,
+        max_layers: int | None = None,
     ):
         self.model_name = model_name
         self.seed = seed
@@ -4977,6 +4981,7 @@ class LlamaEngine:
             max_model_len=max_model_len,
             max_num_seqs=self.max_num_seqs,
             max_num_batched_tokens=self.max_num_batched_tokens,
+            max_layers=max_layers,
         )
 
         # Launch non-rank-0 workers

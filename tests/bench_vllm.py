@@ -127,8 +127,23 @@ def _make_run_id(requested: str | None) -> str:
     return safe
 
 
-def _install_flashinfer_sitecustomize() -> None:
-    """Patch FlashInfer IPC socket IDs in every spawned vLLM rank."""
+def _install_bench_sitecustomize() -> None:
+    """Install a sitecustomize that patches vLLM/FlashInfer in every spawned
+    Python process (the v1 EngineCore and TP worker ranks), driven by env vars.
+
+    Two independent patches, each gated by its own env var so this is safe to
+    install unconditionally:
+
+    * ``FASTKERNELS_FLASHINFER_SOCKET_NAMESPACE`` -- namespaces FlashInfer IPC
+      socket IDs so concurrent TP>1 runs do not collide.
+    * ``FASTKERNELS_MAX_LAYERS`` -- for ``--max-layers``: filters out the
+      checkpoint weights of pruned decoder layers before they reach vLLM's
+      per-model weight loaders. ``hf_overrides`` shrinks the model to the first
+      N layers, but the loaders raise ``KeyError`` on the leftover
+      ``layers.{i>=N}.*`` tensors from the full checkpoint, so they must be
+      dropped from the weight iterator here. A monkeypatch in this process would
+      not survive the spawn to EngineCore/TP ranks -- the sitecustomize does.
+    """
     site_dir = Path(os.environ.get(
         "FASTKERNELS_FLASHINFER_SITECUSTOMIZE_DIR",
         "/tmp/fastkernels_flashinfer_sitecustomize",
@@ -159,6 +174,36 @@ if namespace:
 
             mnnvl.IpcSocket.__init__ = namespaced_init
             mnnvl.IpcSocket._fastkernels_namespaced = True
+
+_max_layers_env = os.environ.get("FASTKERNELS_MAX_LAYERS")
+if _max_layers_env:
+    try:
+        import re as _re
+        _n = int(_max_layers_env)
+        from vllm.model_executor.model_loader import default_loader as _dl
+    except Exception:
+        pass
+    else:
+        if _n >= 1 and not getattr(
+            _dl.DefaultModelLoader, "_fastkernels_max_layers", False
+        ):
+            _orig_get_all = _dl.DefaultModelLoader.get_all_weights
+            # Decoder blocks are named "...layers.<i>..." across the Llama /
+            # Qwen / Mistral families; vision encoders use "...blocks.<i>...",
+            # so they are never matched and stay intact.
+            _layer_re = _re.compile(r"(?:^|\.)layers\.(\d+)\.")
+
+            def _get_all_weights_capped(self, model_config, model,
+                                        _orig=_orig_get_all, _n=_n,
+                                        _pat=_layer_re):
+                for name, tensor in _orig(self, model_config, model):
+                    m = _pat.search(name)
+                    if m is not None and int(m.group(1)) >= _n:
+                        continue
+                    yield name, tensor
+
+            _dl.DefaultModelLoader.get_all_weights = _get_all_weights_capped
+            _dl.DefaultModelLoader._fastkernels_max_layers = True
 ''')
 
     current = os.environ.get("PYTHONPATH", "")
@@ -455,6 +500,19 @@ def _configure_parallel_safe_flashinfer():
 
 _configure_parallel_safe_flashinfer()
 
+def _fastkernels_limit_layers(hf_config):
+    # --max-layers: build only the first N decoder layers. get_text_config()
+    # returns the text sub-config for multimodal models and the config itself
+    # for pure-text models, so this limits the transformer stack in both. N is
+    # read from the env so this module-level function pickles cleanly into
+    # vLLM's spawned EngineCore (a nested closure would not).
+    n = os.environ.get("FASTKERNELS_MAX_LAYERS")
+    if n:
+        tc = hf_config.get_text_config()
+        if getattr(tc, "num_hidden_layers", None):
+            tc.num_hidden_layers = min(tc.num_hidden_layers, int(n))
+    return hf_config
+
 def main():
     from vllm import LLM, SamplingParams
 
@@ -480,6 +538,8 @@ def main():
         }
     if cfg.get("load_format"):
         llm_kwargs["load_format"] = cfg["load_format"]
+    if cfg.get("max_layers") is not None:
+        llm_kwargs["hf_overrides"] = _fastkernels_limit_layers
     llm = LLM(**llm_kwargs)
 
     # Warmup
@@ -599,6 +659,8 @@ def main():
         engine_kwargs["gpu_memory_utilization"] = cfg["gpu_memory_utilization"]
     if "max_model_len" in cfg:
         engine_kwargs["max_model_len"] = cfg["max_model_len"]
+    if "max_layers" in cfg:
+        engine_kwargs["max_layers"] = cfg["max_layers"]
     engine = LlamaEngine(**engine_kwargs)
 
     # Warmup
@@ -994,6 +1056,20 @@ def _configure_parallel_safe_flashinfer():
 _configure_parallel_safe_flashinfer()
 
 
+def _fastkernels_limit_layers(hf_config):
+    # --max-layers: limit only the language-model decoder stack to the first N
+    # layers (get_text_config() returns the LM sub-config for multimodal
+    # models); vision / audio encoders and embeddings are left intact. N is
+    # read from the env so this module-level function pickles cleanly into
+    # vLLM's spawned EngineCore (a nested closure would not).
+    n = os.environ.get("FASTKERNELS_MAX_LAYERS")
+    if n:
+        tc = hf_config.get_text_config()
+        if getattr(tc, "num_hidden_layers", None):
+            tc.num_hidden_layers = min(tc.num_hidden_layers, int(n))
+    return hf_config
+
+
 def main():
     from vllm import LLM, SamplingParams
     from transformers import AutoProcessor
@@ -1020,6 +1096,8 @@ def main():
         llm_kwargs["load_format"] = cfg["load_format"]
     if cfg.get("limit_mm_per_prompt"):
         llm_kwargs["limit_mm_per_prompt"] = cfg["limit_mm_per_prompt"]
+    if cfg.get("max_layers") is not None:
+        llm_kwargs["hf_overrides"] = _fastkernels_limit_layers
     llm = LLM(**llm_kwargs)
 
     llm.generate(
@@ -1206,6 +1284,8 @@ def main():
         engine_kwargs["gpu_memory_utilization"] = cfg["gpu_memory_utilization"]
     if "max_model_len" in cfg:
         engine_kwargs["max_model_len"] = cfg["max_model_len"]
+    if "max_layers" in cfg:
+        engine_kwargs["max_layers"] = cfg["max_layers"]
     engine = LlamaEngine(**engine_kwargs)
 
     engine.generate(["warmup"], SamplingParams(temperature=0.0, max_tokens=16))
@@ -1619,6 +1699,8 @@ def main():
         engine_kwargs["gpu_memory_utilization"] = cfg["gpu_memory_utilization"]
     if "max_model_len" in cfg:
         engine_kwargs["max_model_len"] = cfg["max_model_len"]
+    if "max_layers" in cfg:
+        engine_kwargs["max_layers"] = cfg["max_layers"]
     engine = LlamaEngine(**engine_kwargs)
 
     import torch
@@ -1794,6 +1876,13 @@ def main():
     parser.add_argument("--num-seqs", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--max-layers", type=int, default=None,
+        help="Run only the first MAX_LAYERS transformer decoder layers of the "
+             "model (both vLLM and fastkernels). Only those layers are built "
+             "and their weights loaded; the embedding, final norm, and LM head "
+             "are unaffected. Not supported for Whisper (encoder-decoder).",
+    )
+    parser.add_argument(
         "--trust-remote-code",
         action="store_true",
         help="Pass trust_remote_code=True to the reference vLLM worker when required.",
@@ -1844,6 +1933,14 @@ def main():
     is_qwen_omni = _is_qwen_omni_model(args.model)
     is_whisper = _is_whisper_model(args.model)
 
+    if args.max_layers is not None:
+        if args.max_layers < 1:
+            raise SystemExit("--max-layers must be >= 1")
+        if is_whisper:
+            print("  NOTE: --max-layers is ignored for Whisper "
+                  "(encoder-decoder) models.")
+            args.max_layers = None
+
     if args.output_dir is None:
         short = args.model.split("/")[-1]
         run_id = _make_run_id(args.run_id)
@@ -1865,19 +1962,29 @@ def main():
     previous_flashinfer_namespace_env = os.environ.get(
         "FASTKERNELS_FLASHINFER_SOCKET_NAMESPACE",
     )
+    previous_max_layers_env = os.environ.get("FASTKERNELS_MAX_LAYERS")
     if not args.skip_vllm:
         vllm_port, vllm_port_lock = _reserve_tcp_port(
             preferred=_parse_port_env("VLLM_PORT"),
         )
         _HELD_PORT_LOCKS.append(vllm_port_lock)
         os.environ["VLLM_PORT"] = str(vllm_port)
+        need_sitecustomize = False
         if args.tp > 1:
             flashinfer_namespace = (
                 os.environ.get("FASTKERNELS_FLASHINFER_SOCKET_NAMESPACE")
                 or f"bench-vllm-{os.getpid()}-{vllm_port}"
             )
             os.environ["FASTKERNELS_FLASHINFER_SOCKET_NAMESPACE"] = flashinfer_namespace
-            _install_flashinfer_sitecustomize()
+            need_sitecustomize = True
+        if args.max_layers is not None:
+            # Filter pruned-layer weights inside every spawned vLLM rank so its
+            # per-model loaders don't KeyError on the full checkpoint's extra
+            # ``layers.{i>=N}`` tensors (hf_overrides only shrinks the model).
+            os.environ["FASTKERNELS_MAX_LAYERS"] = str(args.max_layers)
+            need_sitecustomize = True
+        if need_sitecustomize:
+            _install_bench_sitecustomize()
 
     if is_whisper:
         throughput_scenarios = WHISPER_SCENARIOS
@@ -2098,6 +2205,8 @@ def main():
     if (is_vlm or is_qwen_omni) and args.modality != "all":
         print(f"  Modality       : {args.modality}")
     print(f"  TP             : {args.tp}")
+    if args.max_layers is not None:
+        print(f"  Max layers     : {args.max_layers}")
     has_full = any(s.get("use_full_dataset") for s in throughput_scenarios) if is_whisper else False
     seqs_label = "full dataset" if has_full else str(args.num_seqs)
     print(f"  Seqs/scenario  : {seqs_label}")
@@ -2151,6 +2260,8 @@ def main():
             "load_format": "fastsafetensors",
             "is_qwen_omni": is_qwen_omni,
         }
+        if args.max_layers is not None:
+            vllm_config["max_layers"] = args.max_layers
         if is_qwen_omni:
             vllm_config["limit_mm_per_prompt"] = {
                 "image": 1,
@@ -2170,6 +2281,13 @@ def main():
             os.environ["FASTKERNELS_FLASHINFER_SOCKET_NAMESPACE"] = (
                 previous_flashinfer_namespace_env
             )
+        # The fastkernels worker takes max_layers via its JSON config, not the
+        # env; clear it so the sitecustomize's vLLM weight filter stays inert
+        # in that subprocess.
+        if previous_max_layers_env is None:
+            os.environ.pop("FASTKERNELS_MAX_LAYERS", None)
+        else:
+            os.environ["FASTKERNELS_MAX_LAYERS"] = previous_max_layers_env
 
     # -- Run fastkernels (one subprocess, all scenarios) --
     kb_root = str(_PROJECT_ROOT)
@@ -2186,6 +2304,8 @@ def main():
         "scenarios": scenario_data,
         "latency_scenarios": latency_data,
     }
+    if args.max_layers is not None:
+        kb_config["max_layers"] = args.max_layers
     short_name = args.model.split("/")[-1]
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(kb_nccl_port)
@@ -2211,9 +2331,17 @@ def main():
             kb_data = kb_results[i]
             kb_tps = kb_data["total_output_tokens"] / kb_data["elapsed"]
 
+            # Actual requests processed. Whisper workers report ``num_seqs``
+            # explicitly; text/VLM workers don't, so fall back to the number of
+            # returned outputs. Curated datasets (e.g. long-context, 64 rows)
+            # run fewer than ``--num-seqs`` requests, so we must not assume
+            # ``args.num_seqs`` here or the averages come out wrong.
+            num_requests = kb_data.get("num_seqs") or len(
+                kb_data.get("outputs", []))
+
             result = {
                 "scenario": scenario["name"],
-                "num_seqs": kb_data.get("num_seqs", args.num_seqs),
+                "num_seqs": num_requests,
                 "fastkernels_elapsed": kb_data["elapsed"],
                 "fastkernels_output_tokens": kb_data["total_output_tokens"],
                 "fastkernels_tok_per_s": kb_tps,
@@ -2222,10 +2350,9 @@ def main():
                 result["input_len"] = scenario["input_len"]
             if "output_len" in scenario:
                 result["output_len"] = scenario["output_len"]
-            elif kb_data.get("num_seqs", args.num_seqs):
+            elif num_requests:
                 result["avg_output_len"] = (
-                    kb_data["total_output_tokens"]
-                    / kb_data.get("num_seqs", args.num_seqs)
+                    kb_data["total_output_tokens"] / num_requests
                 )
             if is_whisper:
                 result["total_audio_duration_s"] = kb_data.get(
@@ -2272,18 +2399,18 @@ def main():
             )
         elif is_vlm or is_qwen_omni:
             header = (
-                f"  {'SCENARIO':<16} {'OUT':>5} "
+                f"  {'SCENARIO':<16} {'SEQS':>5} {'OUT':>5} "
                 f"{'FASTKERNELS tok/s':>15} {'vLLM tok/s':>12} {'SPEEDUP':>8} "
                 f"{'AVG MATCH TOKS':>15}"
             )
         else:
             header = (
-                f"  {'SCENARIO':<16} {'IN':>5} {'OUT':>5} "
+                f"  {'SCENARIO':<16} {'SEQS':>5} {'IN':>5} {'OUT':>5} "
                 f"{'FASTKERNELS tok/s':>15} {'vLLM tok/s':>12} {'SPEEDUP':>8} "
                 f"{'AVG MATCH TOKS':>15}"
             )
         print(header)
-        print(f"  {'-' * 84}")
+        print(f"  {'-' * 90}")
 
         for r in all_results:
             kb_tps_str = f"{r['fastkernels_tok_per_s']:,.0f}"
@@ -2318,7 +2445,7 @@ def main():
                     else f"{r.get('avg_output_len', 0):>5.0f}"
                 )
                 print(
-                    f"  {r['scenario']:<16} {out_str} "
+                    f"  {r['scenario']:<16} {r['num_seqs']:>5} {out_str} "
                     f"{kb_tps_str:>15} {v_tps_str:>12} {speedup_str:>8} "
                     f"{match_str:>15}"
                 )
@@ -2330,7 +2457,7 @@ def main():
                 )
                 in_str = f"{r['input_len']:>5}" if "input_len" in r else f"{'var':>5}"
                 print(
-                    f"  {r['scenario']:<16} {in_str} {out_str} "
+                    f"  {r['scenario']:<16} {r['num_seqs']:>5} {in_str} {out_str} "
                     f"{kb_tps_str:>15} {v_tps_str:>12} {speedup_str:>8} "
                     f"{match_str:>15}"
                 )
@@ -2420,6 +2547,8 @@ def main():
             "fastkernels_nccl_port": kb_nccl_port,
             "vllm_flashinfer_socket_namespace": flashinfer_namespace,
         }
+        if args.max_layers is not None:
+            combined["max_layers"] = args.max_layers
         if vllm_port is not None:
             combined["vllm_port"] = vllm_port
         if all_results:
