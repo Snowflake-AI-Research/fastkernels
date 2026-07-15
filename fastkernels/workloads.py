@@ -1,26 +1,31 @@
-"""Benchmark workloads: identities, parameters, prompts and dataset adapter.
+"""Benchmark workloads, architecture registry, and scenario tables.
 
-Single source of truth for everything workload-related. It holds:
+Single source of truth for everything workload- and benchmark-related. It holds:
 
-* the per-family workload *identity* enums (e.g. ``LLM.mixed``) used in
-  ``registry.py``;
+* the per-family workload *identity* enums (e.g. ``LLM.mixed``);
 * the per-workload throughput/latency *parameter* specs and model configs
   consumed by the eval pipeline and the ``tests/`` benchmarks;
 * the real chat-prompt loader (``load_real_prompt_workload``) used to run the
-  LLM mixed (WildChat) and long-context (LongBench-v2) workloads; and
-* a thin, lazily-imported adapter over vLLM's dataset infrastructure.
+  LLM mixed (WildChat) and long-context (LongBench-v2) workloads;
+* the architecture registry (``FAMILIES``, ``FASTKERNELS_ARCHITECTURES``,
+  ``module_for``) and the ``BenchmarkScenario`` dataclass; and
+* the ``FULL_BENCHMARK`` / ``DEFAULT_BENCHMARK`` scenario tables, loaded from the
+  user-editable YAML files in ``scenarios/`` via ``load_benchmark``.
 
-Kept import-light on purpose: importing this module must not pull in ``vllm``
-(the dataset re-exports below are resolved lazily via ``__getattr__``) or the
-Hugging Face ``datasets`` package (imported inside the loader), so
-``registry.py`` and ``capture.py`` can import it cheaply.
+Kept import-light on purpose: importing this module must not pull in ``vllm`` or
+the Hugging Face ``datasets`` package (imported inside the loader), so
+``capture.py`` and ``list.py`` can import it cheaply. ``module_for`` imports
+``transformers`` lazily (inside the function), and the scenario loader imports
+``yaml`` lazily.
 """
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 
@@ -1114,5 +1119,254 @@ def throughput_params(family: type[Workload], name: str) -> Any:
     if spec is None or spec.purpose is not Purpose.THROUGHPUT:
         return None
     return spec.params
+
+
+# ===========================================================================
+# Architecture registry (aligned with table.tex) and benchmark scenarios
+#
+# Merged here from the former ``registry.py``: the family/architecture registry
+# and name->module resolution, the ``BenchmarkScenario`` dataclass, and the
+# loader that builds ``FULL_BENCHMARK`` / ``DEFAULT_BENCHMARK`` from the
+# user-editable YAML tables in ``scenarios/``.
+# ===========================================================================
+
+@dataclass(frozen=True)
+class Family:
+    keyword: str
+    display_name: str
+
+
+@dataclass(frozen=True)
+class Architecture:
+    module: str
+    family: str
+    class_name: str
+    model_type: str | None = None
+
+
+# keyword -> full display name
+_FAMILIES = (
+    Family("llm", "Dense & MoE LLMs"),
+    Family("linear_attn", "Linear Attention & New Archs"),
+    Family("vision", "Vision / Video / Audio"),
+    Family("multimodal", "Multimodal & Encoders"),
+    Family("edge", "Edge & Detection"),
+    Family("3d_robotics", "3D / Robotics / Science"),
+    Family("recsys", "Recommendation & Specialized"),
+    Family("world_models", "World Models"),
+)
+FAMILIES: dict[str, Family] = {f.keyword: f for f in _FAMILIES}
+
+# L4 module stem -> Architecture
+_ARCHITECTURES = (
+    Architecture("llama", "llm", "Llama-3.1+", "llama"),
+    Architecture("deepseek", "llm", "DeepSeek-V3.2", "deepseek_v32"),
+    Architecture("mixtral", "llm", "Mixtral", "mixtral"),
+    Architecture("bitnet", "llm", "BitNet 1.58b", "llama"),
+    Architecture("gpt_oss", "llm", "GPT-OSS (MXFP4)", "gpt_oss"),
+    Architecture("llama_eagle3", "llm", "EAGLE-3", "llama"),
+    Architecture("gemma4", "llm", "Gemma-4", "gemma4"),
+    Architecture("mamba", "linear_attn", "Mamba", "mamba"),
+    Architecture("mamba2", "linear_attn", "Mamba2", "mamba2"),
+    Architecture("rwkv7", "linear_attn", "RWKV-7", "rwkv7"),
+    Architecture("gla", "linear_attn", "GLA", "gla"),
+    Architecture("retnet", "linear_attn", "RetNet", "retnet"),
+    Architecture("qwen3_next", "linear_attn", "Qwen-3-Next", "qwen3_next"),
+    Architecture("kimi_linear", "linear_attn", "Kimi-Linear", "kimi_linear"),
+    Architecture("ttt_e2e", "linear_attn", "TTT-E2E", None),
+    Architecture("jamba", "linear_attn", "Jamba", "jamba"),
+    Architecture("flux", "vision", "FLUX.1-Dev", None),
+    Architecture("hunyuan_video", "vision", "HunyuanVideo-1.5", None),
+    Architecture("sdxl", "vision", "SDXL", None),
+    Architecture("sam3", "vision", "SAM3.1", "sam3_video"),
+    Architecture("whisper", "vision", "Whisper", "whisper"),
+    Architecture("cosyvoice3", "vision", "CosyVoice3", "cosyvoice3"),
+    Architecture("qwen2_vl", "multimodal", "Qwen2-VL", "qwen2_vl"),
+    Architecture("qwen3_vl", "multimodal", "Qwen3-VL", "qwen3_vl_moe"),
+    Architecture("qwen2_5_omni", "multimodal", "Qwen-2.5-Omni", "qwen2_5_omni"),
+    Architecture("siglip2", "multimodal", "SigLIP-2", "siglip2"),
+    Architecture("dinov3", "multimodal", "DINOv3", "dinov3_vit"),
+    Architecture("swinv2", "multimodal", "SwinV2", "swinv2"),
+    Architecture("mobilenetv4", "edge", "MobileNetV4", None),
+    Architecture("convnextv2", "edge", "ConvNeXtV2", "convnextv2"),
+    Architecture("efficientnetv2", "edge", "EfficientNetV2", None),
+    Architecture("yolov10", "edge", "YOLOv10", None),
+    Architecture("rtdetrv2", "edge", "RTDetrV2", "rt_detr_v2"),
+    Architecture("gaussian_splatting", "3d_robotics", "3DGS", None),
+    Architecture("instant_ngp", "3d_robotics", "InstantNGP", None),
+    Architecture("pointtransformerv3", "3d_robotics", "PointTransformerV3", None),
+    Architecture("openfold3", "3d_robotics", "OpenFold3", None),
+    Architecture("pi0", "3d_robotics", "Pi0", "pi0"),
+    Architecture("dp3", "3d_robotics", "DP3", None),
+    Architecture("dlrmv2", "recsys", "DLRMv2", None),
+    Architecture("lightgcn", "recsys", "LightGCN", None),
+    Architecture("bge_m3", "recsys", "BGE-M3", "xlm-roberta"),
+    Architecture("colbertv2", "recsys", "ColBERTv2", "bert"),
+    Architecture("llada", "recsys", "LLaDA", "llada"),
+    Architecture("oasis", "world_models", "Oasis", None),
+    Architecture("vjepa2", "world_models", "V-JEPA 2", "vjepa2"),
+)
+FASTKERNELS_ARCHITECTURES: dict[str, Architecture] = {a.module: a for a in _ARCHITECTURES}
+
+
+def _normalize(text: str) -> str:
+    """Lowercase, alphanumeric-only form for tolerant name matching."""
+    return "".join(ch for ch in text.lower() if ch.isalnum())
+
+
+@functools.lru_cache(maxsize=None)
+def _module_from_name(hf_name: str) -> str | None:
+    """Infer the L4 module from the HF name alone -- no config, no network.
+
+    Matches the normalized model name against each architecture's module stem
+    and display name, preferring the most specific (longest) match, e.g.
+    ``black-forest-labs/FLUX.1-dev`` -> ``flux`` and ``fla-hub/gla-2.7B-100B``
+    -> ``gla``. Returns ``None`` when nothing matches.
+    """
+    norm = _normalize(hf_name)
+    best_module: str | None = None
+    best_len = 0
+    for arch in _ARCHITECTURES:
+        for token in (arch.module, arch.class_name):
+            key = _normalize(token)
+            if len(key) >= 3 and key in norm and len(key) > best_len:
+                best_module, best_len = arch.module, len(key)
+    return best_module
+
+
+@functools.lru_cache(maxsize=None)
+def module_for(hf_name: str) -> str | None:
+    """Infer the fastkernels L4 module stem for a HuggingFace model.
+
+    Prefers the authoritative ``model_type`` from the model's config, read via
+    ``transformers`` (which, for uncached models, requires network access).
+    Several architectures can share a ``model_type`` (e.g. Llama, BitNet and
+    EAGLE-3 all report ``"llama"``), in which case the first registered one wins.
+
+    Falls back to a name-based match against the registered architectures only
+    when the config cannot be loaded (offline, gated, or a non-transformers
+    pipeline such as a diffusers model) or its ``model_type`` is unknown. This
+    keeps diffusers pipelines and custom repos (e.g. FLUX, YOLOv10, OpenFold3,
+    Oasis) resolvable. Returns ``None`` when neither the config nor the name
+    resolves.
+    """
+    try:
+        from transformers import AutoConfig
+
+        config = AutoConfig.from_pretrained(hf_name, trust_remote_code=True)
+        model_type = getattr(config, "model_type", None)
+    except Exception:
+        model_type = None
+    if model_type is not None:
+        for arch in _ARCHITECTURES:
+            if arch.model_type == model_type:
+                return arch.module
+    return _module_from_name(hf_name)
+
+
+@dataclass(frozen=True)
+class BenchmarkScenario:
+    """A model to benchmark, its per-scenario engine config and its workloads.
+
+    ``enforce_eager`` and ``max_num_seqs`` are *engine* knobs that apply to the
+    whole scenario (every one of its workloads). Per-*workload* parameters --
+    request counts, sequence lengths, and the throughput/latency purpose -- live
+    on the workload spec (``spec_for(workload)``), which is why there is no
+    scenario-level ``num_requests``.
+
+    ``workloads`` mixes throughput and latency workloads; use the
+    ``throughput_workloads`` / ``latency_workloads`` splits to iterate one kind.
+    """
+    hf_name: str
+    tp: int
+    dtype: str
+    workloads: list[Workload]
+    enforce_eager: bool = False
+    max_num_seqs: int | None = None
+
+    @property
+    def specs(self) -> list[WorkloadSpec]:
+        """This scenario's workloads resolved to purpose + parameter specs."""
+        return [spec_for(w) for w in self.workloads]
+
+    @property
+    def throughput_workloads(self) -> list[Workload]:
+        return [w for w in self.workloads if purpose_of(w) is Purpose.THROUGHPUT]
+
+    @property
+    def latency_workloads(self) -> list[Workload]:
+        return [w for w in self.workloads if purpose_of(w) is Purpose.LATENCY]
+
+
+# --- Scenario YAML loader --------------------------------------------------
+#
+# The benchmark tables live in ``scenarios/full.yaml`` and ``scenarios/default.yaml``
+# as user-editable YAML. Each scenario names its workloads with fully-qualified
+# ``Family.member`` tokens (the enum member names above); there is no bare-family
+# "all" shorthand -- every workload is spelled out.
+
+_WORKLOAD_FAMILIES: dict[str, type[Workload]] = {c.__name__: c for c in _ALL_FAMILIES}
+_ALLOWED_DTYPES = {"bfloat16", "float16", "float32", "fp8", "mxfp4"}
+
+
+def _resolve_workload_token(token: str) -> Workload:
+    """Resolve a ``Family.member`` token to its ``Workload`` enum member."""
+    fam_name, sep, member = token.strip().partition(".")
+    if not sep:  # bare family names are not allowed -- workloads must be explicit
+        raise ValueError(f"workload token {token!r} must be 'Family.member'")
+    fam = _WORKLOAD_FAMILIES.get(fam_name)
+    if fam is None:
+        raise ValueError(
+            f"unknown workload family {fam_name!r} in {token!r}; "
+            f"valid: {sorted(_WORKLOAD_FAMILIES)}"
+        )
+    try:
+        return fam[member]  # enum lookup by MEMBER NAME
+    except KeyError:
+        raise ValueError(
+            f"unknown workload {member!r} for {fam_name!r}; "
+            f"valid: {[m.name for m in fam]}"
+        )
+
+
+def _scenario_from_mapping(entry: Mapping[str, Any], *, source: str) -> BenchmarkScenario:
+    """Build a ``BenchmarkScenario`` from one YAML mapping, validating as we go."""
+    try:
+        model, tp, dtype = entry["model"], int(entry["tp"]), entry["dtype"]
+        tokens = entry["workloads"]
+    except (KeyError, TypeError, ValueError) as e:
+        raise ValueError(f"{source}: bad scenario entry {entry!r}: {e}")
+    if dtype not in _ALLOWED_DTYPES:
+        raise ValueError(f"{source}: {model}: dtype {dtype!r} not in {sorted(_ALLOWED_DTYPES)}")
+    workloads: list[Workload] = []
+    seen: set[Workload] = set()
+    for tok in tokens:
+        try:
+            wl = _resolve_workload_token(tok)
+        except ValueError as e:
+            raise ValueError(f"{source}: {model}: {e}")
+        if wl not in seen:
+            seen.add(wl)
+            workloads.append(wl)
+    if not workloads:
+        raise ValueError(f"{source}: {model}: no workloads")
+    return BenchmarkScenario(
+        model, tp, dtype, workloads,
+        enforce_eager=bool(entry.get("enforce_eager", False)),
+        max_num_seqs=entry.get("max_num_seqs"),
+    )
+
+
+def load_benchmark(path: Path) -> list[BenchmarkScenario]:
+    """Load a benchmark scenario table from a YAML file (see ``scenarios/``)."""
+    import yaml
+
+    data = yaml.safe_load(path.read_text())
+    return [_scenario_from_mapping(e, source=path.name) for e in data["scenarios"]]
+
+
+_SCENARIO_DIR = Path(__file__).resolve().parent / "scenarios"
+FULL_BENCHMARK: list[BenchmarkScenario] = load_benchmark(_SCENARIO_DIR / "full.yaml")
+DEFAULT_BENCHMARK: list[BenchmarkScenario] = load_benchmark(_SCENARIO_DIR / "default.yaml")
 
 

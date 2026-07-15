@@ -17,7 +17,7 @@ from pathlib import Path
 
 from fastkernels import KB_ROOT
 
-from .registry import FAMILIES, FASTKERNELS_ARCHITECTURES, DEFAULT_BENCHMARK, BenchmarkScenario, module_for
+from .workloads import FAMILIES, FASTKERNELS_ARCHITECTURES, DEFAULT_BENCHMARK, BenchmarkScenario, module_for
 
 
 def print_benchmark_set(benchmarks: list[BenchmarkScenario], title: str = "BENCHMARK SCENARIOS") -> None:

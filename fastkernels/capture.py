@@ -61,9 +61,8 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from .registry import FULL_BENCHMARK
 from .workloads import (
-    VLM, OmniModal, Purpose, load_real_prompt_workload, spec_for,
+    VLM, FULL_BENCHMARK, OmniModal, Purpose, load_real_prompt_workload, spec_for,
 )
 
 # Default directory for capture reports (override per-run with ``--output``).
