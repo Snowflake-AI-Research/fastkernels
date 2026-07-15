@@ -95,9 +95,14 @@ def _pin_build_arch() -> None:
         os.environ["TORCH_CUDA_ARCH_LIST"] = arch
 
 
+# Pin the local GPU arch for the build UNCONDITIONALLY. torch's JIT compile-cache
+# key includes TORCH_CUDA_ARCH_LIST, so pinning it only when a build already
+# looks pending would flip the key between runs (pinned vs inherited multi-arch)
+# and force torch to rebuild every time the key changes. Doing it on every import
+# keeps the key stable: build once, then always a cache hit.
+_pin_build_arch()
 _verbose = _build_pending()
 if _verbose:
-    _pin_build_arch()
     print(f"[fastkernels] Building CUDA extension {_NAME!r} ({len(_SOURCES)} "
           f"sources) for arch {os.environ.get('TORCH_CUDA_ARCH_LIST', 'auto')!r}"
           f" -- one-time JIT compile; streaming ninja progress ...", flush=True)
