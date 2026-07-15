@@ -89,33 +89,31 @@ python tests/bench_vllm.py \
 
 ---
 
-## LLM Kernel Agent
+## Creating Kernel Stubs
 
-The agent uses Claude to generate replacement kernels, validate them, and benchmark them end-to-end:
+Scaffold skeleton replacement modules under `tasks/candidate/` — one per discovered operator, each mirroring its baseline's `__init__`/`forward` signature with a `raise NotImplementedError` body for you to fill in:
 
 ```bash
-# Generate all L1 kernels for Llama
-fastkernels agent \
-    --model meta-llama/Llama-3.1-8B-Instruct --level 1
+# Stubs for every operator
+fastkernels create-stubs
 
-# CUDA-only kernels (no Triton/PyTorch builtins)
-fastkernels agent \
-    --model meta-llama/Llama-3.1-8B-Instruct --level 1 --cuda-only
+# Only level-1 operators
+fastkernels create-stubs --level 1
 
-# Mixtral L2 operators with TP
-fastkernels agent \
-    --model mistralai/Mixtral-8x7B-Instruct-v0.1 --level 2 --tp 4
+# Only operators used by a given architecture
+fastkernels create-stubs --architecture llama
+fastkernels create-stubs --level 2 --architecture mixtral
 ```
 
-The agent discovers operators at the specified level, generates replacements in parallel, validates compilation and numerical correctness, patches all successful kernels into the model, and reports token match rate and speedup. Failed kernels are retried with error feedback.
+Existing candidates are archived to `tasks/candidate/prev-attempts/` before new stubs are written. Edit the `forward()` methods to add your custom implementations, then benchmark with `fastkernels bench --target <name>`.
 
-Generated kernels are saved to `tasks/candidate/L{level}/{op_name}.py`.
+Generated stubs are saved to `tasks/candidate/L{level}/{op_name}.py`.
 
 ---
 
 ## Experiment Tracking
 
-Every `fastkernels agent`, `fastkernels kernels`, `fastkernels eval`, and `fastkernels e2e` run is automatically logged to [MLflow](https://mlflow.org). This provides:
+Every `fastkernels kernels`, `fastkernels eval`, and `fastkernels e2e` run is automatically logged to [MLflow](https://mlflow.org). This provides:
 
 - **Kernel lineage**: Every generated kernel is stored as an MLflow artifact, linked to the run parameters that produced it.
 - **Benchmark history**: Speedup, correctness, and max error ratio for every operator across every benchmark run.
@@ -125,7 +123,6 @@ Every `fastkernels agent`, `fastkernels kernels`, `fastkernels eval`, and `fastk
 
 | Command | Logged data |
 |---------|-------------|
-| `fastkernels agent` | Run params, per-op generation success/attempts, unit test results, e2e speedup, kernel source code |
 | `fastkernels kernels` | Bench params, per-operator per-scenario speedup/correctness, kernel source code |
 | `fastkernels eval` | Per-model throughput/latency speedup, alignment rate, MacroEval speedup/correctness/coverage/score, wall-clock time |
 | `fastkernels e2e` | Throughput (tokens/s), latency (percentiles), serve metrics (TTFT, TPOT, ITL) |
@@ -272,7 +269,6 @@ Each run is tagged with a `tier` that indicates its source:
 
 | Tag | Source command | Key metrics |
 |-----|---------------|-------------|
-| `agent` | `fastkernels agent` | `gen_{op}_success`, `utest_{op}_success`, `e2e_speedup`, `e2e_token_match_rate` |
 | `kernel` | `fastkernels kernels` | `{op}_avg_speedup`, `{op}_passed`, `{op}_failed`, `avg_speedup` |
 | `eval` | `fastkernels eval` | `avg_throughput_speedup`, `avg_latency_speedup`, `alignment_rate`, `macro_speedup`, `macro_correctness`, `macro_coverage`, `macro_score` |
 | `e2e` | `fastkernels e2e` | `tokens_per_second`, `avg_latency`, `mean_ttft_ms` (varies by bench type) |

@@ -6,29 +6,51 @@ forward signatures but delegates to the baseline implementation, giving the
 user a starting point for writing a custom kernel.
 
 Usage:
-    python -m fastkernels.agent.create_stubs
-    python -m fastkernels.agent.create_stubs --level 1
-    python -m fastkernels.agent.create_stubs --architecture llama
-    python -m fastkernels.agent.create_stubs --level 1 --architecture mixtral
+    fastkernels create-stubs
+    fastkernels create-stubs --level 1
+    fastkernels create-stubs --architecture llama
+    fastkernels create-stubs --level 1 --architecture mixtral
+
+    # equivalently, as a module:
+    python -m fastkernels.utils.create_stubs
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib
 import inspect
 import shutil
 import sys
 import time
-from pathlib import Path
 
-from fastkernels import CANDIDATE_DIR, PREV_ATTEMPTS_DIR, PROJECT_ROOT
-
-_PROJECT_ROOT = str(PROJECT_ROOT)
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
+from fastkernels import CANDIDATE_DIR, PREV_ATTEMPTS_DIR
 
 _CANDIDATE_DIR = CANDIDATE_DIR
 _PREV_ATTEMPTS_DIR = PREV_ATTEMPTS_DIR
+
+
+def _resolve_operator_class(module_path: str, class_name: str):
+    """Import a baseline operator module and return its primary nn.Module class.
+
+    ``module_path`` is the dotted path relative to the ``fastkernels`` package
+    (e.g. ``tasks.baseline.L1.rms_norm``). Prefers the class named by the static
+    analyzer; falls back to the last nn.Module subclass defined in the module.
+    Importing can fail when the operator pulls an uninstalled optional
+    dependency (e.g. ``spconv``); the caller is expected to handle that.
+    """
+    import torch.nn as nn
+
+    mod = importlib.import_module(f"fastkernels.{module_path}")
+    cls = getattr(mod, class_name, None)
+    if isinstance(cls, type) and issubclass(cls, nn.Module):
+        return cls
+    result = None
+    for v in vars(mod).values():
+        if (isinstance(v, type) and issubclass(v, nn.Module)
+                and v is not nn.Module and v.__module__ == mod.__name__):
+            result = v
+    return result
 
 
 def _candidate_has_kernels() -> bool:
@@ -161,9 +183,8 @@ def _needs_init_stub(cls: type) -> bool:
     return "__init__" in cls.__dict__
 
 
-def generate_stub(target) -> str:
-    """Generate a stub module string for a BenchTarget."""
-    cls = target.target_cls
+def generate_stub(cls: type, level: int, name: str) -> str:
+    """Generate a stub module string for an operator class."""
     class_name = cls.__name__
 
     init_sig = inspect.signature(cls.__init__) if _needs_init_stub(cls) else None
@@ -171,7 +192,7 @@ def generate_stub(target) -> str:
 
     lines = []
 
-    lines.append(f'"""Stub replacement for {class_name} (L{target.level}/{target.name})."""')
+    lines.append(f'"""Stub replacement for {class_name} (L{level}/{name})."""')
     lines.append("")
     lines.append("from __future__ import annotations")
     lines.append("")
@@ -239,8 +260,9 @@ def generate_stub(target) -> str:
     return "\n".join(lines)
 
 
-def main():
+def main(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(
+        prog="fastkernels create-stubs",
         description="Create stub replacement modules in tasks/candidate/",
     )
     parser.add_argument(
@@ -249,27 +271,33 @@ def main():
     )
     parser.add_argument(
         "--architecture", type=str, default=None,
-        help="Only create stubs for operators used by this architecture "
-             "(e.g. 'llama', 'mixtral'). Matches against model keys.",
+        help="Only create stubs for operators used by this architecture, "
+             "matched against the L4 module stem (e.g. 'llama', 'mixtral'); "
+             "see 'fastkernels list --map'.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    from fastkernels.infra.kernel_swapper import discover_targets, _L4_MODEL_KEYS
+    # Enumerate operators with list.py's pure-static analyzer (ast + filesystem,
+    # never imports torch or the operator modules), so discovery never crashes
+    # on an operator whose optional dependency is missing.
+    from fastkernels.list import discover_operator_targets
 
-    arch_key = None
-    if args.architecture:
-        lower = args.architecture.lower()
-        arch_key = _L4_MODEL_KEYS.get(lower, lower)
-
-    targets = discover_targets()
+    targets = discover_operator_targets()
     if args.level is not None:
         targets = [t for t in targets if t.level == args.level]
-    if arch_key is not None:
-        targets = [t for t in targets if arch_key in t.models]
+    if args.architecture is not None:
+        arch = args.architecture.lower()
+        matched = [t for t in targets if arch in t.models]
+        if not matched:
+            avail = sorted({m for t in targets for m in t.models})
+            print(f"No operators for architecture {args.architecture!r}. "
+                  f"Available: {', '.join(avail)}")
+            sys.exit(1)
+        targets = matched
     targets = sorted(targets, key=lambda t: (t.level, t.name))
 
     if not targets:
-        print("No targets match the given filters.")
+        print("No operators match the given filters.")
         sys.exit(1)
 
     if _candidate_has_kernels():
@@ -286,19 +314,35 @@ def main():
 
     _CANDIDATE_DIR.mkdir(parents=True, exist_ok=True)
 
-    print(f"\nCreating {len(targets)} stubs:\n")
+    print(f"\nCreating stubs for up to {len(targets)} operators:\n")
+    written = 0
+    skipped: list[tuple[str, str]] = []
     for t in targets:
+        module_path = f"tasks.baseline.L{t.level}.{t.name}"
+        try:
+            cls = _resolve_operator_class(module_path, t.class_name)
+        except Exception as exc:  # noqa: BLE001 - usually a missing optional dep
+            skipped.append((f"L{t.level}/{t.name}", f"{type(exc).__name__}: {exc}"))
+            continue
+        if cls is None:
+            skipped.append((f"L{t.level}/{t.name}", "no nn.Module class found"))
+            continue
+
         level_dir = _CANDIDATE_DIR / f"L{t.level}"
         level_dir.mkdir(parents=True, exist_ok=True)
         out_file = level_dir / f"{t.name}.py"
+        out_file.write_text(generate_stub(cls, t.level, t.name))
+        written += 1
+        print(f"  L{t.level}/{t.name}.py  ({cls.__name__})")
 
-        stub_code = generate_stub(t)
-        out_file.write_text(stub_code)
-        print(f"  L{t.level}/{t.name}.py  ({t.target_cls.__name__})")
-
-    print(f"\nDone. Stubs written to {_CANDIDATE_DIR}")
-    print("Edit the forward() methods to add your custom implementations,")
-    print("then benchmark with: fastkernels kernels --target <name>")
+    print(f"\nDone. {written} stub(s) written to {_CANDIDATE_DIR}")
+    if skipped:
+        print(f"\nSkipped {len(skipped)} operator(s) whose module could not be "
+              f"imported (likely a missing optional dependency):")
+        for name, reason in skipped:
+            print(f"  {name}: {reason}")
+    print("\nEdit the forward() methods to add your custom implementations,")
+    print("then benchmark with: fastkernels bench --target <name>")
 
 
 if __name__ == "__main__":

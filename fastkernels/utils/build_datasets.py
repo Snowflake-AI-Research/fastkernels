@@ -16,9 +16,9 @@ and are chat-templated + tokenized per *target* model at load time (see
 recorded here are advisory (Llama-3.1-8B).
 
 Usage:
-    python -m fastkernels.build_datasets --which all
-    python -m fastkernels.build_datasets --which mixed --push
-    python -m fastkernels.build_datasets --which longctx --out /some/dir
+    python -m fastkernels.utils.build_datasets --which all
+    python -m fastkernels.utils.build_datasets --which mixed --push
+    python -m fastkernels.utils.build_datasets --which longctx --out /some/dir
 
 The Hub repo IDs and the mixed decode cap come from
 ``fastkernels.workloads`` so this stays in sync with the loader.
@@ -33,7 +33,7 @@ from collections import Counter
 
 import numpy as np
 
-from .workloads import DEFAULT_DECODE_CAPS, DEFAULT_WORKLOAD_DATASETS
+from ..workloads import DEFAULT_DECODE_CAPS, DEFAULT_WORKLOAD_DATASETS
 
 # --- frozen, canonical build parameters (do not change without a re-push) ----
 SEED = 42

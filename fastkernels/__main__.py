@@ -20,6 +20,10 @@ def main() -> None:
         from .bench_kernel import main as bench_main
         raise SystemExit(bench_main(sys.argv[2:]))
 
+    if len(sys.argv) > 1 and sys.argv[1] == "create-stubs":
+        from .utils.create_stubs import main as create_stubs_main
+        raise SystemExit(create_stubs_main(sys.argv[2:]))
+
     parser = argparse.ArgumentParser(description="fastkernels CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -39,6 +43,12 @@ def main() -> None:
         "bench",
         help="Benchmark candidate kernels against their baseline for "
              "correctness and performance (see 'fastkernels bench --help')",
+    )
+
+    subparsers.add_parser(
+        "create-stubs",
+        help="Scaffold candidate-kernel skeleton modules under tasks/candidate/ "
+             "(see 'fastkernels create-stubs --help')",
     )
 
     parser.parse_args()
