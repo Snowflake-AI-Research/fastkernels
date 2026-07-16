@@ -38,8 +38,8 @@ def main() -> None:
     # ``fastkernels list`` command (args forwarded to ``fastkernels.list``)
     subparsers.add_parser(
         "list",
-        help="List families/architectures/benchmarks, or the model<->operator "
-             "map with '--map'",
+        help="List families/architectures/benchmarks, the available workloads "
+             "with '--workloads', or the model<->operator map with '--map'",
     )
 
     subparsers.add_parser(

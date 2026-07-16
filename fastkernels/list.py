@@ -1,4 +1,4 @@
-"""List architectures, benchmarks, and the model<->operator map via CLI.
+"""List architectures, benchmarks, workloads, and the model<->operator map via CLI.
 
 The model<->operator map is built with pure static analysis (``ast`` +
 filesystem walking) so it has *no* external dependencies: it never imports
@@ -18,7 +18,16 @@ from pathlib import Path
 
 from fastkernels import CANDIDATE_DIR, KB_ROOT
 
-from .workloads import FAMILIES, FASTKERNELS_ARCHITECTURES, DEFAULT_BENCHMARK, BenchmarkScenario, module_for
+from .workloads import (
+    DEFAULT_BENCHMARK,
+    FAMILIES,
+    FASTKERNELS_ARCHITECTURES,
+    WORKLOAD_SPECS,
+    BenchmarkScenario,
+    Purpose,
+    Workload,
+    module_for,
+)
 
 
 def print_benchmark_set(benchmarks: list[BenchmarkScenario], title: str = "BENCHMARK SCENARIOS") -> None:
@@ -86,6 +95,57 @@ def print_registry() -> None:
     print("=" * arch_width)
     
     print_benchmark_set(DEFAULT_BENCHMARK, "DEFAULT BENCHMARK")
+
+
+def print_workloads() -> None:
+    """List every benchmark workload in a tabular format."""
+    rows = []
+    
+    for member, spec in WORKLOAD_SPECS.items():
+        family_name = type(member).__name__
+        workload_name = f"{family_name}.{member.name}"
+        
+        ds_name = getattr(spec.params, "dataset_name", "") if spec.params else ""
+        if not ds_name:
+            ds_name = "-"
+            
+        purpose_str = "Throughput" if spec.purpose == Purpose.THROUGHPUT else "Latency"
+        chars = [purpose_str]
+        
+        if spec.params:
+            for field in ["batch_size", "num_requests", "output_len", "input_len", 
+                          "max_text_len", "image_size", "resolution", "height", "width",
+                          "batch_clips", "num_frames", "num_images", "num_queries"]:
+                if hasattr(spec.params, field):
+                    val = getattr(spec.params, field)
+                    if val is not None and val != "" and val != 0:
+                        chars.append(f"{field}={val}")
+                        
+        chars_str = ", ".join(chars)
+        
+        rows.append((family_name, workload_name, str(ds_name), chars_str))
+        
+    width_name = max(len("Workload Name"), max((len(r[1]) for r in rows), default=0))
+    width_ds = max(len("Dataset"), max((len(r[2]) for r in rows), default=0))
+    width_chars = max(len("Characteristic"), max((len(r[3]) for r in rows), default=0))
+    
+    total_width = width_name + width_ds + width_chars + 6
+    
+    print("\n" + "=" * total_width)
+    print(f"{'AVAILABLE WORKLOADS':^{total_width}}")
+    print("=" * total_width)
+    print(f"{'Workload Name':<{width_name}} | {'Dataset':<{width_ds}} | {'Characteristic'}")
+    print("-" * width_name + "-+-" + "-" * width_ds + "-+-" + "-" * width_chars)
+    
+    prev_family = None
+    for r in rows:
+        current_family = r[0]
+        if prev_family is not None and current_family != prev_family:
+            print("-" * total_width)
+        print(f"{r[1]:<{width_name}} | {r[2]:<{width_ds}} | {r[3]}")
+        prev_family = current_family
+        
+    print("=" * total_width + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -325,17 +385,28 @@ def _apply_candidates_from_env() -> None:
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="fastkernels list",
-        description="List families/architectures/benchmarks and the model<->operator map.",
+        description="List families/architectures/benchmarks, the available "
+                    "workloads (--workloads), or the model<->operator map (--map).",
     )
-    parser.add_argument(
+    view = parser.add_mutually_exclusive_group()
+    view.add_argument(
         "--map", action="store_true",
         help="Print operators-by-model and models-by-operator mappings instead "
              "of the family/architecture/benchmark registry.",
+    )
+    view.add_argument(
+        "--workloads", action="store_true",
+        help="Print the available benchmark workloads, grouped by family and by "
+             "throughput/latency purpose, instead of the registry.",
     )
     args = parser.parse_args(argv)
 
     if args.map:
         print_model_operator_map()
+        return
+
+    if args.workloads:
+        print_workloads()
         return
 
     print_registry()
