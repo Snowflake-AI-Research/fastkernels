@@ -21,7 +21,7 @@ def main() -> None:
         raise SystemExit(0)
 
     if len(sys.argv) > 1 and sys.argv[1] == "bench":
-        from .bench_kernel import main as bench_main
+        from .bench import main as bench_main
         raise SystemExit(bench_main(sys.argv[2:]))
 
     if len(sys.argv) > 1 and sys.argv[1] == "create-stubs":

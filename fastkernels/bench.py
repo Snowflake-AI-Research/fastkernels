@@ -54,9 +54,8 @@ Known limitations (honest by design):
 * One GPU per operator (tp=1) -- matches the L1/L2 kernel scope; multi-GPU
   operators would need the tp-packing logic from ``capture.py``.
 
-No existing top-level ``fastkernels`` command conflicts with ``bench`` (the
-``fastkernels/bench/{e2e,eval}`` packages are only reachable via
-``python -m fastkernels.bench.*``), so nothing needs to be disabled.
+This module is ``fastkernels/bench.py`` (invoked as ``fastkernels bench`` /
+``python -m fastkernels.bench``); importing it has no side effects.
 
 Code map (see the ``PART N`` banners below):
 
@@ -1296,7 +1295,7 @@ def _kill_group(proc: subprocess.Popen, pgid: int) -> None:
 
 
 def _worker_command(op: Operator, args) -> list[str]:
-    cmd = [sys.executable, "-u", "-m", "fastkernels.bench_kernel", "--worker",
+    cmd = [sys.executable, "-u", "-m", "fastkernels.bench", "--worker",
            "--op", op.qualname, "--captures", str(args.captures),
            "--max-shapes", str(args.max_shapes), "--warmup", str(args.warmup),
            "--iters", str(args.iters), "--rounds", str(args.rounds)]
@@ -1604,7 +1603,7 @@ def main(argv: list[str] | None = None) -> int:
             _unlock_clocks()
 
     result.print_table()
-    out_path = Path(args.output) if args.output else run_output_path("bench_kernel")
+    out_path = Path(args.output) if args.output else run_output_path("bench")
     result.save_json(out_path)
     print(f"\nResults written to {out_path}")
     if args.json:
