@@ -2,14 +2,6 @@
 
 Quick-start for porting a new model into fastkernels, optimizing its kernels against a SOTA reference (vLLM or SGLang), and shipping the winners back.
 
-## Quick Start
-
-```bash
-git clone https://github.com/Snowflake-AI-Research/fastkernels.git
-cd fastkernels
-pip install .
-```
-
 ---
 
 ## Workflow
@@ -130,33 +122,14 @@ Run the capture command:
 fastkernels capture fastkernels/scenarios/glm5.2.yaml --max-layers 4 --max-requests 64
 ```
 
-**stdout** (per scenario·workload; parallel across GPUs, one scenario at a time at `tp=8`):
-```text
-Discovering operators in fastkernels.tasks.baseline ...
-  Instrumented 583 operator class(es).
-
-########## Scenario: zai-org/GLM-5.2 (dtype=bfloat16, tp=8) ##########
-  [1/6] Loading model weights...
-  NOTE: --max-layers capping transformer layers 92 -> 4
-  [1/6] Model loaded in 12.7s
-  [4/6] Allocating KV cache...
-  Engine ready in 41.2s total
-
-=== Capturing workload: mixed ===
-Loading 'mixed' workload prompts (64) ...
-  Generation: 61/64 reached EOS; lengths=[228, 577, 43, ...]
-  Verification 1 (hook cross-check)   [PASS]: 19/19 operator forwards match the capture.
-  Verification 2 (mock batching replay) [PASS]: 5/5 checks passed (312 simulated steps).
-  Captured 20 executed operator class(es) (of 583 instrumented).
-  Report written to ~/.fastkernels/captures/zai-org__GLM-5.2_tp8_bfloat16_mixed_req64_seqsauto_L4_eager.json
-```
-
 One JSON report is written per scenario·workload. This JSON records every executed operator's init/forward parameters and inputs. Drop `--max-layers`/`--max-requests` if you want a full-fidelity capture rather than a truncated run.
 
 
 ### 3. Optimize the kernels
 
-After capturing the shapes, it's time to optimize performance. fastkernels allows you to do that by replacing the model's baseline operators with optimized versions. To optimize an operator, create a candidate file at the path: `fastkernels/tasks/candidate/<operator level>/<operator_name>.py`. Each candidate will need to have the exact same interface (init/forward signature) as its corresponding baseline operator. You can write one or more such candidates, each with the optimized kernel code. 
+After capturing the shapes, it's time to optimize performance. fastkernels allows you to do that by replacing the model's baseline operators with optimized versions. Higher levels in the architecture hierarchy compose lower ones via standard Python imports. When you replace a lower-level operator (like an L1 kernel), the change propagates upward automatically through every level that uses it.
+
+To optimize an operator, create a candidate file at the path: `fastkernels/tasks/candidate/<operator level>/<operator_name>.py`. Each candidate will need to have the **exact same class name** and **exact same `forward` signature** as its corresponding baseline operator. You can write one or more such candidates, each with the optimized kernel code. 
 
 To facilitate this step, you can use `fastkernels list --map` to list all operators used by a given model. You can then use `fastkernels create-stubs` to automatically create empty stub candidates for a particular model's operators:
 
