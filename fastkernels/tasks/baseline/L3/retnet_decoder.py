@@ -54,6 +54,7 @@ class RetNetDecoderLayer(nn.Module):
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             use_cache=use_cache,
+            **kwargs,
         )
         hidden_states = residual + h
 

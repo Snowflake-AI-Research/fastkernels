@@ -32,8 +32,6 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-import triton
-import triton.language as tl
 
 
 # ---------------------------------------------------------------------------
@@ -145,82 +143,20 @@ def _swizzle_mxfp4(quant_tensor: torch.Tensor, scale: torch.Tensor, num_warps: i
 # ---------------------------------------------------------------------------
 
 
-@triton.jit
-def _pack_bitmatrix_kernel(
-    bitmatrix,
-    topk_ids,
-    n_rows,
-    bm_cols: tl.constexpr,
-    n_expts_act,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_K: tl.constexpr,
-):
-    """Pack ``topk_ids`` into a bitmatrix.
-
-    Original Triton reference:
-    https://github.com/triton-lang/triton/blob/dd1bbc52b34d202dfe5ffea1e04fb16166c5c04e/python/triton_kernels/bench/distributed.py#L264
-    """
-    pid_m = tl.program_id(0)
-    offsets_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offsets_k = tl.arange(0, BLOCK_SIZE_K)
-    offsets = offsets_m[:, None] * n_expts_act + offsets_k[None, :]
-    mask = (offsets_m < n_rows)[:, None] & (offsets_k < n_expts_act)[None, :]
-    indices = tl.load(topk_ids + offsets, mask=mask, other=-1)
-    div = indices // 32
-    rem = indices % 32
-    one = tl.cast(1, tl.uint32)
-
-    for i in range(bm_cols):
-        offs = tl.arange(0, BLOCK_SIZE_K // 32) + i * (BLOCK_SIZE_K // 32)
-        x = tl.where(
-            div[:, :, None] == offs[None, None, :], (one << rem)[:, :, None], 0
-        )
-        y = tl.reduce_or(x, axis=1)
-        bitmatrix_ptrs = bitmatrix + offsets_m[:, None] * bm_cols + offs[None, :]
-        tl.store(bitmatrix_ptrs, y, mask=offsets_m[:, None] < n_rows)
-
-
-def _routing_from_bitmatrix(bitmatrix, expt_scal, expt_indx, n_expts_tot, n_expts_act):
-    """Build (RoutingData, GatherIndx, ScatterIndx) from a packed bitmatrix."""
-    _ensure_triton_kernels_on_path()
-    from triton_kernels.matmul_ogs import GatherIndx, RoutingData, ScatterIndx
-    from triton_kernels.tensor import SparseMatrix, make_ragged_tensor_metadata
-
-    sparse_logits = SparseMatrix(indx=expt_indx, vals=expt_scal, mask=bitmatrix)
-    dispatch_indx = sparse_logits.mask_metadata.row_sorted_indx
-    combine_indx = sparse_logits.mask_metadata.col_sorted_indx
-    ragged_batch_metadata = make_ragged_tensor_metadata(
-        sparse_logits.mask_metadata.col_sum,
-        dispatch_indx.shape[0],
-    )
-    gate_scal = sparse_logits.vals.flatten()[combine_indx]
-    routing_data = RoutingData(
-        gate_scal,
-        ragged_batch_metadata.block_sizes,
-        n_expts_tot,
-        n_expts_act,
-        ragged_batch_metadata,
-    )
-    gather_idx = GatherIndx(combine_indx, dispatch_indx)
-    scatter_idx = ScatterIndx(dispatch_indx, combine_indx)
-    return routing_data, gather_idx, scatter_idx
-
-
 def _routing_from_logits(logits: torch.Tensor, n_expts_act: int, sm_first: bool):
-    """Compute routing data straight from gating logits."""
-    _ensure_triton_kernels_on_path()
-    from triton_kernels.topk import topk
+    """Compute ``(RoutingData, GatherIndx, ScatterIndx)`` from gating logits.
 
-    if sm_first:
-        logits = torch.softmax(logits, dim=-1)
-    sparse_logits = topk(logits, n_expts_act, apply_softmax=not sm_first)
-    return _routing_from_bitmatrix(
-        sparse_logits.mask,
-        sparse_logits.vals,
-        sparse_logits.indx,
-        logits.shape[-1],
-        n_expts_act,
-    )
+    Delegates to ``triton_kernels.routing.routing``, which fuses softmax, top-k,
+    bitmatrix packing and routing-metadata construction into a single launch.
+    This is the same entry point vLLM's GPT-OSS MoE uses; earlier revisions of
+    this file reimplemented it against a ``SparseMatrix`` /
+    ``make_ragged_tensor_metadata`` API that has since been removed from
+    ``triton_kernels``.
+    """
+    _ensure_triton_kernels_on_path()
+    from triton_kernels.routing import routing
+
+    return routing(logits, n_expts_act, sm_first=sm_first)
 
 
 # ---------------------------------------------------------------------------
@@ -275,14 +211,12 @@ def _fused_experts(
     intermediate_cache = _resize_cache(intermediate_cache, (batch_dim, M * topk, N // 2))
     output_tensor = _resize_cache(output_tensor, (batch_dim, M, K))
 
+    # ``reduction_n`` is an argument of ``FusedActivation`` (positional, after
+    # the activation args), not of ``FnSpecs``, in the bundled triton_kernels.
     act = FusedActivation(
-        FnSpecs(
-            "swiglu",
-            triton_kernels.swiglu.swiglu_fn,
-            ("alpha", "limit"),
-            reduction_n=2,
-        ),
+        FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn, ("alpha", "limit")),
         (swiglu_alpha, swiglu_limit),
+        2,
     )
     gammas = routing_data.gate_scal if routing_data else None
 

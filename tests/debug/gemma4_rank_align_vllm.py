@@ -164,7 +164,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     repo_root, _ = _repo_paths()
-    from fastkernels.bench.utils.real_prompts import (
+    from fastkernels.workloads import (
         DEFAULT_WORKLOAD_DATASETS,
         load_real_prompt_workload,
     )
@@ -172,7 +172,7 @@ def main() -> None:
 
     args = parse_args()
     result_dir = Path(args.result_dir)
-    scenarios = ["prefill-heavy", "balanced", "decode-heavy"]
+    scenarios = ["mixed"]
     indices = [
         round(i * (args.num_requests - 1) / (args.sample - 1))
         for i in range(args.sample)

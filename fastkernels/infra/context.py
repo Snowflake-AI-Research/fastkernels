@@ -255,6 +255,22 @@ def get_no_compile_layers() -> dict[str, "nn.Module"]:
     return _STATIC_NO_COMPILE_LAYERS
 
 
+def clear_no_compile_layers() -> None:
+    """Drop all registered layers and reset the global context.
+
+    ``register_no_compile_layers`` only ever ``update``s this module-level
+    registry, so every attention/MoE module a model registers -- along with the
+    KV-cache slices they hold on ``.k_cache`` / ``.v_cache`` -- stays pinned for
+    the lifetime of the process. That silently prevents a released engine's model
+    and KV cache (tens to >100 GB) from being garbage-collected, starving the
+    next engine of memory. Engine teardown must call this so the model can
+    actually be freed.
+    """
+    global _CONTEXT
+    _STATIC_NO_COMPILE_LAYERS.clear()
+    _CONTEXT = Context()
+
+
 def auto_register_no_compile_layers(model: "nn.Module") -> None:
     """Walk *model* and register every MoE and Attention sub-module by its
     fully-qualified prefix so custom ops can find them at runtime.

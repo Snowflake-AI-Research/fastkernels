@@ -145,6 +145,7 @@ class RWKV7Attention(nn.Module):
         attention_mask: torch.Tensor | None = None,
         past_key_values=None,
         use_cache: bool = False,
+        cu_seqlens: torch.Tensor | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, None, object | None, torch.Tensor]:
         B, T, _ = hidden_states.shape
@@ -152,21 +153,35 @@ class RWKV7Attention(nn.Module):
         # Token shift: shifted[t] = previous token's hidden state.
         # For cached decode the previous token lives in past_key_values.conv_states[id(self)]
         # (a [B, hidden_size] tensor); for fresh prefill it's zero (left-pad).
+        # In the packed varlen path (cu_seqlens set, B==1) the shift must not
+        # cross sequence boundaries: each sequence's first token shifts in that
+        # sequence's own previous token (its stored conv_state), or zero.
         prev_shift = None
         if past_key_values is not None:
             cs = getattr(past_key_values, "conv_states", None)
             if cs is not None:
                 prev_shift = cs.get(id(self))
         shifted = torch.empty_like(hidden_states)
-        if prev_shift is not None:
-            shifted[:, 0] = prev_shift
-        else:
-            shifted[:, 0].zero_()
         if T > 1:
             shifted[:, 1:] = hidden_states[:, :-1]
+        if cu_seqlens is not None:
+            starts = cu_seqlens[:-1].to(torch.long)
+            if prev_shift is not None:
+                shifted[0].index_copy_(0, starts, prev_shift.to(shifted.dtype))
+            else:
+                shifted[0, starts] = 0
+        else:
+            shifted[:, 0] = prev_shift if prev_shift is not None else 0
         delta = shifted - hidden_states
-        # Save the last hidden vec as the conv_state for the next call.
-        new_conv_state = hidden_states[:, -1].detach() if use_cache else None
+        # Save the last hidden vec of each sequence as its conv_state for the
+        # next call ([B, d] dense, or [N, d] per-sequence in the varlen path).
+        new_conv_state = None
+        if use_cache:
+            if cu_seqlens is not None:
+                ends = (cu_seqlens[1:] - 1).to(torch.long)
+                new_conv_state = hidden_states[0].index_select(0, ends).detach()
+            else:
+                new_conv_state = hidden_states[:, -1].detach()
 
         # Fused addcmul: xi = hidden_states + delta * x_i
         xr = torch.addcmul(hidden_states, delta, self.x_r)
@@ -226,6 +241,7 @@ class RWKV7Attention(nn.Module):
                     scale=1.0,
                     initial_state=initial_state,
                     output_final_state=use_cache,
+                    cu_seqlens=cu_seqlens,
                 )
             else:
                 o, final_state = self.fused_recurrence(
@@ -234,6 +250,7 @@ class RWKV7Attention(nn.Module):
                     scale=1.0,
                     initial_state=initial_state,
                     output_final_state=use_cache,
+                    cu_seqlens=cu_seqlens,
                 )
             # Fast-path output is already [B, T, H, V] — no transpose needed.
         else:

@@ -94,7 +94,10 @@ class Qwen3VLConfig:
             max_position_embeddings=text_config.max_position_embeddings,
             rms_norm_eps=text_config.rms_norm_eps,
             rope_theta=rope_theta,
-            tie_word_embeddings=text_config.tie_word_embeddings,
+            tie_word_embeddings=getattr(
+                text_config, "tie_word_embeddings",
+                getattr(hf, "tie_word_embeddings", False),
+            ),
             mrope_section=rope.get("mrope_section", [24, 20, 20]),
             mrope_interleaved=rope.get("mrope_interleaved", True),
             image_token_id=hf.image_token_id,
@@ -294,6 +297,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         video_grid_thw: list[list[int]] | None = None,
         image_offsets: list[int] | None = None,
         video_offsets: list[int] | None = None,
+        **kwargs,  # tolerate engine-passed extras (e.g. video_second_per_grid, audio_feature_lengths)
     ) -> tuple[torch.Tensor, int]:
         return self._mrope_positions(
             input_tokens, self.config.vision.spatial_merge_size,

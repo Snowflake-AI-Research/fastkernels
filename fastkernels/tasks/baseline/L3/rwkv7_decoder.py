@@ -65,6 +65,7 @@ class RWKV7Block(nn.Module):
         attention_mask: torch.Tensor | None = None,
         past_key_values=None,
         use_cache: bool = False,
+        cu_seqlens: torch.Tensor | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor, None, object | None]:
         residual = self.pre_norm(hidden_states) if hasattr(self, 'pre_norm') else hidden_states
@@ -76,6 +77,7 @@ class RWKV7Block(nn.Module):
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             use_cache=use_cache,
+            cu_seqlens=cu_seqlens,
         )
         hidden_states = residual + h
 
@@ -83,6 +85,7 @@ class RWKV7Block(nn.Module):
         h = self.ffn_norm(hidden_states)
         hidden_states = residual + self.ffn(
             h, past_key_values=past_key_values, use_cache=use_cache,
+            cu_seqlens=cu_seqlens,
         )
 
         return hidden_states, v_first, attentions, past_key_values

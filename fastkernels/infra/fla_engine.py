@@ -99,6 +99,7 @@ class _ActiveSeq:
 _REGISTRY = {
     "fla-hub/gla-2.7B-100B": ("fastkernels.tasks.baseline.L4.gla", "GLAConfig", "GLAForCausalLM"),
     "fla-hub/retnet-2.7B-100B": ("fastkernels.tasks.baseline.L4.retnet", "RetNetConfig", "RetNetForCausalLM"),
+    "fla-hub/rwkv7-1.5B-world": ("fastkernels.tasks.baseline.L4.rwkv7", "RWKV7Config", "RWKV7ForCausalLM"),
     "fla-hub/rwkv7-2.9B-g1": ("fastkernels.tasks.baseline.L4.rwkv7", "RWKV7Config", "RWKV7ForCausalLM"),
     "fla-hub/rwkv7-2.9B-world": ("fastkernels.tasks.baseline.L4.rwkv7", "RWKV7Config", "RWKV7ForCausalLM"),
 }

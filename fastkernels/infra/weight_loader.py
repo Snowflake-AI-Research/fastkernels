@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import re
 from glob import glob
+from typing import TYPE_CHECKING
 
 import torch
 from huggingface_hub import snapshot_download
@@ -31,19 +32,17 @@ except ImportError:
 from concurrent.futures import ThreadPoolExecutor
 
 from .tp import _tp_size
-from ..tasks.baseline.L4.bitnet import BitNetConfig, BitNetForCausalLM
+# Only the (lightweight) Llama config/model is imported eagerly. Every other
+# architecture is imported lazily inside ``load_model`` / the EAGLE-3 loader so
+# that loading a plain Llama checkpoint does not require optional, arch-specific
+# dependencies (deep_gemm for DeepSeek, diffusers/peft for Flux, fla for the
+# linear-attention models, etc.).
 from ..tasks.baseline.L4.llama import LlamaConfig, LlamaForCausalLM
-from ..tasks.baseline.L4.llama_eagle3 import LlamaEagle3Config, LlamaForCausalLMEagle3
-from ..tasks.baseline.L4.llama4 import Llama4Config, Llama4ForCausalLM
-from ..tasks.baseline.L4.mixtral import MixtralConfig, MixtralForCausalLM
-from ..tasks.baseline.L4.qwen2_vl import Qwen2VLConfig, Qwen2VLForConditionalGeneration
-from ..tasks.baseline.L4.qwen3_vl import Qwen3VLConfig, Qwen3VLForConditionalGeneration
-from ..tasks.baseline.L4.qwen3_next import Qwen3NextConfig, Qwen3NextForCausalLM
-from ..tasks.baseline.L4.deepseek import DeepSeekV3Config, DeepSeekV3ForCausalLM
-from ..tasks.baseline.L4.flux import FluxConfig, FluxPipeline
-from ..tasks.baseline.L4.gemma4 import Gemma4Config, Gemma4ForCausalLM
-from ..tasks.baseline.L4.whisper import WhisperConfig, WhisperForConditionalGeneration
-from ..tasks.baseline.L4.cosyvoice3 import CosyVoice3Config, CosyVoice3ForTTS
+
+if TYPE_CHECKING:  # annotations only; never imported at runtime
+    from ..tasks.baseline.L4.llama_eagle3 import (
+        LlamaEagle3Config, LlamaForCausalLMEagle3,
+    )
 
 
 def default_weight_loader(param: torch.nn.Parameter, loaded_weight: torch.Tensor):
@@ -964,12 +963,19 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
             expert_id = int(expert_id_str)
             if w_name in ("w1", "w3"):
                 param_name = f"{moe_prefix}.w13"
-                param = model.get_parameter(param_name)
-                param.weight_loader(param, _get_tensor(), expert_id, is_w1=(w_name == "w1"))
+                is_w1 = (w_name == "w1")
             else:
                 param_name = f"{moe_prefix}.w2"
+                is_w1 = None
+            try:
                 param = model.get_parameter(param_name)
+            except AttributeError:
+                # Layer pruned by --max-layers (its module doesn't exist).
+                continue
+            if is_w1 is None:
                 param.weight_loader(param, _get_tensor(), expert_id)
+            else:
+                param.weight_loader(param, _get_tensor(), expert_id, is_w1=is_w1)
             loaded += 1
             continue
 
@@ -1321,10 +1327,45 @@ def _restore_mamba_ssm_params(
                 )
 
 
+def _apply_max_layers(config, max_layers: int | None) -> None:
+    """Cap the transformer stack to the first ``max_layers`` decoder blocks.
+
+    Applied to the config *before* the model is constructed, so only those
+    layers are ever allocated -- and because the weight loader skips checkpoint
+    tensors whose target parameter does not exist, only their weights are read.
+    The embedding, final norm, and LM head live outside the decoder stack and
+    are left untouched. No-op when ``max_layers`` is ``None`` or already >= the
+    model's layer count.
+
+    Encoder-decoder models (e.g. Whisper) build their stacks from
+    ``encoder_layers`` / ``decoder_layers`` and only carry ``num_hidden_layers``
+    for KV-cache sizing, so capping it there would desync the cache from the
+    model -- those models are skipped.
+    """
+    if max_layers is None:
+        return
+    if max_layers < 1:
+        raise ValueError(f"max_layers must be >= 1, got {max_layers}")
+    if getattr(config, "is_encoder_decoder", False):
+        return
+    n = getattr(config, "num_hidden_layers", None)
+    if not isinstance(n, int) or max_layers >= n:
+        return
+    config.num_hidden_layers = max_layers
+    # Some configs carry a per-layer type list (e.g. Gemma4 ``layer_types``
+    # describing sliding/full-attention patterns); keep it consistent.
+    layer_types = getattr(config, "layer_types", None)
+    if isinstance(layer_types, (list, tuple)) and len(layer_types) > max_layers:
+        config.layer_types = type(layer_types)(layer_types[:max_layers])
+    print(f"  NOTE: --max-layers capping transformer layers {n} -> {max_layers}",
+          flush=True)
+
+
 def load_model(
     model_name: str,
     device: torch.device = torch.device("cuda"),
     dtype: torch.dtype = torch.bfloat16,
+    max_layers: int | None = None,
 ):
     model_path = download_model(model_name)
     model_type = _detect_model_type(model_name)
@@ -1367,12 +1408,15 @@ def load_model(
         from ..tasks.baseline.L4.gpt_oss import GptOssConfig, GptOssForCausalLM
         config = GptOssConfig.from_pretrained(model_name)
         config.dtype = dtype
+        _apply_max_layers(config, max_layers)
         print(f"  Allocating GPT-OSS model ({config.num_local_experts} experts, "
               f"top-{config.num_experts_per_tok})...")
         model = GptOssForCausalLM(config)
     elif model_type == "gemma4":
+        from ..tasks.baseline.L4.gemma4 import Gemma4Config, Gemma4ForCausalLM
         config = Gemma4Config.from_pretrained(model_name)
         config.dtype = dtype
+        _apply_max_layers(config, max_layers)
         print(f"  Allocating Gemma4 model ({config.num_experts} experts, "
               f"top-{config.top_k_experts})...")
         model = Gemma4ForCausalLM(config)
@@ -1382,6 +1426,7 @@ def load_model(
         )
         config = WhisperConfig.from_pretrained(model_name)
         config.dtype = dtype
+        _apply_max_layers(config, max_layers)
         print(f"  Allocating Whisper model (enc={config.encoder_layers}L, "
               f"dec={config.decoder_layers}L, d={config.d_model})...")
         model = WhisperForConditionalGeneration(config)
@@ -1389,6 +1434,7 @@ def load_model(
         from ..tasks.baseline.L4.llama4 import Llama4Config, Llama4ForCausalLM
         config = Llama4Config.from_pretrained(model_name)
         config.dtype = dtype
+        _apply_max_layers(config, max_layers)
         print(f"  Allocating Llama4 model ({config.num_local_experts} experts, "
               f"top-{config.num_experts_per_tok})...")
         model = Llama4ForCausalLM(config)
@@ -1396,6 +1442,7 @@ def load_model(
         from ..tasks.baseline.L4.mixtral import MixtralConfig, MixtralForCausalLM
         config = MixtralConfig.from_pretrained(model_name)
         config.dtype = dtype
+        _apply_max_layers(config, max_layers)
         print(f"  Allocating Mixtral model ({config.num_local_experts} experts)...")
         model = MixtralForCausalLM(config)
     elif model_type == "qwen2_vl":
@@ -1404,6 +1451,7 @@ def load_model(
         )
         config = Qwen2VLConfig.from_pretrained(model_name)
         config.dtype = dtype
+        _apply_max_layers(config, max_layers)
         print("  Allocating Qwen2-VL model...")
         model = Qwen2VLForConditionalGeneration(config)
     elif model_type in ("qwen3_vl", "qwen3_vl_moe"):
@@ -1412,6 +1460,7 @@ def load_model(
         )
         config = Qwen3VLConfig.from_pretrained(model_name)
         config.dtype = dtype
+        _apply_max_layers(config, max_layers)
         if config.is_moe:
             print(f"  Allocating Qwen3-VL-MoE model ({config.num_experts} experts, "
                   f"top-{config.num_experts_per_tok})...")
@@ -1419,8 +1468,12 @@ def load_model(
             print("  Allocating Qwen3-VL model...")
         model = Qwen3VLForConditionalGeneration(config, quant_config=quant_config)
     elif model_type == "qwen3_next":
+        from ..tasks.baseline.L4.qwen3_next import (
+            Qwen3NextConfig, Qwen3NextForCausalLM,
+        )
         config = Qwen3NextConfig.from_pretrained(model_name)
         config.dtype = dtype
+        _apply_max_layers(config, max_layers)
         print(
             "  Allocating Qwen3-Next model "
             f"({config.num_experts} experts, "
@@ -1434,12 +1487,14 @@ def load_model(
         )
         config = Qwen2_5OmniConfig.from_pretrained(model_name)
         config.dtype = dtype
+        _apply_max_layers(config, max_layers)
         print("  Allocating Qwen2.5-Omni Thinker model...")
         model = Qwen2_5OmniThinkerForConditionalGeneration(config)
     elif model_type == "mamba2":
         from ..tasks.baseline.L4.mamba2 import Mamba2Config, Mamba2ForCausalLM
         config = Mamba2Config.from_pretrained(model_path)
         config.dtype = dtype
+        _apply_max_layers(config, max_layers)
         print(f"  Allocating Mamba2 model "
               f"(L={config.num_hidden_layers}, hidden={config.hidden_size}, "
               f"heads={config.num_heads}, head_dim={config.head_dim}, "
@@ -1449,6 +1504,7 @@ def load_model(
         from ..tasks.baseline.L4.mamba import MambaConfig, MambaForCausalLM
         config = MambaConfig.from_pretrained(model_path)
         config.dtype = dtype
+        _apply_max_layers(config, max_layers)
         print(f"  Allocating Mamba model "
               f"(L={config.num_hidden_layers}, hidden={config.hidden_size}, "
               f"intermediate={config.intermediate_size}, state={config.state_size})...")
@@ -1459,12 +1515,15 @@ def load_model(
         )
         config = DeepSeekV3Config.from_pretrained(model_name)
         config.dtype = dtype
+        _apply_max_layers(config, max_layers)
         print(f"  Allocating DeepSeek V3.2 model ({config.n_routed_experts} experts, "
               f"top-{config.num_experts_per_tok}, DSA topk={config.index_topk})...")
         model = DeepSeekV3ForCausalLM(config, quant_config=quant_config)
     elif model_type == "bitnet":
+        from ..tasks.baseline.L4.bitnet import BitNetConfig, BitNetForCausalLM
         config = BitNetConfig.from_pretrained(model_name)
         config.dtype = dtype
+        _apply_max_layers(config, max_layers)
         print(f"  Allocating BitNet b1.58 model "
               f"({config.num_hidden_layers}L, hidden={config.hidden_size}, "
               f"W1.58A8)...")
@@ -1476,6 +1535,7 @@ def load_model(
         )
         config = KimiLinearConfig.from_pretrained(model_name)
         config.dtype = dtype
+        _apply_max_layers(config, max_layers)
         print(
             "  Allocating Kimi-Linear model "
             f"({config.num_experts} experts, "
@@ -1485,6 +1545,7 @@ def load_model(
     else:
         config = LlamaConfig.from_pretrained(model_name)
         config.dtype = dtype
+        _apply_max_layers(config, max_layers)
         print("  Allocating Llama model...")
         model = LlamaForCausalLM(config)
 
@@ -1584,8 +1645,51 @@ def load_model(
         if os.environ.get("KB_BITNET_BF16_ALIGN", "1") != "0":
             _override_bitnet_bf16_with_master(model, model_name, device)
 
+    _maybe_tie_word_embeddings(model, model_name, config)
+
     model.eval()
     return model, config
+
+
+def _maybe_tie_word_embeddings(model, model_name: str, config) -> None:
+    """Copy ``embed_tokens`` weights into ``lm_head`` for tied-embedding models.
+
+    Checkpoints for models with ``tie_word_embeddings=True`` (e.g.
+    Llama-3.2-1B/3B, Gemma, small Qwen) omit ``lm_head.weight``; without this
+    the LM head stays uninitialized and produces garbage logits. We detect the
+    flag from the HF config (fastkernels configs don't all carry it) and share
+    the embedding matrix into the LM head after loading.
+    """
+    tie = getattr(config, "tie_word_embeddings", None)
+    if tie is None:
+        try:
+            hf_cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+            tie = bool(getattr(hf_cfg, "tie_word_embeddings", False))
+        except (ValueError, OSError):
+            try:
+                tie = bool(_load_config_dict(model_name).get("tie_word_embeddings", False))
+            except Exception:
+                tie = False
+    if not tie:
+        return
+
+    try:
+        lm = model.get_parameter("lm_head.embedding_op.emb.weight")
+    except AttributeError:
+        return
+    for embed_name in (
+        "model.embed_tokens.embedding_op.emb.weight",
+        "model.model.embed_tokens.embedding_op.emb.weight",
+    ):
+        try:
+            emb = model.get_parameter(embed_name)
+        except AttributeError:
+            continue
+        if emb.shape == lm.shape:
+            lm.data.copy_(emb.data.to(device=lm.device, dtype=lm.dtype))
+            print("  Tied lm_head to embed_tokens (tie_word_embeddings=True).",
+                  flush=True)
+        return
 
 
 
@@ -1862,6 +1966,9 @@ def load_eagle3_draft_model(
     ``model.set_embed_tokens(target.model.embed_tokens)`` to share memory with
     the target.
     """
+    from ..tasks.baseline.L4.llama_eagle3 import (
+        LlamaEagle3Config, LlamaForCausalLMEagle3,
+    )
     model_path = snapshot_download(
         draft_repo,
         allow_patterns=["*.safetensors", "*.json", "*.bin"],

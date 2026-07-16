@@ -30,6 +30,12 @@ class TRTLLMPrefill(nn.Module):
             q = q.contiguous()
             seq_lens = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
             batch_size = seq_lens.shape[0]
+            # trtllm-gen reads the page table as a dense row-major tensor; a
+            # non-contiguous block_table (e.g. a column slice of a wider buffer)
+            # makes every row > 0 read wrong page ids. Match vLLM, which asserts
+            # is_strictly_contiguous here. See TRTLLMDecode for the full story.
+            block_table = block_table.contiguous()
+            seq_lens = seq_lens.contiguous()
             return trtllm_batch_context_with_kv_cache(
                 query=q,
                 kv_cache=(k, v),

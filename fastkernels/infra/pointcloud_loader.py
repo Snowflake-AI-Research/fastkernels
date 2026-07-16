@@ -92,7 +92,7 @@ def load_reference_point_model(model_name: str, device: str = "cuda", dtype: tor
 def load_ours_point_model(model_name: str, device: str = "cuda", dtype: torch.dtype = torch.float16, **model_kwargs):
     if not is_pointtransv3_model(model_name):
         raise ValueError(f"Unsupported point model: {model_name}")
-    from tasks.baseline.L4.pointtransformerv3 import PointTransformerV3
+    from fastkernels.tasks.baseline.L4.pointtransformerv3 import PointTransformerV3
 
     model = PointTransformerV3(**model_kwargs).to(device=device, dtype=dtype).eval()
     return model

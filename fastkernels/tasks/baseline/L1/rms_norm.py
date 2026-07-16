@@ -36,7 +36,12 @@ from .csrc import _C
 
 try:
     import vllm._C  # noqa: F401 — registers torch.ops._C.rms_norm etc.
-    _VLLM_NORM_AVAILABLE = True
+    # Importing the extension is not sufficient: some vLLM builds don't register
+    # rms_norm / fused_add_rms_norm into the ``_C`` op namespace. Verify the ops
+    # actually exist, otherwise fall back to fastkernels' own CUDA kernels.
+    _VLLM_NORM_AVAILABLE = hasattr(torch.ops._C, "rms_norm") and hasattr(
+        torch.ops._C, "fused_add_rms_norm"
+    )
 except ImportError:
     _VLLM_NORM_AVAILABLE = False
 

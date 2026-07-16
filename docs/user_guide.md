@@ -64,14 +64,15 @@ A benchmark is **PASS** if the candidate output's max error ratio is <= 1.0 agai
 
 ### vLLM Alignment Test
 
-`tests/bench_vllm.py` runs fastkernels and vLLM side-by-side across three workload scenarios (prefill-heavy, balanced, decode-heavy) plus latency benchmarks, comparing throughput and per-token alignment:
+`fastkernels/validate/bench_vllm.py` runs fastkernels and vLLM side-by-side across the real-prompt throughput scenarios (mixed, long-context) plus latency benchmarks, comparing throughput and per-token alignment. Run it directly, or let `fastkernels validate <scenario>` pick it per model:
 
 ```bash
-python tests/bench_vllm.py --model meta-llama/Llama-3.1-8B-Instruct
-python tests/bench_vllm.py --model meta-llama/Llama-3.1-70B-Instruct --tp 4
+fastkernels validate minimal                      # dispatch by model; --max-requests / --max-layers
+python fastkernels/validate/bench_vllm.py --model meta-llama/Llama-3.1-8B-Instruct
+python fastkernels/validate/bench_vllm.py --model meta-llama/Llama-3.1-70B-Instruct --tp 4
 
 # Latency only (skip throughput)
-python tests/bench_vllm.py --model meta-llama/Llama-3.1-8B-Instruct --skip-throughput
+python fastkernels/validate/bench_vllm.py --model meta-llama/Llama-3.1-8B-Instruct --skip-throughput
 
 # Parse and plot results
 python tests/utils/parse_vllm_bench_results.py
@@ -82,40 +83,38 @@ Results are saved to `tests/results/<GPU>/<model>_tp<N>/results.json`. The parse
 For a quick correctness check (no throughput measurement), use the `--skip-throughput` flag:
 
 ```bash
-python tests/bench_vllm.py \
+python fastkernels/validate/bench_vllm.py \
     --model meta-llama/Llama-3.1-8B-Instruct \
     --skip-throughput --skip-latency
 ```
 
 ---
 
-## LLM Kernel Agent
+## Creating Kernel Stubs
 
-The agent uses Claude to generate replacement kernels, validate them, and benchmark them end-to-end:
+Scaffold skeleton replacement modules under `tasks/candidate/` — one per discovered operator, each mirroring its baseline's `__init__`/`forward` signature with a `raise NotImplementedError` body for you to fill in:
 
 ```bash
-# Generate all L1 kernels for Llama
-fastkernels agent \
-    --model meta-llama/Llama-3.1-8B-Instruct --level 1
+# Stubs for every operator
+fastkernels create-stubs
 
-# CUDA-only kernels (no Triton/PyTorch builtins)
-fastkernels agent \
-    --model meta-llama/Llama-3.1-8B-Instruct --level 1 --cuda-only
+# Only level-1 operators
+fastkernels create-stubs --level 1
 
-# Mixtral L2 operators with TP
-fastkernels agent \
-    --model mistralai/Mixtral-8x7B-Instruct-v0.1 --level 2 --tp 4
+# Only operators used by a given architecture
+fastkernels create-stubs --architecture llama
+fastkernels create-stubs --level 2 --architecture mixtral
 ```
 
-The agent discovers operators at the specified level, generates replacements in parallel, validates compilation and numerical correctness, patches all successful kernels into the model, and reports token match rate and speedup. Failed kernels are retried with error feedback.
+Existing candidates are archived to `tasks/candidate/prev-attempts/` before new stubs are written. Edit the `forward()` methods to add your custom implementations, then benchmark with `fastkernels bench --target <name>`.
 
-Generated kernels are saved to `tasks/candidate/L{level}/{op_name}.py`.
+Generated stubs are saved to `tasks/candidate/L{level}/{op_name}.py`.
 
 ---
 
 ## Experiment Tracking
 
-Every `fastkernels agent`, `fastkernels kernels`, `fastkernels eval`, and `fastkernels e2e` run is automatically logged to [MLflow](https://mlflow.org). This provides:
+Every `fastkernels kernels`, `fastkernels eval`, and `fastkernels e2e` run is automatically logged to [MLflow](https://mlflow.org). This provides:
 
 - **Kernel lineage**: Every generated kernel is stored as an MLflow artifact, linked to the run parameters that produced it.
 - **Benchmark history**: Speedup, correctness, and max error ratio for every operator across every benchmark run.
@@ -125,7 +124,6 @@ Every `fastkernels agent`, `fastkernels kernels`, `fastkernels eval`, and `fastk
 
 | Command | Logged data |
 |---------|-------------|
-| `fastkernels agent` | Run params, per-op generation success/attempts, unit test results, e2e speedup, kernel source code |
 | `fastkernels kernels` | Bench params, per-operator per-scenario speedup/correctness, kernel source code |
 | `fastkernels eval` | Per-model throughput/latency speedup, alignment rate, MacroEval speedup/correctness/coverage/score, wall-clock time |
 | `fastkernels e2e` | Throughput (tokens/s), latency (percentiles), serve metrics (TTFT, TPOT, ITL) |
@@ -180,41 +178,6 @@ fastkernels history --limit 50       # show more results
   silu_and_mul                     1.45x 2026-03-14 09:55   b7c8d9e0
 ======================================================================
 ```
-
-### Tracking API for custom agents
-
-Any kernel optimization script can use the tracking API directly:
-
-```python
-from fastkernels.bench.tracking import tracker
-
-with tracker.start_run("my-run", params={"model": "llama", "level": 1}):
-    # Log a generated kernel (stored as MLflow artifact)
-    tracker.log_kernel("rms_norm", level=1, code=kernel_source)
-
-    # Log kernel benchmark results (pass KernelBenchResult directly)
-    tracker.log_kernel_bench(result)
-
-    # Log eval results (pass EvalReport directly)
-    tracker.log_eval(report)
-
-    # Log e2e results
-    tracker.log_e2e(results_dict, bench_type="throughput")
-
-    # Log any custom metrics
-    tracker.log_metrics({"my_score": 0.95, "compile_time": 12.3})
-```
-
-The full API surface is five logging functions plus one context manager:
-
-| Function | Purpose |
-|----------|---------|
-| `tracker.start_run(name, params, tags)` | Context manager that opens an MLflow run |
-| `tracker.log_kernel(op, level, code)` | Log kernel source code as artifact |
-| `tracker.log_kernel_bench(result)` | Log `KernelBenchResult` metrics |
-| `tracker.log_eval(report)` | Log `EvalReport` metrics |
-| `tracker.log_e2e(results, bench_type)` | Log E2E benchmark metrics |
-| `tracker.log_metrics(dict)` | Log arbitrary key-value metrics |
 
 ### MLflow Web UI
 
@@ -272,7 +235,6 @@ Each run is tagged with a `tier` that indicates its source:
 
 | Tag | Source command | Key metrics |
 |-----|---------------|-------------|
-| `agent` | `fastkernels agent` | `gen_{op}_success`, `utest_{op}_success`, `e2e_speedup`, `e2e_token_match_rate` |
 | `kernel` | `fastkernels kernels` | `{op}_avg_speedup`, `{op}_passed`, `{op}_failed`, `avg_speedup` |
 | `eval` | `fastkernels eval` | `avg_throughput_speedup`, `avg_latency_speedup`, `alignment_rate`, `macro_speedup`, `macro_correctness`, `macro_coverage`, `macro_score` |
 | `e2e` | `fastkernels e2e` | `tokens_per_second`, `avg_latency`, `mean_ttft_ms` (varies by bench type) |

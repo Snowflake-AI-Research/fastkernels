@@ -1,0 +1,43 @@
+# Default benchmark: a curated subset of the full table (see full.yaml) used as
+# the quick, representative benchmark set. Same schema as full.yaml -- each
+# scenario lists its workloads explicitly as `Family.member` tokens; per-workload
+# request counts and sequence lengths live in workloads.py. Note the dtype for a
+# model may differ from full.yaml (e.g. oasis/yolov10 here vs there).
+
+scenarios:
+  - model: meta-llama/Llama-3.1-8B-Instruct
+    tp: 1
+    dtype: bfloat16
+    workloads: [LLM.mixed, LLM.long_context]
+  - model: openai/gpt-oss-120b
+    tp: 2
+    dtype: mxfp4
+    workloads: [LLM.mixed, LLM.long_context]
+  - model: fla-hub/gla-2.7B-100B
+    tp: 1
+    dtype: bfloat16
+    workloads: [LLM.mixed, LLM.long_context]
+  - model: black-forest-labs/FLUX.1-dev
+    tp: 1
+    dtype: bfloat16
+    workloads: [Diffusion.res_1024, Diffusion.res_512]
+  - model: Qwen/Qwen3-VL-235B-A22B-Instruct-FP8
+    tp: 4
+    dtype: fp8
+    workloads: [VLM.text_only, VLM.image, VLM.video]
+  - model: jameslahm/yolov10n
+    tp: 1
+    dtype: bfloat16
+    workloads: [Detection.coco_val]
+  - model: OpenFold/OpenFold3
+    tp: 1
+    dtype: bfloat16
+    workloads: [StructurePrediction.short, StructurePrediction.medium, StructurePrediction.long, StructurePrediction.extra_long]
+  - model: BAAI/bge-m3
+    tp: 1
+    dtype: bfloat16
+    workloads: [Embedding.bge_m3_mldr_docs]
+  - model: Etched/oasis-500m
+    tp: 1
+    dtype: float16
+    workloads: [WorldModel.short_bs4_16f_4ddim, WorldModel.medium_bs8_24f_4ddim, WorldModel.long_bs8_32f_4ddim, WorldModel.denoise_bs4_16f_8ddim]

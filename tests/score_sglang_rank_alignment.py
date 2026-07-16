@@ -25,12 +25,12 @@ _PROJECT_ROOT = _PACKAGE_DIR.parent
 
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from fastkernels.bench.utils.real_prompts import (  # noqa: E402
+from fastkernels.workloads import (  # noqa: E402
     DEFAULT_WORKLOAD_DATASETS,
     load_real_prompt_workload,
 )
-from fastkernels.bench.utils.worker import run_worker  # noqa: E402
-from fastkernels.tests.bench_sglang import PROMPTS  # noqa: E402
+from fastkernels.validate.worker import run_worker  # noqa: E402
+from fastkernels.validate.bench_sglang import PROMPTS  # noqa: E402
 
 
 RANK_WORKER = r'''
@@ -207,8 +207,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--workload", choices=["fixed", "wildchat"], default="wildchat")
     p.add_argument(
         "--scenario",
-        choices=["prefill-heavy", "balanced", "decode-heavy"],
-        default="balanced",
+        choices=["mixed", "long-context"],
+        default="mixed",
     )
     p.add_argument("--num-seqs", type=int, default=1000)
     p.add_argument("--output-len", type=int, default=128)

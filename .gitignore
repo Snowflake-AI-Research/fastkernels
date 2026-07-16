@@ -223,7 +223,6 @@ tests/baselines/
 # Benchmark outputs
 tests/results/
 tests/plots/
-bench/results/
 
 # Agent-generated kernels and build cache
 agent/_cuda_build_cache/
@@ -234,6 +233,9 @@ tasks/candidate/prev-attempts/
 mlruns/
 
 data/
+
+# Vendored external checkouts / build trees (e.g. instant-ngp for the NeRF bench)
+third_party/
 
 .codex
 

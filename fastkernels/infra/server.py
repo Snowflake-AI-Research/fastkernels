@@ -611,12 +611,12 @@ def main():
         sys.path.insert(0, project_root)
 
     if not args.no_candidate_kernels:
-        from fastkernels.infra.kernel_swapper import (
+        from fastkernels.list import (
             apply_candidates,
-            discover_candidates,
+            discover_candidate_impls,
             print_candidate_summary,
         )
-        candidates = discover_candidates()
+        candidates = discover_candidate_impls()
         if candidates:
             print_candidate_summary(candidates)
             apply_candidates(candidates)

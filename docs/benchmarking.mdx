@@ -109,9 +109,8 @@ fastkernels eval --num-prompts 500 --gpu-pool 4
 Eval uses fixed, non-configurable workloads for reproducibility:
 
 **Throughput** (per model/TP pair):
-- `prefill-heavy` — 1024 input, 512 output tokens
-- `balanced` — 512 input, 512 output tokens
-- `decode-heavy` — 512 input, 1024 output tokens
+- `mixed` — WildChat-1M, 1000 real requests with a natural short/long prompt+decode mix (decode capped at 1024); saturates continuous batching.
+- `long-context` — LongBench-v2, 64 real requests bucketed 8K–128K prefill with fixed decode; exercises long-sequence attention and large-KV decode.
 
 **Latency** (per model/TP pair):
 - `single-request` — batch 1, 128 in/out tokens
