@@ -52,7 +52,7 @@ from pathlib import Path
 import numpy as np
 
 _THIS_DIR = Path(__file__).resolve().parent
-_PACKAGE_DIR = _THIS_DIR.parent
+_PACKAGE_DIR = _THIS_DIR.parent.parent
 _PROJECT_ROOT = _PACKAGE_DIR.parent
 
 sys.path.insert(0, str(_PROJECT_ROOT))
@@ -2278,7 +2278,7 @@ def main():
 
     if args.output_dir is None:
         short = args.model.split("/")[-1]
-        repo_root = Path(__file__).resolve().parent.parent
+        repo_root = Path(__file__).resolve().parent.parent.parent
         args.output_dir = str(repo_root / "tests" / "results" / gpu_name / short)
 
     use_real_data = not args.synthetic_only

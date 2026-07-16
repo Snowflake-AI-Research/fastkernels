@@ -20,7 +20,7 @@ makes timings unreliable. Same pattern used by tests/bench_dp3.py.
 
 Run directly with the path to the cloned/vendored ttt-e2e repo on sys.path:
 
-    python -m fastkernels.tests.bench_ttt_e2e_jax_worker --help
+    python -m fastkernels.validate.bench_ttt_e2e_jax_worker --help
 """
 
 from __future__ import annotations

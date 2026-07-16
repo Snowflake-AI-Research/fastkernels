@@ -65,7 +65,7 @@ ADULT_LABEL_COLUMN = "income"
 
 
 def _bootstrap_local_package() -> None:
-    root = Path(__file__).resolve().parent.parent
+    root = Path(__file__).resolve().parent.parent.parent
     if not (root / "__init__.py").exists() and (root / "fastkernels" / "__init__.py").exists():
         root = root / "fastkernels"
     spec = importlib.util.spec_from_file_location(

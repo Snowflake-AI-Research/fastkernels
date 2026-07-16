@@ -30,7 +30,7 @@ from fastkernels.workloads import (  # noqa: E402
     load_real_prompt_workload,
 )
 from fastkernels.bench.utils.worker import run_worker  # noqa: E402
-from fastkernels.tests.bench_sglang import PROMPTS  # noqa: E402
+from fastkernels.validate.bench_sglang import PROMPTS  # noqa: E402
 
 
 RANK_WORKER = r'''

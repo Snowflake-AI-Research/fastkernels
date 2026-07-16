@@ -212,7 +212,7 @@ if _max_layers_env:
         os.environ["PYTHONPATH"] = os.pathsep.join([str(site_dir), *parts])
 
 _THIS_DIR = Path(__file__).resolve().parent
-_PACKAGE_DIR = _THIS_DIR.parent
+_PACKAGE_DIR = _THIS_DIR.parent.parent
 _PROJECT_ROOT = _PACKAGE_DIR.parent
 _PACKAGE_NAME = _PACKAGE_DIR.name
 
@@ -1944,7 +1944,7 @@ def main():
     if args.output_dir is None:
         short = args.model.split("/")[-1]
         run_id = _make_run_id(args.run_id)
-        repo_root = Path(__file__).resolve().parent.parent
+        repo_root = Path(__file__).resolve().parent.parent.parent
         args.output_dir = str(
             repo_root / "tests" / "results" / gpu / f"{short}_tp{args.tp}" / run_id
         )

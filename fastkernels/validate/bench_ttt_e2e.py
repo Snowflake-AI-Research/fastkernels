@@ -37,7 +37,7 @@ Workload:
 Output: a JSON results blob plus a short text summary printed to stdout.
 
 Usage:
-  CUDA_VISIBLE_DEVICES=3 python -m fastkernels.tests.bench_ttt_e2e \\
+  CUDA_VISIBLE_DEVICES=3 python -m fastkernels.validate.bench_ttt_e2e \\
       --variant 125m_e2e --seq-lens 8192 --n-sequences 4 \\
       --modes pretrain meta
 """

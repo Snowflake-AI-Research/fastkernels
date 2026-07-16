@@ -44,7 +44,7 @@ from pathlib import Path
 import numpy as np
 
 _THIS_DIR = Path(__file__).resolve().parent
-_PACKAGE_DIR = _THIS_DIR.parent
+_PACKAGE_DIR = _THIS_DIR.parent.parent
 _PROJECT_ROOT = _PACKAGE_DIR.parent
 
 sys.path.insert(0, str(_PROJECT_ROOT))
@@ -627,7 +627,7 @@ def main():
     gpu_name = _detect_gpu_name()
 
     if args.output_dir is None:
-        repo_root = Path(__file__).resolve().parent.parent
+        repo_root = Path(__file__).resolve().parent.parent.parent
         args.output_dir = str(repo_root / "tests" / "results" / gpu_name / model_info["short_name"])
 
     default_res = args.resolution or model_info["default_resolution"]

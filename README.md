@@ -53,23 +53,28 @@ fastkernels e2e throughput --help
 fastkernels e2e latency    --help
 ```
 
-Per-architecture comparison benchmarks live under `tests/`:
+Per-architecture comparison benchmarks live under `fastkernels/validate/`. Run one
+directly, or let `fastkernels validate <scenario>` dispatch the right harness per model:
 
 ```bash
-python tests/bench_vllm.py        --model <hf-id>     # LLMs vs vLLM
-python tests/bench_fla.py         --model <hf-id>     # GLA / RetNet / RWKV-7 vs FLA
-python tests/bench_vllm_omni.py   --model <hf-id>     # Diffusion / video / TTS vs vllm-omni
-python tests/bench_diffusers.py   --model <hf-id>     # SDXL vs diffusers
-python tests/bench_timm.py        --model <hf-id>     # SigLIP-2 / DINOv3 / SwinV2 vs timm
-python tests/bench_embedding.py   --model <hf-id>     # BGE-M3 / ColBERTv2
-python tests/bench_recsys.py                          # DLRMv2 / LightGCN
-python tests/bench_dp3.py                             # 3D-Diffusion-Policy
-python tests/bench_pi0.py                             # Pi0 / OpenPI
-python tests/bench_openfold3.py                       # OpenFold3
-python tests/bench_ttt_e2e.py                         # TTT-E2E (vs JAX reference)
-python tests/test_sam.py                              # SAM3.1
-# (see tests/ for the full list)
+fastkernels validate minimal                              # dispatch by model in a scenario table
+fastkernels validate full --max-requests 8 --max-layers 12
+
+python fastkernels/validate/bench_vllm.py      --model <hf-id>   # LLMs vs vLLM
+python fastkernels/validate/bench_fla.py       --model <hf-id>   # GLA / RetNet / RWKV-7 vs FLA
+python fastkernels/validate/bench_vllm_omni.py --model <hf-id>   # Diffusion / video / TTS vs vllm-omni
+python fastkernels/validate/bench_diffusers.py --model <hf-id>   # SDXL vs diffusers
+python fastkernels/validate/bench_timm.py      --model <hf-id>   # SigLIP-2 / DINOv3 / SwinV2 vs timm
+python fastkernels/validate/bench_embedding.py --model <hf-id>   # BGE-M3 / ColBERTv2
+python fastkernels/validate/bench_recsys.py                      # DLRMv2 / LightGCN
+python fastkernels/validate/bench_dp3.py                         # 3D-Diffusion-Policy
+python fastkernels/validate/bench_openpi.py                      # Pi0 / OpenPI
+python fastkernels/validate/bench_openfold3.py                   # OpenFold3
+python fastkernels/validate/bench_ttt_e2e.py                     # TTT-E2E (vs JAX reference)
+python fastkernels/validate/bench_sam.py                         # SAM3
+# (see fastkernels/validate/ for the full list)
 ```
+
 
 ## Adding a candidate kernel
 

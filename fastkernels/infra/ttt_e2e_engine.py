@@ -2,7 +2,7 @@
 
 Wraps :class:`tasks.baseline.L4.ttt_e2e.TTTE2EPipeline` with a state-dict
 loader that reads the JAX-reference's portable ``.npz`` (produced by
-``tests/bench_ttt_e2e_jax_worker.py init_and_save``). The engine is
+``fastkernels/validate/bench_ttt_e2e_jax_worker.py init_and_save``). The engine is
 deliberately small — all model logic lives in L1-L4; this file is wiring.
 
 Layout expected in the npz (path = JAX equinox tree path joined by dots):

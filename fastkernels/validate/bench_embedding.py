@@ -15,7 +15,7 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 _THIS_DIR = Path(__file__).resolve().parent
-_PACKAGE_DIR = _THIS_DIR.parent
+_PACKAGE_DIR = _THIS_DIR.parent.parent
 _PROJECT_ROOT = _PACKAGE_DIR.parent
 
 sys.path.insert(0, str(_PROJECT_ROOT))
@@ -29,7 +29,7 @@ from fastkernels.workloads import (
 
 from bench_vllm import (
     _detect_gpu_name,
-    _install_flashinfer_sitecustomize,
+    _install_bench_sitecustomize,
     _make_run_id,
     _parse_port_env,
     _reserve_tcp_port,
@@ -903,7 +903,7 @@ def main() -> None:
                 or f"bench-embedding-{os.getpid()}-{vllm_port}"
             )
             os.environ["FASTKERNELS_FLASHINFER_SOCKET_NAMESPACE"] = flashinfer_namespace
-            _install_flashinfer_sitecustomize()
+            _install_bench_sitecustomize()
 
     workloads = _select_workloads(args.model)
     print("=" * 78)

@@ -39,7 +39,7 @@ from transformers import AutoTokenizer
 # Paths / package wiring
 # ---------------------------------------------------------------------------
 _THIS_DIR = Path(__file__).resolve().parent
-_PACKAGE_DIR = _THIS_DIR.parent
+_PACKAGE_DIR = _THIS_DIR.parent.parent
 _PROJECT_ROOT = _PACKAGE_DIR.parent
 
 sys.path.insert(0, str(_PROJECT_ROOT))

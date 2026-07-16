@@ -40,7 +40,7 @@ from pathlib import Path
 import numpy as np
 
 _THIS_DIR = Path(__file__).resolve().parent
-_PACKAGE_DIR = _THIS_DIR.parent
+_PACKAGE_DIR = _THIS_DIR.parent.parent
 _PROJECT_ROOT = _PACKAGE_DIR.parent
 
 from fastkernels.bench.utils.worker import run_worker

@@ -30,7 +30,7 @@ from pathlib import Path
 import numpy as np
 
 _THIS_DIR = Path(__file__).resolve().parent
-_PACKAGE_DIR = _THIS_DIR.parent
+_PACKAGE_DIR = _THIS_DIR.parent.parent
 _PROJECT_ROOT = _PACKAGE_DIR.parent
 
 from fastkernels.bench.utils.worker import run_worker
@@ -1194,7 +1194,7 @@ def main():
     parser.add_argument("--modality", type=str, default="all",
                         choices=["all", "image", "video"])
     parser.add_argument("--data-cache-dir", type=str,
-                        default=str(Path(__file__).resolve().parent.parent / "data" / "saco_cache"))
+                        default=str(Path(__file__).resolve().parent.parent.parent / "data" / "saco_cache"))
     parser.add_argument("--gold-subset", type=str, default="metaclip",
                         help="SACo-Gold subset: metaclip, sa1b, crowded, fg_food, fg_sports_equipment, attributes, wiki_common")
     parser.add_argument("--veval-subset", type=str, default="smartglasses_val",
@@ -1205,7 +1205,7 @@ def main():
 
     if args.output_dir is None:
         short = args.model.split("/")[-1]
-        repo_root = Path(__file__).resolve().parent.parent
+        repo_root = Path(__file__).resolve().parent.parent.parent
         args.output_dir = str(repo_root / "tests" / "results" / gpu / f"{short}_tp{args.tp}")
 
     latency_scenarios = SEGMENTATION_LATENCY_WORKLOADS

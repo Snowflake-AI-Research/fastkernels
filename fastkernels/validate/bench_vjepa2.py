@@ -31,7 +31,7 @@ from pathlib import Path
 import torch
 
 _THIS_DIR = Path(__file__).resolve().parent
-_PACKAGE_DIR = _THIS_DIR.parent
+_PACKAGE_DIR = _THIS_DIR.parent.parent
 if not (_PACKAGE_DIR / "__init__.py").exists() and (_PACKAGE_DIR / "fastkernels" / "__init__.py").exists():
     _PACKAGE_DIR = _PACKAGE_DIR / "fastkernels"
 

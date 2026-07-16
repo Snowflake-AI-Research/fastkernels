@@ -41,7 +41,7 @@ from pathlib import Path
 import numpy as np
 
 _THIS_DIR = Path(__file__).resolve().parent
-_PACKAGE_DIR = _THIS_DIR.parent
+_PACKAGE_DIR = _THIS_DIR.parent.parent
 _PROJECT_ROOT = _PACKAGE_DIR.parent
 
 sys.path.insert(0, str(_PROJECT_ROOT))
@@ -946,7 +946,7 @@ def main():
     gpu = _detect_gpu_name()
 
     if args.output_dir is None:
-        args.output_dir = str(_THIS_DIR / "results" / "openfold3" / f"{gpu}_{args.dtype}")
+        args.output_dir = str(_PACKAGE_DIR / "tests" / "results" / "openfold3" / f"{gpu}_{args.dtype}")
     if args.data_dir is None:
         args.data_dir = "/tmp/openfold_bench_data"
 

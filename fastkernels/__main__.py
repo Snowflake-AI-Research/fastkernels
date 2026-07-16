@@ -28,6 +28,10 @@ def main() -> None:
         from .utils.create_stubs import main as create_stubs_main
         raise SystemExit(create_stubs_main(sys.argv[2:]))
 
+    if len(sys.argv) > 1 and sys.argv[1] == "validate":
+        from .validate._cli import main as validate_main
+        raise SystemExit(validate_main(sys.argv[2:]))
+
     parser = argparse.ArgumentParser(description="fastkernels CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -60,6 +64,13 @@ def main() -> None:
         "create-stubs",
         help="Scaffold candidate-kernel skeleton modules under tasks/candidate/ "
              "(see 'fastkernels create-stubs --help')",
+    )
+
+    subparsers.add_parser(
+        "validate",
+        help="Validate models in a scenario table against their SOTA reference "
+             "library by running the proper bench harness per model "
+             "(see 'fastkernels validate --help')",
     )
 
     parser.parse_args()

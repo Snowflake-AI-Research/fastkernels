@@ -55,7 +55,7 @@ def _detect_gpu_name() -> str:
 
 
 _THIS_DIR = Path(__file__).resolve().parent
-_PACKAGE_DIR = _THIS_DIR.parent
+_PACKAGE_DIR = _THIS_DIR.parent.parent
 _PROJECT_ROOT = _PACKAGE_DIR.parent
 
 sys.path.insert(0, str(_PROJECT_ROOT))
@@ -66,7 +66,7 @@ from fastkernels.workloads import (
     THROUGHPUT_WORKLOADS,
     load_real_prompt_workload,
 )
-from fastkernels.tests.bench_vllm import compute_alignment
+from fastkernels.validate.bench_vllm import compute_alignment
 
 
 SCENARIOS = [

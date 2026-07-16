@@ -30,7 +30,7 @@ from pathlib import Path
 import numpy as np
 
 _THIS_DIR = Path(__file__).resolve().parent
-_PACKAGE_DIR = _THIS_DIR.parent
+_PACKAGE_DIR = _THIS_DIR.parent.parent
 _PROJECT_ROOT = _PACKAGE_DIR.parent
 
 sys.path.insert(0, str(_PACKAGE_DIR))
@@ -79,7 +79,7 @@ def _load_coco_images(
     from torchvision import transforms
 
     if cache_dir is None:
-        cache_dir = str(Path(__file__).resolve().parent.parent / "data" / "coco_cache")
+        cache_dir = str(Path(__file__).resolve().parent.parent.parent / "data" / "coco_cache")
     os.makedirs(cache_dir, exist_ok=True)
 
     tensor_path = os.path.join(
@@ -474,7 +474,7 @@ def main():
 
     if args.output_dir is None:
         short = args.model.split("/")[-1]
-        repo_root = Path(__file__).resolve().parent.parent
+        repo_root = Path(__file__).resolve().parent.parent.parent
         args.output_dir = str(repo_root / "tests" / "results" / gpu / short)
     os.makedirs(args.output_dir, exist_ok=True)
 

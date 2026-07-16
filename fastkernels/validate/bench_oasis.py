@@ -43,7 +43,7 @@ from tqdm import tqdm
 
 
 def _bootstrap_local_package() -> None:
-    root = Path(__file__).resolve().parent.parent
+    root = Path(__file__).resolve().parent.parent.parent
     if not (root / "__init__.py").exists() and (root / "fastkernels" / "__init__.py").exists():
         root = root / "fastkernels"
     spec = importlib.util.spec_from_file_location(
@@ -168,11 +168,11 @@ def _download_model(model_name: str) -> str:
 
 
 def _default_cache_dir() -> Path:
-    return Path(__file__).resolve().parent.parent / "data" / "oasis_cache"
+    return Path(__file__).resolve().parent.parent.parent / "data" / "oasis_cache"
 
 
 def _default_open_oasis_dir() -> Path:
-    return Path(__file__).resolve().parent.parent / "data" / "open_oasis_src"
+    return Path(__file__).resolve().parent.parent.parent / "data" / "open_oasis_src"
 
 
 def _ensure_open_oasis_source(open_oasis_src: str | None, *, repo: str) -> Path:

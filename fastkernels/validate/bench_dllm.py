@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 _THIS_DIR = Path(__file__).resolve().parent
-_PACKAGE_DIR = _THIS_DIR.parent
+_PACKAGE_DIR = _THIS_DIR.parent.parent
 sys.path.insert(0, str(_PACKAGE_DIR))
 
 from fastkernels.bench.utils.worker import run_worker

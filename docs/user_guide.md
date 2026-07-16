@@ -64,14 +64,15 @@ A benchmark is **PASS** if the candidate output's max error ratio is <= 1.0 agai
 
 ### vLLM Alignment Test
 
-`tests/bench_vllm.py` runs fastkernels and vLLM side-by-side across the real-prompt throughput scenarios (mixed, long-context) plus latency benchmarks, comparing throughput and per-token alignment:
+`fastkernels/validate/bench_vllm.py` runs fastkernels and vLLM side-by-side across the real-prompt throughput scenarios (mixed, long-context) plus latency benchmarks, comparing throughput and per-token alignment. Run it directly, or let `fastkernels validate <scenario>` pick it per model:
 
 ```bash
-python tests/bench_vllm.py --model meta-llama/Llama-3.1-8B-Instruct
-python tests/bench_vllm.py --model meta-llama/Llama-3.1-70B-Instruct --tp 4
+fastkernels validate minimal                      # dispatch by model; --max-requests / --max-layers
+python fastkernels/validate/bench_vllm.py --model meta-llama/Llama-3.1-8B-Instruct
+python fastkernels/validate/bench_vllm.py --model meta-llama/Llama-3.1-70B-Instruct --tp 4
 
 # Latency only (skip throughput)
-python tests/bench_vllm.py --model meta-llama/Llama-3.1-8B-Instruct --skip-throughput
+python fastkernels/validate/bench_vllm.py --model meta-llama/Llama-3.1-8B-Instruct --skip-throughput
 
 # Parse and plot results
 python tests/utils/parse_vllm_bench_results.py
@@ -82,7 +83,7 @@ Results are saved to `tests/results/<GPU>/<model>_tp<N>/results.json`. The parse
 For a quick correctness check (no throughput measurement), use the `--skip-throughput` flag:
 
 ```bash
-python tests/bench_vllm.py \
+python fastkernels/validate/bench_vllm.py \
     --model meta-llama/Llama-3.1-8B-Instruct \
     --skip-throughput --skip-latency
 ```
