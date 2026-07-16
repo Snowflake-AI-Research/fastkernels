@@ -29,7 +29,7 @@ def main() -> None:
         raise SystemExit(create_stubs_main(sys.argv[2:]))
 
     if len(sys.argv) > 1 and sys.argv[1] == "validate":
-        from .validate._cli import main as validate_main
+        from .validate import main as validate_main
         raise SystemExit(validate_main(sys.argv[2:]))
 
     parser = argparse.ArgumentParser(description="fastkernels CLI")
