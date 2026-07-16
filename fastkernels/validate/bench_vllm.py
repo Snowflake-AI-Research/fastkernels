@@ -220,7 +220,7 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 
 from importlib import import_module
 
-run_worker = import_module(f"{_PACKAGE_NAME}.bench.utils.worker").run_worker
+run_worker = import_module(f"{_PACKAGE_NAME}.validate.worker").run_worker
 load_real_prompt_workload = import_module(
     f"{_PACKAGE_NAME}.workloads",
 ).load_real_prompt_workload

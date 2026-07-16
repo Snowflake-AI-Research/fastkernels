@@ -15,7 +15,7 @@ if str(_KB_ROOT) not in sys.path:
 import torch
 
 from fastkernels.infra.pointcloud_loader import DEFAULT_PTV3_CHECKPOINT_FILE
-from fastkernels.bench.utils.worker import run_worker
+from fastkernels.validate.worker import run_worker
 
 POINTCLOUD_WORKER = r'''
 import json, os, random, sys, time

@@ -54,7 +54,7 @@ def _bootstrap_local_package() -> None:
 
 _bootstrap_local_package()
 
-from fastkernels.bench.utils.worker import run_worker
+from fastkernels.validate.worker import run_worker
 
 
 def _detect_gpu_name() -> str:

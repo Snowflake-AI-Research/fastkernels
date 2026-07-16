@@ -28,9 +28,10 @@ CANDIDATE_DIR = Path(
 )
 PREV_ATTEMPTS_DIR = CANDIDATE_DIR / "prev-attempts"
 
-# --- Benchmark results ---
+# --- Benchmark results (kept out of the repo; override with FASTKERNELS_RESULTS_DIR) ---
 RESULTS_DIR = Path(
-    os.environ.get("FASTKERNELS_RESULTS_DIR", str(KB_ROOT / "bench" / "results"))
+    os.environ.get("FASTKERNELS_RESULTS_DIR",
+                   str(Path.home() / ".fastkernels" / "results"))
 )
 
 # --- MLflow tracking ---
@@ -41,6 +42,8 @@ CUDA_BUILD_CACHE = KB_ROOT / "agent" / "_cuda_build_cache"
 
 
 def run_output_path(tool: str, ext: str = "json") -> Path:
-    """Return a timestamped output path, e.g. ``bench/results/kernels_20260313_143022.json``."""
+    """Return a timestamped output path under ``RESULTS_DIR`` (created if needed),
+    e.g. ``~/.fastkernels/results/kernels_20260313_143022.json``."""
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     return RESULTS_DIR / f"{tool}_{ts}.{ext}"

@@ -20,7 +20,7 @@ _PROJECT_ROOT = _PACKAGE_DIR.parent
 
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from fastkernels.bench.utils.worker import run_worker
+from fastkernels.validate.worker import run_worker
 from fastkernels.workloads import (
     EMBEDDING_LATENCY_WORKLOADS,
     EMBEDDING_THROUGHPUT_WORKLOADS,

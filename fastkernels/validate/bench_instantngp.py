@@ -14,7 +14,7 @@ _KB_ROOT = Path(__file__).resolve().parents[2]
 if str(_KB_ROOT) not in sys.path:
     sys.path.insert(0, str(_KB_ROOT))
 
-from fastkernels.bench.utils.worker import run_worker
+from fastkernels.validate.worker import run_worker
 
 
 INSTANTNGP_WORKER = r'''

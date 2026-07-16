@@ -14,7 +14,7 @@ if str(_KB_ROOT) not in sys.path:
 
 import torch
 
-from fastkernels.bench.utils.worker import run_worker
+from fastkernels.validate.worker import run_worker
 
 THREEDGS_WORKER = r'''
 import json, math, sys, time

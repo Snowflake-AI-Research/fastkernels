@@ -179,41 +179,6 @@ fastkernels history --limit 50       # show more results
 ======================================================================
 ```
 
-### Tracking API for custom agents
-
-Any kernel optimization script can use the tracking API directly:
-
-```python
-from fastkernels.bench.tracking import tracker
-
-with tracker.start_run("my-run", params={"model": "llama", "level": 1}):
-    # Log a generated kernel (stored as MLflow artifact)
-    tracker.log_kernel("rms_norm", level=1, code=kernel_source)
-
-    # Log kernel benchmark results (pass KernelBenchResult directly)
-    tracker.log_kernel_bench(result)
-
-    # Log eval results (pass EvalReport directly)
-    tracker.log_eval(report)
-
-    # Log e2e results
-    tracker.log_e2e(results_dict, bench_type="throughput")
-
-    # Log any custom metrics
-    tracker.log_metrics({"my_score": 0.95, "compile_time": 12.3})
-```
-
-The full API surface is five logging functions plus one context manager:
-
-| Function | Purpose |
-|----------|---------|
-| `tracker.start_run(name, params, tags)` | Context manager that opens an MLflow run |
-| `tracker.log_kernel(op, level, code)` | Log kernel source code as artifact |
-| `tracker.log_kernel_bench(result)` | Log `KernelBenchResult` metrics |
-| `tracker.log_eval(report)` | Log `EvalReport` metrics |
-| `tracker.log_e2e(results, bench_type)` | Log E2E benchmark metrics |
-| `tracker.log_metrics(dict)` | Log arbitrary key-value metrics |
-
 ### MLflow Web UI
 
 ```bash

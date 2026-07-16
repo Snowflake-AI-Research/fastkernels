@@ -43,7 +43,7 @@ _THIS_DIR = Path(__file__).resolve().parent
 _PACKAGE_DIR = _THIS_DIR.parent.parent
 _PROJECT_ROOT = _PACKAGE_DIR.parent
 
-from fastkernels.bench.utils.worker import run_worker
+from fastkernels.validate.worker import run_worker
 from fastkernels.workloads import (
     COSYVOICE3_CONFIG,
     DIFFUSION_LATENCY_WORKLOADS,
