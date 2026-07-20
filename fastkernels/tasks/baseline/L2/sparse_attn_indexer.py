@@ -265,8 +265,14 @@ class SparseAttnIndexer(nn.Module):
                     q_fp8_dc, weights_dc, ctx, hidden_states.device,
                 )
         else:
-            # Decode path (decode-only batch)
-            topk_indices = self._decode_topk(q_fp8, weights, ctx, hidden_states.device)
+            # Decode-only batch. Write results INTO the (possibly shared) buffer
+            # view — do NOT rebind to a fresh tensor. Under DSA index sharing the
+            # skip layers reuse this shared ``topk_indices_buffer``; rebinding
+            # would leave it at -1 and feed skip layers invalid indices on every
+            # decode step. Matches vLLM, which writes the decode top-k straight
+            # into ``topk_indices_buffer`` (sparse_attn_indexer.py:335).
+            topk_indices[:] = self._decode_topk(
+                q_fp8, weights, ctx, hidden_states.device)
 
         return topk_indices
 

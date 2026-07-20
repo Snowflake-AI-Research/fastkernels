@@ -30,6 +30,7 @@ class DeepSeekMLAAttention(nn.Module):
     def __init__(self, config, rotary_emb: nn.Module,
                  quant_config: dict | None = None,
                  is_v32: bool = False,
+                 skip_topk: bool = False,
                  topk_indices_buffer: torch.Tensor | None = None):
         super().__init__()
         tp = _tp_size()
@@ -57,6 +58,12 @@ class DeepSeekMLAAttention(nn.Module):
 
         self.rotary_emb = rotary_emb
         self.is_v32 = is_v32
+        # DSA index-topk sharing: a "skip" layer builds NO indexer and reuses the
+        # last compute layer's top-k indices from the shared ``topk_indices_buffer``
+        # (matches vLLM ``skip_topk``). Compute layers overwrite that buffer.
+        self.skip_topk = is_v32 and skip_topk
+        self.topk_indices_buffer = topk_indices_buffer
+        self.topk_tokens = config.index_topk if is_v32 else None
 
         self.fused_qkv_a_proj = MergedColumnParallelLinear(
             self.hidden_size,
@@ -102,8 +109,10 @@ class DeepSeekMLAAttention(nn.Module):
         # registration as a submodule.
         object.__setattr__(self.attn, "_kv_b_proj", self.kv_b_proj)
 
-        # DSA Indexer (V3.2 only)
-        if self.is_v32:
+        # DSA Indexer (V3.2 only). Skip layers (DSA index sharing) build no
+        # indexer — matching vLLM, whose checkpoint carries indexer weights ONLY
+        # for compute layers; building one here would load garbage on skip layers.
+        if self.is_v32 and not self.skip_topk:
             _rp = getattr(config, "rope_parameters", None) or {}
             self.indexer = SparseAttnIndexer(
                 hidden_size=self.hidden_size,
@@ -242,8 +251,15 @@ class DeepSeekMLAAttention(nn.Module):
         # DSA Indexer (V3.2) — rope_emb is wired to self.indexer._rope_emb
         # so the forward takes only tensor args (custom-op safe).
         topk_indices = None
-        if self.indexer is not None and self.is_v32:
-            topk_indices = self.indexer(hidden_states, q_c, positions)
+        if self.is_v32:
+            if self.indexer is not None:
+                # Compute layer: run the indexer (writes the shared buffer).
+                topk_indices = self.indexer(hidden_states, q_c, positions)
+            elif self.topk_indices_buffer is not None:
+                # Skip layer (DSA index sharing): reuse the last compute layer's
+                # top-k indices from the shared buffer — no recompute, matching
+                # vLLM's ``skip_topk`` (deepseek_v2.py:1029-1049,1084).
+                topk_indices = self.topk_indices_buffer[:N, :self.topk_tokens]
 
         # MLA attention — kv_b_proj is wired to self.attn._kv_b_proj so
         # the forward takes only tensor args (custom-op safe).

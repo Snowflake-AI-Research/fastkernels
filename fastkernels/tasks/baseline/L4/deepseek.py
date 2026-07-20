@@ -65,6 +65,14 @@ class DeepSeekV3Config:
     # (``glm_moe_dsa``) sets ``indexer_rope_interleave=True`` (interleaved).
     # Consumed by the DSA indexer as ``is_neox_style = not indexer_rope_interleave``.
     indexer_rope_interleave: bool = False
+    # DSA index-topk sharing: most layers SKIP computing their own top-k index
+    # and REUSE the last compute layer's (via the shared ``topk_indices_buffer``).
+    # Per-layer skip is derived from these exactly as vLLM's DeepseekV2MLAAttention
+    # (``deepseek_v2.py:1003-1018``). Defaults (freq=1) => every layer computes,
+    # so DeepSeek-V3.2 is unchanged; GLM-5.2 ships freq=4, offset=3.
+    index_topk_freq: int = 1
+    index_topk_pattern: Optional[list] = None
+    index_skip_topk_offset: int = 2
 
     # YARN RoPE params
     rope_parameters: dict = field(default_factory=lambda: {
@@ -184,6 +192,9 @@ class DeepSeekV3Config:
             index_n_heads=getattr(hf, 'index_n_heads', None),
             index_head_dim=getattr(hf, 'index_head_dim', None),
             indexer_rope_interleave=getattr(hf, 'indexer_rope_interleave', False),
+            index_topk_freq=getattr(hf, 'index_topk_freq', 1),
+            index_topk_pattern=getattr(hf, 'index_topk_pattern', None),
+            index_skip_topk_offset=getattr(hf, 'index_skip_topk_offset', 2),
             rope_parameters=rope_params,
         )
 
@@ -224,12 +235,28 @@ class DeepSeekV3Model(nn.Module):
         else:
             self.topk_indices_buffer = None
 
+        def _layer_skip_topk(layer_id: int) -> bool:
+            """DSA index-topk sharing: which backbone layers REUSE a prior layer's
+            top-k index instead of recomputing it. Matches vLLM
+            ``deepseek_v2.py:1011-1017``. Non-v32 (or freq==1) => always compute."""
+            if not is_v32:
+                return False
+            pat = getattr(config, 'index_topk_pattern', None)
+            if pat is None:
+                freq = getattr(config, 'index_topk_freq', 1)
+                off = getattr(config, 'index_skip_topk_offset', 2)
+                return (max(layer_id - off + 1, 0) % freq) != 0
+            if 0 <= layer_id < len(pat):
+                return pat[layer_id] == "S"
+            return False
+
         self.layers = nn.ModuleList([
             DeepSeekDecoderLayer(
                 config, layer_idx=i,
                 rotary_emb=self.rotary_emb,
                 quant_config=quant_config,
                 is_v32=is_v32,
+                skip_topk=_layer_skip_topk(i),
                 topk_indices_buffer=self.topk_indices_buffer,
             )
             for i in range(config.num_hidden_layers)

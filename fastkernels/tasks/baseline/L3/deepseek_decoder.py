@@ -20,6 +20,7 @@ class DeepSeekDecoderLayer(nn.Module):
                  rotary_emb: nn.Module,
                  quant_config: dict | None = None,
                  is_v32: bool = False,
+                 skip_topk: bool = False,
                  topk_indices_buffer: torch.Tensor | None = None):
         super().__init__()
         self.layer_idx = layer_idx
@@ -29,6 +30,7 @@ class DeepSeekDecoderLayer(nn.Module):
             config, rotary_emb=rotary_emb,
             quant_config=quant_config,
             is_v32=is_v32,
+            skip_topk=skip_topk,
             topk_indices_buffer=topk_indices_buffer,
         )
 
