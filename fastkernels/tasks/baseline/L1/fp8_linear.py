@@ -219,7 +219,11 @@ def _fp8_group_quant_kernel(
     # ``vllm/.../fp8_utils.py:860``).  Differs from the previous 1e-12
     # only on all-zero rows but the bias compounds across layers.
     absmax = tl.maximum(absmax, 1e-10)
-    scale_raw = absmax / fp8_max
+    # Multiply-by-reciprocal (not division) to match vLLM's
+    # ``_per_token_group_quant_fp8`` (fp8_utils.py:144): fast-division for a
+    # constexpr divisor introduces a 1-ULP error that flips FP8 quantization
+    # at representable-value boundaries.
+    scale_raw = absmax * (1.0 / fp8_max)
     scale = tl.math.exp2(tl.math.ceil(tl.math.log2(scale_raw))) if USE_UE8M0 else scale_raw
 
     x_scaled = x / scale
@@ -630,14 +634,25 @@ def postprocess_fp8_weights_batched(weight_fp8: torch.Tensor,
         w_q.copy_(w_requant)
         s_old.copy_(s_requant)
 
-    recipe = (1, block_size, block_size)
-    scale_transformed = deep_gemm.transform_sf_into_required_layout(
-        sf=scale_inv[:, :scale_rows, :scale_cols],
-        mn=N,
-        k=K,
-        recipe=recipe,
-        num_groups=E,
-        is_sfa=False,
-        disable_ue8m0_cast=not use_ue8m0,
-    )
-    scale_inv[:, :scale_rows, :scale_cols].copy_(scale_transformed)
+    # The requant loop above already wrote UNPACKED per-block UE8M0 fp32 scales
+    # into ``scale_inv[:, :scale_rows, :scale_cols]`` — the exact [E, N/128, K/128]
+    # fp32 layout the Triton MoE grouped GEMM (MoeGroupedGemm, used by
+    # VllmFusedExperts) reads via strides. ``transform_sf_into_required_layout``
+    # is a DeepGEMM-only SF layout (see vLLM quant_utils.py:428); on Blackwell
+    # (``use_ue8m0``) it PACKS 4 UE8M0 exponents per int32, shrinking the last dim
+    # (e.g. 48 -> 12) into a layout the Triton kernel does not consume — so applying
+    # it here corrupts the scale (and its old in-place ``copy_`` even crashed on the
+    # shape change). Only run the transform on the non-UE8M0 (Hopper) path, where it
+    # preserves shape, to keep that path bit-identical.
+    if not use_ue8m0:
+        recipe = (1, block_size, block_size)
+        scale_transformed = deep_gemm.transform_sf_into_required_layout(
+            sf=scale_inv[:, :scale_rows, :scale_cols],
+            mn=N,
+            k=K,
+            recipe=recipe,
+            num_groups=E,
+            is_sfa=False,
+            disable_ue8m0_cast=True,
+        )
+        scale_inv[:, :scale_rows, :scale_cols].copy_(scale_transformed)

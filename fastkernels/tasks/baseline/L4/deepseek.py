@@ -73,6 +73,10 @@ class DeepSeekV3Config:
     index_topk_freq: int = 1
     index_topk_pattern: Optional[list] = None
     index_skip_topk_offset: int = 2
+    # Sizes the shared DSA topk_indices_buffer. vLLM uses
+    # scheduler_config.max_num_batched_tokens; this is not an HF-config field, so
+    # the engine threads its real value in via load_model before construction.
+    max_num_batched_tokens: int = 16384
 
     # YARN RoPE params
     rope_parameters: dict = field(default_factory=lambda: {
@@ -221,6 +225,9 @@ class DeepSeekV3Model(nn.Module):
             mscale=config.rope_parameters.get('mscale', 1.0),
             mscale_all_dim=config.rope_parameters.get('mscale_all_dim', 0.0),
             is_plain=is_plain_rope,
+            # Plain-rope (GLM-5.2) stores the cos/sin cache in the compute dtype
+            # once, matching vLLM's base RotaryEmbedding (no per-forward re-cast).
+            cache_dtype=config.dtype,
         )
 
         is_v32 = hasattr(config, 'index_topk') and config.index_topk is not None

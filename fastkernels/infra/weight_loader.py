@@ -1183,12 +1183,19 @@ def _postprocess_fp8_weights(model: torch.nn.Module) -> None:
         _t_moe = _time.perf_counter()
         total = len(deepseek_moe_modules)
         for j, module in enumerate(deepseek_moe_modules):
-            for wname, sname in (("w13", "w13_weight_scale_inv"),
-                                 ("w2", "w2_weight_scale_inv")):
-                w = getattr(module, wname)
-                s = getattr(module, sname)
-                postprocess_fp8_weights_batched(w.data, s.data)
-                moe_count += w.shape[0]
+            if getattr(module, "_use_trtllm", False):
+                # Blackwell FLASHINFER_TRTLLM experts: transform the RAW fp8
+                # weights into the BlockMajorK layout (NO UE8M0 requant — vLLM's
+                # TRTLLM path uses the un-requantized checkpoint weights).
+                module.prepare_trtllm_weights()
+                moe_count += 2 * module.num_experts
+            else:
+                for wname, sname in (("w13", "w13_weight_scale_inv"),
+                                     ("w2", "w2_weight_scale_inv")):
+                    w = getattr(module, wname)
+                    s = getattr(module, sname)
+                    postprocess_fp8_weights_batched(w.data, s.data)
+                    moe_count += w.shape[0]
             if j % max(1, total // 5) == 0 or j == total - 1:
                 print(f"    DeepSeek MoE postprocess {j+1}/{total} "
                       f"({(j+1)*100//total}%, "
@@ -1371,6 +1378,7 @@ def load_model(
     device: torch.device = torch.device("cuda"),
     dtype: torch.dtype = torch.bfloat16,
     max_layers: int | None = None,
+    max_num_batched_tokens: int | None = None,
 ):
     model_path = download_model(model_name)
     model_type = _detect_model_type(model_name)
@@ -1520,6 +1528,12 @@ def load_model(
         )
         config = DeepSeekV3Config.from_pretrained(model_name)
         config.dtype = dtype
+        # DSA topk_indices_buffer is sized from this (vLLM uses
+        # scheduler_config.max_num_batched_tokens); the HF config has no such
+        # field, so thread the engine's value in before the model (and its
+        # buffer) is constructed.
+        if max_num_batched_tokens is not None:
+            config.max_num_batched_tokens = max_num_batched_tokens
         _apply_max_layers(config, max_layers)
         print(f"  Allocating DeepSeek-V3.2 / GLM-5.2 (MLA+DSA+MoE) model "
               f"({config.n_routed_experts} experts, "

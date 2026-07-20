@@ -182,7 +182,10 @@ void invokeRouterGemmFloatOutput(float* output, T const* mat_a, T const* mat_b,
   config.stream = stream;
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attrs[0].val.programmaticStreamSerializationAllowed = getEnvEnablePDL();
+  // Match vLLM (dsv3_router_gemm_float_out.cu:182): PDL always on. The kernel
+  // is only dispatched on SM>=90 (see entry.cu), and griddepcontrol is compiled
+  // out below SM90, so this is safe and numerically identical.
+  attrs[0].val.programmaticStreamSerializationAllowed = 1;
   config.numAttrs = 1;
   config.attrs = attrs;
   cudaLaunchKernelEx(

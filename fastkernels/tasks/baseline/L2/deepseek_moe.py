@@ -26,6 +26,10 @@ from ..L1.gate_linear import GateLinear
 from .fused_experts import FusedExperts
 from .llama_mlp import LlamaMLP
 from .vllm_fused_experts import VllmFusedExperts
+from ..L1.fp8_linear import PerTokenGroupQuantFp8
+from ..L1.trtllm_fp8_moe import (
+    TrtllmFp8MoE, prepare_trtllm_moe_weights, trtllm_fp8_moe_available,
+)
 
 _FP8_BLOCK = 128
 
@@ -150,6 +154,18 @@ class DeepSeekMoE(nn.Module):
             self.fused_experts = VllmFusedExperts()
         else:
             self.fused_experts = FusedExperts()
+        # On Blackwell (sm100) vLLM's fp8-MoE oracle selects the
+        # FLASHINFER_TRTLLM kernel, not Triton (it only forces TRITON to the
+        # front on Hopper/sm90). Match it: run the TRTLLM path for fp8 experts
+        # on sm100, keeping the Triton ``VllmFusedExperts`` for Hopper/other
+        # arches. Weights are transformed to the BlockMajorK layout at load
+        # time by ``prepare_trtllm_weights`` (the weight postprocess hook calls
+        # it and SKIPs the UE8M0 requant for these experts).
+        self._use_trtllm = self.use_fp8 and trtllm_fp8_moe_available()
+        self._trtllm_weights_ready = False
+        if self._use_trtllm:
+            self.trtllm_moe = TrtllmFp8MoE()
+            self.act_quant = PerTokenGroupQuantFp8()
         self.allreduce = AllReduce()
         # Mirrors vLLM's ``VLLM_DISABLE_SHARED_EXPERTS_STREAM`` env knob
         # (default: stream enabled). When disabled, the shared expert runs
@@ -195,6 +211,29 @@ class DeepSeekMoE(nn.Module):
         scale_cols = math.ceil(N / _FP8_BLOCK)
         src = loaded_weight.chunk(tp, 1)[rank]
         param.data[expert_id].copy_(src)
+
+    def prepare_trtllm_weights(self) -> None:
+        """Transform the raw loaded fp8 expert weights into the FlashInfer
+        BlockMajorK layout for the TRTLLM kernel and drop the originals.
+
+        Called once from the weight postprocess hook for sm100 fp8 MoE modules
+        (which then SKIP the UE8M0 requant — the TRTLLM path uses the
+        un-requantized checkpoint weights). No-op off the TRTLLM path.
+        """
+        if not getattr(self, "_use_trtllm", False) or self._trtllm_weights_ready:
+            return
+        w13_fi, w2_fi, w13_scale_fi, w2_scale_fi = prepare_trtllm_moe_weights(
+            self.w13.data, self.w2.data,
+            self.w13_weight_scale_inv.data, self.w2_weight_scale_inv.data,
+        )
+        self.register_buffer("w13_fi", w13_fi, persistent=False)
+        self.register_buffer("w2_fi", w2_fi, persistent=False)
+        self.register_buffer("w13_scale_fi", w13_scale_fi, persistent=False)
+        self.register_buffer("w2_scale_fi", w2_scale_fi, persistent=False)
+        # Free the raw [E,2N,K]/[E,K,N] params — the FI buffers replace them.
+        del self.w13, self.w2, self.w13_weight_scale_inv, self.w2_weight_scale_inv
+        self._trtllm_weights_ready = True
+        torch.cuda.empty_cache()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self._use_custom_op:
@@ -255,7 +294,28 @@ class DeepSeekMoE(nn.Module):
         # — and ``invoke_fused_moe_triton_kernel`` consumes them directly).
         # Cast to activation dtype only for the BF16 / "unquantized" path,
         # which still uses fastkernels's local FusedExperts wrapper.
-        if self.use_fp8:
+        if self._use_trtllm:
+            # Blackwell FLASHINFER_TRTLLM path (vLLM's oracle choice on sm100).
+            # Quantize activations per-token-group to fp8 (UE8M0 scales, matching
+            # vLLM), transpose the scale to the DeepSeekFp8 [K//128, M] layout,
+            # and call the fused kernel (GEMM1+SiLU-gate+GEMM2+top-k sum in one
+            # op, do_finalize=True). ``routed_scaling_factor`` is applied
+            # post-experts below (kernel arg left None), and NO ``moe_sum`` is
+            # needed (the kernel already finalizes). ``topk_weights`` stays FP32
+            # (packed into the kernel's routing input as bf16, matching vLLM).
+            M, K = hidden_states.shape
+            a_fp8 = torch.empty(M, K, dtype=torch.float8_e4m3fn,
+                                device=hidden_states.device)
+            a_scale = torch.empty(M, K // _FP8_BLOCK, dtype=torch.float32,
+                                  device=hidden_states.device)
+            self.act_quant(hidden_states, a_fp8, a_scale)
+            out = self.trtllm_moe(
+                a_fp8, a_scale.t().contiguous(),
+                self.w13_fi, self.w13_scale_fi, self.w2_fi, self.w2_scale_fi,
+                topk_weights, topk_ids, self.num_experts, self.top_k,
+                self.intermediate_per_tp,
+            )
+        elif self.use_fp8:
             # FP8 W8A8 block-quant on Hopper + TP: vLLM's oracle
             # (``select_fp8_moe_backend`` -> ``_get_priority_backends``
             # in ``vllm/.../fused_moe/oracle/fp8.py``) explicitly moves

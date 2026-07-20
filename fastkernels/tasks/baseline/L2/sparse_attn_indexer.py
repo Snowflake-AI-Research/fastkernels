@@ -239,7 +239,6 @@ class SparseAttnIndexer(nn.Module):
             k_fp8, k_scale_bytes = self.k_cache_gather(
                 self.indexer_k_cache, bt, cu_k)
 
-            num_seqs = cu_k.shape[0] - 1
             seq_lens_k = cu_k[1:] - cu_k[:-1]
             cu_seqlen_ks, cu_seqlen_ke = _kv_spans_from_batches(
                 cu_q, seq_lens_k, hidden_states.device, N=np_)
@@ -252,9 +251,11 @@ class SparseAttnIndexer(nn.Module):
                 cu_seqlen_ke,
             )
 
-            topk_indices[:np_] = self.topk_per_row.forward_prefill(
+            # Write the top-k straight into the shared buffer (in place),
+            # avoiding a fresh [np_, topk] allocation + copy each layer/step.
+            self.topk_per_row.forward_prefill(
                 logits, cu_seqlen_ks, cu_seqlen_ke,
-                self.topk_tokens,
+                self.topk_tokens, out=topk_indices[:np_],
             )
 
             if ctx.is_mixed and ctx.num_decode_tokens > 0:
@@ -321,4 +322,5 @@ class SparseAttnIndexer(nn.Module):
         )
         return self.topk_per_row.forward_decode(
             logits, ctx.decode_context_lens, next_n=next_n, topk=self.topk_tokens,
+            max_seq_len=max_ctx,
         )

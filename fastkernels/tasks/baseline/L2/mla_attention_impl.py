@@ -1011,6 +1011,13 @@ class MLAAttention(nn.Module):
                 head_dim_v=_MLA_HEAD_DIM_V,
                 tile_scheduler_metadata=tile_sched_meta,
                 softmax_scale=self.scale,
+                # Sparse attention: the FlashMLA kernel asserts causal==False
+                # whenever ``indices`` is set (the top-k already encodes the
+                # causal span). ``decode_op`` (FlashMLADecode) defaults
+                # causal=True, so pass it explicitly here — matching the
+                # mixed-batch and sparse-decode call sites above and vLLM's
+                # FlashMLASparseImpl (which never passes causal).
+                causal=False,
                 is_fp8_kvcache=True,
                 indices=topk_dc_4d,
             )

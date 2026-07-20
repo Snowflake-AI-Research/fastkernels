@@ -171,6 +171,7 @@ class YarnRotaryEmbedding(nn.Module):
         mscale_all_dim: float = 0,
         is_neox_style: bool = False,
         is_plain: bool = False,
+        cache_dtype: torch.dtype | None = None,
     ):
         super().__init__()
         self.head_dim = head_dim
@@ -208,6 +209,14 @@ class YarnRotaryEmbedding(nn.Module):
         cos = freqs.cos() * softmax_mscale
         sin = freqs.sin() * softmax_mscale
         cache = torch.cat((cos, sin), dim=-1).float()
+        # Plain "default" rope (GLM-5.2): vLLM's base ``RotaryEmbedding`` stores
+        # the cos/sin cache in the model compute dtype (bf16) once at init, so
+        # its forward never re-casts. Match that — computing in fp32 then
+        # casting to bf16 here is bit-identical to casting per-forward, and
+        # skips a full-cache dtype conversion on every rope call. YARN
+        # (is_plain=False) keeps the fp32 cache for the FlashInfer path.
+        if self.is_plain and cache_dtype is not None:
+            cache = cache.to(cache_dtype)
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
     def forward(self, positions, query, key):

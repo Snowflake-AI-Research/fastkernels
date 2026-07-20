@@ -412,6 +412,7 @@ class ModelRunner:
         self.model, self.config = load_model(
             model_name, torch.device(f"cuda:{rank}"), dtype,
             max_layers=self.max_layers,
+            max_num_batched_tokens=self.max_num_batched_tokens,
         )
         model_type = getattr(self.config, "model_type", "")
         self.is_kimi_linear = model_type == "kimi_linear"
@@ -640,7 +641,11 @@ class ModelRunner:
             512 * 1024 * 1024, dtype=torch.uint8, device=f"cuda:{self.rank}"
         )
         for layer in self._attn_layers:
-            layer.set_trtllm_workspace(trtllm_workspace)
+            # MLA layers (DeepSeek-V3.2 / GLM-5.2) expose k_cache/v_cache but use
+            # the FlashMLA workspace, not the TRT-LLM per-layer workspace, so they
+            # do not implement set_trtllm_workspace — skip them.
+            if hasattr(layer, "set_trtllm_workspace"):
+                layer.set_trtllm_workspace(trtllm_workspace)
         torch.cuda.empty_cache()
 
     def _share_activation_buffers(self):
