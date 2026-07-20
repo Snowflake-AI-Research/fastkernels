@@ -48,7 +48,7 @@ import torch
 import torch.nn as nn
 import triton
 
-import vllm._C  # noqa: F401  - registers torch.ops._C.silu_and_mul + per_token_group_fp8_quant
+import vllm._custom_ops  # noqa: F401  - registers torch.ops._C.silu_and_mul + per_token_group_fp8_quant (vLLM 0.24 stable ABI)
 
 from ..L1.csrc import _C
 from ..L1.fp8_linear import PerTokenGroupQuantFp8

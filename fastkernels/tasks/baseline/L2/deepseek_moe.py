@@ -229,27 +229,19 @@ class DeepSeekMoE(nn.Module):
         # that flips near-tie group/expert selection in the noaux_tc
         # grouped-topk path.
         #
-        # vLLM chooses the router ``out_dtype`` in
-        # ``deepseek_v2.py:DeepseekV2MoE.__init__``:
-        #
-        #     self.gate.set_out_dtype(
-        #         torch.float32
-        #         if self.experts.quant_method.is_monolithic
-        #         and self.experts.routing_method_type ==
-        #             RoutingMethodType.DeepSeekV3
-        #         else torch.bfloat16
-        #     )
-        #
-        # For FP8 blockwise DeepSeek-V3 experts (our ``use_fp8`` path) the
-        # quant method is *not* ``is_monolithic``, so vLLM uses BF16 here
-        # — and the router_logits carry BF16 precision, which matters for
-        # near-tie top-k boundaries. For the BF16 / "unquantized" path vLLM
-        # is monolithic, so it keeps FP32. We mirror that choice exactly.
-        router_out_dtype = (
-            torch.float32 if not self.use_fp8 else torch.bfloat16
-        )
+        # Router ``out_dtype`` mirrors vLLM ``DeepseekV2MoE``: on CUDA the
+        # ``GateLinear`` is constructed with ``out_dtype=None`` and
+        # ``set_out_dtype`` is called ONLY on the ROCm/aiter path
+        # (``deepseek_v2.py:304-309``). So on CUDA ``gate.out_dtype`` stays
+        # ``None`` for BOTH the FP8 and the BF16/unquantized experts. With
+        # ``None``, vLLM's dispatch yields FP32 router logits in decode (the
+        # DSV3 kernel's ``torch.empty(dtype=None)`` output) and BF16 in prefill
+        # (the ``F.linear`` fallback, no cast) — and vLLM does NOT upcast before
+        # the sigmoid, so this precision split feeds grouped-topk verbatim.
+        # Pass ``None`` to reproduce it exactly (GateLinear pins FP32 for the
+        # DSV3 output since fastkernels' global default dtype is bf16).
         router_logits = self.gate(
-            hidden_states, self.gate_weight, out_dtype=router_out_dtype,
+            hidden_states, self.gate_weight, out_dtype=None,
         )
         topk_weights, topk_ids = self.grouped_topk(
             router_logits, self.e_score_correction_bias,

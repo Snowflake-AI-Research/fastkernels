@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 try:
-    import vllm._C  # noqa: F401  - registers torch.ops._C.silu_and_mul
+    import vllm._custom_ops  # noqa: F401  - registers torch.ops._C.silu_and_mul (vLLM 0.24 stable ABI)
     _silu_and_mul_kernel = torch.ops._C.silu_and_mul
 except (AttributeError, ImportError):
     from .csrc import _C

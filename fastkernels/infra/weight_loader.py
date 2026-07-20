@@ -1266,7 +1266,12 @@ def _detect_model_type(model_name: str) -> str:
         # files that don't exist in the repo (model_type is registered
         # natively).  In both cases reading config.json directly works.
         model_type = _load_config_dict(model_name).get("model_type", "llama")
-    if model_type == "deepseek_v32":
+    if model_type in ("deepseek_v32", "glm_moe_dsa"):
+        # GLM-5.2 (``glm_moe_dsa`` / ``GlmMoeDsaForCausalLM``) is a pure config
+        # variant of DeepSeek-V3.2 -- in vLLM ``GlmMoeDsaForCausalLM`` subclasses
+        # ``DeepseekV2ForCausalLM`` with an empty body -- so it shares the entire
+        # MLA + DSA + MoE stack (weight names, MLA-absorbed weights, TP KV-head
+        # exemption, FP8 block dequant). Route it through the DeepSeek path.
         model_type = "deepseek_v3"
     return model_type
 
@@ -1516,7 +1521,8 @@ def load_model(
         config = DeepSeekV3Config.from_pretrained(model_name)
         config.dtype = dtype
         _apply_max_layers(config, max_layers)
-        print(f"  Allocating DeepSeek V3.2 model ({config.n_routed_experts} experts, "
+        print(f"  Allocating DeepSeek-V3.2 / GLM-5.2 (MLA+DSA+MoE) model "
+              f"({config.n_routed_experts} experts, "
               f"top-{config.num_experts_per_tok}, DSA topk={config.index_topk})...")
         model = DeepSeekV3ForCausalLM(config, quant_config=quant_config)
     elif model_type == "bitnet":

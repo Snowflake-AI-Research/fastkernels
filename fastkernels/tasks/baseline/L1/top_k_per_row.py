@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-import vllm._C  # noqa: F401  — registers torch.ops._C
+import vllm._custom_ops  # noqa: F401  — registers torch.ops._C (vLLM 0.24 stable ABI)
 
 
 class TopKPerRow(nn.Module):

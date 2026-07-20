@@ -1209,6 +1209,18 @@ _ARCHITECTURES = (
 FASTKERNELS_ARCHITECTURES: dict[str, Architecture] = {a.module: a for a in _ARCHITECTURES}
 
 
+# Several HuggingFace ``model_type`` strings map to a single fastkernels L4
+# module because they are the same architecture. GLM-5.2 (``glm_moe_dsa`` /
+# ``GlmMoeDsaForCausalLM``) is a pure config variant of DeepSeek-V3.2 -- in vLLM
+# it subclasses ``DeepseekV2ForCausalLM`` with an empty body -- so it is served
+# by the ``deepseek`` module (which the registry keys on ``deepseek_v32``). This
+# mirrors the ``glm_moe_dsa -> deepseek_v3`` remap in ``weight_loader``.
+_MODEL_TYPE_ALIASES: dict[str, str] = {
+    "glm_moe_dsa": "deepseek_v32",
+    "deepseek_v3": "deepseek_v32",
+}
+
+
 def _normalize(text: str) -> str:
     """Lowercase, alphanumeric-only form for tolerant name matching."""
     return "".join(ch for ch in text.lower() if ch.isalnum())
@@ -1234,6 +1246,29 @@ def _module_from_name(hf_name: str) -> str | None:
     return best_module
 
 
+def _model_type_from_config_json(hf_name: str) -> str | None:
+    """Read ``model_type`` straight from a model's ``config.json``.
+
+    Fallback for architectures whose ``model_type`` is not registered with the
+    installed ``transformers`` (so ``AutoConfig`` raises), e.g. GLM-5.2. Accepts
+    a local directory or a HuggingFace repo id; returns ``None`` on any failure.
+    """
+    import json
+    import os
+
+    try:
+        if os.path.isdir(hf_name):
+            path = os.path.join(hf_name, "config.json")
+        else:
+            from huggingface_hub import hf_hub_download
+
+            path = hf_hub_download(hf_name, "config.json")
+        with open(path) as f:
+            return json.load(f).get("model_type")
+    except Exception:
+        return None
+
+
 @functools.lru_cache(maxsize=None)
 def module_for(hf_name: str) -> str | None:
     """Infer the fastkernels L4 module stem for a HuggingFace model.
@@ -1256,8 +1291,12 @@ def module_for(hf_name: str) -> str | None:
         config = AutoConfig.from_pretrained(hf_name, trust_remote_code=True)
         model_type = getattr(config, "model_type", None)
     except Exception:
-        model_type = None
+        # Custom/unregistered ``model_type`` (e.g. GLM-5.2's ``glm_moe_dsa``,
+        # DeepSeek-V3.2's ``deepseek_v32``) makes AutoConfig raise. Read the raw
+        # config.json to recover ``model_type`` before falling back to the name.
+        model_type = _model_type_from_config_json(hf_name)
     if model_type is not None:
+        model_type = _MODEL_TYPE_ALIASES.get(model_type, model_type)
         for arch in _ARCHITECTURES:
             if arch.model_type == model_type:
                 return arch.module

@@ -35,7 +35,7 @@ import torch.nn.functional as F
 from .csrc import _C
 
 try:
-    import vllm._C  # noqa: F401 — registers torch.ops._C.rms_norm etc.
+    import vllm._custom_ops  # noqa: F401 — registers torch.ops._C.rms_norm etc. (vLLM 0.24 stable ABI)
     # Importing the extension is not sufficient: some vLLM builds don't register
     # rms_norm / fused_add_rms_norm into the ``_C`` op namespace. Verify the ops
     # actually exist, otherwise fall back to fastkernels' own CUDA kernels.

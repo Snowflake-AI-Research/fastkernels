@@ -122,6 +122,10 @@ class DeepSeekMLAAttention(nn.Module):
             # The only divergence from main rope is ``is_neox_style``, which is
             # ``not indexer_rope_interleave``.
             indexer_interleave = getattr(config, "indexer_rope_interleave", False)
+            # Match the main-attention rope: GLM-5.2's "default" rope is plain
+            # (bf16 cache, no FlashInfer) whereas DeepSeek-V3.2 YARN keeps
+            # FlashInfer + fp32 cache. See ``YarnRotaryEmbedding.is_plain``.
+            indexer_is_plain = _rp.get("rope_type") in ('default', 'plain', 'linear')
             self.indexer_rope_emb = YarnRotaryEmbedding(
                 head_dim=self.qk_rope_head_dim,
                 max_position_embeddings=_rp.get(
@@ -135,6 +139,7 @@ class DeepSeekMLAAttention(nn.Module):
                 mscale=_rp.get("mscale", 1.0),
                 mscale_all_dim=_rp.get("mscale_all_dim", 0.0),
                 is_neox_style=not indexer_interleave,
+                is_plain=indexer_is_plain,
             )
             # Share the rope_emb module with the indexer so its custom op
             # doesn't need a non-tensor argument (same reasoning as
@@ -174,6 +179,30 @@ class DeepSeekMLAAttention(nn.Module):
         self.attn.W_UV = W_UV.permute(1, 0, 2).contiguous()
         # W_UK_T: (L, N, P) -> (N, P, L) — matches vllm
         self.attn.W_UK_T = W_UK.permute(1, 2, 0).contiguous()
+
+        # DSA indexer K projection must run in BF16 to match vLLM. vLLM builds
+        # the indexer ``wk`` as a BF16 ``MergedColumnParallelLinear`` (fused with
+        # ``weights_proj``) and dequantizes any FP8 checkpoint ``wk`` weight to
+        # BF16 at load (``_try_load_fp8_indexer_wk`` in deepseek_v2.py). We load
+        # ``wk`` as FP8, so dequantize it here — after weight load, before FP8
+        # post-processing — so ``k = wk(hidden_states)`` is computed in BF16.
+        # Running it in FP8 adds an extra rounding on the indexer K that flows
+        # into k_norm -> RoPE -> fp8 K-cache -> MQA logits -> top-k and can flip
+        # the selected sparse tokens vs vLLM. Applies to every DSA model
+        # (DeepSeek-V3.2 and GLM-5.2); no-op for the BF16 (non-FP8) checkpoints.
+        idx = self.indexer
+        if idx is not None and getattr(idx.wk, "use_fp8", False):
+            wk = idx.wk
+            w_bf16 = self._dequant_fp8_block(
+                wk.weight.data, wk.weight_scale_inv.data)
+            wk.weight = nn.Parameter(w_bf16, requires_grad=False)
+            wk.weight.weight_loader = lambda p, w: p.data.copy_(w)
+            wk.use_fp8 = False
+            # Drop the FP8 apparatus so ``_postprocess_fp8_weights`` (which keys
+            # on ``isinstance(m.linear_op, Fp8Linear)``) skips this now-BF16 wk.
+            wk.linear_op = None
+            if hasattr(wk, "weight_scale_inv"):
+                del wk.weight_scale_inv
 
     @staticmethod
     def _dequant_fp8_block(w_fp8: torch.Tensor, scale_inv: torch.Tensor,

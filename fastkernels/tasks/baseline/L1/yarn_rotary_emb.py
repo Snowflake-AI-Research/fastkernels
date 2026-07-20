@@ -170,10 +170,18 @@ class YarnRotaryEmbedding(nn.Module):
         mscale: float = 1,
         mscale_all_dim: float = 0,
         is_neox_style: bool = False,
+        is_plain: bool = False,
     ):
         super().__init__()
         self.head_dim = head_dim
         self.is_neox_style = is_neox_style
+        # ``is_plain`` marks a degenerate (scaling_factor==1.0) instance that is
+        # really standard RoPE — e.g. GLM-5.2's ``rope_type: "default"``. vLLM
+        # maps a "default" rope to the base ``RotaryEmbedding``, which does NOT
+        # use the FlashInfer kernel and casts the cos/sin cache to the model
+        # dtype (bf16). DeepSeek-V3.2 YARN (scaling_factor>1) keeps FlashInfer +
+        # fp32 cache. Threading this flag lets both match vLLM exactly.
+        self.is_plain = is_plain
         rotary_dim = head_dim
         base = rope_theta
 
@@ -208,7 +216,8 @@ class YarnRotaryEmbedding(nn.Module):
         # ``vllm/model_executor/layers/rotary_embedding/deepseek_scaling_rope.py:181-198``).
         # FlashInfer keeps ``cos_sin_cache`` in float32; only the fastkernels
         # CUDA kernel needs the cache cast to query.dtype.
-        if _USE_FLASHINFER_ROPE and query.dtype in (torch.float16, torch.bfloat16) \
+        if _USE_FLASHINFER_ROPE and not self.is_plain \
+                and query.dtype in (torch.float16, torch.bfloat16) \
                 and self.head_dim in (64, 128, 256, 512):
             torch.ops.vllm.flashinfer_rotary_embedding(
                 positions, query, key, self.head_dim, self.cos_sin_cache,

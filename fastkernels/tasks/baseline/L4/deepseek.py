@@ -61,6 +61,10 @@ class DeepSeekV3Config:
     index_topk: Optional[int] = None
     index_n_heads: Optional[int] = None
     index_head_dim: Optional[int] = None
+    # Indexer RoPE layout: DeepSeek-V3.2 uses NeoX (interleave=False); GLM-5.2
+    # (``glm_moe_dsa``) sets ``indexer_rope_interleave=True`` (interleaved).
+    # Consumed by the DSA indexer as ``is_neox_style = not indexer_rope_interleave``.
+    indexer_rope_interleave: bool = False
 
     # YARN RoPE params
     rope_parameters: dict = field(default_factory=lambda: {
@@ -93,19 +97,61 @@ class DeepSeekV3Config:
                 cfg = json.load(f)
             cfg["model_type"] = "deepseek_v3"
             hf = _HFDSConfig(**cfg)
-        rope = getattr(hf, 'rope_scaling', {}) or {}
-        rope_params = {
-            'rope_type': rope.get('type', rope.get('rope_type', 'deepseek_yarn')),
-            'factor': rope.get('factor', 40.0),
-            'mscale': rope.get('mscale', 1.0),
-            'mscale_all_dim': rope.get('mscale_all_dim', 1.0),
-            'attn_factor': rope.get('attn_factor', 1.0),
-            'beta_fast': rope.get('beta_fast', 32),
-            'beta_slow': rope.get('beta_slow', 1),
-            'original_max_position_embeddings': rope.get(
-                'original_max_position_embeddings',
-                getattr(hf, 'original_max_position_embeddings', 4096)),
-        }
+        # DeepSeek-V3.2 carries its YARN settings under ``rope_scaling`` with a
+        # top-level ``rope_theta``. GLM-5.2 (``glm_moe_dsa``) instead uses the
+        # newer ``rope_parameters`` block with ``rope_type: "default"`` (plain
+        # RoPE, no YARN) and ``rope_theta`` nested inside it. Parse both, and
+        # gate the plain-RoPE branch so DeepSeek stays byte-identical.
+        rope = getattr(hf, 'rope_scaling', None) or {}
+        rope_params_hf = getattr(hf, 'rope_parameters', None) or {}
+        rope_type = (
+            rope.get('type') or rope.get('rope_type')
+            or rope_params_hf.get('rope_type') or 'deepseek_yarn'
+        )
+        # theta: the ``rope_parameters`` block is authoritative when present
+        # (GLM-5.2 nests ``rope_theta: 8e6`` there and has no top-level value);
+        # otherwise use the top-level ``rope_theta`` (DeepSeek-V3.2 -> 10000).
+        # NB: the AutoConfig-fallback path builds an HF ``DeepseekV3Config`` which
+        # injects a spurious default ``rope_theta=10000``, so we must not let a
+        # top-level value shadow the nested GLM one.
+        rope_theta = rope_params_hf.get('rope_theta')
+        if rope_theta is None:
+            rope_theta = rope.get('rope_theta')  # migrated into rope_scaling
+        if rope_theta is None:
+            rope_theta = getattr(hf, 'rope_theta', 10000.0)
+
+        if rope_type in ('default', 'plain', 'linear'):
+            # Plain RoPE (GLM-5.2). Gate on ``rope_type`` -- not on ``rope`` being
+            # empty -- because some transformers versions migrate the new
+            # ``rope_parameters`` block into ``rope_scaling``, so ``rope`` is
+            # non-empty even for GLM. DeepSeek-V3.2 uses ``rope_type='yarn'`` /
+            # ``'deepseek_yarn'`` (never in this set), so it keeps the else path.
+            # factor=1.0 makes YarnRotaryEmbedding degrade
+            # to standard RoPE (softmax_mscale=1.0, inv_freq == 1/pos_freqs), and
+            # the cache must span the full context (original_max = max_position).
+            rope_params = {
+                'rope_type': rope_type,
+                'factor': 1.0,
+                'mscale': 1.0,
+                'mscale_all_dim': 0.0,
+                'attn_factor': 1.0,
+                'beta_fast': 32,
+                'beta_slow': 1,
+                'original_max_position_embeddings': hf.max_position_embeddings,
+            }
+        else:
+            rope_params = {
+                'rope_type': rope.get('type', rope.get('rope_type', 'deepseek_yarn')),
+                'factor': rope.get('factor', 40.0),
+                'mscale': rope.get('mscale', 1.0),
+                'mscale_all_dim': rope.get('mscale_all_dim', 1.0),
+                'attn_factor': rope.get('attn_factor', 1.0),
+                'beta_fast': rope.get('beta_fast', 32),
+                'beta_slow': rope.get('beta_slow', 1),
+                'original_max_position_embeddings': rope.get(
+                    'original_max_position_embeddings',
+                    getattr(hf, 'original_max_position_embeddings', 4096)),
+            }
 
         return cls(
             hidden_size=hf.hidden_size,
@@ -116,7 +162,7 @@ class DeepSeekV3Config:
             vocab_size=hf.vocab_size,
             max_position_embeddings=hf.max_position_embeddings,
             rms_norm_eps=getattr(hf, 'rms_norm_eps', 1e-6),
-            rope_theta=getattr(hf, 'rope_theta', 10000.0),
+            rope_theta=rope_theta,
             q_lora_rank=getattr(hf, 'q_lora_rank', 1536),
             kv_lora_rank=getattr(hf, 'kv_lora_rank', 512),
             qk_nope_head_dim=getattr(hf, 'qk_nope_head_dim', 128),
@@ -137,6 +183,7 @@ class DeepSeekV3Config:
             index_topk=getattr(hf, 'index_topk', None),
             index_n_heads=getattr(hf, 'index_n_heads', None),
             index_head_dim=getattr(hf, 'index_head_dim', None),
+            indexer_rope_interleave=getattr(hf, 'indexer_rope_interleave', False),
             rope_parameters=rope_params,
         )
 
@@ -146,6 +193,11 @@ class DeepSeekV3Model(nn.Module):
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
 
+        # GLM-5.2 uses plain RoPE (rope_type "default"); vLLM routes that to the
+        # base RotaryEmbedding (no FlashInfer, bf16 cos/sin cache). Flag it so
+        # YarnRotaryEmbedding matches, while DeepSeek-V3.2 YARN keeps FlashInfer.
+        is_plain_rope = config.rope_parameters.get('rope_type') in (
+            'default', 'plain', 'linear')
         self.rotary_emb = YarnRotaryEmbedding(
             head_dim=config.qk_rope_head_dim,
             max_position_embeddings=config.rope_parameters.get(
@@ -157,6 +209,7 @@ class DeepSeekV3Model(nn.Module):
             beta_slow=config.rope_parameters.get('beta_slow', 1),
             mscale=config.rope_parameters.get('mscale', 1.0),
             mscale_all_dim=config.rope_parameters.get('mscale_all_dim', 0.0),
+            is_plain=is_plain_rope,
         )
 
         is_v32 = hasattr(config, 'index_topk') and config.index_topk is not None

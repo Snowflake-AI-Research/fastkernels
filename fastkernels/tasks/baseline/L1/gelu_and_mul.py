@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 try:
-    import vllm._C  # noqa: F401  -- registers torch.ops._C.gelu*_and_mul
+    import vllm._custom_ops  # noqa: F401  -- registers torch.ops._C.gelu*_and_mul (vLLM 0.24 stable ABI)
     # Importing the extension does not guarantee the ops are registered in the
     # ``_C`` namespace (varies by vLLM build). Verify before binding, otherwise
     # fall back to the pure-PyTorch path (there is no fastkernels csrc gelu
