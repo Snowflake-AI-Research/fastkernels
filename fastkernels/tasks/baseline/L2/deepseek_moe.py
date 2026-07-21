@@ -282,40 +282,33 @@ class DeepSeekMoE(nn.Module):
         router_logits = self.gate(
             hidden_states, self.gate_weight, out_dtype=None,
         )
-        topk_weights, topk_ids = self.grouped_topk(
-            router_logits, self.e_score_correction_bias,
-            self.n_group, self.topk_group, self.top_k,
-        )
-        # ``topk_weights`` is FP32 (matches vLLM). For the FP8 expert path
-        # we pass FP32 weights through verbatim so the Triton kernel reads
-        # them at the same precision vLLM does (vLLM's grouped_topk router
-        # returns FP32 — see
-        # ``vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py:165``
-        # — and ``invoke_fused_moe_triton_kernel`` consumes them directly).
-        # Cast to activation dtype only for the BF16 / "unquantized" path,
-        # which still uses fastkernels's local FusedExperts wrapper.
         if self._use_trtllm:
             # Blackwell FLASHINFER_TRTLLM path (vLLM's oracle choice on sm100).
-            # Quantize activations per-token-group to fp8 (UE8M0 scales, matching
-            # vLLM), transpose the scale to the DeepSeekFp8 [K//128, M] layout,
-            # and call the fused kernel (GEMM1+SiLU-gate+GEMM2+top-k sum in one
-            # op, do_finalize=True). ``routed_scaling_factor`` is applied
-            # post-experts below (kernel arg left None), and NO ``moe_sum`` is
-            # needed (the kernel already finalizes). ``topk_weights`` stays FP32
-            # (packed into the kernel's routing input as bf16, matching vLLM).
+            # Use the MONOLITHIC kernel (``trtllm_fp8_block_scale_moe``) with
+            # routing (sigmoid + noaux_tc grouped top-k + norm) done INSIDE the
+            # kernel from raw ``router_logits`` — exactly vLLM's DeepSeek/GLM CUDA
+            # path (``routing_method_type=DeepSeekV3``). This is BIT-IDENTICAL to
+            # vLLM; the pre-routed variant instead truncates the top-k combine
+            # weights to bf16, a ~1-ULP error that scales with expert-output
+            # magnitude. ``routed_scaling_factor`` is applied post-experts below.
             M, K = hidden_states.shape
             a_fp8 = torch.empty(M, K, dtype=torch.float8_e4m3fn,
                                 device=hidden_states.device)
             a_scale = torch.empty(M, K // _FP8_BLOCK, dtype=torch.float32,
                                   device=hidden_states.device)
             self.act_quant(hidden_states, a_fp8, a_scale)
-            out = self.trtllm_moe(
+            out = self.trtllm_moe.forward_monolithic(
                 a_fp8, a_scale.t().contiguous(),
                 self.w13_fi, self.w13_scale_fi, self.w2_fi, self.w2_scale_fi,
-                topk_weights, topk_ids, self.num_experts, self.top_k,
+                router_logits, self.e_score_correction_bias,
+                self.num_experts, self.top_k, self.n_group, self.topk_group,
                 self.intermediate_per_tp,
             )
         elif self.use_fp8:
+            topk_weights, topk_ids = self.grouped_topk(
+                router_logits, self.e_score_correction_bias,
+                self.n_group, self.topk_group, self.top_k,
+            )
             # FP8 W8A8 block-quant on Hopper + TP: vLLM's oracle
             # (``select_fp8_moe_backend`` -> ``_get_priority_backends``
             # in ``vllm/.../fused_moe/oracle/fp8.py``) explicitly moves
@@ -335,6 +328,10 @@ class DeepSeekMoE(nn.Module):
                 block_shape=[_FP8_BLOCK, _FP8_BLOCK],
             )
         else:
+            topk_weights, topk_ids = self.grouped_topk(
+                router_logits, self.e_score_correction_bias,
+                self.n_group, self.topk_group, self.top_k,
+            )
             topk_weights_act = topk_weights.to(hidden_states.dtype)
             out = self.fused_experts(
                 hidden_states, self.w13, self.w2,

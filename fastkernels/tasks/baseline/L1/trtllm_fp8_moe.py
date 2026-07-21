@@ -198,3 +198,56 @@ class TrtllmFp8MoE(nn.Module):
             output=out,
         )
         return out
+
+    def forward_monolithic(
+        self,
+        a_fp8: torch.Tensor,          # [M, K] float8_e4m3fn
+        a_scale_t: torch.Tensor,      # [K//128, M] float32 (DeepSeekFp8 layout)
+        w13_fi: torch.Tensor,
+        w13_scale: torch.Tensor,
+        w2_fi: torch.Tensor,
+        w2_scale: torch.Tensor,
+        router_logits: torch.Tensor,  # [M, num_experts] raw gate logits (pre-sigmoid)
+        routing_bias: torch.Tensor | None,  # e_score_correction_bias [num_experts]
+        num_experts: int,
+        top_k: int,
+        n_group: int,
+        topk_group: int,
+        intermediate_size: int,
+    ) -> torch.Tensor:
+        """Monolithic TRTLLM MoE: routing (sigmoid + noaux_tc grouped top-k +
+        norm) is done INSIDE the kernel from raw ``router_logits``, exactly as
+        vLLM's DeepSeek/GLM CUDA path (``trtllm_fp8_block_scale_moe`` with
+        ``routing_method_type=DeepSeekV3``). This is BIT-IDENTICAL to vLLM,
+        whereas the pre-routed variant truncates the top-k combine weights to
+        bf16 (``_pack_topk_ids_weights``) — a ~1-ULP error that scales with the
+        expert-output magnitude. ``routed_scaling_factor`` is left at 1.0 here
+        and applied post-experts by the caller (matching vLLM's runner)."""
+        import flashinfer.fused_moe as fm
+        from flashinfer.fused_moe import (
+            Fp8QuantizationType, WeightLayout, RoutingMethodType,
+        )
+        res = fm.trtllm_fp8_block_scale_moe(
+            routing_logits=router_logits,
+            routing_bias=routing_bias,
+            hidden_states=a_fp8,
+            hidden_states_scale=a_scale_t,
+            gemm1_weights=w13_fi,
+            gemm1_weights_scale=w13_scale,
+            gemm2_weights=w2_fi,
+            gemm2_weights_scale=w2_scale,
+            num_experts=num_experts,
+            top_k=top_k,
+            n_group=n_group,
+            topk_group=topk_group,
+            intermediate_size=intermediate_size,
+            local_expert_offset=0,
+            local_num_experts=num_experts,
+            routed_scaling_factor=1.0,    # kernel no-op; real factor applied post
+            routing_method_type=int(RoutingMethodType.DeepSeekV3),
+            use_shuffled_weight=True,
+            weight_layout=int(WeightLayout.BlockMajorK),
+            do_finalize=True,
+            fp8_quantization_type=Fp8QuantizationType.DeepSeekFp8,
+        )
+        return res[0] if isinstance(res, (list, tuple)) else res
