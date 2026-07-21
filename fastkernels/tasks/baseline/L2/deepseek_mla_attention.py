@@ -159,35 +159,40 @@ class DeepSeekMLAAttention(nn.Module):
             self.indexer_rope_emb = None
 
     def compute_absorbed_weights(self):
-        """Compute W_UV and W_UK_T from kv_b_proj for absorbed MLA decode.
+        """Prepare MLA absorbed weights + BF16 indexer wk. Called after weight
+        loading but BEFORE FP8 post-processing.
 
-        Must be called after weight loading but BEFORE FP8 postprocessing
-        (transform_sf_into_required_layout). For FP8 weights, we dequantize
-        using the original block scales to recover accurate BF16 values,
-        matching vLLM's get_and_maybe_dequant_weights.
-
-        Produces:
-        - W_UV: [N, L, V] for v_up_proj (matches vllm)
-        - W_UK_T: [N, P, L] for decode query absorption (matches vllm)
+        - BF16 kv_b_proj: builds W_UV [N,L,V] / W_UK_T [N,P,L] now (trivial cast).
+        - FP8 kv_b_proj: DEFERS W_UV/W_UK_T to ``finalize_absorbed_weights()``
+          (runs AFTER post-processing, via an fp8 GEMM on identity — bit-identical
+          to vLLM's ``get_and_maybe_dequant_weights`` use_deep_gemm path).
+        - Always: dequantizes the FP8 DSA indexer ``wk`` to BF16 (must happen
+          before post-processing, matching vLLM's BF16 indexer wk).
         """
-        weight = self.kv_b_proj.weight.data
         if hasattr(self.kv_b_proj, 'use_fp8') and self.kv_b_proj.use_fp8:
-            scale = self.kv_b_proj.weight_scale_inv.data
-            weight = self._dequant_fp8_block(weight, scale)
+            # FP8 kv_b_proj: DEFER W_UK/W_UV to finalize_absorbed_weights(),
+            # which runs AFTER FP8 post-processing and builds them by running
+            # the (DeepGEMM-ready) fp8 kv_b_proj on an identity. That exactly
+            # reproduces vLLM's get_and_maybe_dequant_weights ``use_deep_gemm``
+            # path (fp8 GEMM on ``torch.eye``), which is BIT-IDENTICAL to vLLM's
+            # W_UK_T/W_UV — whereas a direct block-dequant here is ~1-2 bf16 ULP
+            # off (it matches ``scaled_dequantize``, but vLLM uses the eye-GEMM
+            # on Blackwell). That ULP flows into q_absorbed -> the MLA attention
+            # core and flips near-tie tokens. See finalize_absorbed_weights().
+            pass
         else:
-            weight = weight.to(torch.bfloat16)
-        weight = weight.T  # [L, N*(P+V)]
-        L = self.kv_lora_rank
-        N = self.num_local_heads
-        P = self.qk_nope_head_dim
-        V = self.v_head_dim
-        weight = weight.view(L, N, P + V)
-        W_UK = weight[:, :, :P]  # [L, N, P]
-        W_UV = weight[:, :, P:]  # [L, N, V]
-        # W_UV: (L, N, V) -> (N, L, V) — matches vllm
-        self.attn.W_UV = W_UV.permute(1, 0, 2).contiguous()
-        # W_UK_T: (L, N, P) -> (N, P, L) — matches vllm
-        self.attn.W_UK_T = W_UK.permute(1, 2, 0).contiguous()
+            # BF16 checkpoint: no postprocessing, dequant is trivial — build now.
+            weight = self.kv_b_proj.weight.data.to(torch.bfloat16)
+            weight = weight.T  # [L, N*(P+V)]
+            L = self.kv_lora_rank
+            N = self.num_local_heads
+            P = self.qk_nope_head_dim
+            V = self.v_head_dim
+            weight = weight.view(L, N, P + V)
+            W_UK = weight[:, :, :P]  # [L, N, P]
+            W_UV = weight[:, :, P:]  # [L, N, V]
+            self.attn.W_UV = W_UV.permute(1, 0, 2).contiguous()   # (N, L, V)
+            self.attn.W_UK_T = W_UK.permute(1, 2, 0).contiguous()  # (N, P, L)
 
         # DSA indexer K projection must run in BF16 to match vLLM. vLLM builds
         # the indexer ``wk`` as a BF16 ``MergedColumnParallelLinear`` (fused with
@@ -212,6 +217,33 @@ class DeepSeekMLAAttention(nn.Module):
             wk.linear_op = None
             if hasattr(wk, "weight_scale_inv"):
                 del wk.weight_scale_inv
+
+    def finalize_absorbed_weights(self):
+        """Build W_UV / W_UK_T from the POST-PROCESSED fp8 ``kv_b_proj`` via an
+        fp8 GEMM on an identity matrix. This reproduces vLLM's
+        ``get_and_maybe_dequant_weights`` ``use_deep_gemm`` path
+        (``quant_method.apply(layer, eye)``) BIT-FOR-BIT, so the absorbed
+        weights — and therefore q_absorbed and the whole MLA attention core —
+        are bit-identical to vLLM. Must run AFTER ``_postprocess_fp8_weights``
+        (kv_b_proj must be DeepGEMM-ready). No-op for BF16 checkpoints (W_UK_T
+        was already built in ``compute_absorbed_weights``)."""
+        if self.attn.W_UK_T is not None:
+            return
+        if not (hasattr(self.kv_b_proj, 'use_fp8') and self.kv_b_proj.use_fp8):
+            return
+        L = self.kv_lora_rank
+        N = self.num_local_heads
+        P = self.qk_nope_head_dim
+        V = self.v_head_dim
+        eye = torch.eye(L, dtype=torch.bfloat16, device=self.kv_b_proj.weight.device)
+        with torch.no_grad():
+            out = self.kv_b_proj(eye)              # fp8 GEMM(eye) -> [L, N*(P+V)] bf16
+            w = out[0] if isinstance(out, tuple) else out
+        w = w.view(L, N, P + V)
+        W_UK = w[:, :, :P]  # [L, N, P]
+        W_UV = w[:, :, P:]  # [L, N, V]
+        self.attn.W_UV = W_UV.permute(1, 0, 2).contiguous()   # (N, L, V)
+        self.attn.W_UK_T = W_UK.permute(1, 2, 0).contiguous()  # (N, P, L)
 
     @staticmethod
     def _dequant_fp8_block(w_fp8: torch.Tensor, scale_inv: torch.Tensor,

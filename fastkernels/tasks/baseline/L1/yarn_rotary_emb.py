@@ -37,6 +37,22 @@ def _detect_flashinfer_rope() -> bool:
 
 _USE_FLASHINFER_ROPE = _detect_flashinfer_rope()
 
+
+# GLM-5.2's plain "default" rope: vLLM applies it via torch.ops._C.rotary_embedding
+# (base RotaryEmbedding.forward_cuda, flashinfer disabled by default). fastkernels'
+# own rope kernel differs from _C by ~1 bf16 ULP (verified: max|Δ|=3.1e-2 on
+# identical input+cache), which is the ROPE half of the MLA-core divergence. Call
+# _C directly so q_pe/k_pe are bit-identical to vLLM. Registered by importing
+# vllm._custom_ops.
+def _detect_vllm_c_rope() -> bool:
+    try:
+        import vllm._custom_ops  # noqa: F401 — registers torch.ops._C
+        return hasattr(torch.ops._C, "rotary_embedding")
+    except Exception:
+        return False
+
+_HAS_VLLM_C_ROPE = _detect_vllm_c_rope()
+
 from .rotary_emb import RotaryEmbedding
 
 
@@ -236,7 +252,15 @@ class YarnRotaryEmbedding(nn.Module):
         cache = self.cos_sin_cache
         if cache.dtype != query.dtype:
             cache = cache.to(query.dtype)
-        torch.ops.fastkernels_rope.rotary_embedding(
-            positions, query, key, self.head_dim, cache, self.is_neox_style,
-        )
+        if self.is_plain and _HAS_VLLM_C_ROPE:
+            # GLM-5.2 plain "default" rope: call vLLM's EXACT rotary kernel so
+            # q_pe/k_pe are bit-identical to vLLM (fastkernels' own kernel is
+            # ~1 ULP off, the rope half of the MLA-core divergence).
+            torch.ops._C.rotary_embedding(
+                positions, query, key, self.head_dim, cache, self.is_neox_style,
+            )
+        else:
+            torch.ops.fastkernels_rope.rotary_embedding(
+                positions, query, key, self.head_dim, cache, self.is_neox_style,
+            )
         return query, key

@@ -1641,6 +1641,10 @@ def load_model(
         if model_type in ("deepseek_v3", "kimi_linear"):
             _compute_mla_absorbed_weights(model)
         _postprocess_fp8_weights(model)
+        # fp8 MLA absorbed weights are built here (post-processing done) via an
+        # fp8 GEMM on identity, matching vLLM's use_deep_gemm dequant bit-for-bit.
+        if model_type == "deepseek_v3":
+            _finalize_mla_absorbed_weights(model)
     elif model_type != "gpt_oss":
         model = model.to(device=device, dtype=dtype)
 
@@ -2018,3 +2022,15 @@ def _compute_mla_absorbed_weights(model: torch.nn.Module) -> None:
             module.compute_absorbed_weights()
             count += 1
     print(f"  Computed absorbed MLA weights for {count} attention layers.")
+
+
+def _finalize_mla_absorbed_weights(model: torch.nn.Module) -> None:
+    """Build fp8 MLA absorbed weights (W_UV/W_UK_T) AFTER FP8 post-processing,
+    via an fp8 GEMM on an identity — bit-identical to vLLM's use_deep_gemm
+    dequant. No-op for BF16 checkpoints (already built)."""
+    from ..tasks.baseline.L2.deepseek_mla_attention import DeepSeekMLAAttention
+    for module in model.modules():
+        if isinstance(module, DeepSeekMLAAttention) and hasattr(
+            module, "finalize_absorbed_weights"
+        ):
+            module.finalize_absorbed_weights()
