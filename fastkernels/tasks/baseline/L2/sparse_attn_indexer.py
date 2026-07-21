@@ -448,18 +448,28 @@ class SparseAttnIndexer(nn.Module):
         B = ctx.decode_context_lens.shape[0]
         next_n = M // B if B > 0 else 1
 
-        schedule = self.paged_mqa_metadata(
-            ctx.decode_context_lens,
-            block_size,
-            num_sms,
-        )
+        # deep_gemm's paged MQA-logits API requires 2D context_lens (B, next_n):
+        # (B, 1) for normal decode, per-position causal lengths for spec decode.
+        # vLLM feeds decode_metadata.seq_lens the same way (2D) — see
+        # vllm sparse_attn_indexer.py:299-301 "deep_gemm ... requires 2D
+        # context_lens". (deep_gemm asserts context_lens.dim()==2.) The radix
+        # top-k kernel below still takes the 1D [B] per-sequence lengths.
+        cl = ctx.decode_context_lens.to(torch.int32)
+        if next_n == 1:
+            cl_2d = cl.view(B, 1)
+        else:
+            j = torch.arange(next_n, device=device, dtype=torch.int32)
+            cl_2d = (cl.view(B, 1) - next_n + 1 + j.view(1, next_n)).clamp_min_(0)
+        cl_2d = cl_2d.contiguous()
+
+        schedule = self.paged_mqa_metadata(cl_2d, block_size, num_sms)
         q_fp8_4d = q_fp8.view(B, next_n, self.n_head, self.head_dim)
         kv_cache_4d = self.indexer_k_cache.unsqueeze(-2)
         logits = self.fp8_mqa_logits.forward_decode(
             q_fp8_4d,
             kv_cache_4d,
             weights[:B * next_n],
-            ctx.decode_context_lens,
+            cl_2d,
             ctx.decode_block_tables,
             schedule,
             max_context_len=max_ctx,
