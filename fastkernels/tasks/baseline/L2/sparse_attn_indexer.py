@@ -10,6 +10,8 @@ Produces top-k token indices for sparse attention. Components:
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 
@@ -69,6 +71,57 @@ def _kv_spans_from_batches(
     return start_tensor.int(), end_location.int()
 
 
+# Bound on the per-chunk indexer logits tensor (M*N*4 bytes). Mirrors vLLM's
+# VLLM_SPARSE_INDEXER_MAX_LOGITS_MB (default 512; vllm/envs.py).
+_INDEXER_MAX_LOGITS_MB = int(
+    os.environ.get("FASTKERNELS_SPARSE_INDEXER_MAX_LOGITS_MB", "512"))
+
+
+def _split_prefill_chunks(
+    seq_lens: list[int],
+    query_lens: list[int],
+    workspace_size: int,
+    max_logits_elems: int,
+) -> list[tuple[int, int, int, int, bool]]:
+    """Split prefill requests into chunks for the DSA indexer, respecting the
+    N-constraint (Σ seq_lens_k ≤ workspace_size, bounds the reused K-gather
+    workspace) and the logits-constraint (M·N ≤ max_logits_elems, bounds the
+    per-chunk logits tensor). When a single request alone exceeds the logits
+    budget, sub-chunks on the query (M) dimension. Verbatim port of vLLM's
+    ``split_indexer_prefill_chunks`` (vllm/v1/attention/backends/mla/indexer.py).
+
+    Returns ``(r0, r1, q_off, sub_m, skip_gather)`` tuples: request span
+    ``[r0, r1)``, query sub-range ``[q_off, q_off+sub_m)`` within the chunk's
+    query block, and ``skip_gather`` (True for M-subchunks after the first —
+    the single request's KV is already resident in the workspace).
+    """
+    chunks: list[tuple[int, int, int, int, bool]] = []
+    n = len(seq_lens)
+    end = 0
+    while end < n:
+        start = end
+        chunk_m = chunk_n = 0
+        while end < n:
+            q, s = query_lens[end], seq_lens[end]
+            new_m, new_n = chunk_m + q, chunk_n + s
+            if new_n <= workspace_size and new_m * new_n <= max_logits_elems:
+                chunk_m, chunk_n = new_m, new_n
+                end += 1
+            else:
+                break
+        # A single request can exceed the logits budget -> M-subchunking.
+        if end == start:
+            chunk_m, chunk_n = query_lens[end], seq_lens[end]
+            end += 1
+        max_q = max(1, max_logits_elems // chunk_n) if chunk_n > 0 else chunk_m
+        first = True
+        for q_off in range(0, chunk_m, max_q):
+            sub_m = min(max_q, chunk_m - q_off)
+            chunks.append((start, end, q_off, sub_m, not first))
+            first = False
+    return chunks
+
+
 class SparseAttnIndexer(nn.Module):
     """DSA sparse attention indexer.
 
@@ -123,6 +176,15 @@ class SparseAttnIndexer(nn.Module):
 
         # Shared buffer to avoid per-step allocation (matches vllm)
         self.topk_indices_buffer = topk_indices_buffer
+
+        # Reused prefill K-gather workspace (one buffer shared by all indexer
+        # layers, attached by the engine at KV-cache alloc). When present,
+        # prefill chunks over it (bounded memory, no per-step alloc); when
+        # absent (warmup / non-engine callers) forward falls back to single-shot.
+        self._gather_ws_k_fp8: torch.Tensor | None = None
+        self._gather_ws_k_scale: torch.Tensor | None = None
+        self._gather_ws_tokens: int = 0
+        self._max_logits_elems: int = _INDEXER_MAX_LOGITS_MB * 1024 * 1024 // 4
 
         # Custom-op dispatch scaffolding (matches MLAAttention / Attention).
         self._use_custom_op = False
@@ -236,26 +298,13 @@ class SparseAttnIndexer(nn.Module):
             if cu_q is None or cu_k is None or bt is None:
                 return topk_indices
 
-            k_fp8, k_scale_bytes = self.k_cache_gather(
-                self.indexer_k_cache, bt, cu_k)
-
-            seq_lens_k = cu_k[1:] - cu_k[:-1]
-            cu_seqlen_ks, cu_seqlen_ke = _kv_spans_from_batches(
-                cu_q, seq_lens_k, hidden_states.device, N=np_)
-
-            logits = self.fp8_mqa_logits.forward_prefill(
-                q_fp8_pf.view(-1, self.n_head, self.head_dim),
-                (k_fp8, k_scale_bytes.view(torch.float32).flatten()),
-                weights_pf,
-                cu_seqlen_ks,
-                cu_seqlen_ke,
-            )
-
-            # Write the top-k straight into the shared buffer (in place),
-            # avoiding a fresh [np_, topk] allocation + copy each layer/step.
-            self.topk_per_row.forward_prefill(
-                logits, cu_seqlen_ks, cu_seqlen_ke,
-                self.topk_tokens, out=topk_indices[:np_],
+            # Gather + logits + top-k, chunked over the reused workspace when one
+            # is wired (bounded memory for long context); writes results in place
+            # into ``topk_indices[:np_]``. Bit-identical (per-query top-k set) to
+            # single-shot — the kernel reads exactly each query's [ks,ke).
+            self._prefill_topk(
+                ctx, q_fp8_pf, weights_pf, cu_q, cu_k, bt, np_,
+                topk_indices, hidden_states.device,
             )
 
             if ctx.is_mixed and ctx.num_decode_tokens > 0:
@@ -276,6 +325,101 @@ class SparseAttnIndexer(nn.Module):
                 q_fp8, weights, ctx, hidden_states.device)
 
         return topk_indices
+
+    def _build_prefill_chunk_meta(self, cu_q, cu_k, np_, device):
+        """Compute the prefill chunk plan + per-chunk causal spans ONCE per
+        forward (cached on the Context, shared by all indexer layers — matches
+        vLLM's metadata builder). Returns a list of per-chunk tuples
+        ``(r0, r1, skip_gather, cu_k_chunk, ks, ke, tok0, tok1, total_tokens)``.
+        """
+        cu_q_cpu = cu_q.to("cpu", torch.int64).tolist()
+        cu_k_cpu = cu_k.to("cpu", torch.int64).tolist()
+        seq_list = [cu_k_cpu[i + 1] - cu_k_cpu[i] for i in range(len(cu_k_cpu) - 1)]
+        query_list = [cu_q_cpu[i + 1] - cu_q_cpu[i] for i in range(len(cu_q_cpu) - 1)]
+        plan = _split_prefill_chunks(
+            seq_list, query_list, self._gather_ws_tokens, self._max_logits_elems)
+        seq_lens_k_t = cu_k[1:] - cu_k[:-1]
+        meta = []
+        for (r0, r1, q_off, sub_m, skip_gather) in plan:
+            total_tokens = sum(seq_list[r0:r1])
+            cu_k_chunk = None if skip_gather else (cu_k[r0:r1 + 1] - cu_k[r0])
+            tok0 = cu_q_cpu[r0] + q_off
+            tok1 = tok0 + sub_m
+            full_q = cu_q_cpu[r1] - cu_q_cpu[r0]
+            if q_off == 0 and sub_m == full_q:
+                # Request-level chunk covering the FULL query range of [r0:r1):
+                # chunk-local causal spans via the shared span builder on the
+                # rebased cu_q (KV offsets start at 0 within the chunk's gather).
+                cu_q_chunk = (cu_q[r0:r1 + 1] - cu_q[r0]).to(torch.int32)
+                ks, ke = _kv_spans_from_batches(
+                    cu_q_chunk, seq_lens_k_t[r0:r1], device, N=sub_m)
+            else:
+                # Single-request M-subchunk: attend from KV start (ks=0) up to
+                # each query's causal cutoff = num_computed + q_off + j + 1.
+                num_computed = seq_list[r0] - query_list[r0]
+                ks = torch.zeros(sub_m, dtype=torch.int32, device=device)
+                ke = (num_computed + q_off + 1
+                      + torch.arange(sub_m, dtype=torch.int32, device=device))
+            meta.append((r0, r1, skip_gather, cu_k_chunk, ks, ke,
+                         tok0, tok1, total_tokens))
+        return meta
+
+    def _prefill_topk(self, ctx, q_fp8_pf, weights_pf, cu_q, cu_k, bt, np_,
+                      topk_indices, device) -> None:
+        """Prefill indexer top-k, written in place into ``topk_indices[:np_]``.
+
+        Single-shot when no reused workspace is wired (warmup / non-engine
+        callers); otherwise chunked over the workspace (vLLM
+        ``split_indexer_prefill_chunks``), with the chunk plan computed once per
+        forward and cached on ``ctx``. Chunking preserves each query's exact
+        [ks,ke), so the per-query top-k SET is identical to single-shot (the
+        radix kernel's within-row order may differ, which is irrelevant to the
+        order-invariant sparse attention that consumes these indices).
+        """
+        if self._gather_ws_k_fp8 is None:
+            # Single-shot fallback (writing in place).
+            k_fp8, k_scale = self.k_cache_gather(self.indexer_k_cache, bt, cu_k)
+            ks, ke = _kv_spans_from_batches(
+                cu_q, cu_k[1:] - cu_k[:-1], device, N=np_)
+            logits = self.fp8_mqa_logits.forward_prefill(
+                q_fp8_pf.view(-1, self.n_head, self.head_dim),
+                (k_fp8, k_scale.view(torch.float32).flatten()),
+                weights_pf, ks, ke,
+            )
+            self.topk_per_row.forward_prefill(
+                logits, ks, ke, self.topk_tokens, out=topk_indices[:np_])
+            return
+
+        # Chunked path: build the plan once per forward (cached on ctx).
+        meta = getattr(ctx, "indexer_prefill_meta", None)
+        if meta is None:
+            meta = self._build_prefill_chunk_meta(cu_q, cu_k, np_, device)
+            ctx.indexer_prefill_meta = meta
+
+        ws_k_fp8 = self._gather_ws_k_fp8
+        ws_k_scale = self._gather_ws_k_scale
+        for (r0, r1, skip_gather, cu_k_chunk, ks, ke,
+             tok0, tok1, total_tokens) in meta:
+            if not skip_gather:
+                # Gather chunk KV into the reused workspace (precomputed
+                # total_tokens -> no D2H sync; out_* reuse the workspace).
+                k_fp8, k_scale = self.k_cache_gather(
+                    self.indexer_k_cache, bt[r0:r1], cu_k_chunk,
+                    total_tokens=total_tokens,
+                    out_k_fp8=ws_k_fp8, out_k_scale=ws_k_scale,
+                )
+            else:
+                k_fp8 = ws_k_fp8[:total_tokens]
+                k_scale = ws_k_scale[:total_tokens]
+            logits = self.fp8_mqa_logits.forward_prefill(
+                q_fp8_pf[tok0:tok1].view(-1, self.n_head, self.head_dim),
+                (k_fp8, k_scale.view(torch.float32).flatten()),
+                weights_pf[tok0:tok1], ks, ke,
+            )
+            self.topk_per_row.forward_prefill(
+                logits, ks, ke, self.topk_tokens,
+                out=topk_indices[tok0:tok1],
+            )
 
     def _decode_topk(
         self,

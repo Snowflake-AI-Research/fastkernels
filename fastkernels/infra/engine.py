@@ -3401,6 +3401,27 @@ class ModelRunner:
                     num_blocks, _MLA_BLOCK_SIZE, _INDEXER_CACHE_BYTES,
                     dtype=torch.uint8, device=device,
                 )
+            # Shared, reused DSA-indexer prefill K-gather workspace (ONE buffer
+            # for all indexer layers). Bounds the gather + logits memory so long
+            # prefills chunk over it instead of allocating O(ΣN) per layer/step.
+            # Sized like vLLM's get_max_prefill_buffer_size = max_model_len*40,
+            # capped by the cache size and floored at max_model_len so any single
+            # request always fits (see SparseAttnIndexer._prefill_topk).
+            idx_head_dim = indexer_layers[0].head_dim
+            idx_ws_tokens = min(40 * self.max_model_len,
+                                num_blocks * _MLA_BLOCK_SIZE)
+            idx_ws_tokens = max(idx_ws_tokens, self.max_model_len)
+            idx_k_fp8_ws = torch.empty(
+                idx_ws_tokens, idx_head_dim,
+                dtype=torch.float8_e4m3fn, device=device,
+            )
+            idx_k_scale_ws = torch.empty(
+                idx_ws_tokens, 4, dtype=torch.uint8, device=device,
+            )
+            for layer in indexer_layers:
+                layer._gather_ws_k_fp8 = idx_k_fp8_ws
+                layer._gather_ws_k_scale = idx_k_scale_ws
+                layer._gather_ws_tokens = idx_ws_tokens
 
         if self.rank == 0:
             print(f"  MLA attention backend: FlashMLA (block_size={_MLA_BLOCK_SIZE}, {backend_desc})")
