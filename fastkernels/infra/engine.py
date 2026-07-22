@@ -6365,7 +6365,8 @@ class LlamaEngine:
         with ThreadPoolExecutor(max_workers=8) as pool:
             all_seqs_ordered = list(pool.map(_make_seq, range(len(prompts))))
 
-        for seq in all_seqs_ordered:
+        for _ri, seq in enumerate(all_seqs_ordered):
+            seq._req_idx = _ri
             waiting.append(seq)
             if collect_logits:
                 seq_logits[id(seq)] = []
@@ -6503,7 +6504,18 @@ class LlamaEngine:
 
             return False
 
+        # Diagnostic gate: force every decode step through the fresh-rebuild
+        # path (_prepare_decode_arrays reads live seq state). The async fast
+        # path reuses the prior step's sampled ``token_ids`` to build the next
+        # input incrementally (6664), so token substitution at append_token
+        # would NOT propagate there. Off by default; used only by the
+        # forced-decode agreement harness.
+        _force_sync_decode = os.environ.get(
+            "FASTKERNELS_FORCE_SYNC_DECODE", "0") != "0"
+
         def _can_enter_decode_fast_path() -> bool:
+            if _force_sync_decode:
+                return False
             return (
                 running
                 and use_greedy
@@ -6511,6 +6523,19 @@ class LlamaEngine:
             )
 
         while waiting or running or prefilling:
+            # Keep the decode (running) queue in admission order so the packed
+            # batch layout matches vLLM's persistent-batch order step-for-step
+            # (offline determinism vs vLLM). fk otherwise rotates decoded seqs
+            # to the tail of ``running`` each step; vLLM keeps them in place.
+            # DSA sparse attention's decode split-KV reduction is batch-order-
+            # sensitive, so this ordering is what lets fk reproduce vLLM's
+            # long-context batched tokens. Gated to DSA/MLA to avoid perturbing
+            # other models' batch shapes.
+            if getattr(getattr(self, "model_runner", None),
+                       "is_deepseek_mla", False) and len(running) > 1:
+                running = deque(
+                    sorted(running, key=lambda s: getattr(s, "_req_idx", 0))
+                )
             if pbar is not None:
                 _flush_pbar()
             # =============================================================
