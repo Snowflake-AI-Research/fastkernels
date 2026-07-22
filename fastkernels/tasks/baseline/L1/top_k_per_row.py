@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 
@@ -12,6 +14,79 @@ import vllm._custom_ops  # noqa: F401  — registers torch.ops._C (vLLM 0.24 sta
 # common index_topk sizes; see ``vllm/model_executor/layers/sparse_attn_indexer.py:337-385``.
 _RADIX_TOPK_SIZES = (512, 1024, 2048)
 _RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024  # bytes (matches vLLM RADIX_TOPK_WORKSPACE_SIZE)
+
+
+# --- Optional DETERMINISTIC DSA top-k ------------------------------------
+# vLLM's radix top-k kernels (cooperative_topk / persistent_topk /
+# top_k_per_row_*) emit the correct top-k SET but in a NONDETERMINISTIC ORDER
+# (atomic-append), plus a rarer SET race at exact score ties on the k-th
+# boundary. Downstream ``flash_mla_sparse_fwd`` is order-sensitive, so this
+# makes greedy decode run-to-run nondeterministic at seq>index_topk — for vLLM
+# too (proven by injection). ``flashinfer.top_k`` is a radix top-k with a
+# ``deterministic`` flag AND a ``tie_break`` knob, giving a bit-reproducible
+# SET *and* ORDER while staying faster than ``torch.topk`` (esp. at long ctx).
+# Enable with ``FASTKERNELS_DSA_DETERMINISTIC_TOPK=1`` (default off = match
+# vLLM's native nondeterministic kernels).
+_DETERMINISTIC_TOPK = os.environ.get("FASTKERNELS_DSA_DETERMINISTIC_TOPK", "0") != "0"
+try:
+    import flashinfer as _flashinfer
+    from flashinfer import TopKTieBreak as _TopKTieBreak
+    _HAS_FI_TOPK = hasattr(_flashinfer, "top_k")
+except Exception:  # pragma: no cover - flashinfer optional
+    _flashinfer = None
+    _HAS_FI_TOPK = False
+
+
+def _deterministic_topk_indices(
+    logits: torch.Tensor,
+    ks: torch.Tensor,
+    ke: torch.Tensor,
+    topk: int,
+) -> torch.Tensor:
+    """Deterministic per-row top-k indices within the window ``[ks, ke)``.
+
+    Masks out-of-window positions (this also neutralizes the
+    ``clean_logits=False`` garbage region) to a finite sentinel, then uses
+    ``flashinfer.top_k(sorted=True, deterministic=True, tie_break=SMALL)`` for a
+    bit-reproducible set+order. Rows with fewer than ``topk`` valid positions
+    get ``-1`` padding (selected sentinels are mapped back to ``-1``).
+    Returns ``[R, topk]`` int32.
+    """
+    R, N = logits.shape
+    dev = logits.device
+    cols = torch.arange(N, device=dev)
+    valid = (cols.unsqueeze(0) >= ks.unsqueeze(1).to(torch.long)) & (
+        cols.unsqueeze(0) < ke.unsqueeze(1).to(torch.long)
+    )
+    sentinel = torch.finfo(logits.dtype).min
+    lm = torch.where(valid, logits, torch.full_like(logits, sentinel))
+    vals, idx = _flashinfer.top_k(
+        lm, topk, sorted=False, deterministic=True,
+        tie_break=int(_TopKTieBreak.SMALL),
+    )
+    idx = idx.to(torch.int32)
+    # Under-k rows selected the sentinel -> mark invalid.
+    idx = torch.where(vals <= sentinel, torch.full_like(idx, -1), idx)
+    # Return indices RELATIVE to the per-row window start ``ks`` — this is what
+    # the native ``top_k_per_row_prefill`` kernel emits (verified: window
+    # [2000,5000) -> [0,3000), not absolute columns). ``convert_indices`` then
+    # computes ``block_id = idx // block_size`` against the PER-REQUEST block
+    # table, so an ABSOLUTE column of a sequence at a non-zero packed offset
+    # (e.g. the 2nd+ sequence in a batch) overflows that request's block table
+    # and gets dropped to -1 — the packed-batch DSA bug. ``flashinfer.top_k``
+    # returns absolute columns of ``lm``, so subtract ``ks`` here. Decode passes
+    # ``ks=0`` so this is a no-op there.
+    ks_row = ks.reshape(-1, 1).to(idx.dtype)
+    idx = torch.where(idx >= 0, idx - ks_row, idx)
+    # Emit in INDEX-ASCENDING order (padding -1 last). This is value-INSENSITIVE:
+    # for a given selected SET the order is identical regardless of tiny
+    # cross-engine logit differences (batched GEMM tiling). A value-sorted order
+    # would flip under those ULP diffs and desync the order-sensitive sparse
+    # attention across engines / batch compositions.
+    _INTMAX = 2147483647
+    t = torch.where(idx >= 0, idx, torch.full_like(idx, _INTMAX))
+    t, _ = torch.sort(t, dim=-1)
+    return torch.where(t == _INTMAX, torch.full_like(t, -1), t)
 
 
 class TopKPerRow(nn.Module):
@@ -71,6 +146,11 @@ class TopKPerRow(nn.Module):
         if M == 0:
             return indices
 
+        if _DETERMINISTIC_TOPK and _HAS_FI_TOPK:
+            det = _deterministic_topk_indices(logits, cu_seqlen_ks, cu_seqlen_ke, topk)
+            indices.copy_(det)
+            return indices
+
         torch.ops._C.top_k_per_row_prefill(
             logits,
             cu_seqlen_ks,
@@ -109,6 +189,22 @@ class TopKPerRow(nn.Module):
             (total_rows, topk), -1, dtype=torch.int32, device=logits.device,
         )
         if total_rows == 0:
+            return indices
+
+        if _DETERMINISTIC_TOPK and _HAS_FI_TOPK and logits.is_cuda:
+            # Per-row causal length (same cap as the radix path: seq_len for
+            # next_n==1, else max(0, seq_len - next_n + 1 + j)). Window is
+            # [0, row_len); flashinfer gives a deterministic set+order.
+            if next_n == 1:
+                row_lens = seq_lens.to(torch.int32)
+            else:
+                B = seq_lens.numel()
+                j = torch.arange(next_n, device=seq_lens.device, dtype=torch.int32)
+                row_lens = (
+                    seq_lens.to(torch.int32).view(B, 1) - next_n + 1 + j.view(1, next_n)
+                ).clamp_min_(0).reshape(-1)
+            ks = torch.zeros(total_rows, dtype=torch.int32, device=logits.device)
+            indices.copy_(_deterministic_topk_indices(logits, ks, row_lens, topk))
             return indices
 
         # Radix fast path — matches vLLM ``sparse_attn_indexer.py:337-385``. The

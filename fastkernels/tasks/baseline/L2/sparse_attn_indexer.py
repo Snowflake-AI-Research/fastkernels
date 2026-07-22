@@ -174,6 +174,24 @@ class SparseAttnIndexer(nn.Module):
 
         self._quant_block_size = 128
 
+        # Opt-in run-to-run determinism for the DSA sparse path (see forward_impl).
+        self._sort_topk = os.environ.get("FASTKERNELS_DSA_SORT_TOPK", "0") != "0"
+
+        # Fused wk + weights_proj weight, built after load by
+        # ``DeepSeekMLAAttention.compute_absorbed_weights`` (which also
+        # dequantizes the FP8 ``wk`` to BF16). vLLM computes wk AND weights_proj
+        # in ONE bf16 GEMM (``wk_weights_proj``, deepseek_v2.py:636-643/706-708);
+        # running weights_proj as a SEPARATE GEMM picks a different-N cuBLAS
+        # path. Fusing matches vLLM's exact invocation.
+        # (Note: this removes the fused-vs-separate divergence but the residual
+        # cross-process cuBLAS bf16 accumulation difference is irreducible — see
+        # the long-context findings memo.) ``None`` until finalized (bf16
+        # checkpoints / warmup fall back to the separate wk/weights_proj modules).
+        # Plain attribute (not a registered buffer): derived at load, kept
+        # on-device by construction, and read inside the opaque
+        # ``fastkernels::sparse_attn_indexer`` custom op which runs eagerly.
+        self._wk_wp_fused: torch.Tensor | None = None
+
         # Shared buffer to avoid per-step allocation (matches vllm)
         self.topk_indices_buffer = topk_indices_buffer
 
@@ -230,8 +248,18 @@ class SparseAttnIndexer(nn.Module):
         q_pe = q[..., :self.rope_dim]  # [M, n_head, rope_dim]
         q_nope = q[..., self.rope_dim:]  # [M, n_head, head_dim - rope_dim]
 
-        # K path: wk -> k_norm -> split pe/nope
-        k = self.wk(hidden_states)  # [M, head_dim]
+        # K path: (fused wk|weights_proj) -> split -> k_norm -> split pe/nope.
+        # vLLM runs wk and weights_proj as ONE fused bf16 GEMM; we replicate it
+        # (single ``F.linear`` over the concatenated weight) so both ``k`` and
+        # the weights_proj output are bit-identical to vLLM. Only ``k`` goes
+        # through ``k_norm`` (matches vLLM: weights split off before the norm).
+        if self._wk_wp_fused is not None:
+            kw = torch.nn.functional.linear(hidden_states, self._wk_wp_fused)
+            k = kw[:, :self.head_dim]  # [M, head_dim]
+            wp_out = kw[:, self.head_dim:]  # [M, n_head]
+        else:
+            k = self.wk(hidden_states)  # [M, head_dim]
+            wp_out = self.weights_proj(hidden_states)  # [M, n_head]
         k = self.k_norm(k)
         k_pe = k[:, :self.rope_dim]  # [M, rope_dim]
         k_nope = k[:, self.rope_dim:]  # [M, head_dim - rope_dim]
@@ -260,9 +288,11 @@ class SparseAttnIndexer(nn.Module):
         if ctx.slot_mapping is not None and self.indexer_k_cache.numel():
             self.k_cache_store(k, self.indexer_k_cache, ctx.slot_mapping)
 
-        weights = self.weights_proj(hidden_states)  # [M, n_head]
+        # ``wp_out`` is the weights_proj output from the fused GEMM above
+        # (bit-identical to vLLM). Fold in the per-token Q scale + softmax
+        # scale exactly as vLLM (deepseek_v2.py:738-741).
         weights = (
-            weights.unsqueeze(-1) * q_scale * self.softmax_scale * self.n_head ** -0.5
+            wp_out.unsqueeze(-1) * q_scale * self.softmax_scale * self.n_head ** -0.5
         )
         weights = weights.squeeze(-1)
 
@@ -323,6 +353,25 @@ class SparseAttnIndexer(nn.Module):
             # into ``topk_indices_buffer`` (sparse_attn_indexer.py:335).
             topk_indices[:] = self._decode_topk(
                 q_fp8, weights, ctx, hidden_states.device)
+
+        # Optional determinism: the radix top-k kernels (cooperative_topk /
+        # persistent_topk / top_k_per_row_prefill) select the correct top-k SET
+        # but emit it in a NONDETERMINISTIC ORDER run-to-run when there is real
+        # sparsity (n_valid > topk). The downstream ``flash_mla_sparse_fwd`` is
+        # order-sensitive (~1e-4 per permutation), so that order race makes
+        # greedy decode nondeterministic at seq>index_topk — for vLLM too, since
+        # these are the same vendored kernels. Sorting the valid indices into a
+        # canonical ascending order (padding -1 last) makes fk run-to-run
+        # deterministic AND batch-invariant. OFF by default (matches vLLM's
+        # native, nondeterministic kernel order); enable with
+        # FASTKERNELS_DSA_SORT_TOPK=1.
+        if self._sort_topk:
+            _INT_MAX = 2147483647
+            tmp = torch.where(topk_indices >= 0, topk_indices,
+                              torch.full_like(topk_indices, _INT_MAX))
+            tmp, _ = torch.sort(tmp, dim=-1)
+            topk_indices[:] = torch.where(
+                tmp == _INT_MAX, torch.full_like(tmp, -1), tmp)
 
         return topk_indices
 

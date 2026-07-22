@@ -218,6 +218,22 @@ class DeepSeekMLAAttention(nn.Module):
             if hasattr(wk, "weight_scale_inv"):
                 del wk.weight_scale_inv
 
+        # Fuse the (now BF16) ``wk`` and ``weights_proj`` into ONE weight so the
+        # indexer forward runs a SINGLE GEMM — exactly vLLM's ``wk_weights_proj``
+        # (deepseek_v2.py:636-643, 706-708). Running ``weights_proj`` as a
+        # separate GEMM (different N) takes a different cuBLAS accumulation path,
+        # giving a ~1-ULP ``weights`` difference that reorders the indexer top-k;
+        # the order-sensitive ``flash_mla_sparse_fwd`` then amplifies it at
+        # seq>index_topk. Matching vLLM's fused invocation removes that
+        # divergence source. Runs for both FP8 (wk just dequantized) and BF16
+        # checkpoints; ``wk``/``weights_proj`` are on-device and BF16 here.
+        if idx is not None and getattr(idx, "weights_proj", None) is not None:
+            idx._wk_wp_fused = torch.cat(
+                [idx.wk.weight.data.to(torch.bfloat16),
+                 idx.weights_proj.weight.data.to(torch.bfloat16)],
+                dim=0,
+            ).contiguous()
+
     def finalize_absorbed_weights(self):
         """Build W_UV / W_UK_T from the POST-PROCESSED fp8 ``kv_b_proj`` via an
         fp8 GEMM on an identity matrix. This reproduces vLLM's

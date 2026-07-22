@@ -111,6 +111,19 @@ class ConvertIndicesToGlobal(nn.Module):
         max_num_blocks_per_req = block_table.shape[1]
         tiles_per_row = topk // BLOCK_N
 
+        # Materialize contiguous copies BEFORE reading strides. The kernel
+        # indexes with the strides passed here, so they must belong to the
+        # exact tensors the kernel receives. ``block_table`` in eager decode is
+        # a non-contiguous slice (``_eager_block_tables[:n, :bt_cols]`` whose
+        # row stride is the full buffer width, not ``bt_cols``); taking strides
+        # from the slice while passing a fresh ``.contiguous()`` copy made the
+        # kernel read request rows at the wrong offset -> garbage global slots
+        # for every request but the first (req 0 starts at 0 either way, so
+        # single-sequence / offset-0 batches masked the bug).
+        req_ids = req_ids.contiguous()
+        block_table = block_table.contiguous()
+        indices = indices.contiguous()
+
         out = torch.empty_like(indices)
 
         bt_stride0, bt_stride1 = block_table.stride()
@@ -119,9 +132,9 @@ class ConvertIndicesToGlobal(nn.Module):
 
         grid = (num_tokens, tiles_per_row)
         _convert_req_index_to_global_index_kernel[grid](
-            req_ids.contiguous(),
-            block_table.contiguous(),
-            indices.contiguous(),
+            req_ids,
+            block_table,
+            indices,
             out,
             prefill_request_ids if has_prefill else prefill_request_ids,
             prefill_workspace_starts if has_prefill else prefill_workspace_starts,

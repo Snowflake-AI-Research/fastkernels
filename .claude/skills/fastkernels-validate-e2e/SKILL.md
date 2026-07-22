@@ -38,7 +38,10 @@ Iterate each rung until both targets are met before moving on.
 ## Debugging a divergence (do this FIRST — it pinpoints the op in minutes)
 - **Clean-room injection, not tolerance.** Capture the reference op's EXACT input tensors, feed
   them into the fk op, require **max|Δ| = 0** (bit-identical). Bisect per-layer/per-op to the FIRST
-  op that diverges on identical input; everything after is just propagation.
+  op that diverges on identical input; everything after is just propagation. When injection points 
+  at an op, diff its full numeric pipeline against the reference side-by-side - dtypes, exact
+  kernel fn, weight/scale prep, and kernel args (not just the math). The mismatch can often be a kernel
+  variant or weight-prep method, e.g. routed-vs-monolithic MoE, direct-dequant-vs-eye-GEMM.
 - **Capture cleanly:** single-sequence, ONE hook at a time. Many hooks / kernel-arg wrappers force
   mid-forward `.cpu()` syncs that perturb async paths (e.g. a separate-stream shared expert) and
   fabricate divergences; batched runs add reference nondeterminism. A 1-ULP error scales with

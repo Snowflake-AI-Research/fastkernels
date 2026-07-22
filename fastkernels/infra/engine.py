@@ -3994,6 +3994,17 @@ class ModelRunner:
         req_id_per_token = getattr(self, "_decode_req_id_buf", None)
         if req_id_per_token is not None:
             req_id_per_token = req_id_per_token[:n]
+        else:
+            # Eager decode without a captured CUDA graph never allocated the
+            # persistent arange buffer. Pure-decode is one token per request
+            # (token i -> request i); without this the sparse-MLA
+            # ``convert_indices`` sees an all-zeros req map and every decode
+            # token past the first indexes request 0's (shorter) block table,
+            # truncating its sparse-attention KV. Mirrors the fallback at the
+            # non-eager ``prepare_decode`` above.
+            req_id_per_token = torch.arange(
+                n, dtype=torch.int32, device=f"cuda:{self.rank}",
+            )
         set_context(
             False,
             slot_mapping=slot_mapping,
