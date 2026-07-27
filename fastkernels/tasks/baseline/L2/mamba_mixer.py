@@ -240,6 +240,7 @@ class MambaMixer(nn.Module):
                 self.conv1d.bias,
                 self.activation,
                 conv_state_indices=mamba_meta.state_indices_d,
+                null_block_id=-1,
             ).transpose(0, 1)
 
             dt_d, B_d, C_d = self._ssm_transform(conv_out_d.transpose(-2, -1))
@@ -252,10 +253,11 @@ class MambaMixer(nn.Module):
                 B_d,
                 C_d,
                 self.D,
-                gate_d.transpose(0, 1),
-                time_proj_bias,
+                dt_bias=time_proj_bias,
+                z=gate_d.transpose(0, 1),
                 dt_softplus=True,
                 state_batch_indices=mamba_meta.state_indices_d,
+                null_block_id=-1,
                 out=out_d,
             )
             ssm_outputs.append(out_d.transpose(0, 1))

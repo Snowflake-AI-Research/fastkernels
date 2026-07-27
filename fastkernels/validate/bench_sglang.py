@@ -39,7 +39,7 @@ from transformers import AutoTokenizer
 # Paths / package wiring
 # ---------------------------------------------------------------------------
 _THIS_DIR = Path(__file__).resolve().parent
-_PACKAGE_DIR = _THIS_DIR.parent.parent
+_PACKAGE_DIR = _THIS_DIR.parent
 _PROJECT_ROOT = _PACKAGE_DIR.parent
 
 sys.path.insert(0, str(_PROJECT_ROOT))
@@ -560,7 +560,7 @@ def main():
     if args.output_dir is None:
         short = args.model.split("/")[-1]
         args.output_dir = str(
-            _PACKAGE_DIR / "tests" / "results" / gpu / f"{short}_eagle3"
+            _PROJECT_ROOT / "tests" / "results" / gpu / f"{short}_eagle3"
         )
 
     # Build scenarios.

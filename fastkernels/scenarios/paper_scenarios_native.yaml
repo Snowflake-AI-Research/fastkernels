@@ -1,0 +1,188 @@
+# Paper validation model table using the current workload registry.
+# DeepSeek-V3.2 is intentionally excluded because of its runtime.
+
+scenarios:
+  - model: meta-llama/Llama-3.1-8B-Instruct
+    tp: 1
+    dtype: bfloat16
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+  - model: mistralai/Mixtral-8x7B-Instruct-v0.1
+    tp: 4
+    dtype: bfloat16
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+  - model: microsoft/bitnet-b1.58-2B-4T
+    tp: 1
+    dtype: bfloat16
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+  - model: openai/gpt-oss-120b
+    tp: 2
+    dtype: mxfp4
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+  - model: meta-llama/Llama-3.1-8B-Instruct + jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B (draft)
+    tp: 1
+    dtype: bfloat16
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+  - model: google/gemma-4-26B-A4B-it
+    tp: 1
+    dtype: bfloat16
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+  - model: state-spaces/mamba-2.8b-hf
+    tp: 1
+    dtype: bfloat16
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+  - model: mistralai/Mamba-Codestral-7B-v0.1
+    tp: 1
+    dtype: bfloat16
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+  - model: fla-hub/rwkv7-2.9B-g1
+    tp: 1
+    dtype: bfloat16
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+  - model: fla-hub/gla-2.7B-100B
+    tp: 1
+    dtype: bfloat16
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+  - model: fla-hub/retnet-2.7B-100B
+    tp: 1
+    dtype: bfloat16
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+  - model: Qwen/Qwen3-Next-80B-A3B-Instruct
+    tp: 2
+    dtype: bfloat16
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+  - model: moonshotai/Kimi-Linear-48B-A3B-Instruct
+    tp: 2
+    dtype: bfloat16
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+  - model: ttt_e2e
+    tp: 1
+    dtype: bfloat16
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+  - model: ai21labs/AI21-Jamba-Mini-1.7
+    tp: 1
+    dtype: bfloat16
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+  - model: black-forest-labs/FLUX.1-dev
+    tp: 1
+    dtype: bfloat16
+    workloads: [Diffusion.res_1024, Diffusion.res_512, Diffusion.single_1024, Diffusion.single_512]
+  - model: hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v
+    tp: 1
+    dtype: bfloat16
+    workloads: [VideoDiffusion.p480_short, VideoDiffusion.p480_medium, VideoDiffusion.single_480p_short, VideoDiffusion.single_480p_medium]
+  - model: stabilityai/stable-diffusion-xl-base-1.0
+    tp: 1
+    dtype: bfloat16
+    workloads: [Diffusion.res_1024, Diffusion.res_512, Diffusion.single_1024, Diffusion.single_512]
+  - model: facebook/sam3.1
+    tp: 1
+    dtype: float32
+    workloads: [Segmentation.gold_metaclip_nps, Segmentation.gold_wiki_common, Segmentation.gold_crowded, Segmentation.veval_sav_val, Segmentation.veval_yt1b_val, Segmentation.sav_val_video, Segmentation.smartglasses_val_video, Segmentation.single_image_1008, Segmentation.batch_4_image_1008, Segmentation.single_video_frame_1008]
+  - model: openai/whisper-large-v3
+    tp: 1
+    dtype: float16
+    workloads: [ASR.librispeech, ASR.single_utterance, ASR.fixed_batch_32]
+  - model: FunAudioLLM/Fun-CosyVoice3-0.5B-2512
+    tp: 1
+    dtype: bfloat16
+    workloads: [TTS.tts_short, TTS.tts_medium, TTS.tts_long, TTS.single_utterance]
+  - model: Qwen/Qwen2-VL-7B-Instruct
+    tp: 1
+    dtype: bfloat16
+    workloads: [VLM.text_only, VLM.image, VLM.video, VLM.single_image, VLM.single_video]
+  - model: Qwen/Qwen3-VL-8B-Instruct
+    tp: 1
+    dtype: bfloat16
+    workloads: [VLM.text_only, VLM.image, VLM.video, VLM.single_image, VLM.single_video]
+  - model: Qwen/Qwen3-VL-235B-A22B-Instruct-FP8
+    tp: 4
+    dtype: fp8
+    workloads: [VLM.text_only, VLM.image, VLM.video, VLM.single_image, VLM.single_video]
+  - model: Qwen/Qwen2.5-Omni-7B
+    tp: 1
+    dtype: bfloat16
+    workloads: [OmniModal.text, OmniModal.image, OmniModal.video, OmniModal.audio, OmniModal.single_text, OmniModal.single_image, OmniModal.single_video, OmniModal.single_audio]
+  - model: google/siglip2-so400m-patch16-naflex
+    tp: 1
+    dtype: bfloat16
+    workloads: [VisionEncoder.default_res, VisionEncoder.high_res, VisionEncoder.single_image, VisionEncoder.batch_8]
+  - model: facebook/dinov3-vit7b16-pretrain-lvd1689m
+    tp: 1
+    dtype: bfloat16
+    workloads: [VisionEncoder.default_res, VisionEncoder.high_res, VisionEncoder.single_image, VisionEncoder.batch_8]
+  - model: timm/swinv2_large_window12_192.ms_in22k
+    tp: 1
+    dtype: bfloat16
+    workloads: [VisionEncoder.default_res, VisionEncoder.high_res, VisionEncoder.single_image, VisionEncoder.batch_8]
+  - model: timm/mobilenetv4_conv_medium.e500_r256_in1k
+    tp: 1
+    dtype: bfloat16
+    workloads: [VisionEncoder.default_res, VisionEncoder.high_res, VisionEncoder.single_image, VisionEncoder.batch_8]
+  - model: facebook/convnextv2-base-22k-384
+    tp: 1
+    dtype: float32
+    workloads: [VisionEncoder.default_res, VisionEncoder.high_res, VisionEncoder.single_image, VisionEncoder.batch_8]
+  - model: timm/efficientnetv2_rw_m.agc_in1k
+    tp: 1
+    dtype: float32
+    workloads: [VisionEncoder.default_res, VisionEncoder.high_res, VisionEncoder.single_image, VisionEncoder.batch_8]
+  - model: jameslahm/yolov10n
+    tp: 1
+    dtype: float16
+    workloads: [Detection.coco_val, Detection.single_image, Detection.batch_4]
+  - model: PekingU/rtdetr_v2_r101vd
+    tp: 1
+    dtype: float16
+    workloads: [Detection.coco_val, Detection.single_image, Detection.batch_4]
+  - model: Voxel51/gaussian_splatting
+    tp: 1
+    dtype: float32
+    workloads: [Rendering.render, Rendering.single_render]
+  - model: NVlabs/instant-ngp fox scene (data/nerf/fox)
+    tp: 1
+    dtype: float32
+    workloads: [Rendering.render, Rendering.single_render]
+  - model: Pointcept/PointTransformerV3
+    tp: 1
+    dtype: float32
+    workloads: [PointCloudSeg.scanobjectnn, PointCloudSeg.single_cloud, PointCloudSeg.batch_8]
+  - model: OpenFold/OpenFold3
+    tp: 1
+    dtype: bfloat16
+    workloads: [StructurePrediction.short, StructurePrediction.medium, StructurePrediction.long, StructurePrediction.extra_long, StructurePrediction.single_short, StructurePrediction.single_medium, StructurePrediction.single_long, StructurePrediction.single_extra_long]
+  - model: openpi-assets/checkpoints/pi0_aloha_pen_uncap
+    tp: 1
+    dtype: bfloat16
+    workloads: [Robotics.libero_1cam, Robotics.libero_3cam, Robotics.single_3cam, Robotics.single_1cam]
+  - model: rishabhrj11/gym-xarm-pointcloud - variant simple_dp3
+    tp: 1
+    dtype: float32
+    workloads: [PointCloudPolicy.dp3_1env, PointCloudPolicy.dp3_batch, PointCloudPolicy.single_step, PointCloudPolicy.batch_8]
+  - model: dlrmv2
+    tp: 1
+    dtype: float32
+    workloads: [Recsys.ctr_batch, Recsys.single_request, Recsys.fixed_batch_32]
+  - model: lightgcn
+    tp: 1
+    dtype: float32
+    workloads: [Recsys.recommend_batch, Recsys.single_request, Recsys.fixed_batch_32]
+  - model: BAAI/bge-m3
+    tp: 1
+    dtype: float16
+    workloads: [Embedding.bge_m3_mldr_docs, Embedding.single_request, Embedding.fixed_batch_32]
+  - model: colbert-ir/colbertv2.0
+    tp: 1
+    dtype: float16
+    workloads: [Embedding.colbertv2_msmarco_passages, Embedding.single_request, Embedding.fixed_batch_32]
+  - model: GSAI-ML/LLaDA-8B-Instruct
+    tp: 1
+    dtype: bfloat16
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+  - model: Etched/oasis-500m
+    tp: 1
+    dtype: float16
+    workloads: [WorldModel.short_bs4_16f_4ddim, WorldModel.medium_bs8_24f_4ddim, WorldModel.long_bs8_32f_4ddim, WorldModel.denoise_bs4_16f_8ddim, WorldModel.latency_bs1_8f_4ddim]
+  - model: facebook/vjepa2-vitl-fpc64-256
+    tp: 1
+    dtype: bfloat16
+    workloads: [VideoRepresentation.predictor, VideoRepresentation.encoder, VideoRepresentation.classification, VideoRepresentation.single_video]

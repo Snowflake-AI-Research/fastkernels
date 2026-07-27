@@ -40,7 +40,7 @@ from pathlib import Path
 import numpy as np
 
 _THIS_DIR = Path(__file__).resolve().parent
-_PACKAGE_DIR = _THIS_DIR.parent.parent
+_PACKAGE_DIR = _THIS_DIR.parent
 _PROJECT_ROOT = _PACKAGE_DIR.parent
 
 from fastkernels.validate.worker import run_worker
@@ -1948,7 +1948,7 @@ def main():
 
     if args.output_dir is None:
         short = args.model.split("/")[-1]
-        args.output_dir = str(_PACKAGE_DIR / "tests" / "results" / gpu_name / short)
+        args.output_dir = str(_PROJECT_ROOT / "tests" / "results" / gpu_name / short)
 
     os.makedirs(args.output_dir, exist_ok=True)
 

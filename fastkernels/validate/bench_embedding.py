@@ -15,7 +15,7 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 _THIS_DIR = Path(__file__).resolve().parent
-_PACKAGE_DIR = _THIS_DIR.parent.parent
+_PACKAGE_DIR = _THIS_DIR.parent
 _PROJECT_ROOT = _PACKAGE_DIR.parent
 
 sys.path.insert(0, str(_PROJECT_ROOT))
@@ -49,7 +49,7 @@ def _vllm_default_scheduler_limits(gpu: str) -> tuple[int, int]:
 
 
 def _jsonl_path(workload: EmbeddingThroughputWorkload) -> Path:
-    return _PACKAGE_DIR / "data" / "embedding_workloads" / workload.jsonl_name
+    return _PROJECT_ROOT / "data" / "embedding_workloads" / workload.jsonl_name
 
 
 def _iter_dataset_texts(workload: EmbeddingThroughputWorkload, seed: int):
@@ -876,7 +876,7 @@ def main() -> None:
     if args.output_dir is None:
         run_id = _make_run_id(args.run_id)
         args.output_dir = str(
-            _PACKAGE_DIR / "tests" / "results" / gpu / "embedding" / run_id
+            _PROJECT_ROOT / "tests" / "results" / gpu / "embedding" / run_id
         )
     elif args.run_id is not None:
         print("  NOTE: --run-id is ignored because --output-dir was provided.")

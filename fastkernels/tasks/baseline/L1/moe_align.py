@@ -26,7 +26,6 @@ class MoeAlign(nn.Module):
         self._expert_ids = None
         self._num_tokens_post_padded = None
         self._cumsum_buffer = None
-        self._naive_num_tokens_post_padded = None
 
     def _ensure_buffers(self, max_padded, max_blocks, num_experts, device):
         if (self._sorted_token_ids is None
@@ -59,13 +58,17 @@ class MoeAlign(nn.Module):
         numel = topk_ids.numel()
         max_num_tokens_padded = numel * block_size
         expert_ids = topk_ids.view(-1).to(torch.int32)
-        if (self._naive_num_tokens_post_padded is None
-                or self._naive_num_tokens_post_padded.device != topk_ids.device):
-            self._naive_num_tokens_post_padded = torch.empty(
-                1, dtype=torch.int32, device=topk_ids.device,
-            )
-        self._naive_num_tokens_post_padded.fill_(max_num_tokens_padded)
-        return None, expert_ids, self._naive_num_tokens_post_padded
+        # Allocate fresh each call (matching vllm_fused_experts) rather than
+        # reusing a persistent buffer.  A persisted scalar gets created as an
+        # inference tensor during the inference_mode forward, and a later
+        # in-place ``fill_`` from Inductor's autotuning/benchmark pass (which
+        # runs under ``no_grad``, not ``inference_mode``) would raise
+        # "Inplace update to inference tensor outside InferenceMode".
+        num_tokens_post_padded = torch.full(
+            (1,), max_num_tokens_padded, dtype=torch.int32,
+            device=topk_ids.device,
+        )
+        return None, expert_ids, num_tokens_post_padded
 
     def forward(
         self,

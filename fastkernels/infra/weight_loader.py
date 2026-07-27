@@ -742,10 +742,8 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
             if m_conv:
                 prefix, wb = m_conv.groups()
                 mapped_name = f"{prefix}.conv.{wb}"
-            m_ln = _WHISPER_LAYER_NORM_RE.match(mapped_name)
-            if m_ln:
-                prefix, wb = m_ln.groups()
-                mapped_name = f"{prefix}.norm.{wb}"
+            # LayerNorm exposes weight/bias directly, so checkpoint names
+            # already match. Mapping them under ".norm" silently skips them.
             m_emb = _WHISPER_EMBED_RE.match(mapped_name)
             if m_emb:
                 prefix = m_emb.group(1)
@@ -1541,7 +1539,10 @@ def load_model(
             f"({config.num_experts} experts, "
             f"{len(config.kda_layers)} KDA + {len(config.full_attn_layers)} MLA layers)..."
         )
-        model = KimiLinearForCausalLM(config, quant_config=quant_config)
+        from vllm.config import VllmConfig, set_current_vllm_config
+
+        with set_current_vllm_config(VllmConfig()):
+            model = KimiLinearForCausalLM(config, quant_config=quant_config)
     else:
         config = LlamaConfig.from_pretrained(model_name)
         config.dtype = dtype
@@ -1651,6 +1652,43 @@ def load_model(
     return model, config
 
 
+def _checkpoint_has_lm_head(model_name: str) -> bool:
+    """True if the checkpoint contains a real (untied) ``lm_head`` weight.
+
+    Tied-embedding checkpoints omit ``lm_head.weight`` entirely; a present
+    ``*lm_head.weight`` key means the LM head is a distinct, loaded projection
+    that must not be overwritten by the embedding matrix.
+    """
+    import glob as _glob
+    import json as _json
+    try:
+        path = download_model(model_name)
+    except Exception:
+        return False
+
+    def _is_lm_head(k: str) -> bool:
+        return k.endswith("lm_head.weight")
+
+    # Sharded checkpoints: consult the safetensors / bin weight map.
+    for idx in _glob.glob(os.path.join(path, "*.index.json")):
+        try:
+            wm = _json.load(open(idx)).get("weight_map", {})
+        except Exception:
+            continue
+        if any(_is_lm_head(k) for k in wm):
+            return True
+    # Single-file safetensors: inspect the tensor keys directly.
+    from safetensors import safe_open
+    for st in _glob.glob(os.path.join(path, "*.safetensors")):
+        try:
+            with safe_open(st, framework="pt") as f:
+                if any(_is_lm_head(k) for k in f.keys()):
+                    return True
+        except Exception:
+            continue
+    return False
+
+
 def _maybe_tie_word_embeddings(model, model_name: str, config) -> None:
     """Copy ``embed_tokens`` weights into ``lm_head`` for tied-embedding models.
 
@@ -1660,6 +1698,16 @@ def _maybe_tie_word_embeddings(model, model_name: str, config) -> None:
     flag from the HF config (fastkernels configs don't all carry it) and share
     the embedding matrix into the LM head after loading.
     """
+    # The checkpoint is authoritative: if it ships a real (untied) lm_head
+    # weight, never overwrite it with the embedding matrix — regardless of what
+    # the ``tie_word_embeddings`` flag says. Composite VL configs frequently
+    # carry a null/misleading flag (e.g. Qwen3-VL's text_config sets it to
+    # ``None`` while the top-level config says ``False`` and the checkpoint has
+    # a distinct ``lm_head.weight``); tying there silently swaps in the wrong
+    # projection and garbles every generated token.
+    if _checkpoint_has_lm_head(model_name):
+        return
+
     tie = getattr(config, "tie_word_embeddings", None)
     if tie is None:
         try:

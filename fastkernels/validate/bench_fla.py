@@ -55,7 +55,7 @@ def _detect_gpu_name() -> str:
 
 
 _THIS_DIR = Path(__file__).resolve().parent
-_PACKAGE_DIR = _THIS_DIR.parent.parent
+_PACKAGE_DIR = _THIS_DIR.parent
 _PROJECT_ROOT = _PACKAGE_DIR.parent
 
 sys.path.insert(0, str(_PROJECT_ROOT))
@@ -105,6 +105,15 @@ warnings.filterwarnings(
     message=r".*seq_len.*<.*num_heads.*",
     category=UserWarning,
 )
+
+# Transformers 5.14 replaced CacheLayerMixin.get_max_cache_shape() with the
+# abstract get_max_length(). FLA 0.5.1 still implements only the old name.
+from abc import update_abstractmethods
+from fla.models.utils import FLALayer
+
+if "get_max_length" not in FLALayer.__dict__:
+    FLALayer.get_max_length = lambda self: -1
+    update_abstractmethods(FLALayer)
 
 
 def _load_fla_model(model_name, device, dtype):
@@ -749,12 +758,13 @@ def main():
     parser.add_argument("--num-seqs", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--max-num-seqs", type=int, default=512,
+    parser.add_argument("--max-num-seqs", type=int, default=None,
                         help="Max concurrent sequences in FLAEngine "
-                             "(default tuned for the bench_vllm.py workload)")
-    parser.add_argument("--ref-max-num-seqs", type=int, default=512,
+                             "(default: 256 for RetNet, 512 otherwise)")
+    parser.add_argument("--ref-max-num-seqs", type=int, default=None,
                         help="Max active sequences for the FLA reference "
-                             "continuous batching scheduler.")
+                             "continuous batching scheduler (default: match "
+                             "--max-num-seqs).")
     parser.add_argument("--chunked-prefill-size", type=int, default=1024,
                         help="Per-chunk prefill size (rounded up to a multiple "
                              "of 64). Default tuned for the bench_vllm.py workload.")
@@ -779,11 +789,15 @@ def main():
     if args.model not in SUPPORTED_MODELS:
         print(f"WARNING: {args.model!r} not in known list: {sorted(SUPPORTED_MODELS)}",
               file=sys.stderr)
+    if args.max_num_seqs is None:
+        args.max_num_seqs = 256 if "retnet" in args.model.lower() else 512
+    if args.ref_max_num_seqs is None:
+        args.ref_max_num_seqs = args.max_num_seqs
 
     gpu = _detect_gpu_name()
     if args.output_dir is None:
         short = args.model.split("/")[-1]
-        args.output_dir = str(_PACKAGE_DIR / "tests" / "results" / gpu / f"{short}_fla_tp1")
+        args.output_dir = str(_PROJECT_ROOT / "tests" / "results" / gpu / f"{short}_fla_tp1")
 
     throughput_scenarios = list(SCENARIOS)
     latency_scenarios = list(LATENCY_SCENARIOS)
@@ -899,6 +913,9 @@ def main():
             f"FLA reference [{short_name}] all scenarios",
             timeout=10800,
         )
+        if fla_raw is None:
+            print("  ERROR: FLA reference subprocess failed.")
+            sys.exit(1)
 
     kb_cfg = dict(base_cfg)
     kb_cfg["project_root"] = str(_PROJECT_ROOT)

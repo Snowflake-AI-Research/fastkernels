@@ -231,7 +231,13 @@ def _check_vllm_cuda_quant() -> bool:
     global _HAS_VLLM_CUDA_QUANT
     if _HAS_VLLM_CUDA_QUANT is None:
         try:
-            import vllm._C  # noqa: F401
+            # vLLM registers the fp8 quant ops from ``vllm._custom_ops`` (>=0.20);
+            # ``vllm._C`` no longer exists in 0.24, so importing it here failed and
+            # forced the fastkernels fallback quant, diverging from vLLM's numerics.
+            try:
+                import vllm._custom_ops  # noqa: F401 — vLLM >= 0.20
+            except ImportError:
+                import vllm._C  # noqa: F401 — legacy vLLM <= 0.18
             _HAS_VLLM_CUDA_QUANT = hasattr(torch.ops, "_C") and hasattr(
                 torch.ops._C, "per_token_group_fp8_quant"
             )

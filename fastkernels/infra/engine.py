@@ -47,6 +47,10 @@ from .weight_loader import load_model
 MAX_MODEL_LEN = 131072
 NCCL_PORT = int(os.environ.get("FASTKERNELS_NCCL_PORT", "29501"))
 
+# Bound each device-resident hybrid decode chunk while still amortizing the
+# per-step host round trips.
+_BULK_CHUNK_CAP = 512
+
 
 def _load_tokenizer(model_name: str):
     try:
@@ -305,6 +309,19 @@ class BlockManager:
 # ---------------------------------------------------------------------------
 # ModelRunner — runs on EACH TP rank
 # ---------------------------------------------------------------------------
+def _seq_encoder_tokens(seq, merge_size: int) -> int:
+    """Return post-merge vision tokens contributed by one sequence."""
+    total = 0
+    for attr in ("image_grid_thw", "video_grid_thw"):
+        grid = getattr(seq, attr, None)
+        if grid is None:
+            continue
+        if not isinstance(grid, torch.Tensor):
+            grid = torch.tensor(grid, dtype=torch.long)
+        total += int((grid.prod(-1) // (merge_size**2)).sum().item())
+    return total
+
+
 class ModelRunner:
     def __init__(self, model_name: str, rank: int, world_size: int,
                  dtype: torch.dtype | None, enforce_eager: bool,
@@ -546,6 +563,9 @@ class ModelRunner:
                 self.shm = SharedMemory(name=shm_name, create=True, size=2**20)
                 self.shm.buf[self._SHM_FLAG_OFFSET] = 0
                 self.shm.buf[self._SHM_SEQ_OFFSET:self._SHM_SEQ_OFFSET+4] = (0).to_bytes(4, "little")
+                self.shm.buf[self._SHM_ACK_OFFSET:self._SHM_SEQ_OFFSET] = bytes(
+                    self._SHM_SEQ_OFFSET - self._SHM_ACK_OFFSET
+                )
                 dist.barrier()
             else:
                 dist.barrier()
@@ -573,8 +593,10 @@ class ModelRunner:
     #                              2=mamba decode_greedy,
     #                              3=hybrid recurrent decode_greedy
     # bytes[-5:-1] (_SHM_SEQ_OFFSET): 4-byte little-endian sequence counter
+    # bytes[-37:-5] (_SHM_ACK_OFFSET): per-rank consumed-sequence counters
     _SHM_FLAG_OFFSET = 2**20 - 1
     _SHM_SEQ_OFFSET = 2**20 - 5
+    _SHM_ACK_OFFSET = 2**20 - 5 - 4 * 8
 
     def loop(self):
         """Worker loop: spin-wait on SHM sequence counter for decode, event for generic."""
@@ -589,14 +611,15 @@ class ModelRunner:
                 flag = buf[flag_off]
                 if flag != 0:
                     if flag == 1:
-                        self._loop_decode_greedy()
+                        self._loop_decode_greedy(cur_seq)
                     elif flag == 2:
-                        self._loop_mamba_decode_greedy()
+                        self._loop_mamba_decode_greedy(cur_seq)
                     elif flag == 3:
-                        self._loop_kimi_decode_greedy()
+                        self._loop_kimi_decode_greedy(cur_seq)
                     continue
                 n = int.from_bytes(buf[0:4], "little")
                 method_name, *args = pickle.loads(buf[4:n+4])
+                self._ack_consumed(cur_seq)
                 getattr(self, method_name)(*args)
                 if method_name == "exit":
                     break
@@ -605,12 +628,25 @@ class ModelRunner:
             pass
 
     def _signal_workers(self):
-        """Increment SHM sequence counter to wake spin-waiting workers."""
+        """Wake workers and wait until each has copied the command payload."""
         buf = self.shm.buf
         seq_off = self._SHM_SEQ_OFFSET
         cur = int.from_bytes(buf[seq_off:seq_off+4], "little")
         nxt = (cur + 1) & 0xFFFFFFFF
         buf[seq_off:seq_off+4] = nxt.to_bytes(4, "little")
+        self._await_workers_consumed(nxt)
+
+    def _await_workers_consumed(self, target_seq):
+        buf = self.shm.buf
+        target = target_seq.to_bytes(4, "little")
+        for rank in range(1, self.world_size):
+            offset = self._SHM_ACK_OFFSET + 4 * rank
+            while bytes(buf[offset:offset+4]) != target:
+                pass
+
+    def _ack_consumed(self, seq):
+        offset = self._SHM_ACK_OFFSET + 4 * self.rank
+        self.shm.buf[offset:offset+4] = seq.to_bytes(4, "little")
 
     def call(self, method_name, *args):
         """Called by rank 0 to execute method on ALL ranks."""
@@ -618,6 +654,11 @@ class ModelRunner:
             data = pickle.dumps([method_name, *args])
             n = len(data)
             buf = self.shm.buf
+            if n + 4 > self._SHM_ACK_OFFSET:
+                raise RuntimeError(
+                    f"SHM payload too large for {method_name!r}: {n} bytes "
+                    f"(limit {self._SHM_ACK_OFFSET - 4})"
+                )
             buf[0:4] = n.to_bytes(4, "little")
             buf[4:n+4] = data
             buf[self._SHM_FLAG_OFFSET] = 0  # generic path
@@ -819,19 +860,46 @@ class ModelRunner:
         activation memory, following vLLM's profile_run() approach."""
         import math
         from PIL import Image
+        from transformers import AutoProcessor
 
         model = self.model
         vision_cfg = self.config.vision
         patch_size = vision_cfg.patch_size
         merge_size = vision_cfg.spatial_merge_size
         temporal_patch_size = getattr(vision_cfg, "temporal_patch_size", 2)
-
-        max_pixels = getattr(vision_cfg, "max_pixels", None)
-        if max_pixels is None:
-            max_pixels = 1280 * 28 * 28
-
         unit = patch_size * merge_size
-        max_patches = max_pixels // (unit * unit)
+
+        processor = AutoProcessor.from_pretrained(
+            self.model_name, trust_remote_code=True)
+
+        # Use the REAL per-image pixel cap the processor enforces. Newer Qwen-VL
+        # processors express it as size={longest_edge: max_pixels, ...}; older
+        # ones as image_processor.max_pixels or config.vision.max_pixels. The
+        # earlier hard-coded 1280*28*28 fallback undercounts it by >16x for
+        # Qwen3-VL (real longest_edge=16777216), so the profiled image was tiny
+        # and its self-attention memory nowhere near the real worst case -> the
+        # KV cache left far too little headroom and the first big image OOM'd.
+        ip = getattr(processor, "image_processor", processor)
+        max_pixels = getattr(vision_cfg, "max_pixels", None)
+        size = getattr(ip, "size", None)
+        if size is not None:
+            # transformers exposes this as a plain dict on some versions and a
+            # SizeDict (attribute access, not a dict subclass) on others.
+            if isinstance(size, dict):
+                le = size.get("longest_edge") or size.get("max_pixels")
+            else:
+                le = (getattr(size, "longest_edge", None)
+                      or getattr(size, "max_pixels", None))
+            max_pixels = le or max_pixels
+        max_pixels = max_pixels or getattr(ip, "max_pixels", None) or 1280 * 28 * 28
+
+        # The scheduler admits at most max_num_batched_tokens merged vision
+        # tokens of image per step (the has_mm encoder budget), so the worst
+        # case is a single image that fills that budget -- its full attention
+        # over all patches dominates activation memory. Cap the dummy there.
+        max_merged_tokens = max(
+            1, min(max_pixels // (unit * unit), self.max_num_batched_tokens))
+        max_patches = max_merged_tokens
 
         def _closest_factor_pair(n):
             for d in range(math.isqrt(n), 0, -1):
@@ -846,13 +914,7 @@ class ModelRunner:
                 break
         img_h, img_w = unit * hf, unit * wf
 
-        if self.rank == 0:
-            print(f"  Vision warmup: image {img_w}x{img_h}")
-
         dummy_img = Image.new("RGB", (img_w, img_h), color=255)
-        from transformers import AutoProcessor
-        processor = AutoProcessor.from_pretrained(
-            self.model_name, trust_remote_code=True)
         messages = [{"role": "user", "content": [
             {"type": "image", "image": dummy_img},
             {"type": "text", "text": "x"},
@@ -864,8 +926,34 @@ class ModelRunner:
 
         pv = inputs["pixel_values"].cuda()
         grid_thw = inputs["image_grid_thw"].cpu()
+
+        # _run_vision_encoder batches ALL images scheduled in a step into a
+        # single model.visual() call, bounded by the scheduler's encoder
+        # budget (== max_num_batched_tokens; see the has_mm path in the
+        # scheduler).  Profiling a single image underestimates peak activation
+        # memory by that batching factor, so allocate_kv_cache would leave no
+        # headroom and OOM on the first multi-image step.  Replicate the
+        # worst-case batch here, mirroring vLLM's profile_run over
+        # max_mm_items_per_batch = encoder_budget // max_tokens_per_item.
+        tokens_per_item = max(
+            1, int(grid_thw.prod(dim=-1).sum().item()) // (merge_size ** 2))
+        max_items = max(1, self.max_num_batched_tokens // tokens_per_item)
+        max_items = min(max_items, self.max_num_seqs)
+        if max_items > 1:
+            pv = pv.repeat(max_items, 1)
+            grid_thw = grid_thw.repeat(max_items, 1)
+
+        if self.rank == 0:
+            print(f"  Vision warmup: {max_items} image(s) {img_w}x{img_h} "
+                  f"(~{tokens_per_item} tok/img)")
+
+        # Measure the transient activation this worst-case forward allocates so
+        # allocate_kv_cache can reserve exactly that much runtime headroom.
+        torch.cuda.reset_peak_memory_stats()
+        _base = torch.cuda.memory_allocated()
         with torch.inference_mode():
             vis_out = model.visual(pv, grid_thw=grid_thw)
+        mm_peak = torch.cuda.max_memory_allocated() - _base
 
         self._warmup_encoder_cache = {}
         if isinstance(vis_out, tuple):
@@ -899,14 +987,22 @@ class ModelRunner:
 
         vpv = inputs["pixel_values_videos"].cuda()
         vgrid = inputs["video_grid_thw"].cpu()
+        torch.cuda.reset_peak_memory_stats()
+        _base = torch.cuda.memory_allocated()
         with torch.inference_mode():
             vis_out = model.visual(vpv, grid_thw=vgrid)
+        mm_peak = max(mm_peak, torch.cuda.max_memory_allocated() - _base)
 
         if isinstance(vis_out, tuple):
             embeds, ds = vis_out
             self._warmup_encoder_cache["vid"] = (embeds, ds)
         else:
             self._warmup_encoder_cache["vid"] = vis_out
+
+        # Reserved by allocate_kv_cache as multimodal runtime headroom.
+        self._mm_activation_peak_bytes = int(mm_peak)
+        if self.rank == 0:
+            print(f"  Vision activation peak: {mm_peak / 2**30:.1f}G", flush=True)
 
         del processor, dummy_img, dummy_vid, vid_frames_pil, pv, vpv
         del inputs, messages, text
@@ -998,12 +1094,37 @@ class ModelRunner:
                       f"({cross_blocks_per_seq} per seq x {max_cross_seqs} seqs, "
                       f"capped from {_DEFAULT_MAX_NUM_SEQS})")
 
+        if self.is_qwen_vl:
+            # Reserve runtime headroom for the multimodal per-step forward.
+            # The KV-sizing formula's own (peak - current) term collapses to ~0
+            # for VLMs: warmup runs eagerly and BEFORE the KV cache exists, so it
+            # never allocates the real per-step activation. Measurement shows the
+            # vision encoder itself is cheap (~1-2G even for a full-budget image);
+            # the ~35G peak that OOMs comes from the *compiled* multi-sequence
+            # decode+prefill forward (inductor buffers, fused-MoE workspaces,
+            # DeepStack embeds, CUDA-graph pools) -- none of which the profiling
+            # pass can observe before compilation. So, like vLLM (which reserves
+            # a profiled activation peak plus a CUDA-graph estimate), we reserve
+            # an explicit runtime headroom; because we can't measure the compiled
+            # peak here it is an empirically-calibrated fraction of total memory,
+            # tunable via FASTKERNELS_MM_RUNTIME_RESERVE, and never smaller than
+            # the measured encoder peak. Without it the KV cache consumes
+            # everything up to gpu_memory_utilization and the first multimodal
+            # step OOMs.
+            measured = getattr(self, "_mm_activation_peak_bytes", 0)
+            margin = float(os.environ.get("FASTKERNELS_MM_RESERVE_MARGIN", "1.3"))
+            floor_frac = float(os.environ.get("FASTKERNELS_MM_RUNTIME_RESERVE", "0.30"))
+            mm_reserve = max(int(measured * margin), int(total * floor_frac))
+            available_bytes -= mm_reserve
+            if self.rank == 0:
+                print(f"  Multimodal runtime reserve: {mm_reserve / 2**30:.1f}G "
+                      f"(measured encoder peak {measured / 2**30:.1f}G, "
+                      f"floor {floor_frac:.0%} of {total / 2**30:.0f}G)", flush=True)
+
         self_attn_block_bytes = (
             2 * num_self_attn_layers * BLOCK_SIZE * num_kv_heads * head_dim * elem_size
         )
         num_blocks = available_bytes // self_attn_block_bytes
-        if self.is_qwen_vl:
-            num_blocks = int(num_blocks * 0.95)
         assert num_blocks > 0, f"Not enough GPU memory for KV cache on rank {self.rank}"
         self.num_blocks = num_blocks
         if self.rank == 0:
@@ -1380,7 +1501,7 @@ class ModelRunner:
             return
 
         if self.is_qwen3_next:
-            usable_slots = min(self.max_num_seqs, 512)
+            usable_slots = max(1, self.max_num_seqs)
             use_decode_graph = not self.enforce_eager
             num_slots = usable_slots + (1 if use_decode_graph else 0)
             device = torch.device(f"cuda:{self.rank}")
@@ -1779,6 +1900,14 @@ class ModelRunner:
             self.world_size, max_bs, 2, dtype=torch.float32, device=dev,
         )
         self._kd_greedy_arange = torch.arange(max_bs, device=dev)
+        # Allocate before graph capture and reuse it for every bulk chunk. A
+        # fresh allocation here can alias the CUDA graph private pool.
+        self._kd_bulk_outputs = torch.zeros(
+            _BULK_CHUNK_CAP,
+            max_bs,
+            dtype=torch.int64,
+            device=dev,
+        )
 
     def _prepare_kimi_decode_arrays(self, seqs, copy_block_tables: bool = True):
         """Fill pinned staging buffers for hybrid greedy decode fast path."""
@@ -1841,7 +1970,7 @@ class ModelRunner:
         """
         from contextlib import nullcontext
 
-        graph_max_default = 512 if self.is_qwen3_next else self.max_num_seqs
+        graph_max_default = self.max_num_seqs
         max_bs = min(self.max_num_seqs, graph_max_default)
         bs_candidates = [
             1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 160, 192, 224, 256,
@@ -2099,9 +2228,11 @@ class ModelRunner:
         if not seqs or steps <= 0:
             return [] if self.rank == 0 else None
 
-        final_tokens = max(seq.num_computed_tokens + steps for seq in seqs)
         for seq in seqs:
-            self.mamba_state_manager.ensure_blocks_for(seq, final_tokens)
+            self.mamba_state_manager.ensure_blocks_for(
+                seq,
+                seq.num_computed_tokens + steps,
+            )
 
         decode_data = self._prepare_kimi_decode_arrays(
             seqs, copy_block_tables=True,
@@ -2109,9 +2240,8 @@ class ModelRunner:
         n = decode_data[0]
         self._stage_kimi_decode_graph_inputs(n, copy_block_tables=True)
 
-        dev = self._kd_input_ids.device
         outputs_dev = (
-            torch.empty((steps, n), dtype=torch.int64, device=dev)
+            self._kd_bulk_outputs[:steps, :n]
             if self.rank == 0 else None
         )
         arange = self._kd_greedy_arange[:n]
@@ -2191,7 +2321,7 @@ class ModelRunner:
             + n * 4
             + (n * max_blocks * 4 if copy_block_tables else 0)
         )
-        if payload_bytes > self._SHM_SEQ_OFFSET:
+        if payload_bytes > self._SHM_ACK_OFFSET:
             raise RuntimeError(
                 f"Hybrid decode SHM payload too large: {payload_bytes} bytes",
             )
@@ -2210,7 +2340,7 @@ class ModelRunner:
             buf[off:off + len(raw)] = raw
 
     @torch.inference_mode()
-    def _loop_kimi_decode_greedy(self):
+    def _loop_kimi_decode_greedy(self, cur_seq):
         """Worker fast path for hybrid greedy decode."""
         buf = self.shm.buf
         n = int.from_bytes(buf[0:2], "little")
@@ -2240,6 +2370,7 @@ class ModelRunner:
         self._kd_slot_mapping_int64_np[:n] = slot
         if max_blocks > 0:
             self._kd_block_tables_np[:n, :max_blocks] = bt
+        self._ack_consumed(cur_seq)
         self.run_kimi_decode_fast_async((n, max_blocks > 0))
 
     @torch.inference_mode()
@@ -3242,7 +3373,7 @@ class ModelRunner:
             off += nb
 
     @torch.inference_mode()
-    def _loop_mamba_decode_greedy(self):
+    def _loop_mamba_decode_greedy(self, cur_seq):
         """Worker fast path for Mamba: read decode arrays from SHM into
         the pinned-CPU staging buffers, then dispatch the same fast path
         as rank 0 (the kernels read state_indices_d which we just wrote)."""
@@ -3258,6 +3389,7 @@ class ModelRunner:
         self._md_input_ids_np[:n] = ids
         self._md_positions_np[:n] = pos
         self._md_state_indices_np[:n] = si
+        self._ack_consumed(cur_seq)
         self.run_mamba_decode_fast_async(
             (n,
              self._md_input_ids_np[:n],
@@ -4207,7 +4339,7 @@ class ModelRunner:
             buf[off:off+nb] = arr.tobytes()
             off += nb
 
-    def _loop_decode_greedy(self):
+    def _loop_decode_greedy(self, cur_seq):
         """Worker fast path: read decode arrays from SHM without pickle.
 
         Must mirror :meth:`_write_decode_shm` exactly. In particular, MLA
@@ -4232,6 +4364,7 @@ class ModelRunner:
             sm_np = np.frombuffer(buf, dtype=np.int32, count=n, offset=off).copy(); off += n * 4
         cl_np = np.frombuffer(buf, dtype=np.int32, count=n, offset=off).copy(); off += n * 4
         bt_np = np.frombuffer(buf, dtype=np.int32, count=n*max_bt, offset=off).copy().reshape(n, max_bt)
+        self._ack_consumed(cur_seq)
         self.run_decode_greedy_fast((n, ids_np, pos_np, sm_np, cl_np, bt_np))
 
     def call_decode_greedy(self, seqs):
@@ -4767,11 +4900,15 @@ class ModelRunner:
         decode_req_id = torch.arange(max_bs, dtype=torch.int32).cuda()
         self._decode_req_id_buf = decode_req_id
 
-        # Match vLLM's default ``cudagraph_capture_sizes``:
+        # Match vLLM's default ``cudagraph_capture_sizes`` shape:
         # [1, 2, 4, 8, 16, 24, ..., 256, 272, ..., max_capture].
-        # vLLM normally caps captures at 512, but GPT-OSS overrides this to
-        # 1024 for better high-concurrency decode throughput.
-        max_capture_limit = 1024 if (self.is_gpt_oss or self.is_gemma4) else 512
+        env_cap = os.environ.get("FASTKERNELS_MAX_CUDAGRAPH_BS")
+        if env_cap:
+            max_capture_limit = int(env_cap)
+        else:
+            max_capture_limit = (
+                1024 if (self.is_gpt_oss or self.is_gemma4) else 512
+            )
         max_capture = min(max_bs, max_capture_limit)
         self.graph_bs_list = [i for i in [1, 2, 4] if i <= max_capture]
         if max_capture >= 8:
@@ -5552,9 +5689,25 @@ class LlamaEngine:
             )
         decode_bt_dirty = True
 
+        state_manager = mr.mamba_state_manager
+        block_size = getattr(state_manager, "block_size", 0) or 1
+        total_kv_blocks = getattr(state_manager, "num_mla_blocks", 0) or 0
+        block_budget = max(1, total_kv_blocks - 2) if total_kv_blocks else 0
+
+        def _worst_case_blocks(seq: Sequence) -> int:
+            prompt_len = len(seq.token_ids) - len(seq.generated_ids)
+            final_len = prompt_len + seq.max_tokens
+            return (final_len + block_size - 1) // block_size
+
         while waiting or running:
             prefill_seqs: list[Sequence] = []
             prefill_tokens = 0
+            committed_blocks = (
+                sum(_worst_case_blocks(seq) for seq in running)
+                if total_kv_blocks and waiting
+                else 0
+            )
+            blocked_by_kv = False
             while (
                 waiting
                 and len(prefill_seqs) < max_num_seqs
@@ -5567,6 +5720,16 @@ class LlamaEngine:
                     and prefill_tokens + seq_len > max_batched_tokens
                 ):
                     break
+                if total_kv_blocks:
+                    candidate_blocks = _worst_case_blocks(waiting[0])
+                    must_admit = len(running) + len(prefill_seqs) == 0
+                    if (
+                        not must_admit
+                        and committed_blocks + candidate_blocks > block_budget
+                    ):
+                        blocked_by_kv = True
+                        break
+                    committed_blocks += candidate_blocks
                 seq = waiting.popleft()
                 prefill_seqs.append(seq)
                 prefill_tokens += seq_len
@@ -5610,6 +5773,7 @@ class LlamaEngine:
 
             if (
                 waiting
+                and not blocked_by_kv
                 and all_greedy
                 and all(seq.ignore_eos for seq in running)
                 and len(running) < max_num_seqs
@@ -5631,25 +5795,37 @@ class LlamaEngine:
                     seq.max_tokens - len(seq.generated_ids)
                     for seq in running
                 ]
-                if remaining and min(remaining) == max(remaining) and remaining[0] > 1:
+                min_remaining = min(remaining) if remaining else 0
+                if min_remaining > 1:
+                    chunk = min(min_remaining, _BULK_CHUNK_CAP)
                     graph_max = mr._kimi_graph_bs_list[-1]
                     for start in range(0, len(running), graph_max):
                         mr.call(
                             "run_kimi_decode_many",
                             running[start:start + graph_max],
-                            remaining[0],
+                            chunk,
                         )
                     finished_payloads = [
                         (seq.state_slot, list(seq.block_table))
                         for seq in running
+                        if len(seq.generated_ids) >= seq.max_tokens
                     ]
-                    mr.call("deallocate_mamba_state_batch", finished_payloads)
+                    if finished_payloads:
+                        mr.call(
+                            "deallocate_mamba_state_batch",
+                            finished_payloads,
+                        )
+                    next_running = []
                     for seq in running:
-                        seq.block_table = []
-                        seq.state_slot = None
-                        if pbar is not None:
-                            pbar.update(1)
-                    running = []
+                        if len(seq.generated_ids) >= seq.max_tokens:
+                            seq.block_table = []
+                            seq.state_slot = None
+                            if pbar is not None:
+                                pbar.update(1)
+                        else:
+                            next_running.append(seq)
+                    running = next_running
+                    decode_bt_dirty = True
                     continue
 
             decode_seqs = list(running)
@@ -6055,7 +6231,10 @@ class LlamaEngine:
                 else:
                     new_running.append(s)
 
-            prefilling[:] = still_prefilling
+            scheduled_prefill_ids = {id(s) for s in prefill_seqs}
+            prefilling[:] = still_prefilling + [
+                s for s in prefilling if id(s) not in scheduled_prefill_ids
+            ]
             if finished_now:
                 slot_ids = [s.state_slot for s in finished_now]
                 mr.call("deallocate_mamba_state_batch", slot_ids)
@@ -6159,6 +6338,20 @@ class LlamaEngine:
             )
             for i in range(len(prompts))
         ]
+
+    def _vision_merge_size(self) -> int:
+        try:
+            return int(
+                self.model_runner.model.config.vision.spatial_merge_size
+            )
+        except AttributeError:
+            return 1
+
+    def _max_encoder_tokens(self) -> int:
+        value = os.environ.get("FASTKERNELS_MAX_ENCODER_TOKENS")
+        if value:
+            return max(1, int(value))
+        return int(self.max_num_batched_tokens)
 
     @torch.inference_mode()
     def generate(self, prompts, sampling_params, collect_logits: bool = False,
@@ -6747,7 +6940,9 @@ class LlamaEngine:
             for seq in prefilling:
                 total_peak += (seq.num_prompt_tokens + seq.max_tokens
                                + block_size - 1) // block_size
-            encoder_budget = self.max_num_batched_tokens
+            encoder_budget = self._max_encoder_tokens()
+            merge_size = self._vision_merge_size()
+            mm_admitted = 0
             while waiting and token_budget > 0:
                 seq = waiting[0]
                 prompt_len = seq.num_prompt_tokens
@@ -6771,7 +6966,8 @@ class LlamaEngine:
                         break
                 elif has_mm:
                     chunk = min(prompt_len, token_budget)
-                    if chunk > encoder_budget:
+                    seq_encoder_tokens = _seq_encoder_tokens(seq, merge_size)
+                    if mm_admitted and seq_encoder_tokens > encoder_budget:
                         break
                 else:
                     chunk = min(prompt_len, token_budget)
@@ -6805,7 +7001,8 @@ class LlamaEngine:
                 token_budget -= chunk
                 total_peak += seq_peak
                 if has_mm:
-                    encoder_budget -= chunk
+                    encoder_budget -= seq_encoder_tokens
+                    mm_admitted += 1
 
             if is_bitnet and not prefill_seqs and not decode_seqs and running:
                 _schedule_decode_tokens()

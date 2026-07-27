@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 
-from vllm.model_executor.layers.fla.ops.kda import (
+from vllm.third_party.flash_linear_attention.ops.kda import (
     FusedRMSNormGated,
     chunk_kda,
     fused_kda_gate,
@@ -213,6 +213,7 @@ class KimiDeltaAttention(nn.Module):
             None,
             activation="silu",
             conv_state_indices=meta.non_spec_state_indices_tensor[:meta.num_actual_tokens],
+            null_block_id=-1,
             validate_data=True,
         )
 

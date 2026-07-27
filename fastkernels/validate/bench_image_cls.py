@@ -10,8 +10,9 @@ import sys
 from pathlib import Path
 
 _THIS_DIR = Path(__file__).resolve().parent
-_PACKAGE_DIR = _THIS_DIR.parent.parent
-sys.path.insert(0, str(_PACKAGE_DIR))
+_PACKAGE_DIR = _THIS_DIR.parent
+_PROJECT_ROOT = _PACKAGE_DIR.parent
+sys.path.insert(0, str(_PROJECT_ROOT))
 
 from fastkernels.validate.worker import run_worker
 from fastkernels.infra.image_cls_loader import infer_image_mean_std, infer_image_size
@@ -299,7 +300,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     common = {
-        "project_root": str(_PACKAGE_DIR),
+        "project_root": str(_PROJECT_ROOT),
         "model": args.model,
         "image_size": image_size,
         "dataset_name": args.dataset,

@@ -127,6 +127,44 @@ def _make_run_id(requested: str | None) -> str:
     return safe
 
 
+# --- phase-output caching (for --resume) -------------------------------------
+# Each of the two heavy phases (vLLM reference, fastkernels engine) is a single
+# subprocess whose full result dict (throughput + latency) is persisted as soon
+# as it finishes.  On --resume we reload a phase's cache instead of rerunning it,
+# but only when the config that determines its outputs is unchanged.
+
+def _fingerprint(**parts) -> str:
+    """Stable hash of the config that determines a phase's outputs."""
+    import hashlib
+    blob = json.dumps(parts, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def _save_raw(path: str, raw: dict, fingerprint: str) -> None:
+    """Persist a phase's raw worker output alongside its config fingerprint."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"_fingerprint": fingerprint, "raw": raw}, f)
+    os.replace(tmp, path)  # atomic: a crash mid-write never leaves a partial cache
+
+
+def _load_raw(path: str, fingerprint: str) -> dict | None:
+    """Return the cached raw output iff it exists with a matching fingerprint."""
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            blob = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if blob.get("_fingerprint") != fingerprint:
+        print(f"  NOTE: cache {os.path.basename(path)} fingerprint mismatch "
+              f"(config changed) — ignoring it and rerunning this phase.")
+        return None
+    return blob.get("raw")
+
+
 def _install_bench_sitecustomize() -> None:
     """Install a sitecustomize that patches vLLM/FlashInfer in every spawned
     Python process (the v1 EngineCore and TP worker ranks), driven by env vars.
@@ -212,7 +250,7 @@ if _max_layers_env:
         os.environ["PYTHONPATH"] = os.pathsep.join([str(site_dir), *parts])
 
 _THIS_DIR = Path(__file__).resolve().parent
-_PACKAGE_DIR = _THIS_DIR.parent.parent
+_PACKAGE_DIR = _THIS_DIR.parent
 _PROJECT_ROOT = _PACKAGE_DIR.parent
 _PACKAGE_NAME = _PACKAGE_DIR.name
 
@@ -386,6 +424,39 @@ def _is_qwen_omni_model(model_name: str) -> bool:
     return "qwen" in lower and "omni" in lower
 
 
+_PER_MODEL_DEFAULTS: dict[str, dict] = {
+    "qwen3-vl-235b": {
+        "env": {
+            "FASTKERNELS_MAX_CUDAGRAPH_BS": "1024",
+            "FASTKERNELS_MAX_ENCODER_TOKENS": "4096",
+        },
+    },
+    "qwen2-vl": {
+        "env": {"FASTKERNELS_MAX_ENCODER_TOKENS": "4096"},
+        "gpu_memory_utilization": 0.80,
+    },
+}
+
+
+def _apply_per_model_defaults(model_name: str, args) -> dict[str, str]:
+    """Apply H200-safe defaults without overriding explicit user settings."""
+    lower = model_name.lower()
+    applied: dict[str, str] = {}
+    for key, spec in _PER_MODEL_DEFAULTS.items():
+        if key not in lower:
+            continue
+        for name, value in spec.get("env", {}).items():
+            if os.environ.get(name):
+                continue
+            os.environ[name] = value
+            applied[name] = value
+        utilization = spec.get("gpu_memory_utilization")
+        if utilization is not None and args.gpu_memory_utilization is None:
+            args.gpu_memory_utilization = utilization
+            applied["gpu_memory_utilization"] = str(utilization)
+    return applied
+
+
 def _get_model_max_context_len(model_name: str) -> int | None:
     """Return the model's maximum context length (``max_position_embeddings``).
 
@@ -395,11 +466,25 @@ def _get_model_max_context_len(model_name: str) -> int | None:
     cannot be read or does not advertise a positional limit.
     """
     try:
-        from transformers import AutoConfig
+        from vllm.transformers_utils.config import get_config
 
-        config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+        # Use vLLM's parser so Mistral-format checkpoints derive their limit
+        # from params.json using the same fallback rules as the reference.
+        config = get_config(
+            model_name,
+            trust_remote_code=True,
+            config_format="auto",
+        )
     except Exception:
-        return None
+        try:
+            from transformers import AutoConfig
+
+            config = AutoConfig.from_pretrained(
+                model_name,
+                trust_remote_code=True,
+            )
+        except Exception:
+            return None
     # Some multimodal configs nest the LM settings under ``text_config``.
     for cfg in (config, getattr(config, "text_config", None)):
         if cfg is None:
@@ -567,7 +652,7 @@ def main():
 
         vllm_prompts = [dict(prompt_token_ids=p) for p in prompt_token_ids]
         start = time.perf_counter()
-        outputs = llm.generate(vllm_prompts, sp_list, use_tqdm=False)
+        outputs = llm.generate(vllm_prompts, sp_list, use_tqdm=True)
         elapsed = time.perf_counter() - start
 
         total_prompt_tokens = sum(
@@ -691,7 +776,7 @@ def main():
         outputs = engine.generate(
             prompts,
             sp_list,
-            use_tqdm=False,
+            use_tqdm=True,
             decode_text=False,
         )
         torch.cuda.synchronize()
@@ -923,19 +1008,38 @@ def _preload_mm_data(dataset_name, dataset_split, num_seqs, seed,
         pbar.close()
     elif "MMVU" in dataset_name:
         from huggingface_hub import snapshot_download
+        import glob as _glob
+        import os as _os
         local_root = snapshot_download(dataset_name, repo_type="dataset")
+        n_clips = len(_glob.glob(
+            _os.path.join(local_root, "**", "*.mp4"), recursive=True))
+        if n_clips == 0:
+            offline = _os.environ.get("HF_HUB_OFFLINE", "")
+            reason = (
+                f"HF_HUB_OFFLINE={offline} prevents clip downloads"
+                if offline not in ("", "0")
+                else "the snapshot contains no .mp4 files"
+            )
+            raise SystemExit(
+                f"{dataset_name}: no video files under {local_root} ({reason})"
+            )
         remote_root = (
             f"https://huggingface.co/datasets/{dataset_name}/resolve/main"
         )
         pbar = tqdm(data, total=num_seqs, desc="Loading videos")
+        skipped = 0
         for item in pbar:
             if len(results) >= num_seqs:
                 break
-            prompt = item["question"] + " " + " ".join(
-                f"{k}.{v}" for k, v in item["choices"].items())
-            video_path = item["video"].replace(remote_root, local_root)
-            frames, metadata = _load_video_opencv(
-                video_path, num_frames=num_video_frames)
+            try:
+                prompt = item["question"] + " " + " ".join(
+                    f"{k}.{v}" for k, v in item["choices"].items())
+                video_path = item["video"].replace(remote_root, local_root)
+                frames, metadata = _load_video_opencv(
+                    video_path, num_frames=num_video_frames)
+            except Exception:
+                skipped += 1
+                continue
             results.append({
                 "prompt": prompt,
                 "images": None,
@@ -946,6 +1050,17 @@ def _preload_mm_data(dataset_name, dataset_split, num_seqs, seed,
             })
             pbar.update(0)
         pbar.close()
+        if skipped:
+            print(
+                f"  NOTE: skipped {skipped} unreadable MMVU video(s); "
+                f"loaded {len(results)}/{num_seqs}",
+                flush=True,
+            )
+        if not results:
+            raise SystemExit(
+                f"{dataset_name}: no readable clips among {skipped} attempted "
+                f"({n_clips} .mp4 files under {local_root})"
+            )
     elif "librispeech_asr" in dataset_name:
         pbar = tqdm(data, total=num_seqs, desc="Loading audio")
         for item in pbar:
@@ -1457,6 +1572,16 @@ def main():
         f.flush()
         os.fsync(f.fileno())
 
+    # Kill the engine's spawned TP rank workers before the hard exit. os._exit(0)
+    # deliberately skips atexit (multiprocessing's no-timeout child join can hang
+    # shutdown), but that also skips the engine's atexit cleanup -- so without
+    # this the rank workers orphan and keep holding their GPUs, OOM-ing the next
+    # scenario the scheduler launches on those GPUs.
+    try:
+        engine._cleanup()
+    except Exception:
+        pass
+
     os._exit(0)
 
 if __name__ == "__main__":
@@ -1472,6 +1597,40 @@ import json, os, sys, time
 import numpy as np
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
+
+def _decode_audio_array(audio):
+    from io import BytesIO
+    if isinstance(audio, dict) and audio.get("array") is not None:
+        return (
+            np.asarray(audio["array"], dtype=np.float32),
+            int(audio["sampling_rate"]),
+        )
+    import av
+    source = None
+    if isinstance(audio, dict):
+        if audio.get("bytes") is not None:
+            source = BytesIO(audio["bytes"])
+        elif audio.get("path") is not None:
+            source = audio["path"]
+    if source is None:
+        raise ValueError("Unsupported audio sample format")
+    chunks = []
+    sampling_rate = None
+    with av.open(source) as container:
+        for frame in container.decode(audio=0):
+            chunks.append(frame.to_ndarray())
+            sampling_rate = frame.sample_rate
+    if not chunks or sampling_rate is None:
+        raise ValueError("Audio sample has no decodable frames")
+    samples = np.concatenate(chunks, axis=-1)
+    if np.issubdtype(samples.dtype, np.integer):
+        info = np.iinfo(samples.dtype)
+        samples = samples.astype(np.float32) / max(abs(info.min), info.max)
+    else:
+        samples = samples.astype(np.float32)
+    if samples.ndim == 2:
+        samples = samples.mean(axis=0)
+    return samples, int(sampling_rate)
 
 def _configure_parallel_safe_flashinfer():
     namespace = os.environ.get("FASTKERNELS_FLASHINFER_SOCKET_NAMESPACE")
@@ -1503,17 +1662,32 @@ _configure_parallel_safe_flashinfer()
 
 def _load_librispeech(dataset_name, dataset_split, num_seqs, seed):
     """Load audio samples from LibriSpeech and return as list of numpy arrays."""
-    from datasets import load_dataset
+    from datasets import Audio, load_dataset
     ds = load_dataset(dataset_name, split=dataset_split, streaming=True)
+    ds = ds.cast_column("audio", Audio(decode=False))
     ds = ds.shuffle(seed=seed)
     samples = []
+    seen = failed = 0
+    first_error = None
     for item in ds:
-        audio = item["audio"]
-        arr = np.array(audio["array"], dtype=np.float32)
-        sr = audio["sampling_rate"]
+        seen += 1
+        try:
+            arr, sr = _decode_audio_array(item["audio"])
+        except Exception:
+            failed += 1
+            if first_error is None:
+                import traceback
+                first_error = traceback.format_exc()
+            continue
         samples.append({"audio": arr, "sampling_rate": sr, "text": item["text"]})
         if len(samples) >= num_seqs:
             break
+    if not samples:
+        print(
+            f"  [librispeech diag] seen={seen} fail={failed} "
+            f"first_err=\n{first_error}",
+            flush=True,
+        )
     return samples
 
 def main():
@@ -1665,19 +1839,68 @@ FASTKERNELS_WHISPER_WORKER = r'''
 import json, sys, time
 import numpy as np
 
+def _decode_audio_array(audio):
+    from io import BytesIO
+    if isinstance(audio, dict) and audio.get("array") is not None:
+        return (
+            np.asarray(audio["array"], dtype=np.float32),
+            int(audio["sampling_rate"]),
+        )
+    import av
+    source = None
+    if isinstance(audio, dict):
+        if audio.get("bytes") is not None:
+            source = BytesIO(audio["bytes"])
+        elif audio.get("path") is not None:
+            source = audio["path"]
+    if source is None:
+        raise ValueError("Unsupported audio sample format")
+    chunks = []
+    sampling_rate = None
+    with av.open(source) as container:
+        for frame in container.decode(audio=0):
+            chunks.append(frame.to_ndarray())
+            sampling_rate = frame.sample_rate
+    if not chunks or sampling_rate is None:
+        raise ValueError("Audio sample has no decodable frames")
+    samples = np.concatenate(chunks, axis=-1)
+    if np.issubdtype(samples.dtype, np.integer):
+        info = np.iinfo(samples.dtype)
+        samples = samples.astype(np.float32) / max(abs(info.min), info.max)
+    else:
+        samples = samples.astype(np.float32)
+    if samples.ndim == 2:
+        samples = samples.mean(axis=0)
+    return samples, int(sampling_rate)
+
 def _load_librispeech(dataset_name, dataset_split, num_seqs, seed):
     """Load audio samples from LibriSpeech and return as list of numpy arrays."""
-    from datasets import load_dataset
+    from datasets import Audio, load_dataset
     ds = load_dataset(dataset_name, split=dataset_split, streaming=True)
+    ds = ds.cast_column("audio", Audio(decode=False))
     ds = ds.shuffle(seed=seed)
     samples = []
+    seen = failed = 0
+    first_error = None
     for item in ds:
-        audio = item["audio"]
-        arr = np.array(audio["array"], dtype=np.float32)
-        sr = audio["sampling_rate"]
+        seen += 1
+        try:
+            arr, sr = _decode_audio_array(item["audio"])
+        except Exception:
+            failed += 1
+            if first_error is None:
+                import traceback
+                first_error = traceback.format_exc()
+            continue
         samples.append({"audio": arr, "sampling_rate": sr, "text": item["text"]})
         if len(samples) >= num_seqs:
             break
+    if not samples:
+        print(
+            f"  [librispeech diag] seen={seen} fail={failed} "
+            f"first_err=\n{first_error}",
+            flush=True,
+        )
     return samples
 
 def main():
@@ -1893,6 +2116,26 @@ def main():
     )
     parser.add_argument("--enforce-eager", action="store_true", default=False)
     parser.add_argument("--skip-vllm", action="store_true")
+    parser.add_argument(
+        "--vllm-python",
+        type=str,
+        default=None,
+        help="Python interpreter for the vLLM reference worker. Defaults to "
+        "the current interpreter.",
+    )
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=None,
+        help="GPU memory fraction applied identically to both engines.",
+    )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="Reuse cached phase outputs (vllm_raw.json / fastkernels_raw.json) "
+             "under the output dir when their config fingerprint matches, "
+             "instead of rerunning that phase. Lets an interrupted run continue "
+             "without recomputing the completed (e.g. vLLM) side.",
+    )
     parser.add_argument("--skip-throughput", action="store_true",
                         help="Skip the throughput phase (run latency only)")
     parser.add_argument("--skip-latency", action="store_true",
@@ -1901,14 +2144,14 @@ def main():
                         help="Timed iterations per latency scenario (default: 5)")
     parser.add_argument(
         "--output-dir", type=str, default=None,
-        help="Directory to save per-scenario outputs and results JSON "
-             "(default: tests/results/<gpu>/<model>_tp<tp>/<run-id>)",
+        help="Directory to save per-scenario outputs, phase caches, and results "
+             "JSON (default: ~/.fastkernels/validate/<run-id>)",
     )
     parser.add_argument(
         "--run-id", type=str, default=None,
-        help="Run subdirectory appended to the default output dir. Defaults "
-             "to a timestamp+pid so concurrent runs do not overwrite each "
-             "other. Ignored when --output-dir is provided.",
+        help="Run id naming the output dir ~/.fastkernels/validate/<run-id>. "
+             "Defaults to a timestamp+pid so concurrent runs do not overwrite "
+             "each other. Ignored when --output-dir is provided.",
     )
     parser.add_argument(
         "--modality", type=str, default="all",
@@ -1932,6 +2175,7 @@ def main():
     is_vlm = _is_vlm_model(args.model)
     is_qwen_omni = _is_qwen_omni_model(args.model)
     is_whisper = _is_whisper_model(args.model)
+    engine_env = _apply_per_model_defaults(args.model, args)
 
     if args.max_layers is not None:
         if args.max_layers < 1:
@@ -1942,11 +2186,9 @@ def main():
             args.max_layers = None
 
     if args.output_dir is None:
-        short = args.model.split("/")[-1]
         run_id = _make_run_id(args.run_id)
-        repo_root = Path(__file__).resolve().parent.parent.parent
         args.output_dir = str(
-            repo_root / "tests" / "results" / gpu / f"{short}_tp{args.tp}" / run_id
+            Path.home() / ".fastkernels" / "validate" / run_id
         )
     elif args.run_id is not None:
         print("  NOTE: --run-id is ignored because --output-dir was provided.")
@@ -2215,6 +2457,11 @@ def main():
     print(f"  Seed           : {args.seed}")
     print(f"  Trust RC       : {args.trust_remote_code}")
     print(f"  Max seq len    : {global_max_seq_len}")
+    if engine_env:
+        print(
+            "  Engine env     : "
+            + ", ".join(f"{key}={value}" for key, value in sorted(engine_env.items()))
+        )
     print(f"  fastkernels port   : {kb_nccl_port}")
     if vllm_port is not None:
         print(f"  vLLM port      : {vllm_port}")
@@ -2243,38 +2490,71 @@ def main():
     if is_whisper:
         global_max_seq_len = 448  # Whisper max_target_positions
 
+    # Config fingerprint shared by both phases: reuse a cached phase only when
+    # the inputs that determine its outputs are unchanged.
+    fingerprint = _fingerprint(
+        model=args.model, tp=args.tp, seed=args.seed,
+        temperature=args.temperature, enforce_eager=args.enforce_eager,
+        max_layers=args.max_layers, max_model_len=global_max_seq_len,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        engine_env=engine_env,
+        scenarios=scenario_data, latency=latency_data,
+    )
+    vllm_raw_path = (os.path.join(args.output_dir, "vllm_raw.json")
+                     if args.output_dir else None)
+    kb_raw_path = (os.path.join(args.output_dir, "fastkernels_raw.json")
+                   if args.output_dir else None)
+
     # -- Run vLLM (one subprocess, all scenarios) --
     vllm_raw = None
     if not args.skip_vllm:
-        short_name = args.model.split("/")[-1]
-        vllm_config = {
-            "model": args.model,
-            "tp": args.tp,
-            "seed": args.seed,
-            "temperature": args.temperature,
-            "enforce_eager": args.enforce_eager,
-            "max_model_len": global_max_seq_len,
-            "scenarios": scenario_data,
-            "latency_scenarios": latency_data,
-            "trust_remote_code": args.trust_remote_code,
-            "load_format": "fastsafetensors",
-            "is_qwen_omni": is_qwen_omni,
-        }
-        if args.max_layers is not None:
-            vllm_config["max_layers"] = args.max_layers
-        if is_qwen_omni:
-            vllm_config["limit_mm_per_prompt"] = {
-                "image": 1,
-                "video": 1,
-                "audio": 1,
+        if args.resume and vllm_raw_path:
+            vllm_raw = _load_raw(vllm_raw_path, fingerprint)
+        if vllm_raw is not None:
+            print(f"  Resumed vLLM reference from cache: {vllm_raw_path}",
+                  flush=True)
+        else:
+            short_name = args.model.split("/")[-1]
+            vllm_config = {
+                "model": args.model,
+                "tp": args.tp,
+                "seed": args.seed,
+                "temperature": args.temperature,
+                "enforce_eager": args.enforce_eager,
+                "max_model_len": global_max_seq_len,
+                **(
+                    {"gpu_memory_utilization": args.gpu_memory_utilization}
+                    if args.gpu_memory_utilization is not None
+                    else {}
+                ),
+                "scenarios": scenario_data,
+                "latency_scenarios": latency_data,
+                "trust_remote_code": args.trust_remote_code,
+                "load_format": "fastsafetensors",
+                "is_qwen_omni": is_qwen_omni,
             }
-        os.environ["MASTER_ADDR"] = "127.0.0.1"
-        os.environ["MASTER_PORT"] = str(vllm_port)
-        vllm_raw = run_worker(
-            vllm_worker, vllm_config,
-            f"vLLM [{short_name}] all scenarios (TP={args.tp})",
-            timeout=10800,
-        )
+            if args.max_layers is not None:
+                vllm_config["max_layers"] = args.max_layers
+            if is_qwen_omni:
+                vllm_config["limit_mm_per_prompt"] = {
+                    "image": 1,
+                    "video": 1,
+                    "audio": 1,
+                }
+            os.environ["MASTER_ADDR"] = "127.0.0.1"
+            os.environ["MASTER_PORT"] = str(vllm_port)
+            vllm_raw = run_worker(
+                vllm_worker, vllm_config,
+                f"vLLM [{short_name}] all scenarios (TP={args.tp})",
+                timeout=10800,
+                python_executable=args.vllm_python,
+            )
+            # Persist the vLLM reference immediately, BEFORE the fastkernels
+            # phase runs, so a fastkernels crash never discards it.
+            if vllm_raw is not None and vllm_raw_path:
+                _save_raw(vllm_raw_path, vllm_raw, fingerprint)
+        # Restore env set up for the vLLM subprocess (done above under
+        # `not skip_vllm` regardless of whether we ran or resumed it).
         if previous_flashinfer_namespace_env is None:
             os.environ.pop("FASTKERNELS_FLASHINFER_SOCKET_NAMESPACE", None)
         else:
@@ -2288,32 +2568,49 @@ def main():
             os.environ.pop("FASTKERNELS_MAX_LAYERS", None)
         else:
             os.environ["FASTKERNELS_MAX_LAYERS"] = previous_max_layers_env
+        if vllm_raw is None:
+            print("  ERROR: vLLM reference subprocess failed.")
+            sys.exit(1)
 
     # -- Run fastkernels (one subprocess, all scenarios) --
-    kb_root = str(_PROJECT_ROOT)
-    package_name = _PACKAGE_DIR.name
-    kb_config = {
-        "model": args.model,
-        "tp": args.tp,
-        "seed": args.seed,
-        "temperature": args.temperature,
-        "enforce_eager": args.enforce_eager,
-        "max_model_len": global_max_seq_len,
-        "project_root": kb_root,
-        "package_name": package_name,
-        "scenarios": scenario_data,
-        "latency_scenarios": latency_data,
-    }
-    if args.max_layers is not None:
-        kb_config["max_layers"] = args.max_layers
-    short_name = args.model.split("/")[-1]
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(kb_nccl_port)
-    kb_raw = run_worker(
-        kb_worker, kb_config,
-        f"fastkernels [{short_name}] all scenarios (TP={args.tp})",
-        timeout=10800,
-    )
+    kb_raw = None
+    if args.resume and kb_raw_path:
+        kb_raw = _load_raw(kb_raw_path, fingerprint)
+    if kb_raw is not None:
+        print(f"  Resumed fastkernels outputs from cache: {kb_raw_path}",
+              flush=True)
+    else:
+        kb_root = str(_PROJECT_ROOT)
+        package_name = _PACKAGE_DIR.name
+        kb_config = {
+            "model": args.model,
+            "tp": args.tp,
+            "seed": args.seed,
+            "temperature": args.temperature,
+            "enforce_eager": args.enforce_eager,
+            "max_model_len": global_max_seq_len,
+            **(
+                {"gpu_memory_utilization": args.gpu_memory_utilization}
+                if args.gpu_memory_utilization is not None
+                else {}
+            ),
+            "project_root": kb_root,
+            "package_name": package_name,
+            "scenarios": scenario_data,
+            "latency_scenarios": latency_data,
+        }
+        if args.max_layers is not None:
+            kb_config["max_layers"] = args.max_layers
+        short_name = args.model.split("/")[-1]
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+        os.environ["MASTER_PORT"] = str(kb_nccl_port)
+        kb_raw = run_worker(
+            kb_worker, kb_config,
+            f"fastkernels [{short_name}] all scenarios (TP={args.tp})",
+            timeout=10800,
+        )
+        if kb_raw is not None and kb_raw_path:
+            _save_raw(kb_raw_path, kb_raw, fingerprint)
     if kb_raw is None:
         print("  ERROR: fastkernels subprocess failed.")
         sys.exit(1)

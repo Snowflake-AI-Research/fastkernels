@@ -35,11 +35,11 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-from vllm.model_executor.layers.fla.ops import (
+from vllm.third_party.flash_linear_attention.ops import (
     chunk_gated_delta_rule as _vllm_chunk_gated_delta_rule,
     fused_recurrent_gated_delta_rule as _vllm_fused_recurrent_gdn,
 )
-from vllm.model_executor.layers.fla.ops.chunk import l2norm_fwd
+from vllm.third_party.flash_linear_attention.ops.chunk import l2norm_fwd
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
     causal_conv1d_fn as _vllm_causal_conv1d_fn,
     causal_conv1d_update as _vllm_causal_conv1d_update,
@@ -369,6 +369,7 @@ class Qwen3NextGDNAttention(nn.Module):
                 conv_state_indices=md.non_spec_state_indices_tensor[
                     : md.num_decodes
                 ],
+                null_block_id=-1,
                 validate_data=True,
             )
 

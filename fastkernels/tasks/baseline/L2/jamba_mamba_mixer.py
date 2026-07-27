@@ -280,6 +280,7 @@ class JambaMambaMixer(nn.Module):
             conv_out_d_t = causal_conv1d_update(
                 x_d, conv_state, conv_w, conv_b, "silu",
                 conv_state_indices=state_indices_d,
+                null_block_id=-1,
             )                                                        # [n_d, I]
             conv_out_d = conv_out_d_t.transpose(0, 1).contiguous()   # [I, n_d]
             conv_out = torch.cat([conv_out_p, conv_out_d], dim=-1)   # [I, n_p+n_d]
@@ -315,10 +316,11 @@ class JambaMambaMixer(nn.Module):
                 dt_d,
                 self.A,
                 B_d, C_d, self.D,
-                gate_d.transpose(0, 1).contiguous(),
-                time_proj_bias,
+                dt_bias=time_proj_bias,
+                z=gate_d.transpose(0, 1).contiguous(),
                 dt_softplus=True,
                 state_batch_indices=state_indices_d,
+                null_block_id=-1,
                 out=scan_out_d,
             )
             scan_out_d = scan_out_d.transpose(0, 1).contiguous()     # [I, n_d]
@@ -334,6 +336,7 @@ class JambaMambaMixer(nn.Module):
             conv_out_t = causal_conv1d_update(
                 x_t, conv_state, conv_w, conv_b, "silu",
                 conv_state_indices=cache_indices,
+                null_block_id=-1,
             )
             conv_out = conv_out_t.transpose(0, 1).contiguous()
         else:
@@ -355,10 +358,11 @@ class JambaMambaMixer(nn.Module):
                 conv_out.transpose(0, 1).contiguous(),
                 dt.transpose(0, 1).contiguous(),
                 self.A, B_bts, C_bts, self.D,
-                gate.transpose(0, 1).contiguous(),
-                time_proj_bias,
+                dt_bias=time_proj_bias,
+                z=gate.transpose(0, 1).contiguous(),
                 dt_softplus=True,
                 state_batch_indices=cache_indices,
+                null_block_id=-1,
                 out=scan_out,
             )
             scan_out = scan_out.transpose(0, 1).contiguous()

@@ -10,6 +10,7 @@ as vLLM), falling back to hardcoded defaults when no file is found.
 from __future__ import annotations
 
 import functools
+import importlib.util
 import json
 import os
 
@@ -223,6 +224,21 @@ def _get_moe_configs(E: int, N: int, dtype: str | None,
     if os.path.isdir(vllm_configs_dir):
         config_file_paths.append(os.path.join(vllm_configs_dir, json_file_name))
 
+    # The pinned vLLM wheel ships its tuned H200/B200 tables as package data.
+    # Prefer those over the heuristic when no adjacent source checkout exists.
+    vllm_spec = importlib.util.find_spec("vllm")
+    if vllm_spec is not None and vllm_spec.submodule_search_locations:
+        installed_configs_dir = os.path.join(
+            next(iter(vllm_spec.submodule_search_locations)),
+            "model_executor",
+            "layers",
+            "fused_moe",
+            "configs",
+        )
+        config_file_paths.append(
+            os.path.join(installed_configs_dir, json_file_name)
+        )
+
     local_configs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "moe_configs")
     if os.path.isdir(local_configs_dir):
         config_file_paths.append(os.path.join(local_configs_dir, json_file_name))
@@ -288,6 +304,15 @@ def _get_vllm_default_config(M: int, E: int = 0, dtype: str | None = None) -> di
 
 def _get_default_config(M: int, E: int = 0, N: int = 0,
                         block_shape: list[int] | None = None) -> dict:
+    if block_shape is not None and all(block_shape):
+        return {
+            "BLOCK_SIZE_M": 16 if M <= 64 else 64,
+            "BLOCK_SIZE_N": block_shape[0],
+            "BLOCK_SIZE_K": block_shape[1],
+            "GROUP_SIZE_M": 1 if M <= 16 else 32,
+            "num_warps": 4,
+            "num_stages": 3,
+        }
     if M <= 4:
         return dict(_DEFAULT_CONFIG_HEURISTIC["small"])
     if M <= 64:

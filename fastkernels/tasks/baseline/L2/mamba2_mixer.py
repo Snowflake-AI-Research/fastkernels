@@ -496,6 +496,7 @@ class Mamba2Mixer(nn.Module):
                 self.conv1d.bias,
                 self.activation,
                 conv_state_indices=mamba_meta.state_indices_d,
+                null_block_id=-1,
             )
             x_d, B_d, C_d = self._split_BC(hsBC_d)
 
@@ -524,6 +525,7 @@ class Mamba2Mixer(nn.Module):
                 dt_bias=dt_bias,
                 dt_softplus=True,
                 state_batch_indices=mamba_meta.state_indices_d,
+                null_block_id=-1,
                 out=ssm_out_d.view(num_decode_tokens, -1, self.head_dim),
             )
 

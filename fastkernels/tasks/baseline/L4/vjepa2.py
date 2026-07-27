@@ -135,8 +135,17 @@ def _load_vjepa2_state_dict(weight_dir: str) -> dict[str, torch.Tensor]:
     return remapped
 
 
-def _load_weights_checked(model: nn.Module, state_dict: dict[str, torch.Tensor], model_name: str) -> None:
+def _load_weights_checked(
+    model: nn.Module,
+    state_dict: dict[str, torch.Tensor],
+    model_name: str,
+    allow_missing_prefixes: tuple[str, ...] = (),
+) -> None:
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    missing = [
+        name for name in missing
+        if not name.startswith(allow_missing_prefixes)
+    ]
     if missing or unexpected:
         raise RuntimeError(
             f"Unexpected V-JEPA 2 checkpoint mapping for {model_name}: "
@@ -240,6 +249,18 @@ class VJEPA2Model(nn.Module):
         return model
 
 
+def _prefix_backbone_keys(
+    state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    remapped: dict[str, torch.Tensor] = {}
+    for name, tensor in state_dict.items():
+        if name.startswith(("encoder.", "predictor.")):
+            remapped[f"vjepa2.{name}"] = tensor
+        else:
+            remapped[name] = tensor
+    return remapped
+
+
 class VJEPA2ForVideoClassification(nn.Module):
     def __init__(self, config: HFVJEPA2Config):
         super().__init__()
@@ -297,6 +318,13 @@ class VJEPA2ForVideoClassification(nn.Module):
         config = HFVJEPA2Config.from_pretrained(model_name, local_files_only=local_files_only)
         model = cls(config)
         weight_dir = _snapshot_dir(model_name, local_files_only=local_files_only)
-        state_dict = _load_vjepa2_state_dict(weight_dir)
-        _load_weights_checked(model, state_dict, model_name)
+        state_dict = _prefix_backbone_keys(
+            _load_vjepa2_state_dict(weight_dir)
+        )
+        _load_weights_checked(
+            model,
+            state_dict,
+            model_name,
+            allow_missing_prefixes=("pooler.", "classifier."),
+        )
         return model

@@ -22,8 +22,9 @@ from pathlib import Path
 from typing import Any
 
 _THIS_DIR = Path(__file__).resolve().parent
-_PACKAGE_DIR = _THIS_DIR.parent.parent
-sys.path.insert(0, str(_PACKAGE_DIR))
+_PACKAGE_DIR = _THIS_DIR.parent
+_PROJECT_ROOT = _PACKAGE_DIR.parent
+sys.path.insert(0, str(_PROJECT_ROOT))
 
 from fastkernels.validate.worker import run_worker
 
@@ -522,7 +523,7 @@ def main():
     input_info["protocol"] = "fastdllm-official-like"
 
     common = {
-        "project_root": str(_PACKAGE_DIR),
+        "project_root": str(_PROJECT_ROOT),
         "model": args.model,
         "requests": requests,
         "batch_size": args.batch_size,

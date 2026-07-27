@@ -16,7 +16,10 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-import vllm._C  # noqa: F401  — registers torch.ops._C_cache_ops
+try:
+    import vllm._custom_ops  # noqa: F401 — vLLM >= 0.20 registers torch.ops._C_cache_ops
+except ImportError:
+    import vllm._C  # noqa: F401 — legacy vLLM <= 0.18
 
 _HEAD_DIM = 128
 _SCALE_BYTES = 4
