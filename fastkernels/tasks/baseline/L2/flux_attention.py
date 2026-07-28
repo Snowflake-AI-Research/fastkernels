@@ -13,7 +13,12 @@ import torch
 import torch.nn as nn
 
 from ....infra.tp import _tp_size
-from ..L1.t5_layer_norm import T5LayerNorm as FP32RMSNorm
+# Fused RMSNorm (torch.ops._C.rms_norm) for q/k-norm: head_dim (128) is a multiple
+# of 32 so the CUDA kernel is valid. The divergence diagnostic showed our T5LayerNorm
+# qk-norm is numerically identical to vllm-omni's RMSNorm (attention output cos=1.0),
+# and this fused wrapper is that same kernel -- so it's bit-identical and replaces
+# ~6 fp32 up/down-cast kernels per call with one fused kernel.
+from ..L1.rms_norm import RMSNorm as FP32RMSNorm
 from ..L1.diffusion_rope import DiffusionRoPE
 from ..L1.dense_attention import DenseAttention
 from .parallel_linear import (

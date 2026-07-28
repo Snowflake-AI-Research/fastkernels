@@ -280,26 +280,58 @@ def _patch_t5_load_weights_if_needed():
 
 _patch_t5_load_weights_if_needed()
 
-async def run_benchmark(cfg):
-    from vllm_omni.entrypoints.async_omni_diffusion import AsyncOmniDiffusion
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
+def run_benchmark(cfg):
+    # vllm-omni >=0.25 removed AsyncOmniDiffusion; drive diffusion through the
+    # unified sync Omni engine (same path HunyuanVideo uses). A list of
+    # single-prompt requests is co-batched by the scheduler; output_type="latent"
+    # keeps raw latents for the correctness comparison.
+    from vllm_omni.entrypoints.omni import Omni
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-    od_config = OmniDiffusionConfig(
-        model=cfg["model"],
-        dtype=torch.bfloat16,
-        enforce_eager=True,
-        output_type="latent",
-    )
-    engine = AsyncOmniDiffusion(model=cfg["model"], od_config=od_config)
+    seed = cfg["seed"]
 
-    warmup_params = OmniDiffusionSamplingParams(
-        height=256, width=256, num_inference_steps=2,
-        guidance_scale=3.5,
-    )
-    warmup_params.seed = cfg["seed"]
-    warmup_params.guidance_scale_provided = True
-    await engine.generate_batch(["warmup"], warmup_params)
+    import numpy as np
+
+    def _params(s):
+        # Pass an int seed, NOT a live generator: the Omni engine is multi-process
+        # (spawn), so a live torch.Generator does not survive IPC to the diffusion
+        # worker, which then falls back to UNSEEDED RNG (different noise every run).
+        # With seed set + generator=None the worker builds
+        # torch.Generator(cuda).manual_seed(seed) itself (diffusion_model_runner
+        # ._initialize_generator). Because it reseeds per request, every image
+        # starts from the same seed -- which we mirror on the fastkernels side
+        # (a fresh manual_seed per image) so both engines produce identical latents.
+        return OmniDiffusionSamplingParams(
+            height=s["height"], width=s["width"],
+            num_inference_steps=s["num_inference_steps"],
+            guidance_scale=s.get("guidance_scale", 3.5),
+            seed=seed,
+        )
+
+    def _gen_pixel_batch(prompts, s):
+        # One bare-dict request per prompt (the sync diffusion path; output_type
+        # "latent" errors here), each with a FRESH seeded params so the worker
+        # reseeds identically per image. Collect decoded RGB as a stacked
+        # [N, C, H, W] float tensor in [0, 1] matching what the "ours" worker saves.
+        chw = []
+        for p in prompts:
+            outs = engine.generate({"prompt": p}, _params(s))
+            items = outs if isinstance(outs, list) else [outs]
+            for it in items:
+                imgs = getattr(it, "images", None)
+                if imgs:
+                    arr = np.array(imgs[0].convert("RGB"), dtype=np.float32) / 255.0
+                    chw.append(torch.from_numpy(arr).permute(2, 0, 1))
+                    break
+        return torch.stack(chw, dim=0) if chw else None
+
+    print("[vllm-omni] Creating Omni engine...", file=sys.stderr, flush=True)
+    engine = Omni(model=cfg["model"], enforce_eager=True)
+    print("[vllm-omni] Engine ready", file=sys.stderr, flush=True)
+
+    engine.generate({"prompt": "warmup"}, OmniDiffusionSamplingParams(
+        height=256, width=256, num_inference_steps=2, guidance_scale=3.5, seed=seed,
+    ))
 
     latent_dir = cfg.get("latent_dir")
     if latent_dir:
@@ -310,15 +342,6 @@ async def run_benchmark(cfg):
         batches = scenario.get("batches", [scenario.get("prompts", [])])
         if not isinstance(batches[0], list):
             batches = [batches]
-        params = OmniDiffusionSamplingParams(
-            height=scenario["height"],
-            width=scenario["width"],
-            num_inference_steps=scenario["num_inference_steps"],
-            guidance_scale=scenario.get("guidance_scale", 3.5),
-        )
-        params.seed = cfg["seed"]
-        params.guidance_scale_provided = True
-
         total_elapsed = 0.0
         total_images = 0
         desc = f"vllm-omni {scenario['name']}"
@@ -326,26 +349,17 @@ async def run_benchmark(cfg):
         for batch_idx, batch_prompts in enumerate(pbar):
             torch.cuda.synchronize()
             start = time.perf_counter()
-            output = await engine.generate_batch(batch_prompts, params)
+            pixels = _gen_pixel_batch(batch_prompts, scenario)
             torch.cuda.synchronize()
             batch_elapsed = time.perf_counter() - start
             total_elapsed += batch_elapsed
             total_images += len(batch_prompts)
 
-            if latent_dir and output is not None:
-                latent_tensor = None
-                if hasattr(output, "latents") and output.latents is not None:
-                    latent_tensor = output.latents
-                elif hasattr(output, "images") and output.images:
-                    for img in output.images:
-                        if isinstance(img, torch.Tensor):
-                            latent_tensor = img
-                            break
-                if latent_tensor is not None:
-                    torch.save(
-                        latent_tensor.cpu(),
-                        os.path.join(latent_dir, f"{scenario['name']}_batch{batch_idx:04d}.pt"),
-                    )
+            if latent_dir and pixels is not None:
+                torch.save(
+                    pixels.cpu(),
+                    os.path.join(latent_dir, f"{scenario['name']}_batch{batch_idx:04d}.pt"),
+                )
 
             pbar.set_postfix(imgs=total_images, ips=f"{total_images / total_elapsed:.2f}")
 
@@ -359,24 +373,17 @@ async def run_benchmark(cfg):
     latency_results = []
     for ls in cfg.get("latency_scenarios", []):
         prompts = ls["prompts"]
-        params = OmniDiffusionSamplingParams(
-            height=ls["height"], width=ls["width"],
-            num_inference_steps=ls["num_inference_steps"],
-            guidance_scale=ls.get("guidance_scale", 3.5),
-        )
-        params.seed = cfg["seed"]
-        params.guidance_scale_provided = True
         num_warmup = ls.get("num_warmup", 2)
         num_iters = ls.get("num_iters", 5)
         for i in tqdm(range(num_warmup), desc=f"vllm-omni latency warmup {ls['name']}", file=sys.stderr):
             torch.cuda.synchronize()
-            await engine.generate_batch(prompts, params)
+            _gen_pixel_batch(prompts, ls)
             torch.cuda.synchronize()
         latencies = []
         for i in tqdm(range(num_iters), desc=f"vllm-omni latency {ls['name']}", file=sys.stderr):
             torch.cuda.synchronize()
             t0 = time.perf_counter()
-            await engine.generate_batch(prompts, params)
+            _gen_pixel_batch(prompts, ls)
             torch.cuda.synchronize()
             latencies.append(time.perf_counter() - t0)
         latency_results.append({
@@ -385,7 +392,6 @@ async def run_benchmark(cfg):
             "num_iters": num_iters, "latencies": latencies,
         })
 
-    engine.close()
     torch.cuda.empty_cache()
     with open(cfg["output_file"], "w") as f:
         json.dump({"throughput": all_results, "latency": latency_results}, f)
@@ -393,7 +399,7 @@ async def run_benchmark(cfg):
 def main():
     with open(sys.argv[1]) as f:
         cfg = json.load(f)
-    asyncio.run(run_benchmark(cfg))
+    run_benchmark(cfg)
 
 if __name__ == "__main__":
     main()
@@ -461,9 +467,17 @@ def main():
         desc = f"fastkernels {scenario['name']}"
         pbar = tqdm(batches, desc=desc, unit="batch", file=sys.stderr)
         for batch_idx, batch_prompts in enumerate(pbar):
+            # Reseed per image (fresh manual_seed(seed) per prompt) to mirror the
+            # vllm-omni worker, whose multi-process engine reseeds each request from
+            # the same seed. randn_tensor then draws each image from its own
+            # freshly-seeded generator -> identical initial latents to the reference.
+            batch_gen = [
+                torch.Generator(device="cuda").manual_seed(cfg["seed"])
+                for _ in batch_prompts
+            ]
             torch.cuda.synchronize()
             start = time.perf_counter()
-            output = engine.generate(batch_prompts, params)
+            output = engine.generate(batch_prompts, params, generator=batch_gen)
             torch.cuda.synchronize()
             batch_elapsed = time.perf_counter() - start
             total_elapsed += batch_elapsed
@@ -477,6 +491,9 @@ def main():
                 decoded = (unpacked / pipeline.vae.config.scaling_factor) + pipeline.vae.config.shift_factor
                 decoded = decoded.to(dtype=pipeline.vae.dtype)
                 decoded = pipeline.vae.decode(decoded, return_dict=False)[0]
+                # Normalize VAE output ([-1, 1]) to [0, 1] so it matches the space
+                # the reference worker saves (PIL RGB / 255) for the comparison.
+                decoded = (decoded / 2 + 0.5).clamp(0, 1)
                 torch.save(
                     decoded.cpu(),
                     os.path.join(latent_dir, f"{scenario['name']}_batch{batch_idx:04d}.pt"),
@@ -590,9 +607,12 @@ def main():
         desc = f"fastkernels {scenario['name']}"
         pbar = tqdm(enumerate(prompts), total=len(prompts), desc=desc, unit="vid", file=sys.stderr)
         for pi, prompt in pbar:
+            # Reseed per video (fresh manual_seed(seed)) to mirror the vllm-omni
+            # worker's per-request reseed, so both engines draw identical latents.
+            vid_gen = torch.Generator(device="cuda").manual_seed(cfg["seed"])
             torch.cuda.synchronize()
             start = time.perf_counter()
-            output = engine.generate([prompt], params)
+            output = engine.generate([prompt], params, generator=vid_gen)
             torch.cuda.synchronize()
             elapsed = time.perf_counter() - start
             total_elapsed += elapsed
@@ -669,13 +689,17 @@ def main():
         os.makedirs(frames_dir, exist_ok=True)
 
     def _make_params(s):
-        generator = torch.Generator(device="cuda").manual_seed(seed)
+        # Pass an int seed, NOT a live generator (the Omni engine is multi-process,
+        # so a live torch.Generator won't survive IPC to the diffusion worker and it
+        # would fall back to unseeded RNG). The worker builds
+        # torch.Generator(cuda).manual_seed(seed) itself; a fresh params per video
+        # reseeds each request, which the fastkernels worker mirrors.
         return OmniDiffusionSamplingParams(
             height=s["height"], width=s["width"],
             num_frames=s["num_frames"],
             num_inference_steps=s["num_inference_steps"],
             guidance_scale=s.get("guidance_scale", 6.0),
-            generator=generator,
+            seed=seed,
         )
 
     all_results = []
@@ -745,39 +769,6 @@ import asyncio, json, os, sys, time, torch
 import numpy as np
 from tqdm import tqdm
 
-def _find_stage_config():
-    """Return a patched cosyvoice3.yaml with enforce_eager=true.
-
-    CUDA graph capture for the multi-stage CosyVoice3 pipeline can
-    take 10+ minutes on first run, easily exceeding the default
-    stage_init_timeout.  We copy the shipped YAML and force eager
-    mode so startup is fast and predictable.
-    """
-    import tempfile
-    import vllm_omni
-    import yaml
-
-    pkg_dir = os.path.dirname(vllm_omni.__file__)
-    src = os.path.join(pkg_dir, "model_executor", "stage_configs", "cosyvoice3.yaml")
-    if not os.path.exists(src):
-        raise FileNotFoundError(f"cosyvoice3.yaml not found at {src}")
-
-    with open(src) as f:
-        cfg = yaml.safe_load(f)
-
-    for stage in cfg.get("stage_args", []):
-        ea = stage.get("engine_args", {})
-        ea["enforce_eager"] = True
-
-    patched = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".yaml", prefix="cosyvoice3_eager_",
-        delete=False,
-    )
-    yaml.dump(cfg, patched, default_flow_style=False)
-    patched.close()
-    print(f"  Using eager-mode stage config: {patched.name}", file=sys.stderr)
-    return patched.name
-
 def _download_and_get_tokenizer_path(model_name):
     """Download model and return path to CosyVoice-BlankEN tokenizer dir."""
     from huggingface_hub import snapshot_download
@@ -838,8 +829,6 @@ def _make_prompt(text, prompt_text, ref_audio, ref_sr):
 
 def _build_sampling_params(config):
     from vllm import SamplingParams
-    from vllm_omni.model_executor.models.cosyvoice3.config import CosyVoice3Config
-    cv_cfg = CosyVoice3Config()
     greedy = config.get("greedy", False)
     temp = 0.0 if greedy else 1.0
     seed_val = config.get("seed", None) if greedy else None
@@ -876,17 +865,20 @@ def main():
     with open(sys.argv[1]) as f:
         cfg = json.load(f)
 
-    stage_config = _find_stage_config()
     model_dir, tok_dir = _download_and_get_tokenizer_path(cfg["model"])
     _ensure_config_has_model_type(model_dir)
     _ensure_mel_filters_asset()
 
     from vllm_omni.entrypoints.omni import Omni
+    # vllm-omni >=0.25 removed stage_configs/cosyvoice3.yaml: the pipeline is
+    # auto-resolved from model_type="cosyvoice3" and vllm_omni/deploy/cosyvoice3.yaml
+    # loads automatically. A global enforce_eager forces both stages eager,
+    # avoiding the multi-minute CUDA-graph capture the old patched YAML sidestepped.
     omni = Omni(
         model=model_dir,
-        stage_configs_path=stage_config,
         trust_remote_code=True,
         tokenizer=tok_dir,
+        enforce_eager=True,
         stage_init_timeout=600,
     )
     sampling_params_list = _build_sampling_params(cfg)
@@ -994,6 +986,37 @@ import numpy as np
 from tqdm import tqdm
 from functools import partial
 
+_S3_MODEL = None
+
+def _s3_speech_token(ref_audio, ref_sr, return_device):
+    """Speech tokens via the on-GPU S3Tokenizer.
+
+    vllm-omni >=0.25 removed cosyvoice3.utils.extract_speech_token and moved this
+    logic into CosyVoice3Model._extract_speech_token_via_s3. We replicate it so
+    our "ours" preprocessing produces the identical (speech_token[1,T], len[1])
+    int32 tensors the reference now produces internally.
+    """
+    global _S3_MODEL
+    import s3tokenizer
+    from math import gcd
+    from scipy.signal import resample_poly
+    if _S3_MODEL is None:
+        _S3_MODEL = s3tokenizer.load_model("speech_tokenizer_v3_25hz").to("cuda").eval()
+    wav = np.asarray(ref_audio, dtype=np.float32)
+    if wav.ndim == 2:
+        wav = wav.mean(axis=1)
+    if int(ref_sr) != 16000:
+        g = gcd(int(ref_sr), 16000)
+        wav = resample_poly(wav, 16000 // g, int(ref_sr) // g).astype(np.float32)
+    mel = s3tokenizer.log_mel_spectrogram(torch.from_numpy(wav))
+    mels_p, mels_lens = s3tokenizer.padding([mel])
+    with torch.inference_mode():
+        codes, codes_lens = _S3_MODEL.quantize(mels_p.cuda(), mels_lens.cuda())
+    n = int(codes_lens[0].item())
+    speech_token = codes[:1, :n].to(dtype=torch.int32, device=return_device)
+    speech_token_len = torch.tensor([n], dtype=torch.int32, device=return_device)
+    return speech_token, speech_token_len
+
 def _init_preprocessing(model_dir, config):
     """Initialise tokenizer, speech tokenizer, speaker embedder and mel extractor."""
     import onnxruntime
@@ -1009,29 +1032,26 @@ def _init_preprocessing(model_dir, config):
         skip_special_tokens=config.skip_special_tokens,
         version=config.version,
     )
-    speech_tokenizer = onnxruntime.InferenceSession(
-        os.path.join(model_dir, config.speech_tokenizer_path),
-        sess_options=option,
-        providers=["CUDAExecutionProvider" if torch.cuda.is_available() else "CPUExecutionProvider"],
-    )
+    # Speech tokens now come from the on-GPU S3Tokenizer (see _s3_speech_token),
+    # so the old ONNX speech_tokenizer session is no longer built.
     campplus = onnxruntime.InferenceSession(
         os.path.join(model_dir, config.campplus_onxx_path),
         sess_options=option,
         providers=["CPUExecutionProvider"],
     )
     feat_extractor = partial(mel_spectrogram, **getattr(config, "feat_extractor", {}))
-    return tokenizer, speech_tokenizer, campplus, feat_extractor
+    return tokenizer, None, campplus, feat_extractor
 
 
 def _preprocess(text, prompt_text, ref_audio, ref_sr, tokenizer, speech_tok, campplus, feat_ext, config, device):
     """Run the same preprocessing as vllm-omni to produce model inputs."""
     from vllm_omni.model_executor.models.cosyvoice3.utils import (
-        extract_text_token, extract_speech_token, extract_speech_feat,
-        extract_spk_embedding,
+        extract_text_token, extract_speech_feat, extract_spk_embedding,
     )
     text_token, _ = extract_text_token(text, tokenizer, config.allowed_special)
     prompt_text_token, _ = extract_text_token(prompt_text, tokenizer, config.allowed_special)
-    speech_token, _ = extract_speech_token((ref_audio, ref_sr), speech_tok, device)
+    # extract_speech_token was removed upstream; use the on-GPU S3Tokenizer.
+    speech_token, _ = _s3_speech_token(ref_audio, ref_sr, device)
     speech_feat, speech_feat_len = extract_speech_feat((ref_audio, ref_sr), feat_ext, device)
 
     if config.sample_rate == 24000:
@@ -1269,14 +1289,19 @@ def main():
             conds = conds.transpose(1, 2)
             mel_mask = (~make_pad_mask(torch.tensor([mel_len1 + mel_len2]))).to(h_kb)
 
+            # Both CFMs draw noise from the global RNG (the upstream-aligned forward
+            # has no cfm_seed arg); seed identically before each call so the z the
+            # Euler solver starts from matches, making the comparison meaningful.
+            torch.manual_seed(12345)
             feat_kb, _ = kb_c2w.flow_model.decoder(
                 mu=h_kb.transpose(1, 2).contiguous(), mask=mel_mask.unsqueeze(1),
-                spks=emb_kb, cond=conds, n_timesteps=10, cfm_seed=12345,
+                spks=emb_kb, cond=conds, n_timesteps=10,
             )
 
+            torch.manual_seed(12345)
             feat_vl, _ = vl_c2w.flow_model.decoder(
                 mu=h_vl.transpose(1, 2).contiguous(), mask=mel_mask.unsqueeze(1),
-                spks=emb_vl, cond=conds, n_timesteps=10, cfm_seed=12345,
+                spks=emb_vl, cond=conds, n_timesteps=10,
             )
 
             feat_kb_gen = feat_kb[:, :, mel_len1:].float()
@@ -1599,7 +1624,7 @@ def _print_latency_comparison(
 
 def _print_correctness_flux(correctness: dict):
     print("\n" + "=" * 90)
-    print("  CORRECTNESS COMPARISON (packed latent space, per-batch)")
+    print("  CORRECTNESS COMPARISON (decoded pixel space [0,1], per-batch)")
     print("=" * 90)
     print(f"  {'Scenario':<25} {'Batches':>8} {'Mean CosSim':>12} {'Min CosSim':>11} {'Mean MSE':>12} {'Max MSE':>12} {'Result':>8}")
     print("  " + "-" * 88)

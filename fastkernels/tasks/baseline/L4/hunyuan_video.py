@@ -208,7 +208,7 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
             for _ in range(config.num_layers)
         ])
 
-        self.norm_out = AdaLayerNormContinuous(inner_dim, inner_dim, elementwise_affine=False, eps=1e-6)
+        self.norm_out = AdaLayerNormContinuous(inner_dim, inner_dim, elementwise_affine=False, eps=1e-6, promote_fp32=False)
         self.proj_out = Linear(inner_dim, config.patch_size_t * config.patch_size * config.patch_size * self.out_channels)
 
     def forward(
@@ -320,9 +320,17 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in original_name:
                     continue
-                lookup_name = original_name.replace(weight_name, param_name)
-                if lookup_name not in params_dict:
-                    break
+                # Remap into a temp and only commit lookup_name on a hit. A miss
+                # must `continue` (try other mappings / fall through to the
+                # `for...else` fallback), NOT `break`: the token refiner uses
+                # SEPARATE to_q/to_k/to_v (no packed to_qkv), so the remap misses;
+                # the old `break` aborted the loop AND skipped the fallback loader,
+                # leaving those 12 projection tensors at random init. Mirrors the
+                # reference's `continue` (hunyuan_video_15_transformer.py:883).
+                maybe = original_name.replace(weight_name, param_name)
+                if maybe not in params_dict:
+                    continue
+                lookup_name = maybe
                 param = params_dict[lookup_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)

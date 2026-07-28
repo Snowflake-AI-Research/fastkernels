@@ -96,7 +96,6 @@ import json
 import os
 import sys
 import time
-import warnings
 
 import torch
 from tqdm import tqdm
@@ -236,18 +235,10 @@ def _load_video_paths(dataset_name, dataset_split, num_needed, seed):
 
 
 def _preprocess_dataset_videos(cfg, config, dtype, device, total_videos):
-    try:
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message="The video decoding and encoding capabilities of torchvision are deprecated.*",
-            )
-            from torchvision.io import read_video
-    except Exception as exc:
-        raise RuntimeError(
-            "Real video dataset benchmarking requires torchvision video decoding support. "
-            "Install PyAV, e.g. `python -m pip install av`."
-        ) from exc
+    # torchvision >=0.26 removed torchvision.io.read_video, so decode with
+    # decord (a runtime dependency). len(reader) gives the frame count without
+    # decoding, so we only decode the frames we actually sample.
+    import decord
 
     from transformers import AutoVideoProcessor
 
@@ -258,9 +249,9 @@ def _preprocess_dataset_videos(cfg, config, dtype, device, total_videos):
 
     clips = []
     for path in video_paths:
-        video, _, _ = read_video(path, pts_unit="sec")
-        indices = _sample_frame_indices(video.shape[0], config.frames_per_clip)
-        clip = video.index_select(0, indices).numpy()
+        reader = decord.VideoReader(path, num_threads=1)
+        indices = _sample_frame_indices(len(reader), config.frames_per_clip)
+        clip = reader.get_batch(indices.tolist()).asnumpy()  # (T, H, W, C) uint8
         clips.append(clip)
 
     pixel_values = processor(clips, return_tensors="pt")["pixel_values_videos"]

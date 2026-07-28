@@ -109,11 +109,18 @@ class DenseAttention(nn.Module):
                 )
             return
 
-        # backend == "auto"
+        # backend == "auto": flash-attn on Ampere/Hopper (80<=cc<100); cuDNN flash
+        # on Blackwell (cc>=100), where PyTorch's SDPA heuristic otherwise picks
+        # FA2 (~3.6x slower than cuDNN for large joint-attention shapes on B200).
+        # This mirrors vllm-omni's platform selector, which pins cuDNN/TRTLLM on
+        # Blackwell. The cuDNN forward path already falls back to mem-efficient/MATH
+        # for shapes/masks cuDNN rejects, so this is safe as a default.
         cc = (torch.cuda.get_device_capability()[0] * 10
               + torch.cuda.get_device_capability()[1])
         if 80 <= cc < 100:
             self.fa_func = _resolve_flash_attn_func()
+        elif cc >= 100:
+            self.use_cudnn_kernel = True
 
     def forward(
         self,
@@ -157,10 +164,11 @@ class DenseAttention(nn.Module):
             )
         elif self.use_cudnn_kernel:
             from torch.nn.attention import sdpa_kernel, SDPBackend
-            # cuDNN flash needs contiguous tensors. The permute above
-            # produces non-contiguous strides; without ``.contiguous()``
-            # cuDNN silently falls back to whatever's next on the list.
-            q = q.contiguous(); k = k.contiguous(); v = v.contiguous()
+            # The sdpa_kernel context below FORCES cuDNN, and on Blackwell (sm100,
+            # cuDNN 9.19) the cuDNN flash kernel accepts the permuted, non-contiguous
+            # q/k/v views directly -- so we skip the q/k/v .contiguous() clones (they
+            # were a real cost: 3 clones/block x54 blocks). Verified bit-identical and
+            # faster; if cuDNN ever rejects a layout it raises -> MATH fallback below.
             if attn_mask is not None and not attn_mask.is_contiguous():
                 attn_mask = attn_mask.contiguous()
             # Try strict cuDNN first. Adding MATH as a fallback in the
@@ -187,9 +195,16 @@ class DenseAttention(nn.Module):
                         scale=softmax_scale,
                     )
         else:
+            # SDPA accepts a boolean mask (True = attend) directly; only a float
+            # (additive) mask needs dtype coercion. Coercing a bool mask to q.dtype
+            # would turn True/False into a 1.0/0.0 additive bias (wrong semantics) --
+            # e.g. the HunyuanVideo key-padding mask would then fail to mask padding
+            # on non-cuDNN backends.
+            if attn_mask is not None and attn_mask.dtype != torch.bool:
+                attn_mask = attn_mask.to(dtype=q.dtype)
             out = F.scaled_dot_product_attention(
                 q, k, v,
-                attn_mask=attn_mask.to(dtype=q.dtype) if attn_mask is not None else None,
+                attn_mask=attn_mask,
                 dropout_p=0.0,
                 is_causal=False if attn_mask is not None else causal,
                 scale=softmax_scale,

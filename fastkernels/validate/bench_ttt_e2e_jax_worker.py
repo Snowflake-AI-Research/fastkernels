@@ -40,21 +40,30 @@ def _add_ttt_e2e_to_path() -> str:
 
     Search order:
       1. $TTT_E2E_REPO env var (explicit override)
-      2. /tmp/ttt_e2e_ref (where this branch's bench harness clones it)
-      3. ~/ttt_e2e_ref
+      2. THIRD_PARTY_DIR/ttt_e2e (where ``validate --provision`` clones it;
+         THIRD_PARTY_DIR = $FASTKERNELS_THIRD_PARTY_DIR or ~/.fastkernels/third_party).
+         This worker runs as a bare subprocess and does not import fastkernels,
+         so the path is resolved directly here.
+      3. /tmp/ttt_e2e_ref, ~/ttt_e2e_ref (legacy locations)
     """
     candidates = []
     env = os.environ.get("TTT_E2E_REPO", "").strip()
     if env:
         candidates.append(env)
+    third_party = os.environ.get(
+        "FASTKERNELS_THIRD_PARTY_DIR", str(Path.home() / ".fastkernels" / "third_party")
+    )
+    candidates.append(str(Path(third_party) / "ttt_e2e"))
     candidates += ["/tmp/ttt_e2e_ref", str(Path.home() / "ttt_e2e_ref")]
     for c in candidates:
         if c and Path(c, "ttt", "model", "transformer.py").is_file():
             sys.path.insert(0, c)
             return c
     raise FileNotFoundError(
-        "Could not find the ttt-e2e reference repo. Set $TTT_E2E_REPO or "
-        "clone https://github.com/test-time-training/e2e to /tmp/ttt_e2e_ref."
+        "Could not find the ttt-e2e reference repo. Run "
+        "`python -m fastkernels.validate.provision ttt`, set $TTT_E2E_REPO, or "
+        "clone https://github.com/test-time-training/e2e to "
+        f"{Path(third_party) / 'ttt_e2e'}."
     )
 
 

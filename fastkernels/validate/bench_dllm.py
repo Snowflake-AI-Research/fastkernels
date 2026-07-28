@@ -26,6 +26,7 @@ _PACKAGE_DIR = _THIS_DIR.parent
 _PROJECT_ROOT = _PACKAGE_DIR.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
+from fastkernels import THIRD_PARTY_DIR
 from fastkernels.validate.worker import run_worker
 
 
@@ -36,7 +37,10 @@ DEFAULT_GEN_LENGTH = 256
 DEFAULT_BLOCK_LENGTH = 32
 DEFAULT_THRESHOLD = 0.9
 DEFAULT_OURS_BACKEND = "dual"
-DEFAULT_FASTDLLM_ROOT = "third_party/Fast-dLLM"
+# The official Fast-dLLM reference repo is cloned under THIRD_PARTY_DIR by the
+# provisioner. Upstream moved the LLaDA reference (generate.py + model/) under a
+# ``v1/`` subtree, so the root the harness adds to sys.path is <repo>/v1.
+DEFAULT_FASTDLLM_ROOT = str(THIRD_PARTY_DIR / "Fast-dLLM" / "v1")
 DEFAULT_FEWSHOT_SEED = 1234
 MASK_TOKEN_ID = 126336
 FASTDLLM_IGNORE_TOKEN_ID = 126081

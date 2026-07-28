@@ -29,8 +29,8 @@ class HunyuanVideo15TransformerBlock(nn.Module):
         super().__init__()
         hidden_size = num_attention_heads * attention_head_dim
 
-        self.norm1 = AdaLayerNormZero(hidden_size, norm_type="layer_norm")
-        self.norm1_context = AdaLayerNormZero(hidden_size, norm_type="layer_norm")
+        self.norm1 = AdaLayerNormZero(hidden_size, norm_type="layer_norm", promote_fp32=False)
+        self.norm1_context = AdaLayerNormZero(hidden_size, norm_type="layer_norm", promote_fp32=False)
 
         self.attn = HunyuanVideo15Attention(
             query_dim=hidden_size,
@@ -42,10 +42,10 @@ class HunyuanVideo15TransformerBlock(nn.Module):
             eps=1e-6,
         )
 
-        self.norm2 = LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm2 = LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, promote_fp32=False)
         self.ff = FeedForward(dim=hidden_size, dim_out=hidden_size, mult=mlp_ratio)
 
-        self.norm2_context = LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm2_context = LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6, promote_fp32=False)
         self.ff_context = FeedForward(dim=hidden_size, dim_out=hidden_size, mult=mlp_ratio)
 
     def forward(

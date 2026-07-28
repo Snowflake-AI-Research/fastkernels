@@ -96,4 +96,20 @@ class HunyuanVideo15ConditioningMerge(nn.Module):
                 text_mask[~text_mask],
             ], dim=0))
 
-        return torch.stack(new_hidden), torch.stack(new_mask)
+        encoder_hidden_states = torch.stack(new_hidden)
+        encoder_attention_mask = torch.stack(new_mask)
+
+        # Match the reference (hunyuan_video_15_transformer.py:808-813): tokens are
+        # ordered valid-first, so truncate the merged stream to the max number of
+        # valid tokens across the batch (dropping trailing padding), and drop the
+        # mask entirely when everything that remains is valid. Without this, ~1735
+        # padding tokens per prompt are attended to unmasked on every layer/step
+        # (corrupting the output and wasting attention compute).
+        max_valid = int(encoder_attention_mask.sum(dim=1).max().item())
+        if max_valid < encoder_attention_mask.shape[1]:
+            encoder_hidden_states = encoder_hidden_states[:, :max_valid]
+            encoder_attention_mask = encoder_attention_mask[:, :max_valid]
+        if bool(encoder_attention_mask.all()):
+            return encoder_hidden_states, None
+
+        return encoder_hidden_states, encoder_attention_mask

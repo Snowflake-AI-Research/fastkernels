@@ -34,8 +34,8 @@ class FluxTransformerBlock(nn.Module):
         quant_config: dict | None = None,
     ):
         super().__init__()
-        self.norm1 = AdaLayerNormZero(dim)
-        self.norm1_context = AdaLayerNormZero(dim)
+        self.norm1 = AdaLayerNormZero(dim, promote_fp32=False)
+        self.norm1_context = AdaLayerNormZero(dim, promote_fp32=False)
 
         self.attn = FluxAttention(
             query_dim=dim,
@@ -49,10 +49,10 @@ class FluxTransformerBlock(nn.Module):
             quant_config=quant_config,
         )
 
-        self.norm2 = LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.norm2 = LayerNorm(dim, elementwise_affine=False, eps=1e-6, promote_fp32=False)
         self.ff = FeedForward(dim=dim, dim_out=dim, quant_config=quant_config)
 
-        self.norm2_context = LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.norm2_context = LayerNorm(dim, elementwise_affine=False, eps=1e-6, promote_fp32=False)
         self.ff_context = FeedForward(dim=dim, dim_out=dim, quant_config=quant_config)
 
     def forward(
@@ -127,7 +127,7 @@ class FluxSingleTransformerBlock(nn.Module):
         super().__init__()
         self.mlp_hidden_dim = int(dim * mlp_ratio)
 
-        self.norm = AdaLayerNormZeroSingle(dim)
+        self.norm = AdaLayerNormZeroSingle(dim, promote_fp32=False)
         self.proj_mlp = ReplicatedLinear(dim, self.mlp_hidden_dim, bias=True,
                                          quant_config=quant_config)
         self.act_mlp = GELU(approximate="tanh")

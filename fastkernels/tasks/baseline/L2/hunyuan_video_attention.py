@@ -14,7 +14,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..L1.t5_layer_norm import T5LayerNorm as RMSNorm
+# Fused RMSNorm (torch.ops._C.rms_norm) for q/k-norm: head_dim (128) is a multiple
+# of 32 so the CUDA kernel is valid, and it replaces ~6 fp32 up/down-cast kernels per
+# call with one fused kernel. Numerically identical to the T5LayerNorm path, and
+# faster than the reference (whose RMSNorm falls back to unfused fp32 in eager).
+from ..L1.rms_norm import RMSNorm
 from ..L1.diffusion_rope import DiffusionRoPE
 from ..L1.dense_attention import DenseAttention
 from .parallel_linear import QKVParallelLinear, RowParallelLinear
@@ -135,13 +139,21 @@ class HunyuanVideo15Attention(nn.Module):
             key = torch.cat([key, encoder_key], dim=1)
             value = torch.cat([value, encoder_value], dim=1)
 
+        attn_mask = None
         if attention_mask is not None:
             seq_len = query.shape[1]
-            attention_mask = F.pad(attention_mask, (seq_len - attention_mask.shape[1], 0), value=True)
-            attention_mask = attention_mask.bool()
+            # Left-pad the encoder key mask with True for the leading video/image
+            # query+key tokens, then shape it as a (B, 1, 1, S_kv) boolean
+            # key-padding mask so padding encoder keys are masked for every query.
+            key_mask = F.pad(
+                attention_mask, (seq_len - attention_mask.shape[1], 0), value=True
+            ).bool()
+            attn_mask = key_mask[:, None, None, :]
 
         softmax_scale = 1.0 / (self.head_dim ** 0.5)
-        hidden_states = self.attn(query, key, value, softmax_scale=softmax_scale, causal=False)
+        hidden_states = self.attn(
+            query, key, value, softmax_scale=softmax_scale, causal=False, attn_mask=attn_mask
+        )
         hidden_states = hidden_states.flatten(2, 3)
         hidden_states = hidden_states.to(query.dtype)
 

@@ -497,7 +497,15 @@ def _get_model_max_context_len(model_name: str) -> int | None:
 
 def _chat_template_ids(tokenizer, messages) -> list[int]:
     """Tokenize chat ``messages`` (with generation prompt), normalizing the
-    various return types HF tokenizers use (list / Encoding / dict / tensor)."""
+    various return types HF tokenizers use (list / Encoding / dict / tensor).
+
+    Base models (e.g. Mamba-Codestral) ship no chat template; rather than let
+    ``apply_chat_template`` raise, fall back to a plain completion prompt --
+    concatenate the message contents and tokenize with the tokenizer's default
+    special tokens (so BOS is still prepended)."""
+    if getattr(tokenizer, "chat_template", None) is None:
+        text = "\n\n".join((m.get("content") or "") for m in messages).strip()
+        return list(tokenizer.encode(text))
     token_ids = tokenizer.apply_chat_template(
         messages, tokenize=True, add_generation_prompt=True,
     )

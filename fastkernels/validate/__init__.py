@@ -422,6 +422,25 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  run id : {run_id}")
     print(f"  outputs: {run_root}{'  (resume)' if args.resume else ''}")
 
+    # Provision the reference libraries / task kernels the selected scenarios
+    # need before dispatching (git clones, pip extras, source builds). This is
+    # automatic and unconditional; provision() skips any component whose check()
+    # already passes, so it is a no-op once the references are installed. Only
+    # --dry-run bypasses it (below), since a dry run installs nothing.
+    if not args.dry_run:
+        from .provision import components_for_harnesses, provision
+
+        harnesses = {
+            h for h in (_harness_for(s.hf_name) for s in scenarios) if h is not None
+        }
+        components = components_for_harnesses(harnesses)
+        if components:
+            print(f"  provision: checking {', '.join(components)}")
+            failed = provision(components)
+            if failed:
+                print(f"error: provisioning failed for {failed} component(s)", file=sys.stderr)
+                return 1
+
     if args.dry_run:
         for index, scenario in enumerate(scenarios):
             harness = _harness_for(scenario.hf_name)

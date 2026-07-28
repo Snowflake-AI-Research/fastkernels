@@ -358,6 +358,13 @@ def _run_job_subprocess(
                 for line in proc.stdout:
                     last_output[0] = time.monotonic()
                     log.write(line)
+                    # Echo to the worker's own stdout so the child's output is
+                    # captured in Ray's per-task worker log and viewable in the
+                    # dashboard (the log file above remains the source of truth).
+                    # The worker stdout is block-buffered when redirected to a
+                    # file, so flush per line to keep the dashboard view live.
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
 
             pump = threading.Thread(target=_pump_stdout, daemon=True)
             pump.start()

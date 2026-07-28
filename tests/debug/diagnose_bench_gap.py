@@ -49,10 +49,10 @@ HEIGHT, WIDTH = 1024, 1024
 
 # ============= LOAD FASTKERNELS =============
 print("Loading fastkernels...")
-from fastkernels.infra.diffusion_engine import _download_flux_model, _load_flux_weights
+from fastkernels.infra.diffusion_engine import _download_diffusion_model, _load_flux_weights
 from fastkernels.tasks.baseline.L4.flux import FluxConfig, FluxPipeline, DiffusionSamplingParams
 
-model_path = _download_flux_model(MODEL)
+model_path = _download_diffusion_model(MODEL)
 config = FluxConfig.from_pretrained(model_path)
 kb_pipe = FluxPipeline(config, model_path)
 _load_flux_weights(kb_pipe, model_path)

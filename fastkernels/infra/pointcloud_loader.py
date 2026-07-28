@@ -9,7 +9,7 @@ from pathlib import Path
 
 import torch
 
-from fastkernels import PROJECT_ROOT
+from fastkernels import THIRD_PARTY_DIR
 
 
 DEFAULT_PTV3_CHECKPOINT_REPO = "Pointcept/PointTransformerV3"
@@ -21,13 +21,10 @@ def is_pointtransv3_model(model_name: str) -> bool:
     return "pointtransformerv3" in name or "pointtransv3" in name or "ptv3" in name
 
 
-def _project_root() -> Path:
-    # Repo root, where external checkouts under third_party/ live.
-    return PROJECT_ROOT
-
-
 def _ptv3_repo_root() -> Path:
-    return _project_root() / "third_party" / "PointTransformerV3"
+    # The official PointTransformerV3 code checkout is provisioned under
+    # THIRD_PARTY_DIR (~/.fastkernels/third_party) by validate/provision.py.
+    return THIRD_PARTY_DIR / "PointTransformerV3"
 
 
 def _install_torch_scatter_shim() -> None:

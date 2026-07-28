@@ -57,10 +57,10 @@ print("=" * 80)
 print("Loading fastkernels pipeline...")
 print("=" * 80)
 
-from fastkernels.infra.diffusion_engine import DiffusionEngine, _download_flux_model, _load_flux_weights
+from fastkernels.infra.diffusion_engine import DiffusionEngine, _download_diffusion_model, _load_flux_weights
 from fastkernels.tasks.baseline.L4.flux import FluxConfig, FluxPipeline, DiffusionSamplingParams, _calculate_shift
 
-model_path = _download_flux_model(MODEL)
+model_path = _download_diffusion_model(MODEL)
 config = FluxConfig.from_pretrained(model_path)
 kb_pipe = FluxPipeline(config, model_path)
 _load_flux_weights(kb_pipe, model_path)

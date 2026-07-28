@@ -27,14 +27,17 @@ class AdaLayerNormZero(nn.Module):
     """
 
     def __init__(self, embedding_dim: int, num_embeddings: int | None = None,
-                 norm_type="layer_norm", bias=True):
+                 norm_type="layer_norm", bias=True, promote_fp32: bool = True):
         super().__init__()
         self.emb = None
 
         self.silu = SiLU()
         self.linear = Linear(embedding_dim, 6 * embedding_dim, bias=bias)
         if norm_type == "layer_norm":
-            self.norm = LayerNorm(embedding_dim, elementwise_affine=False, eps=1e-6)
+            # promote_fp32=False (bf16 F.layer_norm already accumulates stats in
+            # fp32) avoids a full fp32 up/down-cast; callers on bf16 pass False.
+            self.norm = LayerNorm(embedding_dim, elementwise_affine=False, eps=1e-6,
+                                  promote_fp32=promote_fp32)
         else:
             raise ValueError(
                 f"Unsupported `norm_type` ({norm_type}) provided. Supported ones are: 'layer_norm'."
@@ -64,13 +67,15 @@ class AdaLayerNormZeroSingle(nn.Module):
         embedding_dim (`int`): The size of each embedding vector.
     """
 
-    def __init__(self, embedding_dim: int, norm_type="layer_norm", bias=True):
+    def __init__(self, embedding_dim: int, norm_type="layer_norm", bias=True,
+                 promote_fp32: bool = True):
         super().__init__()
 
         self.silu = SiLU()
         self.linear = Linear(embedding_dim, 3 * embedding_dim, bias=bias)
         if norm_type == "layer_norm":
-            self.norm = LayerNorm(embedding_dim, elementwise_affine=False, eps=1e-6)
+            self.norm = LayerNorm(embedding_dim, elementwise_affine=False, eps=1e-6,
+                                  promote_fp32=promote_fp32)
         else:
             raise ValueError(
                 f"Unsupported `norm_type` ({norm_type}) provided. Supported ones are: 'layer_norm'."

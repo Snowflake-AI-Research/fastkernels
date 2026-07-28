@@ -15,12 +15,14 @@ import torch
 import torch.nn as nn
 
 
-from fastkernels import PROJECT_ROOT
+from fastkernels import PROJECT_ROOT, THIRD_PARTY_DIR
 
-# Repo root: external checkouts (third_party/) live here, and worker
-# subprocesses add it to sys.path so they can ``import fastkernels``.
+# Repo checkout root — the snapshot-builder subprocess adds it to sys.path (and
+# runs there) so it can ``import fastkernels``.
 _KB_ROOT = PROJECT_ROOT
-_INSTANT_NGP_ROOT = _KB_ROOT / "third_party" / "instant-ngp"
+# The instant-ngp checkout + source build is provisioned under THIRD_PARTY_DIR
+# (~/.fastkernels/third_party by default) by fastkernels/validate/provision.py.
+_INSTANT_NGP_ROOT = THIRD_PARTY_DIR / "instant-ngp"
 _INSTANT_NGP_BUILD = _INSTANT_NGP_ROOT / "build"
 _SNAPSHOT_CACHE = Path.home() / ".cache" / "fastkernels" / "instantngp"
 

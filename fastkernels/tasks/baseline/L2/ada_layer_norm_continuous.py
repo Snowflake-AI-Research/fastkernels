@@ -40,12 +40,14 @@ class AdaLayerNormContinuous(nn.Module):
         eps=1e-5,
         bias=True,
         norm_type="layer_norm",
+        promote_fp32: bool = True,
     ):
         super().__init__()
         self.silu = SiLU()
         self.linear = Linear(conditioning_embedding_dim, embedding_dim * 2, bias=bias)
         if norm_type == "layer_norm":
-            self.norm = LayerNorm(embedding_dim, eps=eps, elementwise_affine=elementwise_affine)
+            self.norm = LayerNorm(embedding_dim, eps=eps, elementwise_affine=elementwise_affine,
+                                  promote_fp32=promote_fp32)
         else:
             raise ValueError(f"unknown norm_type {norm_type}")
 
