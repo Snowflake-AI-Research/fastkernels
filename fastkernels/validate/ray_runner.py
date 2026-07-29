@@ -327,6 +327,44 @@ def _reclaim_gpus(gpu_ids: list[str]) -> None:
             pass
 
 
+def _process_group_alive(pgid: int) -> bool:
+    """Whether any process remains in ``pgid`` (signal 0 probes, sends nothing)."""
+    try:
+        os.killpg(pgid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
+
+
+def _reap_process_group(
+    proc: subprocess.Popen,
+    physical_gpus: list[str],
+) -> bool:
+    """Kill whatever outlived the child, then reclaim its GPUs. Returns True if
+    anything had to be killed.
+
+    Rank processes -- vLLM's MultiprocExecutor workers, fastkernels' per-rank
+    engine processes -- can survive the harness process while still holding GPU
+    memory, typically hanging in NCCL teardown. Ray reassigns these GPUs to the
+    next job the moment this task returns, so a survivor resurfaces later as a
+    CUDA OOM attributed to an unrelated scenario.
+
+    ``start_new_session=True`` put the child in its own session, so its pgid is
+    its pid: this can never signal the runner or a sibling job.
+    """
+    survivors = _process_group_alive(proc.pid)
+    if survivors:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        time.sleep(1.0)
+    # Runs unconditionally: a process that re-parented or called setsid is no
+    # longer in the group but still shows up against the GPU.
+    _reclaim_gpus(physical_gpus)
+    return survivors
+
+
 def _kill_process_group(
     proc: subprocess.Popen,
     physical_gpus: list[str],
@@ -336,11 +374,18 @@ def _kill_process_group(
             os.killpg(proc.pid, sig)
         except (ProcessLookupError, PermissionError):
             break
+        # Wait on the whole group, not on proc.poll() alone: the direct child
+        # dying to SIGTERM says nothing about its rank processes, and treating
+        # it as done here is what let SIGKILL never reach the survivors. Still
+        # poll() each pass, though -- an unreaped child is a zombie, and a
+        # zombie keeps its process group alive.
         for _ in range(40):
-            if proc.poll() is not None:
+            proc.poll()
+            if not _process_group_alive(proc.pid):
                 break
             time.sleep(0.2)
-        if proc.poll() is not None:
+        proc.poll()
+        if not _process_group_alive(proc.pid):
             break
     time.sleep(1.0)
     _reclaim_gpus(physical_gpus)
@@ -375,11 +420,23 @@ def _run_job_subprocess(
         visible_gpus,
         parent_visible_gpus,
     )
+    # Thread budgets are per *rank*: a tp=N job spawns N rank processes (vLLM's
+    # MultiprocExecutor, fastkernels' engine) which each inherit these and size
+    # their own pools, so the job's allocation would otherwise be multiplied by
+    # tp. Inductor additionally ignores the allocation entirely and defaults to
+    # min(32, machine cpus) -- 32 here -- which matters now that every run
+    # starts with cold caches and so really compiles. Floor of 2: Inductor
+    # compiles serially at 1.
+    per_rank = max(2, job["num_cpus"] // max(1, job["tp"]))
+    env["OMP_NUM_THREADS"] = str(per_rank)
+    env["TORCHINDUCTOR_COMPILE_THREADS"] = str(per_rank)
     prefix = _numactl_prefix(physical_gpus or visible_gpus, numactl_mode)
     cmd = [*prefix, *job["cmd"]]
 
     proc: subprocess.Popen | None = None
+    pump: threading.Thread | None = None
     watchdog_reason: str | None = None
+    orphans_reaped = False
     last_output = [time.monotonic()]
     with log_path.open("w", buffering=1) as log:
         log.write(f"job_index: {job['index']}\n")
@@ -393,6 +450,11 @@ def _run_job_subprocess(
         log.write(f"physical_gpus: {','.join(physical_gpus)}\n")
         log.write(f"numactl_prefix: {' '.join(prefix)}\n")
         log.write(f"cache_root: {cache_root}\n")
+        log.write(
+            f"threads: OMP_NUM_THREADS={env['OMP_NUM_THREADS']} "
+            f"TORCHINDUCTOR_COMPILE_THREADS="
+            f"{env['TORCHINDUCTOR_COMPILE_THREADS']}\n"
+        )
         log.write("command: " + " ".join(cmd) + "\n\n")
         log.flush()
         try:
@@ -413,7 +475,14 @@ def _run_job_subprocess(
                     return
                 for line in proc.stdout:
                     last_output[0] = time.monotonic()
-                    log.write(line)
+                    try:
+                        log.write(line)
+                    except ValueError:
+                        # `log` closed under us. Should be unreachable -- the
+                        # reap below reaps survivors before the join, so the
+                        # pipe is closed and this loop has ended by then -- but
+                        # a daemon thread raising here would be invisible.
+                        return
                     # Echo to the worker's own stdout so the child's output is
                     # captured in Ray's per-task worker log and viewable in the
                     # dashboard (the log file above remains the source of truth).
@@ -437,11 +506,29 @@ def _run_job_subprocess(
                 log.write(f"\nWATCHDOG: {watchdog_reason}\n")
                 log.flush()
                 _kill_process_group(proc, physical_gpus)
-            pump.join(timeout=5.0)
         except BaseException:
             if proc is not None and proc.poll() is None:
                 _kill_process_group(proc, physical_gpus)
             raise
+        finally:
+            # Every exit path, clean ones included: the harness process can
+            # return 0 while a rank process is still hanging onto GPU memory,
+            # and this task is about to hand its GPUs back to Ray.
+            if proc is not None and _reap_process_group(proc, physical_gpus):
+                orphans_reaped = True
+                log.write(
+                    "\nORPHANS: killed processes that outlived the harness; "
+                    "GPU memory they held may have perturbed this job\n"
+                )
+            # Join only after the reap. While any survivor still holds the
+            # pipe's write end, `for line in proc.stdout` never returns, so
+            # joining first would time out and then close `log` out from under
+            # the pump thread -- losing exactly the tail of the log that a
+            # failure needs. Killing the survivors closes the pipe, which ends
+            # the loop, so this join returns promptly.
+            if pump is not None:
+                pump.join(timeout=5.0)
+            log.flush()
 
     elapsed = time.monotonic() - start
     returncode = proc.returncode if proc is not None and proc.returncode is not None else -9
@@ -459,6 +546,7 @@ def _run_job_subprocess(
         "cmd": job["cmd"],
         "returncode": returncode,
         "watchdog_reason": watchdog_reason,
+        "orphans_reaped": orphans_reaped,
         "elapsed_s": elapsed,
         "log_path": str(log_path),
         "run_dir": str(run_dir),
@@ -1111,6 +1199,9 @@ def run_validation(scenarios, args, gpus: list[str], root: Path) -> int:
                 len(gpus),
                 cluster_resources,
             )
+            # Record the CPU allocation Ray is about to grant so the job's own
+            # per-rank thread budgets derive from it rather than re-deriving it.
+            job["num_cpus"] = int(resources["num_cpus"])
             ref = remote_fn.options(name=task_name, **resources).remote(
                 job,
                 timeout,
