@@ -309,20 +309,39 @@ def run_benchmark(cfg):
         )
 
     def _gen_pixel_batch(prompts, s):
-        # One bare-dict request per prompt (the sync diffusion path; output_type
-        # "latent" errors here), each with a FRESH seeded params so the worker
-        # reseeds identically per image. Collect decoded RGB as a stacked
-        # [N, C, H, W] float tensor in [0, 1] matching what the "ours" worker saves.
+        # Submit the whole batch in ONE generate() call. Looping one prompt per
+        # call serializes the reference while the fastkernels side below submits a
+        # real batch of the same width, which inflates the reported speedup by
+        # roughly the batching factor. `Omni.generate` takes a sequence of prompts;
+        # `sampling_params_list` is indexed by *pipeline stage*, not by request, so
+        # one params object covers the batch. Per-image seeding is unaffected: the
+        # worker reseeds per request from params.seed, so every image still starts
+        # from the same seed (mirrored on the fastkernels side).
+        # Collect decoded RGB as a stacked [N, C, H, W] float tensor in [0, 1]
+        # matching what the "ours" worker saves.
+        reqs = [{"prompt": p} for p in prompts]
+        outs = engine.generate(reqs, _params(s))
+        items = list(outs) if isinstance(outs, (list, tuple)) else [outs]
+        # Requests may complete out of order; the engine tags each output with an
+        # "<submission index>_<uuid>" request_id, so restore submission order
+        # before the index-wise correctness comparison downstream.
+        def _submit_index(item, fallback):
+            rid = getattr(item, "request_id", None)
+            try:
+                return int(str(rid).split("_", 1)[0])
+            except (TypeError, ValueError):
+                return fallback
+
+        items = [it for _, it in sorted(
+            ((_submit_index(it, i), it) for i, it in enumerate(items)),
+            key=lambda pair: pair[0],
+        )]
         chw = []
-        for p in prompts:
-            outs = engine.generate({"prompt": p}, _params(s))
-            items = outs if isinstance(outs, list) else [outs]
-            for it in items:
-                imgs = getattr(it, "images", None)
-                if imgs:
-                    arr = np.array(imgs[0].convert("RGB"), dtype=np.float32) / 255.0
-                    chw.append(torch.from_numpy(arr).permute(2, 0, 1))
-                    break
+        for it in items:
+            imgs = getattr(it, "images", None)
+            if imgs:
+                arr = np.array(imgs[0].convert("RGB"), dtype=np.float32) / 255.0
+                chw.append(torch.from_numpy(arr).permute(2, 0, 1))
         return torch.stack(chw, dim=0) if chw else None
 
     print("[vllm-omni] Creating Omni engine...", file=sys.stderr, flush=True)
@@ -2032,6 +2051,16 @@ def _run_flux(args, gpu_name: str):
         if vllm_latent_dir:
             vllm_config["latent_dir"] = vllm_latent_dir
         vllm_data = run_worker(FLUX_VLLM_OMNI_WORKER, vllm_config, "vllm-omni FLUX benchmark", timeout=36000)
+        if vllm_data is None:
+            # Without the reference there is no speedup and no correctness check;
+            # printing a one-sided table and exiting 0 reports a pass for a run
+            # that measured nothing comparable.
+            raise SystemExit(
+                "ERROR: the vllm-omni FLUX reference did not complete. Pass "
+                "--skip-vllm-omni to run fastkernels-only on purpose."
+            )
+    if kb_data is None:
+        raise SystemExit("ERROR: the fastkernels FLUX benchmark did not complete.")
 
     # --- Print ---
     if kb_data:

@@ -40,7 +40,7 @@ def _add_ttt_e2e_to_path() -> str:
 
     Search order:
       1. $TTT_E2E_REPO env var (explicit override)
-      2. THIRD_PARTY_DIR/ttt_e2e (where ``validate --provision`` clones it;
+      2. THIRD_PARTY_DIR/ttt_e2e (where ``fastkernels validate`` clones it;
          THIRD_PARTY_DIR = $FASTKERNELS_THIRD_PARTY_DIR or ~/.fastkernels/third_party).
          This worker runs as a bare subprocess and does not import fastkernels,
          so the path is resolved directly here.

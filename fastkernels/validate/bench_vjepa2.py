@@ -158,6 +158,19 @@ def _load_model(cfg):
     else:
         from fastkernels.tasks.baseline.L4.vjepa2 import VJEPA2Model as ModelCls
     model = ModelCls.from_pretrained(cfg["model"]).to(device=device, dtype=dtype).eval()
+    untrained = getattr(model, "untrained_parameters", ())
+    if task == "classification" and untrained:
+        # The classification workload compares logits. With no head weights in the
+        # checkpoint, both sides run a randomly initialized head and the resulting
+        # cosine/MSE describes nothing -- fail instead of reporting noise.
+        raise SystemExit(
+            f"ERROR: {cfg['model']} has no classification head in its checkpoint "
+            f"({len(untrained)} untrained parameter(s), e.g. {list(untrained)[:3]}), "
+            f"so --task classification would compare two randomly initialized "
+            f"heads. Use a fine-tuned checkpoint (e.g. one of the "
+            f"facebook/vjepa2-*-ssv2 / -diving48 classification releases) or run "
+            f"--task predictor / encoder."
+        )
     return model, model.config, dtype
 
 
@@ -204,7 +217,17 @@ def _sample_frame_indices(num_frames, frames_per_clip):
 
 
 def _load_video_paths(dataset_name, dataset_split, num_needed, seed):
+    import datasets.config
     from datasets import Video, load_dataset
+
+    # We never decode through datasets (decode=False here, decord below), but
+    # Video.encode_example imports torchcodec before its str/bytes branches, so
+    # split generation dies if torchcodec is present-but-unusable. datasets gates
+    # that import on find_spec() alone, which is exactly the case that fails:
+    # vllm pulls torchcodec in unconditionally, and the wheel dlopens a system
+    # libavutil that pip cannot install. Declaring it unavailable keeps
+    # encode_example on the path/bytes path.
+    datasets.config.TORCHCODEC_AVAILABLE = False
 
     print(
         f"Loading {num_needed} videos from {dataset_name} ({dataset_split})...",

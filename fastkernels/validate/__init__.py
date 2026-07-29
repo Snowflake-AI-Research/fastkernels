@@ -35,6 +35,10 @@ class ValidateScenario:
     legacy_workloads: tuple[str, ...]
     enforce_eager: bool = False
     max_num_seqs: int | None = None
+    draft_model: str | None = None
+    variant: str | None = None
+    scene: str | None = None
+    reference_checkpoint: str | None = None
 
 
 _MODULE_TO_HARNESS: dict[str, str] = {
@@ -81,9 +85,12 @@ _MODULE_TO_HARNESS: dict[str, str] = {
 }
 
 
-def _harness_for(hf_name: str) -> str | None:
+def _harness_for(hf_name: str, draft_model: str | None = None) -> str | None:
     n = hf_name.lower()
-    if "eagle3" in n:
+    # A scenario with a draft model is speculative decoding regardless of what
+    # the target is called; only the legacy composite names ("<target> + <draft>
+    # (draft)") carry "eagle3" in hf_name itself.
+    if draft_model or "eagle3" in n:
         return "bench_sglang"
     if n.startswith("fla-hub/"):
         return "bench_fla"
@@ -129,6 +136,16 @@ _TP_OK = {
     "bench_sam",
 }
 _MAXLAYERS_OK = {"bench_vllm"}
+# Harnesses that take the optional scenario fields (see BenchmarkScenario):
+# `variant` picks which net a multi-variant harness builds, `scene` which scene a
+# renderer loads, `reference_checkpoint` where the reference implementation's
+# weights live when they are not the same tree as `model`.
+_VARIANT_OK = {"bench_dp3", "bench_ttt_e2e"}
+_SCENE_OK = {"bench_3dgs", "bench_instantngp"}
+_REFERENCE_CHECKPOINT_FLAG = {
+    "bench_openpi": "--openpi-checkpoint",
+    "bench_dp3": "--checkpoint",
+}
 _EAGER_OK = {
     "bench_vllm",
     "bench_sglang",
@@ -183,8 +200,29 @@ def _module_for_scenario(scenario) -> str | None:
     return module_for(scenario.hf_name)
 
 
+def _openpi_datasets(scenario) -> list[str]:
+    """Datasets named by a Pi0 scenario's workloads, in declaration order.
+
+    Robotics workload values are ``<dataset>-<shape>`` (``aloha-3cam``,
+    ``droid-single``, ...), so the set of datasets to benchmark follows from the
+    workload list instead of needing its own field.
+    """
+    known = ("aloha", "droid", "libero")
+    ordered: list[str] = []
+    for workload in _scenario_workloads(scenario):
+        dataset = workload.split("-", 1)[0]
+        if dataset in known and dataset not in ordered:
+            ordered.append(dataset)
+    return ordered
+
+
 def _model_args(scenario, harness: str) -> list[str]:
     if harness == "bench_sglang":
+        draft = getattr(scenario, "draft_model", None)
+        if draft:
+            return ["--model", scenario.hf_name, "--draft-model", draft]
+        # Legacy tables pack both checkpoints into one string:
+        # "<target> + <draft> (draft)".
         raw = scenario.hf_name
         if " + " in raw:
             target, draft = raw.split(" + ", 1)
@@ -234,14 +272,30 @@ def _build_cmd(
             cmd += [flag, str(args.max_requests)]
     if scenario.enforce_eager and harness in _EAGER_OK:
         cmd.append("--enforce-eager")
+    scenario_variant = getattr(scenario, "variant", None)
+    if scenario_variant and harness in _VARIANT_OK:
+        cmd += ["--variant", scenario_variant]
+    scene = getattr(scenario, "scene", None)
+    if scene and harness in _SCENE_OK:
+        cmd += ["--scene", scene]
+    reference_checkpoint = getattr(scenario, "reference_checkpoint", None)
+    if reference_checkpoint and harness in _REFERENCE_CHECKPOINT_FLAG:
+        cmd += [_REFERENCE_CHECKPOINT_FLAG[harness], reference_checkpoint]
+    if harness == "bench_openpi":
+        # One dataset per --datasets entry, each with its own checkpoint and
+        # camera count; the Robotics workload names carry the dataset prefix.
+        datasets = _openpi_datasets(scenario)
+        if datasets:
+            cmd += ["--datasets", *datasets]
     if harness == "bench_ttt_e2e":
-        workloads = _scenario_workloads(scenario)
-        variant = (
-            workloads[0]
-            if len(workloads) == 1 and workloads[0].endswith("_e2e")
-            else "125m_e2e"
-        )
-        cmd += ["--variant", variant]
+        if not scenario_variant:
+            workloads = _scenario_workloads(scenario)
+            cmd += [
+                "--variant",
+                workloads[0]
+                if len(workloads) == 1 and workloads[0].endswith("_e2e")
+                else "125m_e2e",
+            ]
         if output_dir is not None:
             cmd += ["--cache-dir", str(output_dir / "cache")]
     if harness == "bench_vllm" and getattr(args, "vllm_python", None):
@@ -311,6 +365,10 @@ def _load_legacy_validate_scenarios(path: Path) -> list[ValidateScenario] | None
                 legacy_workloads=tuple(str(w) for w in workloads),
                 enforce_eager=bool(entry.get("enforce_eager", False)),
                 max_num_seqs=entry.get("max_num_seqs"),
+                draft_model=entry.get("draft_model"),
+                variant=entry.get("variant"),
+                scene=entry.get("scene"),
+                reference_checkpoint=entry.get("reference_checkpoint"),
             )
         )
     return scenarios
@@ -427,23 +485,45 @@ def main(argv: list[str] | None = None) -> int:
     # automatic and unconditional; provision() skips any component whose check()
     # already passes, so it is a no-op once the references are installed. Only
     # --dry-run bypasses it (below), since a dry run installs nothing.
+    #
+    # provision() never raises: it catches per component and returns a failure
+    # count, so one unbuildable reference cannot kill the others. A non-zero count
+    # is a warning here, not a run-ending error.
     if not args.dry_run:
         from .provision import components_for_harnesses, provision
 
         harnesses = {
-            h for h in (_harness_for(s.hf_name) for s in scenarios) if h is not None
+            h
+            for h in (
+                _harness_for(s.hf_name, getattr(s, "draft_model", None))
+                for s in scenarios
+            )
+            if h is not None
         }
         components = components_for_harnesses(harnesses)
         if components:
             print(f"  provision: checking {', '.join(components)}")
             failed = provision(components)
             if failed:
-                print(f"error: provisioning failed for {failed} component(s)", file=sys.stderr)
-                return 1
+                # Do not abort the sweep: a reference library that will not build
+                # (no `uv`, no network, a source build that needs a toolchain)
+                # should not stop the scenarios that do not depend on it. The
+                # scenarios that DO depend on it still get dispatched and fail on
+                # their own missing dependency, which is recorded per scenario in
+                # the run summary rather than losing the whole run.
+                print(
+                    f"WARNING: provisioning failed for {failed} component(s); "
+                    f"scenarios needing them will run anyway and are expected to "
+                    f"fail with their own missing-dependency error. See the "
+                    f"[provision] lines above for what to fix.",
+                    file=sys.stderr,
+                )
 
     if args.dry_run:
         for index, scenario in enumerate(scenarios):
-            harness = _harness_for(scenario.hf_name)
+            harness = _harness_for(
+                scenario.hf_name, getattr(scenario, "draft_model", None)
+            )
             if harness is None:
                 print(f"[{index}] {scenario.hf_name}: NO HARNESS MAPPED")
                 continue

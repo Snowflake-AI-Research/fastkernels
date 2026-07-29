@@ -1005,7 +1005,7 @@ def main():
                         help="Path to the cloned 3D-Diffusion-Policy repo (must be "
                              "on PYTHONPATH for the reference worker). Default: "
                              "$DP3_REPO, else the inner package dir of the checkout "
-                             "provisioned under THIRD_PARTY_DIR by `validate --provision`.")
+                             "provisioned under THIRD_PARTY_DIR by `fastkernels validate`.")
     parser.add_argument("--dataset", type=str,
                         default="rishabhrj11/gym-xarm-pointcloud",
                         help="HF point-cloud robotics dataset (or 'synthetic').")

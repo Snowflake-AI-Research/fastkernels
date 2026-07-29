@@ -271,6 +271,33 @@ def _finalize_batch_outputs(raw_generated_ids, requests, tokenizer, ignore_token
     return outputs, token_count
 
 
+def _patch_llada_for_transformers_v5(cls):
+    """Make the reference LLaDAModelLM loadable under transformers >=5.
+
+    LLaDAModelLM is a barebones PreTrainedModel subclass: its __init__ never
+    calls post_init(), and it predates two transformers changes.
+
+    1. post_init() is what assigns ``all_tied_weights_keys``, which
+       _finalize_model_loading -> _move_missing_keys_from_meta_to_device now
+       reads unguarded. LLaDA's config sets weight_tying=false, so the correct
+       value here is an empty mapping.
+    2. transformers now calls ``tie_weights(missing_keys=..., recompute_mapping=...)``;
+       the reference override takes no kwargs.
+
+    Both are in the loading path only -- forward is unaffected, and the loaded
+    weights are bitwise identical to what the pre-5.x path produced.
+    """
+    if "all_tied_weights_keys" not in cls.__dict__:
+        cls.all_tied_weights_keys = {}
+    original_tie_weights = cls.tie_weights
+    if getattr(original_tie_weights, "_fastkernels_kwarg_tolerant", False):
+        return
+    def tie_weights(self, *args, **kwargs):
+        return original_tie_weights(self)
+    tie_weights._fastkernels_kwarg_tolerant = True
+    cls.tie_weights = tie_weights
+
+
 def _run_backend(cfg):
     device = cfg.get("device", "cuda")
     dtype = torch.bfloat16 if cfg.get("use_bf16", True) else torch.float16
@@ -306,6 +333,12 @@ def _run_backend(cfg):
         tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         config = FastDLLMConfig.from_pretrained(model_name)
         config.flash_attention = True
+        # modeling_llada.forward reads config.use_cache when the caller omits it;
+        # transformers >=5 no longer defaults it on PretrainedConfig. True was the
+        # pre-5.x default.
+        if not hasattr(config, "use_cache"):
+            config.use_cache = True
+        _patch_llada_for_transformers_v5(FastDLLMLLaDAModelLM)
         model = FastDLLMLLaDAModelLM.from_pretrained(
             model_name,
             trust_remote_code=True,

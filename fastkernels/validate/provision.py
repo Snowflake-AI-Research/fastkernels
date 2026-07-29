@@ -18,13 +18,16 @@ Usage::
     python -m fastkernels.validate.provision --all
     python -m fastkernels.validate.provision ttt dp3 3dgs
 
-or, driven by the validate dispatcher, ``fastkernels validate <table> --provision``.
+or automatically by the validate dispatcher: ``fastkernels validate <table>``
+provisions the components its scenarios need before dispatching (there is no
+``--provision`` flag; only ``--dry-run`` skips it).
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -42,6 +45,19 @@ NGP_DIR = THIRD_PARTY_DIR / "instant-ngp"
 FBGEMM_DIR = THIRD_PARTY_DIR / "FBGEMM"
 PTV3_DIR = THIRD_PARTY_DIR / "PointTransformerV3"
 FASTDLLM_DIR = THIRD_PARTY_DIR / "Fast-dLLM"
+# The OpenPI reference needs its own interpreter: it pins jax[cuda12]==0.5.3 and
+# torch==2.7.1, which cannot coexist with the fastkernels env's torch. `uv sync`
+# builds that venv inside the checkout; bench_openpi drives it via
+# --reference-python. Converted PyTorch checkpoints land next to it.
+OPENPI_DIR = THIRD_PARTY_DIR / "openpi"
+OPENPI_VENV_PYTHON = OPENPI_DIR / ".venv" / "bin" / "python"
+OPENPI_ASSETS_DIR = THIRD_PARTY_DIR / "openpi-assets"
+# openpi asset name -> the JAX checkpoint it is downloaded from. Each is
+# converted once to `OPENPI_ASSETS_DIR/<name>_pytorch` (model.safetensors +
+# config.json), which is the only layout both sides of the benchmark can load.
+OPENPI_CHECKPOINTS: dict[str, str] = {
+    "pi0_aloha_pen_uncap": "gs://openpi-assets/checkpoints/pi0_aloha_pen_uncap",
+}
 
 
 # --- Shell helpers ---------------------------------------------------------
@@ -111,6 +127,169 @@ def _prov_ttt() -> None:
 
 def _check_ttt() -> bool:
     return (TTT_DIR / "ttt" / "model" / "transformer.py").is_file() and _importable("jax")
+
+
+def _prov_openpi() -> None:
+    """Clone OpenPI, build its venv, and convert its Pi0 checkpoints to PyTorch.
+
+    Three things have to exist before bench_openpi can run a reference:
+      1. the repo (its `examples/convert_jax_model_to_pytorch.py` is the only
+         supported way to produce PyTorch Pi0 weights),
+      2. its own venv -- openpi pins jax[cuda12]==0.5.3 and torch==2.7.1, which
+         cannot share an environment with the fastkernels torch,
+      3. a *converted* checkpoint: the published trees are JAX/orbax, and
+         `--openpi-backend pytorch` (the default) requires model.safetensors.
+    """
+    uv = shutil.which("uv")
+    if uv is None:
+        raise RuntimeError(
+            "uv is required to build the OpenPI venv (openpi ships a uv.lock). "
+            "Install it from https://docs.astral.sh/uv/ and re-run."
+        )
+    _git_clone("https://github.com/Physical-Intelligence/openpi", OPENPI_DIR)
+    if OPENPI_VENV_PYTHON.is_file():
+        print(f"    [skip] OpenPI venv already built: {OPENPI_VENV_PYTHON}", flush=True)
+    else:
+        _run([uv, "sync", "--frozen"], cwd=OPENPI_DIR)
+    _align_openpi_torch_to_gpu(uv)
+    _install_openpi_transformers_overlay()
+
+    for name, jax_uri in OPENPI_CHECKPOINTS.items():
+        out_dir = OPENPI_ASSETS_DIR / f"{name}_pytorch"
+        if _openpi_checkpoint_ready(out_dir):
+            print(f"    [skip] already converted: {out_dir}", flush=True)
+            continue
+        print(f"    downloading OpenPI checkpoint {jax_uri}", flush=True)
+        jax_dir = subprocess.run(
+            [
+                str(OPENPI_VENV_PYTHON), "-c",
+                "from openpi.shared import download;"
+                f"print(download.maybe_download({jax_uri!r}))",
+            ],
+            cwd=str(OPENPI_DIR),
+            env={**os.environ, "JAX_PLATFORMS": "cpu"},
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip().splitlines()[-1]
+        out_dir.parent.mkdir(parents=True, exist_ok=True)
+        _run(
+            [
+                str(OPENPI_VENV_PYTHON),
+                str(OPENPI_DIR / "examples" / "convert_jax_model_to_pytorch.py"),
+                "--checkpoint_dir", jax_dir,
+                "--config_name", name,
+                "--output_path", str(out_dir),
+            ],
+            cwd=OPENPI_DIR,
+            env={**os.environ, "JAX_PLATFORMS": "cpu"},
+        )
+        # The upstream script looks for `assets/` one level *above* the checkpoint
+        # dir, so a downloaded tree (which nests assets/ inside it) silently loses
+        # its norm_stats.json -- and both engines then skip state/action
+        # normalization instead of failing. Copy it here.
+        assets_src = Path(jax_dir) / "assets"
+        assets_dst = out_dir / "assets"
+        if assets_src.is_dir() and not assets_dst.exists():
+            print(f"    copying norm stats: {assets_src} -> {assets_dst}", flush=True)
+            shutil.copytree(assets_src, assets_dst)
+        if not _openpi_checkpoint_ready(out_dir):
+            raise RuntimeError(
+                f"OpenPI checkpoint conversion did not produce a usable tree at {out_dir} "
+                f"(need model.safetensors + assets/**/norm_stats.json)"
+            )
+
+
+def _openpi_venv_supports_local_gpu() -> bool:
+    cc = _torch_cc()
+    return subprocess.run(
+        [
+            str(OPENPI_VENV_PYTHON), "-c",
+            f"import sys, torch; sys.exit(0 if 'sm_{cc[0]}{cc[1]}' in torch.cuda.get_arch_list() else 1)",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        cwd=str(OPENPI_DIR),
+    ).returncode == 0
+
+
+def _align_openpi_torch_to_gpu(uv: str) -> None:
+    """Replace openpi's torch wheel when it has no kernels for the local GPU.
+
+    openpi's lock pins ``torch==2.7.1``, and the default PyPI wheel for that
+    version is a CUDA 12.6 build whose arch list stops at ``sm_90``. On Blackwell
+    (``sm_100``) every launch in the reference then dies with "no kernel image is
+    available for execution on the device". The cu128 build of the *same* version
+    carries sm_100, so the pin is preserved and only the CUDA flavor changes.
+    """
+    if _openpi_venv_supports_local_gpu():
+        print("    [skip] OpenPI venv torch already targets this GPU", flush=True)
+        return
+    cc = _torch_cc()
+    print(
+        f"    OpenPI venv torch has no sm_{cc[0]}{cc[1]} kernels; installing the cu128 build",
+        flush=True,
+    )
+    _run(
+        [
+            uv, "pip", "install",
+            "--python", str(OPENPI_VENV_PYTHON),
+            "--index-url", "https://download.pytorch.org/whl/cu128",
+            "torch==2.7.1+cu128", "torchvision==0.22.1+cu128",
+        ],
+        cwd=OPENPI_DIR,
+    )
+    if not _openpi_venv_supports_local_gpu():
+        raise RuntimeError(
+            f"OpenPI venv torch still has no sm_{cc[0]}{cc[1]} kernels after the cu128 "
+            f"install; pick a wheel matching this GPU by hand in {OPENPI_DIR}/.venv"
+        )
+
+
+def _install_openpi_transformers_overlay() -> None:
+    """Copy openpi's `transformers_replace` overlay into its venv's transformers.
+
+    openpi's PyTorch Pi0 refuses to build without it (`transformers_replace is not
+    installed correctly`), and `uv sync` does not apply it -- upstream documents it
+    as a manual post-install step. Idempotent, and re-run after every sync since a
+    re-sync restores the stock transformers.
+    """
+    overlay = OPENPI_DIR / "src" / "openpi" / "models_pytorch" / "transformers_replace"
+    if not overlay.is_dir():
+        raise RuntimeError(f"OpenPI transformers overlay missing: {overlay}")
+    site = subprocess.run(
+        [
+            str(OPENPI_VENV_PYTHON), "-c",
+            "import os, transformers; print(os.path.dirname(transformers.__file__))",
+        ],
+        cwd=str(OPENPI_DIR),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip().splitlines()[-1]
+    print(f"    applying transformers overlay -> {site}", flush=True)
+    shutil.copytree(overlay, site, dirs_exist_ok=True)
+
+
+def _openpi_checkpoint_ready(out_dir: Path) -> bool:
+    return (out_dir / "model.safetensors").is_file() and bool(
+        list(out_dir.glob("assets/**/norm_stats.json"))
+    )
+
+
+def _check_openpi() -> bool:
+    if not OPENPI_VENV_PYTHON.is_file():
+        return False
+    importable = subprocess.run(
+        [str(OPENPI_VENV_PYTHON), "-c", "import openpi.training.config"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        cwd=str(OPENPI_DIR),
+    ).returncode == 0
+    return importable and all(
+        _openpi_checkpoint_ready(OPENPI_ASSETS_DIR / f"{name}_pytorch")
+        for name in OPENPI_CHECKPOINTS
+    )
 
 
 def _prov_dp3() -> None:
@@ -303,6 +482,7 @@ COMPONENTS: dict[str, Component] = {
         Component("dllm", "LLaDA lm_eval tasks + Fast-dLLM reference repo", ("bench_dllm",), _prov_dllm, _check_dllm),
         Component("omni", "vllm-omni references (FLUX/HunyuanVideo/CosyVoice3) + s3tokenizer", ("bench_vllm_omni",), _prov_omni, _check_omni),
         Component("instant_ngp", "instant-ngp pyngp source build + fox scene", ("bench_instantngp",), _prov_instant_ngp, _check_instant_ngp),
+        Component("openpi", "OpenPI reference venv + converted PyTorch Pi0 checkpoint", ("bench_openpi",), _prov_openpi, _check_openpi),
     )
 }
 

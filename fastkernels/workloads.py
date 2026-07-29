@@ -50,6 +50,17 @@ class LLM(Workload):
     fixed_batch_32 = "fixed-batch-32"
 
 
+class DiffusionLM(Workload):
+    """Masked-diffusion LMs (LLaDA).
+
+    ``bench_dllm`` runs one protocol: real task prompts batched together and
+    decoded with a fixed step/block schedule, scored on generated tokens/sec.
+    There is no latency probe -- a single-request number would just be the same
+    fixed step count with a batch of one.
+    """
+    humaneval = "humaneval"
+
+
 class VLM(Workload):
     """Vision-language models."""
     text_only = "text-only"
@@ -161,11 +172,20 @@ class StructurePrediction(Workload):
 
 
 class Robotics(Workload):
-    """Vision-language-action policies (e.g. Pi0)."""
-    libero_1cam = "libero-1cam"
-    libero_3cam = "libero-3cam"
-    single_3cam = "single-3cam"
-    single_1cam = "single-1cam"
+    """Vision-language-action policies (e.g. Pi0).
+
+    Member names encode the dataset the workload runs on, because bench_openpi
+    benchmarks one dataset per `--datasets` entry and each needs its own
+    checkpoint: ALOHA is 3- or 1-camera, DROID and LIBERO are 2-camera.
+    """
+    aloha_3cam = "aloha-3cam"
+    aloha_1cam = "aloha-1cam"
+    droid_2cam = "droid-2cam"
+    libero_2cam = "libero-2cam"
+    aloha_single_3cam = "aloha-single-3cam"
+    aloha_single_1cam = "aloha-single-1cam"
+    droid_single = "droid-single"
+    libero_single = "libero-single"
 
 
 class PointCloudPolicy(Workload):
@@ -1032,10 +1052,15 @@ _SPEC_SOURCES: tuple[tuple[type[Workload], list[Any], list[Any]], ...] = (
 # purpose is assigned by intent (batched runs -> throughput, single/latency
 # probes -> latency).
 _PARAMLESS_PURPOSES: dict[Workload, Purpose] = {
-    Robotics.libero_1cam: Purpose.THROUGHPUT,
-    Robotics.libero_3cam: Purpose.THROUGHPUT,
-    Robotics.single_3cam: Purpose.LATENCY,
-    Robotics.single_1cam: Purpose.LATENCY,
+    DiffusionLM.humaneval: Purpose.THROUGHPUT,
+    Robotics.aloha_3cam: Purpose.THROUGHPUT,
+    Robotics.aloha_1cam: Purpose.THROUGHPUT,
+    Robotics.droid_2cam: Purpose.THROUGHPUT,
+    Robotics.libero_2cam: Purpose.THROUGHPUT,
+    Robotics.aloha_single_3cam: Purpose.LATENCY,
+    Robotics.aloha_single_1cam: Purpose.LATENCY,
+    Robotics.droid_single: Purpose.LATENCY,
+    Robotics.libero_single: Purpose.LATENCY,
     PointCloudSeg.scanobjectnn: Purpose.THROUGHPUT,
     PointCloudSeg.single_cloud: Purpose.LATENCY,
     PointCloudSeg.batch_8: Purpose.THROUGHPUT,
@@ -1055,7 +1080,7 @@ _ALL_FAMILIES: tuple[type[Workload], ...] = (
     LLM, VLM, OmniModal, ASR, TTS, Diffusion, VideoDiffusion, WorldModel,
     Segmentation, Detection, VisionEncoder, Embedding, StructurePrediction,
     Robotics, PointCloudPolicy, PointCloudSeg, Rendering, Recsys,
-    VideoRepresentation,
+    VideoRepresentation, DiffusionLM,
 )
 
 
@@ -1276,6 +1301,14 @@ class BenchmarkScenario:
 
     ``workloads`` mixes throughput and latency workloads; use the
     ``throughput_workloads`` / ``latency_workloads`` splits to iterate one kind.
+
+    ``hf_name`` is always a bare identifier -- an HF repo id, or a short module
+    token for the rows that have no Hub checkpoint (``dlrmv2``, ``dp3``, ...).
+    Anything else a harness needs goes in its own optional field rather than
+    being packed into the name: ``draft_model`` (speculative decoding target +
+    draft), ``variant`` (which net a multi-variant harness builds), ``scene``
+    (which scene a renderer loads), ``reference_checkpoint`` (a reference
+    implementation whose weights live somewhere other than ``hf_name``).
     """
     hf_name: str
     tp: int
@@ -1283,6 +1316,10 @@ class BenchmarkScenario:
     workloads: list[Workload]
     enforce_eager: bool = False
     max_num_seqs: int | None = None
+    draft_model: str | None = None
+    variant: str | None = None
+    scene: str | None = None
+    reference_checkpoint: str | None = None
 
     @property
     def specs(self) -> list[WorkloadSpec]:
@@ -1329,8 +1366,23 @@ def _resolve_workload_token(token: str) -> Workload:
         )
 
 
+_SCENARIO_KEYS = frozenset(
+    {
+        "model", "tp", "dtype", "workloads",
+        "enforce_eager", "max_num_seqs",
+        "draft_model", "variant", "scene", "reference_checkpoint",
+    }
+)
+
+
 def _scenario_from_mapping(entry: Mapping[str, Any], *, source: str) -> BenchmarkScenario:
     """Build a ``BenchmarkScenario`` from one YAML mapping, validating as we go."""
+    unknown = sorted(set(entry) - _SCENARIO_KEYS)
+    if unknown:
+        raise ValueError(
+            f"{source}: {entry.get('model', entry)}: unknown key(s) {unknown}; "
+            f"valid: {sorted(_SCENARIO_KEYS)}"
+        )
     try:
         model, tp, dtype = entry["model"], int(entry["tp"]), entry["dtype"]
         tokens = entry["workloads"]
@@ -1338,6 +1390,13 @@ def _scenario_from_mapping(entry: Mapping[str, Any], *, source: str) -> Benchmar
         raise ValueError(f"{source}: bad scenario entry {entry!r}: {e}")
     if dtype not in _ALLOWED_DTYPES:
         raise ValueError(f"{source}: {model}: dtype {dtype!r} not in {sorted(_ALLOWED_DTYPES)}")
+    for key in ("model", "draft_model", "variant", "scene"):
+        value = entry.get(key)
+        if value is not None and (not isinstance(value, str) or not value or " " in value):
+            raise ValueError(
+                f"{source}: {model}: {key} must be a non-empty identifier without "
+                f"spaces, got {value!r}"
+            )
     workloads: list[Workload] = []
     seen: set[Workload] = set()
     for tok in tokens:
@@ -1354,6 +1413,10 @@ def _scenario_from_mapping(entry: Mapping[str, Any], *, source: str) -> Benchmar
         model, tp, dtype, workloads,
         enforce_eager=bool(entry.get("enforce_eager", False)),
         max_num_seqs=entry.get("max_num_seqs"),
+        draft_model=entry.get("draft_model"),
+        variant=entry.get("variant"),
+        scene=entry.get("scene"),
+        reference_checkpoint=entry.get("reference_checkpoint"),
     )
 
 

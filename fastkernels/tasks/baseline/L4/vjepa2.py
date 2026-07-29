@@ -140,8 +140,12 @@ def _load_weights_checked(
     state_dict: dict[str, torch.Tensor],
     model_name: str,
     allow_missing_prefixes: tuple[str, ...] = (),
-) -> None:
+) -> list[str]:
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    allowed_missing = [
+        name for name in missing
+        if name.startswith(allow_missing_prefixes)
+    ]
     missing = [
         name for name in missing
         if not name.startswith(allow_missing_prefixes)
@@ -151,6 +155,7 @@ def _load_weights_checked(
             f"Unexpected V-JEPA 2 checkpoint mapping for {model_name}: "
             f"missing={missing[:20]}, unexpected={unexpected[:20]}"
         )
+    return allowed_missing
 
 
 class VJEPA2Model(nn.Module):
@@ -321,10 +326,17 @@ class VJEPA2ForVideoClassification(nn.Module):
         state_dict = _prefix_backbone_keys(
             _load_vjepa2_state_dict(weight_dir)
         )
-        _load_weights_checked(
+        # A pretrain-only checkpoint (e.g. facebook/vjepa2-vitl-fpc64-256) ships no
+        # pooler/classifier weights, so those stay at random init. Loading is still
+        # allowed -- the encoder is what most workloads exercise -- but the head is
+        # then untrained, and any logits comparison against another randomly
+        # initialized head is noise. Record it so callers can refuse rather than
+        # report a meaningless number.
+        untrained = _load_weights_checked(
             model,
             state_dict,
             model_name,
             allow_missing_prefixes=("pooler.", "classifier."),
         )
+        model.untrained_parameters = tuple(untrained)
         return model

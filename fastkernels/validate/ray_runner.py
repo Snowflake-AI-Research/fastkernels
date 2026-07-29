@@ -54,6 +54,7 @@ def _make_job(index: int, scenario, harness: str, args, root: Path) -> dict:
     return {
         "index": index,
         "name": scenario.hf_name,
+        "draft_model": getattr(scenario, "draft_model", None),
         "tp": int(scenario.tp),
         "dtype": scenario.dtype,
         "harness": harness,
@@ -88,6 +89,12 @@ def _load_cached_result(job: dict) -> dict | None:
                 "status": "PASS(cached)",
                 "cached": True,
             }
+        # A marker that exists but does not record a PASS for this exact command
+        # is authoritative: the scenario ran and failed (or ran a different
+        # command), so --resume must run it again. Falling through to the legacy
+        # artifact check here would resurrect it as PASS(cached) purely because a
+        # partial results file survived the failure.
+        return None
 
     # Compatibility with runs created before task_result.json was introduced.
     run_dir = Path(job["run_dir"])
@@ -117,7 +124,9 @@ def _plan_jobs(
     cached: list[dict] = []
     results: dict[int, str] = {}
     for index, scenario in enumerate(scenarios):
-        harness = _harness_for(scenario.hf_name)
+        harness = _harness_for(
+            scenario.hf_name, getattr(scenario, "draft_model", None)
+        )
         if harness is None:
             print(f"  - skip {scenario.hf_name}: no harness mapped")
             results[index] = "SKIP(no-harness)"
@@ -331,6 +340,8 @@ def _run_job_subprocess(
     with log_path.open("w", buffering=1) as log:
         log.write(f"job_index: {job['index']}\n")
         log.write(f"name: {job['name']}\n")
+        if job.get("draft_model"):
+            log.write(f"draft_model: {job['draft_model']}\n")
         log.write(f"harness: {job['harness']}\n")
         log.write(f"tp: {job['tp']}\n")
         log.write(f"workloads: {', '.join(job['workloads'])}\n")
@@ -822,7 +833,9 @@ def _build_summary(root: Path, scenarios, results: dict[int, str]) -> dict:
     models: list[dict] = []
     for index, scenario in enumerate(scenarios):
         task = task_results.get(index, {})
-        harness = task.get("harness") or _harness_for(scenario.hf_name)
+        harness = task.get("harness") or _harness_for(
+            scenario.hf_name, getattr(scenario, "draft_model", None)
+        )
         run_dir = Path(task["run_dir"]) if task.get("run_dir") else None
         result_path = (
             _result_artifact_path(run_dir, harness) if run_dir is not None else None
@@ -836,10 +849,12 @@ def _build_summary(root: Path, scenarios, results: dict[int, str]) -> dict:
                 pass
         model = data.get("model") or task.get("name") or scenario.hf_name
         status = results.get(index, task.get("status", "?"))
+        draft_model = getattr(scenario, "draft_model", None)
         models.append(
             {
                 "index": index,
                 "model": model,
+                **({"draft_model": draft_model} if draft_model else {}),
                 "harness": harness,
                 "reference": _reference_name(harness or ""),
                 "tp": data.get("tp") or task.get("tp") or scenario.tp,

@@ -27,7 +27,7 @@ from fastkernels.workloads import (
     EmbeddingThroughputWorkload,
 )
 
-from bench_vllm import (
+from fastkernels.validate.bench_vllm import (
     _detect_gpu_name,
     _install_bench_sitecustomize,
     _make_run_id,
@@ -472,6 +472,7 @@ def main():
     os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
     from vllm import LLM
+    from vllm.config import PoolerConfig
 
     torch.manual_seed(cfg["seed"])
     hf_overrides = None
@@ -482,6 +483,10 @@ def main():
     llm = LLM(
         model=cfg["model_name"],
         runner="pooling",
+        # The pooling task is fixed at engine construction: bge-m3/colbertv2 both
+        # resolve to a sentence-transformers default ("embed&token_classify"), and
+        # vLLM rejects a per-request pooling_task that differs from the engine's.
+        pooler_config=PoolerConfig(task="token_embed"),
         tensor_parallel_size=cfg["tp"],
         dtype=cfg["dtype"],
         seed=cfg["seed"],

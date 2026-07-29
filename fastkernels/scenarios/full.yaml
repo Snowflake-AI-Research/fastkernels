@@ -13,6 +13,15 @@
 # (e.g. the LLM mixed=1000 / long-context=64 curated datasets), not this table.
 # Optional per-scenario engine knobs `enforce_eager` (default false) and
 # `max_num_seqs` (default null) may be added to any row.
+#
+# `model` is always a bare identifier -- an HF repo id, or a short module token
+# for the rows with no Hub checkpoint (dlrmv2, lightgcn, dp3, ttt_e2e). Anything
+# else a harness needs goes in its own optional field, never packed into the
+# name: `draft_model`, `variant`, `scene`, `reference_checkpoint`.
+#
+# Checkpoint ids here are the ones the harnesses actually run. Where the paper
+# table names a different release, the runnable id is used and the table's name
+# is noted in a comment.
 
 scenarios:
   # --- Dense & MoE LLMs ---
@@ -20,15 +29,21 @@ scenarios:
     tp: 1
     dtype: bfloat16
     workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
-  - model: deepseek-ai/DeepSeek-V3.2-Exp
-    tp: 8
-    dtype: fp8
-    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
-  - model: mistralai/Mixtral-8x7B-v0.1
+  # DeepSeek-V3.2-Exp is excluded by default: at tp=8 its runtime dominates a
+  # full sweep. Uncomment to include it.
+  # - model: deepseek-ai/DeepSeek-V3.2-Exp
+  #   tp: 8
+  #   dtype: fp8
+  #   workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+  - model: mistralai/Mixtral-8x7B-Instruct-v0.1
     tp: 2
     dtype: bfloat16
     workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
-  - model: 1bitLLM/bitnet_b1_58-3B
+  # BitNet b1.58: the official 2B-4T release. bench_microsoft_bitnet's SOTA
+  # reference is Microsoft's W2A8 CUDA kernel, which only reads this checkpoint's
+  # native quantized format (the 1bitLLM/bitnet_b1_58-3B reproduction is a
+  # llama-arch model with unpacked weights and does not load here).
+  - model: microsoft/bitnet-b1.58-2B-4T
     tp: 1
     dtype: bfloat16
     workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
@@ -36,7 +51,10 @@ scenarios:
     tp: 2
     dtype: mxfp4
     workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
-  - model: yuhuili/EAGLE3-LLaMA3.1-Instruct-8B
+  # EAGLE-3 speculative decoding: `model` is the target, `draft_model` the EAGLE-3
+  # head. Both are required -- the draft weights are not a standalone model.
+  - model: meta-llama/Llama-3.1-8B-Instruct
+    draft_model: jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B
     tp: 1
     dtype: bfloat16
     workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
@@ -54,7 +72,9 @@ scenarios:
     tp: 1
     dtype: bfloat16
     workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
-  - model: fla-hub/rwkv7-1.5B-world
+  # RWKV-7: table.tex names the 1.5B World model; 2.9B-g1 is the id bench_fla
+  # lists as supported and is size-comparable with GLA/RetNet at 2.7B.
+  - model: fla-hub/rwkv7-2.9B-g1
     tp: 1
     dtype: bfloat16
     workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
@@ -89,17 +109,24 @@ scenarios:
     tp: 1
     dtype: bfloat16
     workloads: [Diffusion.res_1024, Diffusion.res_512, Diffusion.single_1024, Diffusion.single_512]
-  - model: tencent/HunyuanVideo-1.5
+  # HunyuanVideo 1.5: the diffusers conversion of the 480p t2v variant. The
+  # pipeline loads by subfolder (scheduler/tokenizer/text_encoder/...), which the
+  # official tencent/HunyuanVideo-1.5 layout does not provide.
+  - model: hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v
     tp: 1
     dtype: bfloat16
     workloads: [VideoDiffusion.p480_short, VideoDiffusion.p480_medium, VideoDiffusion.single_480p_short, VideoDiffusion.single_480p_medium]
+  # SDXL: bench_diffusers loads with torch_dtype=bfloat16 (reading the
+  # variant="fp16" files); SDXL's VAE overflows in fp16.
   - model: stabilityai/stable-diffusion-xl-base-1.0
     tp: 1
-    dtype: float16
-    workloads: [Diffusion.res_1024, Diffusion.res_512, Diffusion.single_1024, Diffusion.single_512]
-  - model: facebook/sam3
-    tp: 1
     dtype: bfloat16
+    workloads: [Diffusion.res_1024, Diffusion.res_512, Diffusion.single_1024, Diffusion.single_512]
+  # SAM 3.1 (table.tex: SAM 3): the reference builds an fp32 model and patches
+  # sam3's fused addmm_act so it does not force bfloat16.
+  - model: facebook/sam3.1
+    tp: 1
+    dtype: float32
     workloads: [Segmentation.gold_metaclip_nps, Segmentation.gold_wiki_common, Segmentation.gold_crowded, Segmentation.veval_sav_val, Segmentation.veval_yt1b_val, Segmentation.sav_val_video, Segmentation.smartglasses_val_video, Segmentation.single_image_1008, Segmentation.batch_4_image_1008, Segmentation.single_video_frame_1008]
   - model: openai/whisper-large-v3
     tp: 1
@@ -115,9 +142,9 @@ scenarios:
     tp: 1
     dtype: bfloat16
     workloads: [VLM.text_only, VLM.image, VLM.video, VLM.single_image, VLM.single_video]
-  - model: Qwen/Qwen3-VL-8B-Instruct-FP8
+  - model: Qwen/Qwen3-VL-8B-Instruct      # table.tex: the FP8 release
     tp: 1
-    dtype: fp8
+    dtype: bfloat16
     workloads: [VLM.text_only, VLM.image, VLM.video, VLM.single_image, VLM.single_video]
   - model: Qwen/Qwen3-VL-235B-A22B-Instruct-FP8
     tp: 4
@@ -135,15 +162,17 @@ scenarios:
     tp: 1
     dtype: bfloat16
     workloads: [VisionEncoder.default_res, VisionEncoder.high_res, VisionEncoder.single_image, VisionEncoder.batch_8]
-  - model: microsoft/swinv2-large-patch4-window12-192-22k
+  # SwinV2: bench_timm keys its registry on the timm id and loads both sides
+  # through timm; the microsoft/ transformers release is not a lookup key.
+  - model: timm/swinv2_large_window12_192.ms_in22k
     tp: 1
-    dtype: float32
+    dtype: bfloat16   # bench_timm runs its --dtype default
     workloads: [VisionEncoder.default_res, VisionEncoder.high_res, VisionEncoder.single_image, VisionEncoder.batch_8]
 
   # --- Edge & Detection ---
   - model: timm/mobilenetv4_conv_medium.e500_r256_in1k
     tp: 1
-    dtype: float32
+    dtype: bfloat16   # bench_timm runs its --dtype default
     workloads: [VisionEncoder.default_res, VisionEncoder.high_res, VisionEncoder.single_image, VisionEncoder.batch_8]
   - model: facebook/convnextv2-base-22k-384
     tp: 1
@@ -159,17 +188,21 @@ scenarios:
     workloads: [Detection.coco_val, Detection.single_image, Detection.batch_4]
   - model: PekingU/rtdetr_v2_r101vd
     tp: 1
-    dtype: float32
+    dtype: float16   # bench_detection --use-fp16 defaults to true
     workloads: [Detection.coco_val, Detection.single_image, Detection.batch_4]
 
   # --- 3D / Robotics / Science ---
-  - model: gaussian_splatting              # 3DGS (Voxel51/gaussian_splatting scene)
+  - model: Voxel51/gaussian_splatting
+    scene: train
     tp: 1
     dtype: float32
     workloads: [Rendering.render, Rendering.single_render]
-  - model: instant_ngp                     # InstantNGP (Instant-NGP fox scene)
+  # InstantNGP: the fastkernels path is fp32 end to end. Upstream pyngp is
+  # internally fp16, but that is not what this row measures.
+  - model: NVlabs/instant-ngp
+    scene: fox
     tp: 1
-    dtype: float16
+    dtype: float32
     workloads: [Rendering.render, Rendering.single_render]
   - model: Pointcept/PointTransformerV3
     tp: 1
@@ -179,11 +212,22 @@ scenarios:
     tp: 1
     dtype: bfloat16
     workloads: [StructurePrediction.short, StructurePrediction.medium, StructurePrediction.long, StructurePrediction.extra_long, StructurePrediction.single_short, StructurePrediction.single_medium, StructurePrediction.single_long, StructurePrediction.single_extra_long]
-  - model: lerobot/pi0_base
+  # pi0 (ALOHA pen_uncap): `model` names an OpenPI asset, which bench_openpi
+  # resolves to the converted-PyTorch tree the provisioner materializes under
+  # THIRD_PARTY_DIR (openpi publishes JAX/orbax trees; the PyTorch reference path
+  # needs model.safetensors). Both engines load that same tree, which is what makes
+  # the comparison like-with-like. `fastkernels validate` provisions it
+  # automatically (component: openpi).
+  # DROID and LIBERO need their own converted checkpoints; add their workloads
+  # (droid-2cam / libero-2cam, droid-single / libero-single) once those exist.
+  - model: pi0_aloha_pen_uncap
     tp: 1
     dtype: bfloat16
-    workloads: [Robotics.libero_1cam, Robotics.libero_3cam, Robotics.single_3cam, Robotics.single_1cam]
-  - model: dp3                             # DP3 (rishabhrj11/gym-xarm-pointcloud)
+    workloads: [Robotics.aloha_3cam, Robotics.aloha_1cam, Robotics.aloha_single_3cam, Robotics.aloha_single_1cam]
+  # DP3: dataset is rishabhrj11/gym-xarm-pointcloud (fixed in the harness);
+  # `variant` selects Simple-DP3 vs the heavier full DP3 U-Net.
+  - model: dp3
+    variant: simple_dp3
     tp: 1
     dtype: float32
     workloads: [PointCloudPolicy.dp3_1env, PointCloudPolicy.dp3_batch, PointCloudPolicy.single_step, PointCloudPolicy.batch_8]
@@ -210,12 +254,12 @@ scenarios:
   - model: GSAI-ML/LLaDA-8B-Instruct
     tp: 1
     dtype: bfloat16
-    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+    workloads: [DiffusionLM.humaneval]
 
   # --- World Models ---
   - model: Etched/oasis-500m
     tp: 1
-    dtype: bfloat16
+    dtype: float16   # bench_oasis hardcodes float16 on cuda
     workloads: [WorldModel.short_bs4_16f_4ddim, WorldModel.medium_bs8_24f_4ddim, WorldModel.long_bs8_32f_4ddim, WorldModel.denoise_bs4_16f_8ddim, WorldModel.latency_bs1_8f_4ddim]
   - model: facebook/vjepa2-vitl-fpc64-256
     tp: 1
