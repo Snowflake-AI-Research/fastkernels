@@ -196,6 +196,15 @@ def main():
         # Process in micro-batches.  HF's .generate has no continuous
         # batching; we cap concurrency at ``ref_max_num_seqs`` so the
         # reference does not OOM.
+        # Prefill warmup at this scenario's real shapes, so the first timed
+        # micro-batch does not absorb Triton JIT/autotune for the Mamba
+        # conv/scan kernels. out_len=1 covers prefill without paying decode.
+        for start in range(0, len(prompts), micro_batch):
+            end = min(start + micro_batch, len(prompts))
+            _batched_generate(
+                model, tokenizer, prompts[start:end], [1] * (end - start),
+                eos, device, ignore_eos=True,
+            )
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         gen_tokens = []
@@ -304,6 +313,9 @@ def main():
         max_num_seqs=cfg.get("ref_max_num_seqs", 32),
         seed=cfg["seed"],
         trust_remote_code=True,
+        enable_prefix_caching=False,  # match sibling vLLM workers: the per-
+        # scenario warmup replays identical prompts right before timing, so a
+        # prefix cache would let the timed prefill skip compute it should do.
         enforce_eager=False,  # vLLM uses CUDA-graph capture by default; keep it
     )
     load_s = time.time() - t0
@@ -329,6 +341,13 @@ def main():
         print(
             f"  [vLLM reference] throughput {sc['name']}: "
             f"{len(prompts_ids)} requests, max_out={max_out}", flush=True,
+        )
+        # Prefill warmup at this scenario's real shapes (see HF reference).
+        llm.generate(
+            inputs,
+            SamplingParams(temperature=cfg.get("temperature", 0.0),
+                           top_p=1.0, max_tokens=1, ignore_eos=True),
+            use_tqdm=False,
         )
         torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -457,6 +476,14 @@ def main():
             )
             for ol in output_lens
         ]
+
+        # Prefill warmup at this scenario's real shapes (see HF reference).
+        engine.generate(
+            prompts,
+            SamplingParams(temperature=temperature, max_tokens=1,
+                           ignore_eos=True),
+            use_tqdm=False,
+        )
 
         torch.cuda.synchronize()
         t0 = time.perf_counter()

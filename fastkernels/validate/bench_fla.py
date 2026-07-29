@@ -501,6 +501,15 @@ def main():
         # has no continuous-batching, so this is the apples-to-apples way
         # to keep both engines at the same concurrency.
         bs_cap = cfg.get("ref_max_num_seqs", cfg.get("max_num_seqs", 512))
+        # Prefill+decode warmup at this scenario's real shapes, so the first
+        # timed call does not absorb Triton JIT/autotune for the chunked-scan
+        # and conv kernels. out_len=2 also runs one decode step so the recurrent
+        # decode kernel autotunes here, not in the timed region.
+        _continuous_generate(
+            model, tokenizer, prompts, [2] * len(prompts), eos, device, bs_cap,
+            max_prefill_tokens=cfg.get("max_prefill_tokens", 196608),
+            ignore_eos=True,
+        )
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         gen_tokens = _continuous_generate(
@@ -645,6 +654,16 @@ def main():
             )
             for ol in output_lens
         ]
+
+        # Prefill+decode warmup at this scenario's real shapes -- see the
+        # matching comment in the FLA reference worker. max_tokens=2 runs one
+        # decode step so the recurrent decode kernel autotunes here.
+        engine.generate(
+            prompts,
+            SamplingParams(temperature=temperature, top_p=top_p,
+                           max_tokens=2, ignore_eos=True),
+            use_tqdm=False,
+        )
 
         torch.cuda.synchronize()
         t0 = time.perf_counter()

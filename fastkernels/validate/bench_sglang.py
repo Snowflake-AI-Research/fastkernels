@@ -247,6 +247,17 @@ def main():
             for output_len in output_lens
         ]
 
+        # Prefill warmup at this scenario's real shapes, so the first timed
+        # call does not absorb Triton JIT/autotune. max_new_tokens=1 covers
+        # prefill without paying decode.
+        engine.generate(
+            input_ids=prompt_token_ids,
+            sampling_params=[{**p, "max_new_tokens": 1} for p in sp],
+            return_logprob=True,
+            logprob_start_len=-1,
+            top_logprobs_num=0,
+        )
+
         start = time.perf_counter()
         outputs = engine.generate(
             input_ids=prompt_token_ids,
@@ -378,6 +389,15 @@ def main():
             Eagle3SamplingParams(max_tokens=int(output_len), ignore_eos=True)
             for output_len in output_lens
         ]
+
+        # Prefill warmup at this scenario's real shapes -- see the matching
+        # comment in the SGLang reference worker. The reset() below frees
+        # what this allocated.
+        engine.generate(
+            prompt_token_ids,
+            Eagle3SamplingParams(max_tokens=1, ignore_eos=True),
+            use_tqdm=False, decode_text=False,
+        )
 
         engine.reset()
         torch.cuda.synchronize()

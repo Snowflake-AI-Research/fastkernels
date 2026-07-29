@@ -635,10 +635,10 @@ def main():
         llm_kwargs["hf_overrides"] = _fastkernels_limit_layers
     llm = LLM(**llm_kwargs)
 
-    # Warmup
+    # Warmup -- ignore_eos so all 16 decode steps run (parity with the engines).
     llm.generate(
         [dict(prompt_token_ids=[0] * 16)],
-        SamplingParams(temperature=0.0, max_tokens=16),
+        SamplingParams(temperature=0.0, max_tokens=16, ignore_eos=True),
     )
 
     scenarios = cfg["scenarios"]
@@ -659,6 +659,16 @@ def main():
         ]
 
         vllm_prompts = [dict(prompt_token_ids=p) for p in prompt_token_ids]
+        # Prefill warmup at this scenario's real shapes. The engine-level
+        # warmup above is a 16-token batch of 1, so without this the first
+        # timed generate() absorbs the Triton/CuTeDSL JIT for the scenario's
+        # prefill shapes. max_tokens=1 covers prefill without paying decode.
+        llm.generate(
+            vllm_prompts,
+            SamplingParams(temperature=temperature, ignore_eos=True,
+                           max_tokens=1, detokenize=False),
+            use_tqdm=False,
+        )
         start = time.perf_counter()
         outputs = llm.generate(vllm_prompts, sp_list, use_tqdm=True)
         elapsed = time.perf_counter() - start
@@ -756,8 +766,12 @@ def main():
         engine_kwargs["max_layers"] = cfg["max_layers"]
     engine = LlamaEngine(**engine_kwargs)
 
-    # Warmup
-    engine.generate(["warmup"], SamplingParams(temperature=0.0, max_tokens=16))
+    # Warmup -- same 16-token prompt as the vLLM worker, so both sides enter
+    # the scenario loop having done identical work. ignore_eos so the 16 decode
+    # steps run even if token 0 greedily decodes to EOS (parity with fla/jamba).
+    engine.generate([[0] * 16],
+                    SamplingParams(temperature=0.0, max_tokens=16,
+                                   ignore_eos=True))
 
     import torch
     scenarios = cfg["scenarios"]
@@ -777,6 +791,20 @@ def main():
             )
             for ol in output_lens
         ]
+
+        # Prefill warmup at this scenario's real shapes -- see the matching
+        # comment in the vLLM worker. capture_mamba_cudagraph() and friends
+        # cover decode, but nothing runs prefill through the compiled model
+        # before timing, so the first timed generate() would otherwise absorb
+        # a Triton JIT/autotune spike. The reset() below frees what this
+        # allocated (finished seqs release their Mamba state slots).
+        engine.generate(
+            prompts,
+            SamplingParams(temperature=temperature, top_p=top_p,
+                           max_tokens=1, ignore_eos=True),
+            use_tqdm=False,
+            decode_text=False,
+        )
 
         engine.block_manager.reset()
         torch.cuda.synchronize()
@@ -1211,6 +1239,11 @@ def main():
         gpu_memory_utilization=cfg.get("gpu_memory_utilization", 0.9),
         max_model_len=cfg["max_model_len"],
         enable_prefix_caching=False,
+        # The per-scenario warmup replays the identical mm prompts right before
+        # timing; with the cache on, the timed generate() would hit cached
+        # pixel_values and skip the CPU preprocessing that the fastkernels
+        # engine re-runs inside its own timed region.
+        disable_mm_preprocessor_cache=True,
         trust_remote_code=True,
     )
     if cfg.get("trust_remote_code"):
@@ -1223,9 +1256,10 @@ def main():
         llm_kwargs["hf_overrides"] = _fastkernels_limit_layers
     llm = LLM(**llm_kwargs)
 
+    # Warmup -- ignore_eos so all 16 decode steps run (parity with the engines).
     llm.generate(
         [dict(prompt_token_ids=[0] * 16)],
-        SamplingParams(temperature=0.0, max_tokens=16),
+        SamplingParams(temperature=0.0, max_tokens=16, ignore_eos=True),
     )
 
     scenarios = cfg["scenarios"]
@@ -1244,6 +1278,13 @@ def main():
                 for ol in output_lens
             ]
             vllm_prompts = [dict(prompt_token_ids=p) for p in prompt_token_ids]
+            # Prefill warmup at this scenario's real shapes (see LLM worker).
+            llm.generate(
+                vllm_prompts,
+                SamplingParams(temperature=temperature, ignore_eos=True,
+                               max_tokens=1),
+                use_tqdm=False,
+            )
             start = time.perf_counter()
             outputs = llm.generate(vllm_prompts, sp_list)
             elapsed = time.perf_counter() - start
@@ -1280,6 +1321,17 @@ def main():
                     multi_modal_data=mm_dict,
                 ))
 
+            # Prefill warmup at this scenario's real shapes. Covers the vision
+            # encoder too, which is where the timed-region JIT showed up for
+            # the VLMs (rotary_kernel, FlashAttentionForwardSm100,
+            # _bilinear_pos_embed_kernel are all resolution-dependent and so
+            # are never reached by a text-only engine warmup).
+            llm.generate(
+                vllm_prompts,
+                SamplingParams(temperature=temperature, ignore_eos=True,
+                               max_tokens=1),
+                use_tqdm=False,
+            )
             start = time.perf_counter()
             outputs = llm.generate(vllm_prompts, sp_list, use_tqdm=True)
             elapsed = time.perf_counter() - start
@@ -1411,7 +1463,11 @@ def main():
         engine_kwargs["max_layers"] = cfg["max_layers"]
     engine = LlamaEngine(**engine_kwargs)
 
-    engine.generate(["warmup"], SamplingParams(temperature=0.0, max_tokens=16))
+    # Warmup -- 16-token prompt, matching the LLM workers. ignore_eos so the 16
+    # decode steps run even if token 0 greedily decodes to EOS (parity fix).
+    engine.generate([[0] * 16],
+                    SamplingParams(temperature=0.0, max_tokens=16,
+                                   ignore_eos=True))
 
     import torch
     scenarios = cfg["scenarios"]
@@ -1430,6 +1486,13 @@ def main():
                                max_tokens=ol, ignore_eos=True)
                 for ol in output_lens
             ]
+            # Prefill warmup at this scenario's real shapes (see LLM worker).
+            engine.generate(
+                prompts,
+                SamplingParams(temperature=temperature, top_p=top_p,
+                               max_tokens=1, ignore_eos=True),
+                use_tqdm=False,
+            )
             engine.block_manager.reset()
             torch.cuda.synchronize()
             start = time.perf_counter()
@@ -1477,6 +1540,18 @@ def main():
             ] * len(mm_data)
 
             total_input_tokens = 0
+            # Prefill warmup at this scenario's real shapes, vision encoder
+            # included -- _warmup_vision_encoder() only covers the synthetic
+            # max-resolution item, not this dataset's actual resolutions.
+            engine.generate(
+                prompts,
+                SamplingParams(temperature=temperature, top_p=top_p,
+                               max_tokens=1, ignore_eos=True),
+                images=batch_images,
+                videos=batch_videos,
+                audio_features=batch_audios,
+                use_tqdm=False,
+            )
             engine.block_manager.reset()
             torch.cuda.synchronize()
             start = time.perf_counter()
@@ -1712,6 +1787,10 @@ def main():
         gpu_memory_utilization=cfg.get("gpu_memory_utilization", 0.9),
         max_model_len=cfg["max_model_len"],
         enable_prefix_caching=False,
+        # See the VLM worker: the per-scenario warmup replays the identical
+        # audio prompts before timing, so leave the mm preprocessor cache off
+        # to keep the timed region paying for audio preprocessing.
+        disable_mm_preprocessor_cache=True,
     )
     if cfg.get("trust_remote_code"):
         llm_kwargs["trust_remote_code"] = True
@@ -1734,7 +1813,7 @@ def main():
     )
     llm.generate(
         [warmup_prompt],
-        SamplingParams(temperature=0.0, max_tokens=16),
+        SamplingParams(temperature=0.0, max_tokens=16, ignore_eos=True),
     )
 
     scenarios = cfg["scenarios"]
@@ -1770,6 +1849,14 @@ def main():
             temperature=0.0, ignore_eos=True, max_tokens=output_len,
         )
 
+        # Prefill warmup at this scenario's real shapes. Covers the audio
+        # encoder, whose kernels depend on mel length and so are not reached
+        # by the fixed-shape engine warmup above.
+        llm.generate(
+            prompts,
+            SamplingParams(temperature=0.0, ignore_eos=True, max_tokens=1),
+            use_tqdm=False,
+        )
         start = time.perf_counter()
         outputs = llm.generate(prompts, sp, use_tqdm=True)
         elapsed = time.perf_counter() - start
@@ -1967,6 +2054,13 @@ def main():
 
         sp = SamplingParams(
             temperature=0.0, ignore_eos=True, max_tokens=output_len,
+        )
+
+        # Prefill warmup at this scenario's real shapes (see vLLM worker).
+        engine.generate(
+            decoder_prompts,
+            SamplingParams(temperature=0.0, ignore_eos=True, max_tokens=1),
+            audio_features=audio_features_list, use_tqdm=False,
         )
 
         engine.block_manager.reset()
