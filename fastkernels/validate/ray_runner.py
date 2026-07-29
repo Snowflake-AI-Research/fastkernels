@@ -22,6 +22,7 @@ from . import (
     _safe_slug,
     _scenario_workloads,
 )
+from .. import CACHE_DIR
 
 _RAY_PROGRESS_INTERVAL_SEC = 30.0
 _TASK_RESULT_FILE = "task_result.json"
@@ -49,6 +50,46 @@ def _job_paths(
     return run_dir, run_dir / "run.log"
 
 
+# Compiler-cache subdirectories, one env var each. Keys are the env var names
+# the toolchains read; values are the subdirectory under this run's cache root.
+_CACHE_SUBDIRS = {
+    "TRITON_CACHE_DIR": "triton",
+    "TORCHINDUCTOR_CACHE_DIR": "inductor",
+    # One root covering vLLM's torch_compile_cache, flashinfer_autotune_cache,
+    # deep_gemm and modelinfos caches.
+    "VLLM_CACHE_ROOT": "vllm",
+    "CUDA_CACHE_PATH": "cuda",
+}
+
+
+def _run_cache_root(root: Path) -> Path:
+    """Cache root for this validate run.
+
+    Keyed on the run id (``root.name``), so a fresh run starts with empty
+    compiler caches and ``--resume`` -- which resolves back to the same run id
+    -- reuses whatever the interrupted run already compiled. Keeping the caches
+    per-run means one run's accumulated warmth cannot silently change the next
+    run's timings; clearing them all is ``rm -rf`` on one directory.
+    """
+    return CACHE_DIR / root.name
+
+
+def _cache_env(cache_root: Path) -> dict[str, str]:
+    """Env pointing every compiler cache at ``cache_root``, creating the dirs.
+
+    Assigned rather than defaulted: the point is a known cache state per run,
+    so a stray ``TRITON_CACHE_DIR`` in the ambient environment must not quietly
+    reintroduce cross-run sharing. Relocate the whole tree with
+    ``FASTKERNELS_CACHE_DIR`` instead.
+    """
+    env = {}
+    for var, subdir in _CACHE_SUBDIRS.items():
+        path = cache_root / subdir
+        path.mkdir(parents=True, exist_ok=True)
+        env[var] = str(path)
+    return env
+
+
 def _make_job(index: int, scenario, harness: str, args, root: Path) -> dict:
     run_dir, log_path = _job_paths(root, index, scenario, harness)
     return {
@@ -62,6 +103,7 @@ def _make_job(index: int, scenario, harness: str, args, root: Path) -> dict:
         "cmd": _build_cmd(scenario, harness, args, run_dir),
         "run_dir": str(run_dir),
         "log_path": str(log_path),
+        "cache_root": str(_run_cache_root(root)),
     }
 
 
@@ -322,6 +364,8 @@ def _run_job_subprocess(
     env.setdefault("TOKENIZERS_PARALLELISM", "false")
     env["FASTKERNELS_VALIDATE_JOB_INDEX"] = str(job["index"])
     env["FASTKERNELS_VALIDATE_JOB_NAME"] = _safe_slug(job["name"], max_len=120)
+    cache_root = Path(job["cache_root"])
+    env.update(_cache_env(cache_root))
     visible_gpus = [
         token.strip()
         for token in env.get("CUDA_VISIBLE_DEVICES", "").split(",")
@@ -348,6 +392,7 @@ def _run_job_subprocess(
         log.write(f"CUDA_VISIBLE_DEVICES: {','.join(visible_gpus)}\n")
         log.write(f"physical_gpus: {','.join(physical_gpus)}\n")
         log.write(f"numactl_prefix: {' '.join(prefix)}\n")
+        log.write(f"cache_root: {cache_root}\n")
         log.write("command: " + " ".join(cmd) + "\n\n")
         log.flush()
         try:
@@ -1039,6 +1084,10 @@ def run_validation(scenarios, args, gpus: list[str], root: Path) -> int:
         )
         print(f"  Ray dashboard: {dashboard_url or 'unavailable'}")
         print(f"  output root: {root}")
+        print(
+            f"  cache root: {_run_cache_root(root)}"
+            f"{'  (reused)' if args.resume else '  (fresh)'}"
+        )
         print(f"  run log: {root / 'run.jsonl'}\n", flush=True)
         _append_run_event(
             root,
@@ -1048,6 +1097,8 @@ def run_validation(scenarios, args, gpus: list[str], root: Path) -> int:
                 "visible_gpus": gpus,
                 "dashboard_url": dashboard_url,
                 "job_count": len(jobs),
+                "cache_root": str(_run_cache_root(root)),
+                "cache_reused": bool(args.resume),
             },
         )
 
