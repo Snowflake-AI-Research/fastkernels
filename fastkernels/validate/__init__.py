@@ -455,7 +455,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--numactl-mode",
         choices=("off", "cpu", "strict"),
-        default="cpu",
+        default="off",
+        help="Bind each job's CPUs (and with 'strict', memory) to the NUMA "
+             "node closest to its GPUs. Off by default: pinning concentrates "
+             "concurrent jobs onto the same node, so they contend for its "
+             "cores and memory bandwidth.",
     )
     parser.add_argument(
         "--ray-address",

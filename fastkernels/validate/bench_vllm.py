@@ -623,6 +623,14 @@ def main():
     )
     if cfg.get("trust_remote_code"):
         llm_kwargs["trust_remote_code"] = True
+    if cfg["tp"] > 1:
+        # Pin multi-GPU execution to multiprocessing. vLLM's auto-selection
+        # falls back to "ray" whenever Ray is initialized with a placement
+        # group in the calling process, which would nest a second Ray cluster
+        # inside the validate runner's. Only set for tp>1: at tp=1 vLLM picks
+        # "uni" and runs in-process, and forcing "mp" there would spawn a
+        # worker subprocess for no benefit.
+        llm_kwargs["distributed_executor_backend"] = "mp"
     if cfg.get("is_qwen_omni", False):
         llm_kwargs["limit_mm_per_prompt"] = {
             "image": 0,
@@ -1248,6 +1256,9 @@ def main():
     )
     if cfg.get("trust_remote_code"):
         llm_kwargs["trust_remote_code"] = True
+    if cfg["tp"] > 1:
+        # See the LLM worker: keep multi-GPU off vLLM's ray executor.
+        llm_kwargs["distributed_executor_backend"] = "mp"
     if cfg.get("load_format"):
         llm_kwargs["load_format"] = cfg["load_format"]
     if cfg.get("limit_mm_per_prompt"):
@@ -1794,6 +1805,9 @@ def main():
     )
     if cfg.get("trust_remote_code"):
         llm_kwargs["trust_remote_code"] = True
+    if cfg["tp"] > 1:
+        # See the LLM worker: keep multi-GPU off vLLM's ray executor.
+        llm_kwargs["distributed_executor_backend"] = "mp"
     if cfg.get("load_format"):
         llm_kwargs["load_format"] = cfg["load_format"]
     llm = LLM(**llm_kwargs)

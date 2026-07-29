@@ -496,6 +496,10 @@ def main():
         max_model_len=cfg["max_length"],
         max_num_batched_tokens=cfg["max_num_batched_tokens"],
         max_num_seqs=cfg["max_num_seqs"],
+        # Pin multi-GPU execution to multiprocessing so vLLM cannot fall back
+        # to its ray executor and nest a second Ray cluster inside the validate
+        # runner's. None leaves vLLM's own default, which is "uni" at tp=1.
+        distributed_executor_backend="mp" if cfg["tp"] > 1 else None,
     )
 
     warm_prompts = [
