@@ -20,7 +20,6 @@ dependencies = [
     "tqdm",
     "blobfile",
     "halo",
-    "flash-attn",
     "vllm==0.26.0",
     "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@v0.26.0rc1",
     "openai>=2.48.0",
@@ -42,6 +41,41 @@ dependencies = [
     "fastsafetensors",
     "ultralytics",
     "flash-linear-attention>=0.4.2",
+    # --- FlashAttention 2 ---------------------------------------------------
+    # Pinned to prebuilt wheels rather than the PyPI package, whose extension is
+    # compiled against whatever torch the build/wheel-publish env saw. When that
+    # torch differs from the pin above, `import flash_attn` dies at dlopen:
+    #   ImportError: flash_attn_2_cuda...so: undefined symbol:
+    #     _ZN3c104cuda29c10_cuda_check_implementationEiPKcS2_ib
+    # (c10_cuda_check_implementation's line_number arg went int -> uint32_t, so
+    # the mangled name moved from ...S2_ib to ...S2_jb.) vLLM is collateral
+    # damage: rotary_embedding/common.py imports flash_attn.ops.triton.rotary
+    # under `suppress(ModuleNotFoundError)`, which does not catch an ABI
+    # ImportError, so a mismatched wheel is fatal at engine startup.
+    #
+    # These wheels are built per (flash-attn, CUDA, torch, cpython) tuple, so the
+    # ABI is pinned exactly: https://github.com/mjun0812/flash-attention-prebuild-wheels
+    #
+    # CUDA flavor is hardcoded to cu130 because PEP 508 markers cannot see it —
+    # and they don't need to: torch==2.11.0 on PyPI is a CUDA 13 build (it
+    # depends on nvidia-*-cu13), so cu130 is implied by the torch pin. If you
+    # deliberately install torch 2.11.0 from a cu128/cu126 index, swap the wheel
+    # afterwards with the matching URL from the release above:
+    #   pip install --force-reinstall --no-deps \
+    #     ".../v0.9.4/flash_attn-2.8.3+cu128torch2.11-cp312-cp312-linux_x86_64.whl"
+    # Free-threaded interpreters (3.13t/3.14t) are not selectable by marker;
+    # provision those by hand from the same release.
+    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.4/flash_attn-2.8.3+cu130torch2.11-cp310-cp310-linux_x86_64.whl ; python_version == '3.10' and platform_machine == 'x86_64'",
+    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.4/flash_attn-2.8.3+cu130torch2.11-cp311-cp311-linux_x86_64.whl ; python_version == '3.11' and platform_machine == 'x86_64'",
+    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.4/flash_attn-2.8.3+cu130torch2.11-cp312-cp312-linux_x86_64.whl ; python_version == '3.12' and platform_machine == 'x86_64'",
+    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.4/flash_attn-2.8.3+cu130torch2.11-cp313-cp313-linux_x86_64.whl ; python_version == '3.13' and platform_machine == 'x86_64'",
+    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.4/flash_attn-2.8.3+cu130torch2.11-cp314-cp314-linux_x86_64.whl ; python_version == '3.14' and platform_machine == 'x86_64'",
+    # aarch64 (GB200-class hosts) ships in a later release of the same builder.
+    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.22/flash_attn-2.8.3+cu130torch2.11-cp310-cp310-linux_aarch64.whl ; python_version == '3.10' and platform_machine == 'aarch64'",
+    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.22/flash_attn-2.8.3+cu130torch2.11-cp311-cp311-linux_aarch64.whl ; python_version == '3.11' and platform_machine == 'aarch64'",
+    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.22/flash_attn-2.8.3+cu130torch2.11-cp312-cp312-linux_aarch64.whl ; python_version == '3.12' and platform_machine == 'aarch64'",
+    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.22/flash_attn-2.8.3+cu130torch2.11-cp313-cp313-linux_aarch64.whl ; python_version == '3.13' and platform_machine == 'aarch64'",
+    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.22/flash_attn-2.8.3+cu130torch2.11-cp314-cp314-linux_aarch64.whl ; python_version == '3.14' and platform_machine == 'aarch64'",
 ]
 
 # ---------------------------------------------------------------------------
