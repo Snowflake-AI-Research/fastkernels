@@ -247,6 +247,31 @@ def _fused_ar_add_rmsnorm_fake(
     return torch.empty_like(x), torch.empty_like(residual)
 
 
+def _fused_ar_rmsnorm_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused all-reduce + RMSNorm with no residual (layer 0's input_layernorm).
+
+    Returns ``(normed, all_reduced)``: layer 0 carries the un-normalised
+    all-reduce result forward as the residual, so both outputs are live.
+    """
+    from ..tasks.baseline.L1.flashinfer_allreduce_fusion import (
+        fused_allreduce_rmsnorm,
+    )
+
+    return fused_allreduce_rmsnorm(x, weight, eps)
+
+
+def _fused_ar_rmsnorm_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(x), torch.empty_like(x)
+
+
 def _kda_attention_impl(
     q_proj_states: torch.Tensor,
     k_proj_states: torch.Tensor,
@@ -357,6 +382,17 @@ def ensure_custom_ops_registered() -> None:
     )
     lib.impl("fused_allreduce_add_rmsnorm", _fused_ar_add_rmsnorm_impl, "CUDA")
     abstract_lib.impl("fused_allreduce_add_rmsnorm", _fused_ar_add_rmsnorm_fake)
+
+    # No-residual variant: layer 0's input_layernorm consumes the vocab-parallel
+    # embedding's all-reduce and has no residual yet. One site per step, but the
+    # first collective in the decode graph, so it absorbs the step's launch skew.
+    # vLLM fuses it as ``AllReduceRMSNormPattern``.
+    lib.define(
+        "fused_allreduce_rmsnorm(Tensor x, Tensor weight, float eps) "
+        "-> (Tensor, Tensor)"
+    )
+    lib.impl("fused_allreduce_rmsnorm", _fused_ar_rmsnorm_impl, "CUDA")
+    abstract_lib.impl("fused_allreduce_rmsnorm", _fused_ar_rmsnorm_fake)
 
     lib.define(
         "kda_attention(Tensor q_proj_states, Tensor k_proj_states, "
@@ -591,6 +627,7 @@ class AllReduceFusedAddRMSNormPass(InductorPass):
         ensure_custom_ops_registered()
         self._AR = torch.ops.fastkernels.custom_all_reduce.default
         self._FUSED = torch.ops.fastkernels.fused_allreduce_add_rmsnorm.default
+        self._FUSED_NR = torch.ops.fastkernels.fused_allreduce_rmsnorm.default
 
     # -- small helpers over fx nodes ----------------------------------------
 
@@ -631,7 +668,7 @@ class AllReduceFusedAddRMSNormPass(InductorPass):
         candidates = [n for n in graph.nodes
                       if n.op == "call_function" and n.target is self._AR]
         for ar in candidates:
-            if self._fuse_site(graph, ar):
+            if self._fuse_site(graph, ar) or self._fuse_site_no_residual(graph, ar):
                 count += 1
         if count:
             graph.eliminate_dead_code()
@@ -759,6 +796,86 @@ class AllReduceFusedAddRMSNormPass(InductorPass):
                     self._CVT, args=(res_out, torch.float32))
                 w.meta["val"] = add_val
             consumer.replace_input_with(add, w)
+        return True
+
+
+    def _fuse_site_no_residual(self, graph: torch.fx.Graph,
+                               ar: torch.fx.Node) -> bool:
+        """The residual-free form: layer 0's ``input_layernorm``.
+
+        ``forward_native`` with ``residual=None`` skips the add, so the variance
+        branch and the scale multiply hang off the f32 cast of the all-reduce
+        rather than off a sum:
+
+            c1   = convert(ar, f32)
+            rs   = rsqrt(mean(c1 ** 2, -1, keepdim) + eps)
+            norm = convert(c1 * rs, dtype) * weight
+
+        Unlike the with-residual form, ``ar`` legitimately has a second consumer:
+        layer 0 carries the un-normalised all-reduce result forward as the
+        residual. Those consumers are rewired to the op's second output.
+        """
+        dtype = self.dtype
+
+        c1 = next((u for u in ar.users
+                   if self._cvt_to(u, torch.float32) is not None), None)
+        if c1 is None:
+            return self._skip(ar, "[nr] all-reduce output has no convert-to-f32 user")
+
+        pow_n = next((u for u in c1.users
+                      if self._is(u, self._POW) and u.args[1] == 2), None)
+        if pow_n is None:
+            return self._skip(ar, "[nr] no squaring op on the cast")
+        mean = self._sole_user(pow_n, self._MEAN)
+        if mean is None or list(mean.args[1]) != [-1] or mean.args[2] is not True:
+            return self._skip(ar, "[nr] mean is not over the last dim with keepdim")
+        eps_add = self._sole_user(mean, self._ADD)
+        if eps_add is None:
+            return self._skip(ar, "[nr] mean does not feed a lone add(eps)")
+        eps = eps_add.args[1]
+        if not isinstance(eps, float):
+            return self._skip(ar, "[nr] eps is not a float constant")
+        rsqrt = self._sole_user(eps_add, self._RSQRT)
+        if rsqrt is None:
+            return self._skip(ar, "[nr] eps-add does not feed a lone rsqrt")
+
+        scale_mul = next((u for u in c1.users if self._is(u, self._MUL)
+                          and self._binary_operands(u, rsqrt) is c1), None)
+        if scale_mul is None:
+            return self._skip(ar, "[nr] no multiply of the cast by rsqrt")
+        if set(c1.users) - {pow_n, scale_mul}:
+            return self._skip(ar, "[nr] cast has a consumer outside {pow, mul}")
+
+        norm_cvt = self._sole_user(scale_mul, self._CVT)
+        if norm_cvt is None or norm_cvt.args[1] != dtype:
+            return self._skip(ar, "[nr] scale mul does not feed a lone convert back")
+        weight_mul = self._sole_user(norm_cvt, self._MUL)
+        if weight_mul is None:
+            return self._skip(ar, "[nr] convert-back does not feed a lone multiply")
+        weight = self._binary_operands(weight_mul, norm_cvt)
+        if not isinstance(weight, torch.fx.Node):
+            return self._skip(ar, "[nr] gamma operand is not a node")
+        weight_val = weight.meta.get("val")
+        if weight_val is None or weight_val.dim() != 1 or weight_val.dtype != dtype:
+            return self._skip(ar, "[nr] gamma is not 1-D in the activation dtype")
+        norm_val = weight_mul.meta.get("val")
+        ar_val = ar.meta.get("val")
+        if norm_val is None or ar_val is None:
+            return self._skip(ar, "[nr] missing fake-tensor metadata")
+
+        carriers = [u for u in ar.users if u is not c1]
+        with graph.inserting_before(weight_mul):
+            fused = graph.call_function(
+                self._FUSED_NR, args=(ar.args[0], weight, eps))
+            fused.meta["val"] = (norm_val, ar_val)
+            norm_out = graph.call_function(operator.getitem, args=(fused, 0))
+            norm_out.meta["val"] = norm_val
+            ar_out = graph.call_function(operator.getitem, args=(fused, 1))
+            ar_out.meta["val"] = ar_val
+
+        weight_mul.replace_all_uses_with(norm_out)
+        for carrier in carriers:
+            carrier.replace_input_with(ar, ar_out)
         return True
 
 

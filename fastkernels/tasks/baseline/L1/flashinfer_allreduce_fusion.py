@@ -38,6 +38,17 @@ _TorchDistBackend = None
 # for a different hidden dim (which would corrupt rather than fail).
 _WORKSPACES: dict[tuple[int, int, torch.dtype, int], object] = {}
 
+# Zero residual for the no-residual pattern, one per (hidden, dtype), sized for
+# the workspace's whole token range and sliced per call.
+#
+# This MUST be allocated outside any CUDA graph capture. Allocating it lazily on
+# first use placed it in the capturing graph's private memory pool; reusing the
+# cached tensor from another graph or from eager is then undefined behaviour, and
+# it silently corrupted memory and killed a rank mid-capture with no traceback.
+# It is created alongside the workspace instead, which happens during the eager
+# warmup forward, well before decode capture.
+_ZERO_RESIDUALS: dict[tuple[int, torch.dtype], torch.Tensor] = {}
+
 # Max fused-collective payload per (device capability, world size), in MB.
 # Copied from vLLM's ``FI_ALLREDUCE_FUSION_MAX_SIZE_MB`` -- these are FlashInfer
 # workspace limits, not tuning knobs, so they have to agree with vLLM's.
@@ -156,6 +167,12 @@ def get_fi_ar_workspace(hidden_dim: int, dtype: torch.dtype):
             _WORKSPACES[key] = None
             return None, 0
 
+    # Allocate the zero residual here, where we are certainly not capturing.
+    if (hidden_dim, dtype) not in _ZERO_RESIDUALS:
+        _ZERO_RESIDUALS[(hidden_dim, dtype)] = torch.zeros(
+            max_token_num, hidden_dim, dtype=dtype, device="cuda",
+        )
+
     logger.info(
         "Initialized FlashInfer allreduce fusion workspace: backend=%s "
         "world_size=%d hidden_dim=%d max_token_num=%d dtype=%s",
@@ -247,3 +264,59 @@ def fused_allreduce_add_rmsnorm(
         trigger_completion_at_end=num_tokens > _PDL_ADVANCE_LAUNCH_TOKENS,
     )
     return norm_out.view(orig_shape), residual_out.view(residual.shape)
+
+
+def fused_allreduce_rmsnorm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``all_reduce(x)`` then RMSNorm with no residual, in one kernel.
+
+    This is layer 0's ``input_layernorm``: its input is the vocab-parallel
+    embedding's all-reduce and there is no residual yet. One site per step, but it
+    is the *first* collective inside the decode CUDA graph, so it absorbs whatever
+    inter-rank launch skew the step begins with -- 119.73 us average as an unfused
+    ``cross_device_reduce_1stage`` against 5.86 us median for the fused kernel.
+    vLLM fuses it too (``AllReduceRMSNormPattern``).
+
+    FlashInfer has no all-reduce + rms_norm pattern without a residual, so a
+    zeroed residual is supplied, as vLLM does. With ``residual_in`` zero,
+    ``residual_out`` is exactly ``all_reduce(x)`` -- which the caller still needs,
+    because at layer 0 the residual stream *is* the un-normalised embedding
+    output. Both are therefore returned.
+    """
+    orig_shape = x.shape
+    hidden_dim = orig_shape[-1]
+    x2d = x.reshape(-1, hidden_dim)
+    num_tokens = x2d.shape[0]
+
+    workspace, max_token_num = get_fi_ar_workspace(hidden_dim, x.dtype)
+    zeros = _ZERO_RESIDUALS.get((hidden_dim, x.dtype))
+    # ``zeros is None`` can only happen if this op runs before the workspace was
+    # built; falling back avoids ever allocating it inside a capture.
+    if workspace is None or zeros is None or num_tokens > max_token_num:
+        from .rms_norm import RMSNorm
+
+        out = torch.ops.fastkernels.custom_all_reduce(x)
+        return RMSNorm.forward_cuda(out, weight, eps), out
+
+    x2d = x2d.contiguous()
+    norm_out = torch.empty_like(x2d)
+    ar_out = torch.empty_like(x2d)
+    _flashinfer_comm.allreduce_fusion(
+        input=x2d,
+        workspace=workspace,
+        pattern=_flashinfer_comm.AllReduceFusionPattern.kARResidualRMSNorm,
+        launch_with_pdl=True,
+        output=None,
+        residual_out=ar_out,
+        norm_out=norm_out,
+        residual_in=zeros[:num_tokens],
+        rms_gamma=weight,
+        rms_eps=eps,
+        use_oneshot=None,
+        fp32_acc=True,
+        trigger_completion_at_end=num_tokens > _PDL_ADVANCE_LAUNCH_TOKENS,
+    )
+    return norm_out.view(orig_shape), ar_out.view(orig_shape)
