@@ -536,6 +536,24 @@ def _run_job_subprocess(
         status = f"FAIL({watchdog_reason})"
     else:
         status = "PASS" if returncode == 0 else f"FAIL(rc={returncode})"
+
+    # A zero exit code is not sufficient evidence that the job ran. Several
+    # harnesses launch their engines in subprocesses and merely *skip* the
+    # comparison when one dies -- e.g. bench_microsoft_bitnet does
+    # ``kb_data = run_worker(...)`` then ``if kb_data:``, so a failed engine
+    # leaves the script printing nothing and exiting 0. That is how
+    # microsoft/bitnet-b1.58-2B-4T was recorded PASS in 20260729-070206 while
+    # its log ended in ``AttributeError: 'BitNetConfig' object has no
+    # attribute 'rope_theta'`` and it wrote no results at all.
+    #
+    # Every harness is expected to emit a machine-readable result artifact, so
+    # treat its absence as a failure regardless of the exit code.
+    if status == "PASS":
+        artifact = _result_artifact_path(run_dir, job.get("harness"))
+        if not artifact.is_file():
+            status = "FAIL(no-results)"
+            returncode = returncode or 1
+
     result = {
         "index": job["index"],
         "name": job["name"],
@@ -656,7 +674,18 @@ def _alignment_summary(alignment: dict | None) -> str:
         parts.append(f"avg prefix match len: {average:.1f}")
     if isinstance(exact, int) and isinstance(total, int) and total:
         parts.append(f"exact match: {exact}/{total} ({exact / total * 100:.1f}%)")
-    return "; ".join(parts) if parts else "-"
+    if parts:
+        return "; ".join(parts)
+    # Non-generative harnesses have no token stream, so comparison.py reports a
+    # named similarity metric (cosine / match rate) plus an optional threshold.
+    metric = alignment.get("metric")
+    value = alignment.get("value", alignment.get("score"))
+    if isinstance(metric, str) and isinstance(value, (int, float)):
+        cell = f"{metric}={value:.6f}"
+        if isinstance(alignment.get("passed"), bool):
+            cell = f"pass={alignment['passed']}; {cell}"
+        return cell
+    return "-"
 
 
 def _cosine_summary(items: list[float]) -> str:
@@ -677,6 +706,17 @@ def _reference_name(harness: str) -> str:
         "bench_openfold3": "reference",
         "bench_embedding": "vLLM",
         "bench_oasis": "open-oasis",
+        # Harnesses standardized on comparison.py also write "reference_name"
+        # into results.json, which wins over this table; these are the fallbacks
+        # for older result files that predate that field.
+        "bench_3dgs": "gsplat",
+        "bench_instantngp": "pyngp",
+        "bench_pointcloud": "official-detached",
+        "bench_openpi": "openpi",
+        "bench_dllm": "fast-dllm",
+        "bench_image_cls": "timm",
+        "bench_ttt_e2e": "jax",
+        "bench_microsoft_bitnet": "microsoft-bitnet-gpu",
     }.get(harness, "reference")
 
 
@@ -837,6 +877,23 @@ def _throughput_rows_for_result(
                     "correctness": summary,
                 }
             )
+    if not rows:
+        # Generic fallback for any harness that emits the standard shape from
+        # fastkernels/validate/comparison.py. Harnesses standardized after the
+        # branches above (openpi, dllm, image_cls, ttt_e2e, microsoft_bitnet,
+        # 3dgs, instantngp, pointcloud) need no branch of their own.
+        for item in data.get("scenarios", []):
+            if not isinstance(item, dict) or "speedup" not in item:
+                continue
+            rows.append(
+                {
+                    "model": model,
+                    "workload": item.get("scenario") or item.get("name"),
+                    "reference": data.get("reference_name") or reference,
+                    "speedup": item.get("speedup"),
+                    "correctness": _alignment_summary(item.get("alignment")),
+                }
+            )
     return rows
 
 
@@ -917,6 +974,20 @@ def _latency_rows_for_result(
                     "speedup": item.get("speedup"),
                 }
             )
+    if not rows:
+        # Same generic fallback as the throughput table: pick up the standard
+        # latency_scenarios shape from fastkernels/validate/comparison.py.
+        for item in data.get("latency_scenarios", []):
+            if not isinstance(item, dict) or "speedup" not in item:
+                continue
+            rows.append(
+                {
+                    "model": model,
+                    "workload": item.get("scenario") or item.get("name"),
+                    "reference": data.get("reference_name") or reference,
+                    "speedup": item.get("speedup"),
+                }
+            )
     return rows
 
 
@@ -954,6 +1025,8 @@ def _format_table(rows: list[dict], headers: list[tuple[str, str]]) -> str:
 
 def _result_artifact_path(run_dir: Path, harness: str | None) -> Path:
     results_path = run_dir / "results.json"
+    # bench_openpi now emits the standard results.json like every other harness;
+    # the summary.json branch only serves runs recorded before that.
     if results_path.is_file() or harness != "bench_openpi":
         return results_path
     return run_dir / "summary.json"

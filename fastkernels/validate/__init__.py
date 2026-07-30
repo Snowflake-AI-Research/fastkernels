@@ -152,6 +152,14 @@ _EAGER_OK = {
     "bench_diffusers",
     "bench_embedding",
     "bench_openpi",
+    "bench_microsoft_bitnet",
+}
+# Harnesses that take the scenario's declared workload list. Without this the
+# declaration is fiction: bench_microsoft_bitnet ran three hardcoded regimes
+# while full.yaml advertised LLM.mixed/long_context/single_request/
+# fixed_batch_32, so the run summary claimed coverage that never happened.
+_WORKLOADS_FLAG = {
+    "bench_microsoft_bitnet": "--workloads",
 }
 _HF_MODEL_ARG = {
     "bench_vllm",
@@ -272,6 +280,11 @@ def _build_cmd(
             cmd += [flag, str(args.max_requests)]
     if scenario.enforce_eager and harness in _EAGER_OK:
         cmd.append("--enforce-eager")
+    workloads_flag = _WORKLOADS_FLAG.get(harness)
+    if workloads_flag:
+        declared = _scenario_workloads(scenario)
+        if declared:
+            cmd += [workloads_flag, ",".join(declared)]
     scenario_variant = getattr(scenario, "variant", None)
     if scenario_variant and harness in _VARIANT_OK:
         cmd += ["--variant", scenario_variant]

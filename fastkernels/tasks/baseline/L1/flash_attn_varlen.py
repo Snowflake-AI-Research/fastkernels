@@ -1,8 +1,9 @@
 """Variable-length Flash Attention (no KV cache lookup).
 
-Thin ``nn.Module`` wrapper around ``flash_attn_varlen_func`` with the same
-3-way fallback as :mod:`flash_attn_prefill`: vLLM's bundled FA3 on Hopper,
-then upstream ``flash_attn`` (FA2), then ``flash_mla``.
+Thin ``nn.Module`` wrapper around ``flash_attn_varlen_func`` from vLLM's
+bundled FlashAttention build, at the version vLLM would select for this
+device (see :mod:`fa_utils`).  Falls back to ``flash_mla`` only when that
+build is unavailable.
 
 Used by MLA prefill and chunked-context paths where Q, K, V are dense
 ``[total_tokens, num_heads, head_dim]`` tensors (no paged cache lookup,
@@ -15,32 +16,11 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-_FA3_AVAILABLE = False
-_fa3_varlen_func = None
-_fa_version = None
-try:
-    from vllm.vllm_flash_attn import (
-        flash_attn_varlen_func as _vllm_fa_varlen,
-        is_fa_version_supported,
-    )
-    if is_fa_version_supported(3) and torch.cuda.is_available():
-        cc = torch.cuda.get_device_capability()
-        if cc[0] >= 9:
-            _FA3_AVAILABLE = True
-            _fa3_varlen_func = _vllm_fa_varlen
-            try:
-                from vllm.v1.attention.backends.fa_utils import (
-                    get_flash_attn_version as _get_fa_version,
-                )
-                _fa_version = _get_fa_version()
-            except ImportError:
-                _fa_version = 3
-except ImportError:
-    pass
+from .fa_utils import FA_VERSION, VLLM_FA_AVAILABLE, flash_attn_varlen_func
 
 _fa2_varlen_func = None
 _flashmla_varlen_func = None
-if not _FA3_AVAILABLE:
+if not VLLM_FA_AVAILABLE:  # pragma: no cover - CPU-only fallback
     try:
         from flash_attn import flash_attn_varlen_func as _fa2_varlen_func
     except ImportError:
@@ -72,8 +52,9 @@ class FlashAttnVarlen(nn.Module):
         causal: bool = True,
         return_softmax_lse: bool = False,
     ):
-        if _FA3_AVAILABLE:
-            kwargs = dict(
+        if VLLM_FA_AVAILABLE:
+            return flash_attn_varlen_func(
+                q, k, v,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
                 max_seqlen_q=max_seqlen_q,
@@ -81,10 +62,8 @@ class FlashAttnVarlen(nn.Module):
                 softmax_scale=softmax_scale,
                 causal=causal,
                 return_softmax_lse=return_softmax_lse,
+                fa_version=FA_VERSION,
             )
-            if _fa_version is not None:
-                kwargs["fa_version"] = _fa_version
-            return _fa3_varlen_func(q, k, v, **kwargs)
         fn = _fa2_varlen_func if _fa2_varlen_func is not None else _flashmla_varlen_func
         kwargs = dict(
             cu_seqlens_q=cu_seqlens_q,

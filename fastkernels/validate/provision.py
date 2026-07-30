@@ -45,6 +45,13 @@ NGP_DIR = THIRD_PARTY_DIR / "instant-ngp"
 FBGEMM_DIR = THIRD_PARTY_DIR / "FBGEMM"
 PTV3_DIR = THIRD_PARTY_DIR / "PointTransformerV3"
 FASTDLLM_DIR = THIRD_PARTY_DIR / "Fast-dLLM"
+# The Microsoft BitNet GPU reference is a source checkout plus a hand-built CUDA
+# kernel and a two-step checkpoint conversion; the harness only ever loads the
+# int2/fp16 splits, not the bf16 safetensors they are derived from.
+BITNET_DIR = THIRD_PARTY_DIR / "BitNet"
+BITNET_GPU_DIR = BITNET_DIR / "gpu"
+BITNET_KERNEL_SO = BITNET_GPU_DIR / "bitnet_kernels" / "libbitnet.so"
+BITNET_CKPT_DIR = BITNET_GPU_DIR / "checkpoints"
 # The OpenPI reference needs its own interpreter: it pins jax[cuda12]==0.5.3 and
 # torch==2.7.1, which cannot coexist with the fastkernels env's torch. `uv sync`
 # builds that venv inside the checkout; bench_openpi drives it via
@@ -461,6 +468,84 @@ def _check_instant_ngp() -> bool:
     return build.is_dir() and any(build.glob("pyngp*.so"))
 
 
+def _prov_bitnet() -> None:
+    """Microsoft BitNet GPU reference: kernel build + int2/fp16 checkpoints.
+
+    Mirrors the upstream one-time setup in BitNet/gpu/README.md. Two deviations,
+    both deliberate:
+
+    * The kernel is built for the *local* compute capability rather than
+      upstream's hardcoded ``compute_80`` PTX, matching how instant-ngp/tcnn is
+      built here. Otherwise the reference would run JIT-ed sm_80 PTX on a
+      Blackwell GPU, which is not a fair reference measurement.
+    * ``xformers`` is installed because the reference's ``model.py`` imports
+      ``RMSNorm``/``fmha``/``rope_padded`` from it. Current xformers only
+      requires ``torch>=2.10``, so it does not perturb the env's torch.
+    """
+    _git_clone("https://github.com/microsoft/BitNet", BITNET_DIR)
+    if not _importable("xformers"):
+        _pip("xformers")
+
+    if not BITNET_KERNEL_SO.is_file():
+        cc = _torch_cc()
+        arch = f"{cc[0]}{cc[1]}"
+        _run(
+            [
+                "nvcc", "-std=c++17", "-Xcudafe", "--diag_suppress=177",
+                "--compiler-options", "-fPIC", "-lineinfo", "--shared",
+                "bitnet_kernels.cu", "-lcuda",
+                f"-gencode=arch=compute_{arch},code=sm_{arch}",
+                "-o", "libbitnet.so",
+            ],
+            cwd=BITNET_KERNEL_SO.parent,
+        )
+
+    int2 = BITNET_CKPT_DIR / "model_state_int2.pt"
+    fp16 = BITNET_CKPT_DIR / "model_state_fp16.pt"
+    if int2.is_file() and fp16.is_file():
+        print(f"    [skip] already present: {int2.name}, {fp16.name}", flush=True)
+        return
+
+    bf16_dir = BITNET_CKPT_DIR / "bitnet-b1.58-2B-4T-bf16"
+    safetensors = bf16_dir / "model.safetensors"
+    if not safetensors.is_file():
+        BITNET_CKPT_DIR.mkdir(parents=True, exist_ok=True)
+        _run([
+            "hf", "download", "microsoft/bitnet-b1.58-2B-4T-bf16",
+            "--local-dir", str(bf16_dir),
+        ])
+
+    # convert_safetensors.py rewrites the published bf16 safetensors into the
+    # reference's own key layout (same dtype, ~4.8 GB); convert_checkpoint.py
+    # then splits that into the int2 and fp16 halves the official CUDA-graph
+    # path loads. The intermediate is not needed afterwards -- upstream's README
+    # deletes it too.
+    intermediate = BITNET_CKPT_DIR / "model_state.pt"
+    _run(
+        [
+            sys.executable, "convert_safetensors.py",
+            "--safetensors_file", str(safetensors),
+            "--output", str(intermediate),
+            "--model_name", "2B",
+        ],
+        cwd=BITNET_GPU_DIR,
+    )
+    _run(
+        [sys.executable, "convert_checkpoint.py", "--input", str(intermediate)],
+        cwd=BITNET_GPU_DIR,
+    )
+    intermediate.unlink(missing_ok=True)
+
+
+def _check_bitnet() -> bool:
+    return (
+        BITNET_KERNEL_SO.is_file()
+        and (BITNET_CKPT_DIR / "model_state_int2.pt").is_file()
+        and (BITNET_CKPT_DIR / "model_state_fp16.pt").is_file()
+        and _importable("xformers")
+    )
+
+
 # --- Component registry ----------------------------------------------------
 @dataclass(frozen=True)
 class Component:
@@ -483,6 +568,7 @@ COMPONENTS: dict[str, Component] = {
         Component("omni", "vllm-omni references (FLUX/HunyuanVideo/CosyVoice3) + s3tokenizer", ("bench_vllm_omni",), _prov_omni, _check_omni),
         Component("instant_ngp", "instant-ngp pyngp source build + fox scene", ("bench_instantngp",), _prov_instant_ngp, _check_instant_ngp),
         Component("openpi", "OpenPI reference venv + converted PyTorch Pi0 checkpoint", ("bench_openpi",), _prov_openpi, _check_openpi),
+        Component("bitnet", "Microsoft BitNet GPU kernel + int2/fp16 checkpoints", ("bench_microsoft_bitnet",), _prov_bitnet, _check_bitnet),
     )
 }
 

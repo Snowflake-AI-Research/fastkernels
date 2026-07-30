@@ -27,6 +27,7 @@ import copy
 import dataclasses
 import logging
 import operator
+import os
 from collections import defaultdict
 from collections.abc import Callable
 from contextlib import ExitStack, nullcontext
@@ -67,6 +68,7 @@ SPLITTING_OPS: list[str] = [
     "fastkernels::mamba2_conv_ssm_forward",
     "fastkernels::unified_mla_attention",
     "fastkernels::sparse_attn_indexer",
+    "fastkernels::kda_attention",
 ]
 
 
@@ -186,6 +188,97 @@ def _sparse_attn_indexer_fake(
     )
 
 
+def _custom_all_reduce_impl(t: torch.Tensor) -> torch.Tensor:
+    """All-reduce that survives torch.compile, preferring the custom IPC kernel.
+
+    ``AllReduce.forward`` previously took ``dist.all_reduce`` unconditionally when
+    ``torch.compiler.is_compiling()``, because the custom all-reduce does Python-side
+    IPC pointer work that a compiled graph cannot trace. That made every collective
+    in the compiled decode graph go through NCCL, at one-token message sizes (~5.7 KB
+    for gpt-oss) where NCCL is far off its efficient range. Measured effect on
+    gpt-oss-120b decode: tp=1 2.527 ms/step, tp=2 3.026 ms/step -- i.e. adding a
+    second GPU made decode *slower*, where vLLM goes 2.789 -> 2.291.
+
+    Registering it as a custom op is how vLLM handles the same problem: inductor
+    treats the call as opaque, so the IPC work happens at runtime instead of being
+    traced. Falls back to NCCL when the buffer does not qualify (too large,
+    misaligned, non-contiguous) exactly as the eager path does.
+    """
+    from ..tasks.baseline.L1.allreduce import get_custom_ar
+
+    ar = get_custom_ar()
+    if ar is not None:
+        out = ar.custom_all_reduce(t)
+        if out is not None:
+            return out
+    out = t.clone()
+    torch.distributed.all_reduce(out)
+    return out
+
+
+def _custom_all_reduce_fake(t: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(t)
+
+
+def _fused_ar_add_rmsnorm_impl(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One FlashInfer kernel for all-reduce + residual-add + RMSNorm.
+
+    See ``L1.flashinfer_allreduce_fusion`` for why this is a single kernel and
+    what it falls back to when the batch outgrows the workspace.
+    """
+    from ..tasks.baseline.L1.flashinfer_allreduce_fusion import (
+        fused_allreduce_add_rmsnorm,
+    )
+
+    return fused_allreduce_add_rmsnorm(x, residual, weight, eps)
+
+
+def _fused_ar_add_rmsnorm_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(x), torch.empty_like(residual)
+
+
+def _kda_attention_impl(
+    q_proj_states: torch.Tensor,
+    k_proj_states: torch.Tensor,
+    v_proj_states: torch.Tensor,
+    raw_g: torch.Tensor,
+    beta: torch.Tensor,
+    core_attn_out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    layer = get_no_compile_layers()[layer_name]
+    layer.forward_impl(
+        q_proj_states=q_proj_states,
+        k_proj_states=k_proj_states,
+        v_proj_states=v_proj_states,
+        raw_g=raw_g,
+        beta=beta,
+        core_attn_out=core_attn_out,
+    )
+
+
+def _kda_attention_fake(
+    q_proj_states: torch.Tensor,
+    k_proj_states: torch.Tensor,
+    v_proj_states: torch.Tensor,
+    raw_g: torch.Tensor,
+    beta: torch.Tensor,
+    core_attn_out: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return None
+
+
 _registered = False
 
 
@@ -246,6 +339,33 @@ def ensure_custom_ops_registered() -> None:
     lib.impl("sparse_attn_indexer", _sparse_attn_indexer_impl, "CUDA")
     lib.impl("sparse_attn_indexer", _sparse_attn_indexer_impl, "CPU")
     abstract_lib.impl("sparse_attn_indexer", _sparse_attn_indexer_fake)
+
+    # Kimi Delta Attention (Kimi-Linear's linear-attention layers).  Mirrors
+    # vLLM's ``vllm::kda_attention`` splitting op: the recurrence writes into
+    # a preallocated ``core_attn_out`` and returns nothing.
+    lib.define("custom_all_reduce(Tensor t) -> Tensor")
+    lib.impl("custom_all_reduce", _custom_all_reduce_impl, "CUDA")
+    abstract_lib.impl("custom_all_reduce", _custom_all_reduce_fake)
+
+    # Fused all-reduce + residual-add + RMSNorm (FlashInfer). Opaque on purpose:
+    # the workspace lookup and the token-count fallback are Python-side work that
+    # a traced graph cannot express. ``AllReduceFusedAddRMSNormPass`` rewrites the
+    # unfused triple into this op post-grad.
+    lib.define(
+        "fused_allreduce_add_rmsnorm(Tensor x, Tensor residual, "
+        "Tensor weight, float eps) -> (Tensor, Tensor)"
+    )
+    lib.impl("fused_allreduce_add_rmsnorm", _fused_ar_add_rmsnorm_impl, "CUDA")
+    abstract_lib.impl("fused_allreduce_add_rmsnorm", _fused_ar_add_rmsnorm_fake)
+
+    lib.define(
+        "kda_attention(Tensor q_proj_states, Tensor k_proj_states, "
+        "Tensor v_proj_states, Tensor raw_g, Tensor beta, "
+        "Tensor(a!) core_attn_out, str layer_name) -> ()"
+    )
+    lib.impl("kda_attention", _kda_attention_impl, "CUDA")
+    lib.impl("kda_attention", _kda_attention_impl, "CPU")
+    abstract_lib.impl("kda_attention", _kda_attention_fake)
 
     # Keep references alive for the lifetime of the process.
     ensure_custom_ops_registered._lib = lib  # type: ignore[attr-defined]
@@ -422,6 +542,226 @@ class NoopEliminationPass(InductorPass):
         return False
 
 
+class AllReduceFusedAddRMSNormPass(InductorPass):
+    """Rewrite ``all_reduce -> add(residual) -> rms_norm`` into one kernel.
+
+    Mirrors vLLM's ``AllReduceFusionPass``. Every tensor-parallel region in a
+    transformer layer ends with this triple -- 36 layers x 2 sites for
+    gpt-oss-120b -- and collapsing each one from two kernels and two HBM round
+    trips into one, launched with PDL, is worth 0.39 ms/step of decode at tp=2 on
+    B200. (Measured on vLLM by toggling its own ``fuse_allreduce_rms``:
+    2.684 -> 2.292 ms/step.)
+
+    Matched structurally rather than with ``pattern_matcher.register_replacement``.
+    vLLM can use the matcher because their RMSNorm is a single IR-level op, so
+    both of the subgraph's outputs are ``getitem``s off one node. Ours is
+    :meth:`RMSNorm.forward_native`, which decomposes into two independent aten
+    chains that merely share the residual add -- and ``MultiOutputPattern``
+    cannot bridge two separately-traced chains, so it rejects every candidate
+    with "no anchor found". Walking the chain by hand also allows rewiring both
+    consumers, which the matcher does not support.
+
+    The chain, as it appears post-grad (``add`` has exactly three users):
+
+        ar   = fastkernels.custom_all_reduce(x)
+        c1   = convert(ar, f32);  c2 = convert(residual, f32)
+        add  = c1 + c2
+        rs   = rsqrt(mean(add ** 2, -1, keepdim) + eps)
+        norm = convert(add * rs, dtype) * weight
+        res  = convert(add, dtype)
+
+    Any deviation aborts that site and leaves it untouched, so a failed match
+    costs performance, never correctness.
+    """
+
+    name = "allreduce_fused_add_rmsnorm"
+
+    _CVT = torch.ops.prims.convert_element_type.default
+    _ADD = torch.ops.aten.add.Tensor
+    _MUL = torch.ops.aten.mul.Tensor
+    _POW = torch.ops.aten.pow.Tensor_Scalar
+    _MEAN = torch.ops.aten.mean.dim
+    _RSQRT = torch.ops.aten.rsqrt.default
+
+    def __init__(self, dtype: torch.dtype) -> None:
+        self.dtype = dtype
+        self.matched_count = 0
+        # The fastkernels namespace is populated at runtime, after this module is
+        # imported, so these cannot be class attributes.
+        ensure_custom_ops_registered()
+        self._AR = torch.ops.fastkernels.custom_all_reduce.default
+        self._FUSED = torch.ops.fastkernels.fused_allreduce_add_rmsnorm.default
+
+    # -- small helpers over fx nodes ----------------------------------------
+
+    @staticmethod
+    def _is(node: object, target: object) -> bool:
+        return (isinstance(node, torch.fx.Node) and node.op == "call_function"
+                and node.target is target)
+
+    @classmethod
+    def _sole_user(cls, node: torch.fx.Node, target: object) -> torch.fx.Node | None:
+        """The node's only user, if it is a call to *target*."""
+        if len(node.users) != 1:
+            return None
+        user = next(iter(node.users))
+        return user if cls._is(user, target) else None
+
+    @classmethod
+    def _cvt_to(cls, node: object, dtype: torch.dtype) -> torch.fx.Node | None:
+        """*node* if it converts to *dtype*, else None."""
+        if cls._is(node, cls._CVT) and node.args[1] == dtype:
+            return node  # type: ignore[return-value]
+        return None
+
+    @classmethod
+    def _binary_operands(cls, node: torch.fx.Node, one: torch.fx.Node):
+        """Return the other operand of a 2-arg node known to take *one*."""
+        a, b = node.args[0], node.args[1]
+        if a is one:
+            return b
+        if b is one:
+            return a
+        return None
+
+    # -- the pass -----------------------------------------------------------
+
+    def __call__(self, graph: torch.fx.Graph) -> None:
+        count = 0
+        candidates = [n for n in graph.nodes
+                      if n.op == "call_function" and n.target is self._AR]
+        for ar in candidates:
+            if self._fuse_site(graph, ar):
+                count += 1
+        if count:
+            graph.eliminate_dead_code()
+        self.matched_count += count
+        logger.info("AllReduceFusedAddRMSNorm: fused %d of %d all-reduce site(s) "
+                    "in this graph (%d total)", count, len(candidates),
+                    self.matched_count)
+
+    @staticmethod
+    def _skip(ar: torch.fx.Node, reason: str) -> bool:
+        """Record why a site was left alone. Not fusing is always safe, so these
+        are debug-level -- but a run that unexpectedly fuses nothing needs them."""
+        logger.debug("AllReduceFusedAddRMSNorm: skipped %s: %s", ar.name, reason)
+        return False
+
+    def _fuse_site(self, graph: torch.fx.Graph, ar: torch.fx.Node) -> bool:
+        dtype = self.dtype
+
+        c1 = self._sole_user(ar, self._CVT)
+        if c1 is None or c1.args[1] != torch.float32:
+            return self._skip(ar, "all-reduce output is not a lone convert-to-f32")
+        add = self._sole_user(c1, self._ADD)
+        if add is None:
+            return self._skip(ar, "convert-to-f32 does not feed a lone add")
+
+        # The residual must arrive in the activation dtype, because that is what
+        # the fused kernel reads -- and what vLLM's residual stream carries.
+        # Inductor's ``pointless_convert`` collapses the f32 -> dtype -> f32
+        # round-trip between layers, so an unfused site downstream of another
+        # unfused site sees a raw f32 operand instead. Sites are visited in graph
+        # order and each rewrite reinstates a ``convert(residual, f32)`` for its
+        # consumers, so the next site down the residual stream then matches.
+        widened = self._cvt_to(self._binary_operands(add, c1), torch.float32)
+        if widened is None:
+            return self._skip(ar, "add's other operand is not convert(residual, f32)")
+        residual = widened.args[0]
+        if not isinstance(residual, torch.fx.Node):
+            return self._skip(ar, "residual operand is not a node")
+        residual_val = residual.meta.get("val")
+        if residual_val is None or residual_val.dtype != dtype:
+            return self._skip(ar, "residual is not in the activation dtype")
+
+        # Variance branch: add -> pow -> mean -> +eps -> rsqrt.
+        pow_n = next((u for u in add.users
+                      if self._is(u, self._POW) and u.args[1] == 2), None)
+        if pow_n is None:
+            return self._skip(ar, "add does not feed a squaring op")
+        mean = self._sole_user(pow_n, self._MEAN)
+        if mean is None or list(mean.args[1]) != [-1] or mean.args[2] is not True:
+            return self._skip(ar, "mean is not over the last dim with keepdim")
+        eps_add = self._sole_user(mean, self._ADD)
+        if eps_add is None:
+            return self._skip(ar, "mean does not feed a lone add(eps)")
+        eps = eps_add.args[1]
+        if not isinstance(eps, float):
+            return self._skip(ar, "eps is not a float constant")
+        rsqrt = self._sole_user(eps_add, self._RSQRT)
+        if rsqrt is None:
+            return self._skip(ar, "eps-add does not feed a lone rsqrt")
+
+        # Scale branch: identified by taking rsqrt, not merely by being a mul --
+        # a residual consumer can be a mul too.
+        scale_mul = next((u for u in add.users if self._is(u, self._MUL)
+                          and self._binary_operands(u, rsqrt) is add), None)
+        if scale_mul is None:
+            return self._skip(ar, "no multiply of the sum by rsqrt")
+        norm_cvt = self._sole_user(scale_mul, self._CVT)
+        if norm_cvt is None or norm_cvt.args[1] != dtype:
+            return self._skip(ar, "scale multiply does not feed a lone convert back")
+        weight_mul = self._sole_user(norm_cvt, self._MUL)
+        if weight_mul is None:
+            return self._skip(ar, "convert-back does not feed a lone multiply")
+        weight = self._binary_operands(weight_mul, norm_cvt)
+        if not isinstance(weight, torch.fx.Node):
+            return self._skip(ar, "gamma operand is not a node")
+        weight_val = weight.meta.get("val")
+        if weight_val is None or weight_val.dim() != 1:
+            return self._skip(ar, "gamma is not 1-D")
+        # The kernel reads gamma in the activation dtype. A model with an fp32
+        # norm weight (Gemma-style) would be silently misread, so require a
+        # match -- vLLM guards the same case with a separate pattern.
+        if weight_val.dtype != dtype:
+            return self._skip(ar, "gamma is not in the activation dtype")
+
+        norm_val = weight_mul.meta.get("val")
+        add_val = add.meta.get("val")
+        if norm_val is None or add_val is None:
+            return self._skip(ar, "missing fake-tensor metadata")
+
+        # A fresh fake tensor for the residual output: reusing the *input*
+        # residual's ``val`` would leave a surviving node and a new node sharing
+        # one metadata object, which Inductor's aliasing analysis reads.
+        try:
+            with residual_val.fake_mode:
+                res_val = torch.empty_like(residual_val)
+        except AttributeError:
+            res_val = residual_val
+
+        # Everything downstream of the sum that is not the norm itself is a
+        # residual consumer, and gets the fused op's residual output instead.
+        residual_consumers = [u for u in add.users if u not in (pow_n, scale_mul)]
+
+        with graph.inserting_before(weight_mul):
+            fused = graph.call_function(
+                self._FUSED, args=(ar.args[0], residual, weight, eps))
+            fused.meta["val"] = (norm_val, res_val)
+            norm_out = graph.call_function(operator.getitem, args=(fused, 0))
+            norm_out.meta["val"] = norm_val
+            res_out = graph.call_function(operator.getitem, args=(fused, 1))
+            res_out.meta["val"] = res_val
+
+        weight_mul.replace_all_uses_with(norm_out)
+
+        for consumer in residual_consumers:
+            if self._cvt_to(consumer, dtype) is not None:
+                # Already narrowing the sum to the activation dtype -- that is
+                # exactly the fused op's residual output.
+                consumer.replace_all_uses_with(res_out)
+                continue
+            # Consumer wants the f32 sum. Hand it the bf16 residual widened back,
+            # which is the value vLLM carries between layers, and which lets the
+            # next site down the stream match this same shape.
+            with graph.inserting_before(consumer):
+                w = graph.call_function(
+                    self._CVT, args=(res_out, torch.float32))
+                w.meta["val"] = add_val
+            consumer.replace_input_with(add, w)
+        return True
+
+
 class PostGradPassManager(torch._inductor.custom_graph_pass.CustomGraphPass):
     """Orchestrates post-grad Inductor passes.
 
@@ -432,25 +772,81 @@ class PostGradPassManager(torch._inductor.custom_graph_pass.CustomGraphPass):
     and hash the pass correctly.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, model_dtype: torch.dtype | None = None) -> None:
         self.passes: list[InductorPass] = [
             NoopEliminationPass(),
         ]
+        ar_fusion = _maybe_allreduce_fusion_pass(model_dtype)
+        if ar_fusion is not None:
+            self.passes.append(ar_fusion)
 
     def __call__(self, graph: torch.fx.Graph) -> None:
         for p in self.passes:
             p(graph)
 
     def uuid(self):
-        return None
+        """Identity of this pass set, for Inductor's FX graph cache key.
+
+        Returning None makes Inductor cache compiled graphs *without* accounting
+        for these passes, so a cache written before a pass existed -- or before it
+        was edited -- is replayed verbatim and the pass silently never runs. That
+        is how the AR+RMSNorm fusion first appeared to do nothing: it fired on a
+        toy model and matched 0 sites on gpt-oss, purely because the 120B graph
+        came back from a stale cache. Hashing this file's source plus the active
+        pass names makes any change to a pass invalidate the artifacts.
+        """
+        import hashlib
+
+        from torch._inductor.custom_graph_pass import get_hash_for_files
+
+        h = hashlib.sha256()
+        h.update(get_hash_for_files((__file__,)))
+        for p in self.passes:
+            h.update(p.name.encode())
+        return h.hexdigest()
 
     def add(self, pass_: InductorPass) -> None:
         self.passes.append(pass_)
 
 
-def configure_post_grad_passes() -> None:
-    """Install the fastkernels post-grad pass manager into Inductor config."""
-    pm = PostGradPassManager()
+def _maybe_allreduce_fusion_pass(
+    model_dtype: torch.dtype | None = None,
+) -> InductorPass | None:
+    """Build the AR+RMSNorm fusion pass, or None if it cannot run here.
+
+    Every precondition is a real runtime property, not a config choice: there are
+    no collectives to fuse at tp=1, FlashInfer may not be installed, and the
+    mnnvl backend needs NVSwitch multicast that only exists on some topologies.
+    Returning None leaves the graph exactly as it was.
+    """
+    import torch.distributed as dist
+
+    from ..tasks.baseline.L1.flashinfer_allreduce_fusion import (
+        fi_ar_fusion_available,
+    )
+
+    if not (dist.is_available() and dist.is_initialized()):
+        return None
+    if dist.get_world_size() <= 1:
+        logger.debug("AllReduce fusion disabled: world_size <= 1")
+        return None
+    if not fi_ar_fusion_available():
+        logger.info("AllReduce fusion disabled: FlashInfer allreduce_fusion "
+                    "unavailable")
+        return None
+    dtype = model_dtype or torch.get_default_dtype()
+    return AllReduceFusedAddRMSNormPass(dtype=dtype)
+
+
+def configure_post_grad_passes(model_dtype: torch.dtype | None = None) -> None:
+    """Install the fastkernels post-grad pass manager into Inductor config.
+
+    ``model_dtype`` is the activation dtype the graph will actually carry. The
+    AR+RMSNorm pattern bakes it in, so it has to be the model's dtype rather
+    than ``torch.get_default_dtype()`` -- the engine restores the process
+    default before compiling.
+    """
+    pm = PostGradPassManager(model_dtype=model_dtype)
     torch._inductor.config.post_grad_custom_post_pass = pm
     logger.info("Installed PostGradPassManager with passes: %s",
                 [p.name for p in pm.passes])
@@ -459,6 +855,55 @@ def configure_post_grad_passes() -> None:
 def remove_post_grad_passes() -> None:
     """Remove fastkernels post-grad passes from Inductor config."""
     torch._inductor.config.post_grad_custom_post_pass = None
+
+
+# ===================================================================
+# Inductor config alignment (mirrors vLLM's inductor_compile_config)
+# ===================================================================
+#
+# vLLM 0.26 passes these to ``compile_fx`` as ``config_patches`` for every
+# piecewise subgraph (``VllmBackend.inductor_config``).  Reproducing them
+# matters for both numerics and throughput:
+#
+#   enable_auto_functionalized_v2=False
+#       Custom post-grad fusion passes are written against
+#       auto-functionalization V1; V2 silently stops them matching.
+#
+#   size_asserts / alignment_asserts / scalar_asserts = False
+#       Inductor emits an assert_size_stride / assert_alignment call per
+#       buffer.  vLLM measured ~2 ms per forward pass on large models and
+#       disables them on torch < 2.12 unless VLLM_LOGGING_LEVEL=DEBUG.
+#
+#   combo_kernels / benchmark_combo_kernel = True  (torch >= 2.9)
+#       Horizontal fusion, which vLLM enables specifically to fuse qk-norm
+#       and qk-rope where query and key have different shapes.
+
+def _torch_at_least(version: str) -> bool:
+    from torch.torch_version import TorchVersion
+    return TorchVersion(torch.__version__) >= version
+
+
+def vllm_aligned_inductor_config() -> dict[str, Any]:
+    """Build the ``compile_fx`` config patches vLLM 0.26 would use."""
+    cfg: dict[str, Any] = {
+        "enable_auto_functionalized_v2": False,
+    }
+
+    if not _torch_at_least("2.12.0.dev"):
+        # torch >= 2.12 asserts once instead of per-buffer, so the
+        # workaround is only needed below that.
+        enable_asserts = (
+            os.environ.get("FASTKERNELS_LOGGING_LEVEL", "").upper() == "DEBUG"
+        )
+        cfg["size_asserts"] = enable_asserts
+        cfg["alignment_asserts"] = enable_asserts
+        cfg["scalar_asserts"] = enable_asserts
+
+    if _torch_at_least("2.9.0.dev"):
+        cfg["combo_kernels"] = True
+        cfg["benchmark_combo_kernel"] = True
+
+    return cfg
 
 
 # ===================================================================
@@ -781,6 +1226,7 @@ class PiecewiseBackend:
                     config_patches={
                         "fx_graph_cache": True,
                         "fx_graph_remote_cache": False,
+                        **vllm_aligned_inductor_config(),
                     },
                 )
             except _StopCompiling:

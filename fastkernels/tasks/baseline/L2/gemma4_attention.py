@@ -64,6 +64,14 @@ class Gemma4Attention(nn.Module):
             1.0,
             num_kv_heads=self.num_kv_heads,
             sliding_window=config.sliding_window if self.is_sliding else None,
+            # Gemma4 is a PrefixLM: image tokens attend bidirectionally
+            # ("mm_prefix").  vLLM's selector rejects FlashInfer for it
+            # ("partial multimodal token full attention not supported") and
+            # FlashAttention too ("mm_prefix requires FlashAttention v4,
+            # which does not resolve for this head_size"), leaving
+            # TRITON_ATTN for *every* Gemma4 layer -- not just the 512-wide
+            # ones.  Match that so the benchmark compares the same kernel.
+            prefer_triton=True,
         )
 
     def _apply_rope(self, positions, q, k):

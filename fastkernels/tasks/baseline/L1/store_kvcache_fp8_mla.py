@@ -115,11 +115,12 @@ class GatherKVCacheFP8MLA(nn.Module):
 
 
 class GatherAndDequantKVCacheMLA(nn.Module):
-    """Gather FP8 MLA KV cache into a BF16 workspace using the
+    """Gather MLA KV cache into a BF16 workspace using the
     ``gather_and_maybe_dequant_cache`` kernel (vLLM's chunked-context helper).
 
     Required arguments match the kernel's signature:
-        ``kv_cache``: ``[num_blocks, block_size, 656]`` uint8.
+        ``kv_cache``: ``[num_blocks, block_size, 576]`` BF16 (``"auto"``) or
+                      ``[num_blocks, block_size, 656]`` uint8 (``fp8_ds_mla``).
         ``workspace``: ``[total_tokens, 576]`` BF16 output buffer.
         ``block_table``: ``[num_seqs, max_blocks]`` int32.
         ``cu_seq_lens``: ``[num_seqs+1]`` int32 cumulative sequence lengths.
@@ -128,14 +129,24 @@ class GatherAndDequantKVCacheMLA(nn.Module):
         ``workspace_starts``: ``[num_seqs]`` int32 — starting workspace row
                              per sequence (for chunked context gathers).
 
+    ``kv_cache_dtype`` selects the source layout and must match the cache the
+    owning ``MLAAttention`` allocated; vLLM likewise forwards its own
+    ``self.kv_cache_dtype`` here, and passing ``"fp8_ds_mla"`` for a BF16
+    cache reinterprets the bytes and silently corrupts the gathered context.
+
     Raises ``RuntimeError`` if the kernel is unavailable; callers should
     check :pyattr:`available` and fall back to :class:`GatherKVCacheFP8MLA`.
     """
 
     available: bool = _HAS_GATHER_AND_DEQUANT
 
-    def __init__(self):
+    def __init__(self, kv_cache_dtype: str = "fp8_ds_mla"):
         super().__init__()
+        assert kv_cache_dtype in ("auto", "fp8_ds_mla"), (
+            f"GatherAndDequantKVCacheMLA: unsupported "
+            f"kv_cache_dtype={kv_cache_dtype!r}"
+        )
+        self.kv_cache_dtype = kv_cache_dtype
         self.register_buffer(
             "_k_scale", torch.zeros(1, dtype=torch.float32), persistent=False,
         )
@@ -159,7 +170,7 @@ class GatherAndDequantKVCacheMLA(nn.Module):
             kv_cache, workspace,
             block_table, cu_seq_lens, token_to_seq,
             total_tokens,
-            "fp8_ds_mla",
+            self.kv_cache_dtype,
             self._k_scale,
             workspace_starts,
         )

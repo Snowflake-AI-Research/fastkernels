@@ -42,6 +42,13 @@ from ..L1.merge_attn_states import MergeAttnStates
 from ..L1.bmm import BatchMatMul
 from ..L1.convert_indices import ConvertIndicesToGlobal
 
+try:
+    from vllm.v1.attention.ops.triton_merge_attn_states import (
+        mask_empty_context as _mask_empty_context,
+    )
+except ImportError:  # pragma: no cover - optional vLLM runtime dependency
+    _mask_empty_context = None
+
 _MLA_HEAD_DIM_V = 512
 _MLA_WORKSPACE_HEAD_SIZE = 576  # 512 NoPE + 64 RoPE = 576 BF16 dims
 MIN_HEADS_FOR_BF16_PREFILL = 32
@@ -138,7 +145,9 @@ class MLAAttention(nn.Module):
 
         self.store_kvcache = StoreKVCacheFP8MLA(kv_cache_dtype=kv_cache_dtype)
         self.gather_kvcache = GatherKVCacheFP8MLA()
-        self.gather_dequant_kvcache = GatherAndDequantKVCacheMLA()
+        self.gather_dequant_kvcache = GatherAndDequantKVCacheMLA(
+            kv_cache_dtype=kv_cache_dtype,
+        )
         self.decode_op = FlashMLADecode()
         # Dense FP8 decode entry-point (matches vLLM's
         # ``flash_mla_with_kvcache_fp8`` path used in
@@ -146,6 +155,22 @@ class MLAAttention(nn.Module):
         # generic ``FlashMLADecode`` with ``is_fp8_kvcache=True`` when the
         # specialized kernel is not available (older vLLM builds).
         self.decode_op_fp8 = FlashMLADecodeFP8()
+        # Blackwell: FlashMLA's dense decode is SM90a-only, so use the
+        # trtllm-gen MLA decode kernel vLLM selects there (FLASHINFER_MLA).
+        # ``None`` on other devices keeps the FlashMLA path untouched.
+        from ..L1.flashinfer_mla_decode import (
+            FlashInferMLADecode,
+            flashinfer_mla_decode_supported,
+        )
+        self.decode_op_flashinfer = (
+            FlashInferMLADecode(
+                qk_nope_head_dim=qk_nope_head_dim,
+                qk_rope_head_dim=qk_rope_head_dim,
+                kv_lora_rank=kv_lora_rank,
+            )
+            if flashinfer_mla_decode_supported()
+            else None
+        )
         self.sparse_prefill_op = FlashMLASparsePrefill()
         self.get_metadata = FlashMLAGetMetadata()
         self.get_metadata_dense_fp8 = FlashMLAGetMetadataDenseFP8()
@@ -340,6 +365,22 @@ class MLAAttention(nn.Module):
                 max_seqlen_k=chunked_ctx.max_seq_lens[i],
             )
 
+            # A request with no context in this chunk attended to zero keys,
+            # so the backend left its output rows as scratch (possibly
+            # NaN/Inf) even though the LSE is -inf.  Neutralize before the
+            # merge, exactly as vLLM does.
+            if (
+                _mask_empty_context is not None
+                and i < len(chunked_ctx.has_empty_context)
+                and chunked_ctx.has_empty_context[i]
+            ):
+                _mask_empty_context(
+                    attn_softmax_lse,
+                    attn_output,
+                    query_start_loc,
+                    chunked_ctx.cu_seq_lens[i],
+                )
+
             if output is None:
                 output = attn_output
                 output_lse = attn_softmax_lse
@@ -428,6 +469,20 @@ class MLAAttention(nn.Module):
         if not self.use_fp8_kv_cache:
             q = self._absorb_q_to_latent(q)
             q = q.unsqueeze(1)
+            # FlashMLA's dense decode kernel is SM90a-only ("Dense decode MLA
+            # is only supported on SM90a architecture"), so on Blackwell vLLM
+            # runs FLASHINFER_MLA / trtllm-gen instead. Follow the same choice.
+            if self.decode_op_flashinfer is not None:
+                o, _ = self.decode_op_flashinfer(
+                    q,
+                    kv_cache,
+                    block_table,
+                    cache_seqlens,
+                    softmax_scale=self.scale,
+                    max_seq_len=ctx.max_context_len,
+                )
+                o = o.reshape(-1, o.shape[-2], o.shape[-1])
+                return self._v_up_proj(o)
             tile_sched_meta, _ = self.get_metadata(
                 cache_seqlens, self.num_heads, num_heads_k=1,
             )

@@ -173,6 +173,29 @@ def _resize_cache(x: torch.Tensor, v: tuple[int, ...]) -> torch.Tensor:
     return x.flatten()[:n].view(*v)
 
 
+# ``matmul_ogs`` reads its ragged operands a full BLOCK_M tile at a time, so a
+# buffer sized to exactly ``M`` (or ``M * topk``) rows is read past its end.
+# vLLM never trips this because its MoE buffers come from a workspace sized for
+# ``max_num_batched_tokens`` and are then narrowed with ``_resize_cache``; the
+# over-read stays inside the workspace.  Allocating exactly, as this module did,
+# leaves the tail inside whatever the caching allocator happened to place next:
+# harmless with slack, an ``illegal memory access`` once the small allocation
+# lands at the end of a segment.  gpt-oss-120b hit that on its first
+# single-token decode (M=1, 4 gates -> an 11 KiB intermediate cache), while the
+# 16-token prefill in the same process was large enough to absorb it.
+#
+# 128 is the largest ``block_m`` ``matmul_ogs_details.opt_flags`` picks on
+# NVIDIA (``block_m = max(16, min(next_power_of_2(tokens_per_expt), 128))``), so
+# rounding the row count up to it keeps every tile inside our own allocation.
+_MATMUL_OGS_ROW_TILE = 128
+
+
+def _tile_rows(rows: int) -> int:
+    """Round a ragged-operand row count up to ``matmul_ogs``'s tile."""
+    tile = _MATMUL_OGS_ROW_TILE
+    return ((rows + tile - 1) // tile) * tile
+
+
 def _fused_experts(
     output_tensor: torch.Tensor,
     hidden_states: torch.Tensor,
@@ -204,7 +227,7 @@ def _fused_experts(
     _, _, N = w1.shape
 
     intermediate_cache = torch.empty(
-        (batch_dim, M * topk, N // 2),
+        (batch_dim, _tile_rows(M * topk), N // 2),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
@@ -314,7 +337,13 @@ class Mxfp4MoE(nn.Module):
         routing_data, gather_idx, scatter_idx = _routing_from_logits(
             gating_output, topk, sm_first=not renormalize
         )
-        output = torch.empty_like(hidden_states)
+        # Over-allocate the output rows for the same reason as the intermediate
+        # cache above; ``_fused_experts`` narrows it back to ``M`` rows.
+        output = torch.empty(
+            (_tile_rows(hidden_states.shape[0]), hidden_states.shape[1]),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
         return _fused_experts(
             output,
             hidden_states,

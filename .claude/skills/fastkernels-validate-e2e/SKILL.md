@@ -1,7 +1,7 @@
 ---
 name: fastkernels-validate-e2e
 description: Validate a fastkernels model end-to-end against its SOTA reference with tests/bench_vllm.py — token alignment >= 100 and speedup >= 1.0x, eager and compiled, small then full workload, TP if multi-GPU. Invoke with /fastkernels-validate-e2e <HF model id>.
-disable-model-invocation: true
+disable-model-invocation: false
 ---
 
 # End-to-end validation

@@ -20,7 +20,7 @@ from .parallel_linear import ColumnParallelLinear, QKVParallelLinear, RowParalle
 from .attention_impl import Attention
 from ..L1.flash_attn_prefill import FlashAttnPrefill
 from ..L1.flash_attn_decode import FlashAttnDecode
-from ..L1.store_kvcache import StoreKVCache, StoreKVCacheHND
+from ..L1.store_kvcache import StoreKVCache
 
 
 class WhisperEncoderSelfAttention(nn.Module):
@@ -164,11 +164,15 @@ class WhisperCrossAttention(nn.Module):
         attn_cfg = get_attn_backend_config()
         self._block_size = attn_cfg.block_size
 
-        self.store_kvcache = (
-            StoreKVCacheHND(page_size=attn_cfg.block_size)
-            if attn_cfg.use_trtllm
-            else StoreKVCache()
-        )
+        # Cross-attention reads its paged cache with the FlashAttention ops
+        # below, which index it as [num_blocks, block_size, num_kv_heads,
+        # head_size] (NHD).  Declare that layout so the engine allocates the
+        # cross-attn cache to match and the store writes the same way -- an
+        # HND cache here transposes the head and block dims, which FA reports
+        # as "num_head must be divisible by num_head_kv" (it reads block_size
+        # as the KV head count).
+        self.kv_layout = "NHD"
+        self.store_kvcache = StoreKVCache()
         self.prefill_op = FlashAttnPrefill(
             self.num_heads, self.num_heads, self.head_dim,
         )

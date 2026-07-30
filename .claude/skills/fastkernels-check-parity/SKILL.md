@@ -1,7 +1,7 @@
 ---
 name: fastkernels-check-parity
 description: Adversarially check a newly added/modified fastkernels model against its SOTA reference library, hunting for interface/implementation mismatches and shortcuts; fix and iterate to zero differences. Invoke with /fastkernels-check-parity <model/arch> [reference lib].
-disable-model-invocation: true
+disable-model-invocation: false
 ---
 
 # Adversarially check fastkernels vs the SOTA reference

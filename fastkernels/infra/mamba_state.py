@@ -255,7 +255,16 @@ class KimiLinearStateManager:
         self.dtype = dtype
         self.model_type = getattr(config, "model_type", "kimi_linear")
 
-        self._free_slots: deque[int] = deque(range(num_slots))
+        # Slot 0 is reserved as the null slot and never handed out. The FLA
+        # recurrent kernels and vLLM's causal-conv kernels both treat state
+        # index 0 as "skip this sequence" (``NULL_BLOCK_ID`` is 0):
+        # ``fused_recurrent_kda`` given slot 0 returns NaN and writes no
+        # state, while slots >= 1 are correct (measured: slot 0 -> nan and
+        # zero state delta; slots 1 and 3 -> clean, delta ~0.088). vLLM never
+        # hits this because its block allocator reserves block 0; ours used
+        # to hand it out, which froze the recurrence for whichever sequence
+        # landed there and poisoned its logits with NaN.
+        self._free_slots: deque[int] = deque(range(1, num_slots))
         self._in_use: set[int] = set()
 
         self.conv_q: list[torch.Tensor | None] = [None] * self.num_layers
@@ -350,21 +359,39 @@ class KimiLinearStateManager:
                     dtype=self.dtype,
                 )
             elif allocate_mha_kv_tensors:
+                # Follow the attention backend's KV layout. Qwen3-Next's
+                # full-attention layers use ``StoreKVCacheHND`` and pass
+                # ``kv_layout="HND"`` to trtllm-gen when that backend is
+                # selected, and trtllm's launcher reads ``num_kv_heads`` off
+                # ``kv_cache.shape[1]``. Allocating NHD unconditionally put the
+                # page size there instead, which the launcher rejects with
+                # "num_qo_heads must be a multiple of num_kv_heads, got
+                # num_kv_heads: 16 and num_qo_heads: 8" (16 being block_size).
+                # At tp=2 the two orders happen to share a memory layout because
+                # ``local_kv_heads`` is 1, so only the reported shape was wrong
+                # -- but at tp=1 (2 kv heads) they genuinely differ, so this also
+                # fixes the writes there.
+                from .context import get_attn_backend_config
+
+                if get_attn_backend_config().kv_layout == "HND":
+                    kv_shape = (
+                        self.num_mla_blocks,
+                        local_kv_heads,
+                        self.block_size,
+                        head_dim,
+                    )
+                else:
+                    kv_shape = (
+                        self.num_mla_blocks,
+                        self.block_size,
+                        local_kv_heads,
+                        head_dim,
+                    )
                 self.k_cache[i] = torch.zeros(
-                    self.num_mla_blocks,
-                    self.block_size,
-                    local_kv_heads,
-                    head_dim,
-                    device=self.device,
-                    dtype=self.dtype,
+                    *kv_shape, device=self.device, dtype=self.dtype,
                 )
                 self.v_cache[i] = torch.zeros(
-                    self.num_mla_blocks,
-                    self.block_size,
-                    local_kv_heads,
-                    head_dim,
-                    device=self.device,
-                    dtype=self.dtype,
+                    *kv_shape, device=self.device, dtype=self.dtype,
                 )
 
     def has_free_slot(self) -> bool:

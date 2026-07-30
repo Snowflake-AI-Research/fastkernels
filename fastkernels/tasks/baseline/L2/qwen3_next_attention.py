@@ -27,12 +27,12 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-from ....infra.context import get_context
+from ....infra.context import get_attn_backend_config, get_context
 from ....infra.tp import _tp_size
 from ..L1.flash_attn_decode import FlashAttnDecode
 from ..L1.flash_attn_prefill import FlashAttnPrefill
 from ..L1.gemma_rms_norm import GemmaRMSNorm
-from ..L1.store_kvcache import StoreKVCache
+from ..L1.store_kvcache import StoreKVCache, StoreKVCacheHND
 from .parallel_linear import QKVParallelLinear, RowParallelLinear
 
 
@@ -101,13 +101,46 @@ class Qwen3NextAttention(nn.Module):
         self.q_norm = GemmaRMSNorm(head_dim, eps=rms_norm_eps)
         self.k_norm = GemmaRMSNorm(head_dim, eps=rms_norm_eps)
 
-        self.store_kvcache = StoreKVCache()
-        self.flash_attn_prefill = FlashAttnPrefill(
-            self.num_heads, self.num_kv_heads, self.head_dim,
-        )
-        self.flash_attn_decode = FlashAttnDecode(
-            self.num_heads, self.num_kv_heads, self.head_dim,
-        )
+        # Qwen3-Next's full-attention layers use head_dim=256.  vLLM 0.26 runs
+        # them on FlashInfer with an HND cache ("Using FLASHINFER attention
+        # backend" / "Using HND KV cache layout for FLASHINFER" on B200), so
+        # follow the same per-device backend selection the generic
+        # ``Attention`` layer uses.  FlashAttention is not a substitute here:
+        # FA4's SM100 head_dim=256 forward rejects seqused_k/seqused_q, which
+        # the paged decode path requires.
+        attn_cfg = get_attn_backend_config()
+        self.kv_layout = attn_cfg.kv_layout
+        self._use_trtllm = attn_cfg.use_trtllm
+        if self._use_trtllm:
+            from ..L1.flashinfer_decode import TRTLLMDecode
+            from ..L1.flashinfer_prefill import TRTLLMPrefill
+
+            self.store_kvcache = StoreKVCacheHND(page_size=attn_cfg.block_size)
+            self.flash_attn_prefill = TRTLLMPrefill(
+                self.num_heads, self.num_kv_heads, self.head_dim,
+            )
+            self.flash_attn_decode = TRTLLMDecode(
+                self.num_heads, self.num_kv_heads, self.head_dim,
+            )
+        else:
+            self.store_kvcache = StoreKVCache()
+            self.flash_attn_prefill = FlashAttnPrefill(
+                self.num_heads, self.num_kv_heads, self.head_dim,
+            )
+            self.flash_attn_decode = FlashAttnDecode(
+                self.num_heads, self.num_kv_heads, self.head_dim,
+            )
+
+    def set_trtllm_workspace(self, workspace: torch.Tensor) -> None:
+        """Adopt the engine's single shared trtllm-gen workspace.
+
+        Without this each layer keeps the 512 MiB buffer it allocated in
+        ``__init__``; Qwen3-Next has one MHA layer per 4 decoder layers, so
+        that would waste several GiB.
+        """
+        if self._use_trtllm:
+            self.flash_attn_decode._workspace = workspace
+            self.flash_attn_prefill._workspace = workspace
 
     def forward(self, hidden_states, rotary_emb=None, positions=None,
                 state_manager=None):

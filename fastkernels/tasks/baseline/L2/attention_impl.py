@@ -32,6 +32,12 @@ from ..L1.store_kvcache import StoreKVCache, StoreKVCacheHND
 _TRITON_MIN_LAUNCH_GRID_SIZE_2D = 128
 _TRITON_NUM_PAR_SOFTMAX_SEGMENTS = 16
 
+# Largest head size the trtllm-gen / FlashAttention paged kernels advertise.
+# vLLM's ``FlashAttentionBackend.supports_head_size`` returns True up to 256
+# for every FA version (512 only for FA4 dense), and FlashInfer's trtllm-gen
+# paged path tops out here too; above it vLLM drops to TRITON_ATTN.
+_TRTLLM_MAX_HEAD_SIZE = 256
+
 try:
     from vllm.v1.attention.ops.triton_unified_attention import (
         unified_attention as _triton_unified_attention,
@@ -193,7 +199,8 @@ class Attention(nn.Module):
                  num_kv_heads: int | None = None,
                  sliding_window: int | None = None,
                  sinks: torch.nn.Parameter | None = None,
-                 attention_chunk_size: int | None = None):
+                 attention_chunk_size: int | None = None,
+                 prefer_triton: bool = False):
         super().__init__()
         self.num_heads = num_heads
         self.head_size = head_size
@@ -210,11 +217,41 @@ class Attention(nn.Module):
         self.k_cache = self.v_cache = torch.tensor([])
 
         attn_cfg = get_attn_backend_config()
-        self._use_trtllm = attn_cfg.use_trtllm
         self._block_size = attn_cfg.block_size
 
+        # Per-layer backend selection, mirroring vLLM's per-KV-cache-group
+        # choice rather than one global backend.  Reproduced by running
+        # ``CudaPlatform.get_valid_backends`` for each config; on SM100:
+        #
+        #   head_size 128/256, DECODER      -> FLASHINFER  (trtllm-gen)
+        #   ENCODER_ONLY / ENCODER_DECODER  -> FLASH_ATTN  ("attention type
+        #       not supported" excludes FlashInfer) -- see whisper_attention
+        #   PrefixLM bidirectional (Gemma4) -> TRITON_ATTN ("partial
+        #       multimodal token full attention not supported" excludes
+        #       FlashInfer; mm_prefix needs FA4, which "does not resolve for
+        #       this head_size", excluding FlashAttention)
+        #
+        # ``prefer_triton`` is how a model opts into that last case for *all*
+        # its layers, independent of head size.
+        #
+        # The Triton unified kernel indexes the cache as
+        # ``[num_blocks, block_size, num_kv_heads, head_size]`` (NHD), as does
+        # the SDPA fallback's ``_cache_seq``, so a layer routed away from
+        # trtllm-gen must also be *allocated* NHD -- hence the layout is a
+        # per-layer property the engine reads back when sizing the cache.
+        # Note this does not depend on whether the Triton kernel imported: an
+        # HND cache would silently transpose the head and block dims for
+        # either consumer.
+        self._triton_only = prefer_triton or head_size > _TRTLLM_MAX_HEAD_SIZE
+        self._use_trtllm = attn_cfg.use_trtllm and not self._triton_only
+        self.kv_layout = "HND" if self._use_trtllm else "NHD"
+
         # Native FA3/TRTLLM path: sinks -> s_aux, sliding window -> window_size.
-        self._fa3_sinks = sinks
+        # Held as a plain attribute (not a submodule parameter): the sinks
+        # Parameter is already owned by the enclosing attention block, and
+        # ``process_weights_after_loading`` may swap in an FP32 copy for the
+        # trtllm-gen kernels, which nn.Module would reject on a parameter slot.
+        object.__setattr__(self, "_fa3_sinks", sinks)
         self._fa3_window_size = (
             (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
         )
@@ -265,6 +302,25 @@ class Attention(nn.Module):
             self.decode_op._workspace = workspace
             self.prefill_op._workspace = workspace
 
+    def process_weights_after_loading(self) -> None:
+        """Prime the FP32 attention-sink copy the trtllm-gen kernels need.
+
+        The two kernels this layer can dispatch to disagree on the sink dtype:
+        ``trtllm_batch_{decode,context}_with_kv_cache`` reject anything but
+        float32 (``attention_sinks must be a float tensor``) while the
+        FlashAttention build vLLM bundles rejects anything but the model dtype
+        (``learnable_sink must be bfloat16``) -- and a trtllm layer still falls
+        back to FlashAttention for unpaged prefill.  So the layer keeps the
+        checkpoint parameter and each trtllm op holds its own converted copy,
+        materialized here (as vLLM does in
+        ``FlashInferImpl.process_weights_after_loading``) rather than inside a
+        forward or a graph capture.
+        """
+        if self.sinks is None or not self._use_trtllm:
+            return
+        self.prefill_op.prime_sinks(self.sinks)
+        self.decode_op.prime_sinks(self.sinks)
+
     def forward_impl(self, query: torch.Tensor, key: torch.Tensor,
                      value: torch.Tensor) -> torch.Tensor:
         """Core attention logic, callable from both eager and custom-op paths."""
@@ -295,7 +351,7 @@ class Attention(nn.Module):
                 softmax_scale=self.scale,
             )
         elif ctx.is_mixed:
-            if self.head_size > 256:
+            if self._triton_only:
                 can_use_triton = (
                     self._can_use_triton_unified(k_cache, ctx.prefill_block_tables)
                     and (ctx.num_decode_tokens == 0 or ctx.decode_block_tables is not None)
@@ -307,7 +363,7 @@ class Attention(nn.Module):
                 return o.reshape(N, self.num_heads * self.head_size)
             o = self._forward_mixed(q, k_cache, v_cache, ctx)
         else:
-            if self.head_size > 256:
+            if self._triton_only:
                 if self._can_use_triton_unified(k_cache, ctx.block_tables):
                     o = self._forward_pure_triton(q, k_cache, v_cache, ctx)
                 else:
@@ -383,7 +439,10 @@ class Attention(nn.Module):
     ) -> bool:
         return (
             _TRITON_UNIFIED_AVAILABLE
-            and not self._use_trtllm
+            # The kernel reads the cache as [num_blocks, block_size,
+            # num_kv_heads, head_size]; an HND-allocated layer would have its
+            # head and block dims transposed.
+            and self.kv_layout == "NHD"
             and self.attention_chunk_size is None
             and k_cache.numel() > 0
             and block_tables is not None

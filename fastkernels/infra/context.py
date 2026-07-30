@@ -32,9 +32,28 @@ class AttnBackendConfig:
     """Selects attention backend and associated KV cache parameters.
 
     Blackwell (sm_100+) uses TRTLLM-gen kernels via FlashInfer (HND layout,
-    block_size=16).  Hopper and below use flash_attn (NHD layout,
-    block_size=256).  Auto-detection picks the optimal backend for the
-    current GPU.
+    block_size=16), which is what vLLM 0.26 selects there too -- it logs
+    ``Using FLASHINFER attention backend`` / ``Using HND KV cache layout``
+    for dense and MoE transformers on B200.  Hopper and below use
+    flash_attn (NHD layout).
+
+    This is the *default* per model; individual ``Attention`` layers refine
+    it, mirroring vLLM's per-KV-cache-group backend choice.  A layer whose
+    head size exceeds what the paged trtllm-gen/FlashAttention kernels
+    advertise falls back to the Triton unified kernel on an NHD cache (as
+    vLLM does for Gemma4's 512-wide layers), and Whisper's cross-attention
+    pins NHD because it reads the cache through FlashAttention.  Each such
+    layer exposes ``kv_layout`` so the engine allocates its cache to match.
+
+    TODO(tech-debt): the flash_attn ``block_size=256`` default is a leftover
+    from routing paged attention through the PyPI ``flash_attn`` package,
+    which rejects page sizes that are not a multiple of 256.  fastkernels now
+    calls vLLM's bundled FlashAttention build (see
+    ``tasks/baseline/L1/fa_utils.py``), which advertises ``MultipleOf(16)``
+    like vLLM's own ``FlashAttentionBackend``.  Lowering this to 16 would
+    match vLLM and cut KV fragmentation, but it changes block-manager and
+    watermark behaviour on non-Blackwell GPUs, which cannot be validated on
+    this host.
     """
     backend: str = "flash_attn"
     block_size: int = 256
@@ -89,6 +108,11 @@ class ChunkedContextMetadata:
     workspace: torch.Tensor
     token_to_seq: torch.Tensor
     chunk_total_token: list[int]
+    # Per chunk: True when at least one request in the batch has no context
+    # in that chunk.  Those queries attended to zero keys, so the backend
+    # leaves their output rows undefined and they must be neutralized before
+    # the merge (vLLM's ``mask_empty_context``).
+    has_empty_context: list[bool] = field(default_factory=list)
 
 
 @dataclass

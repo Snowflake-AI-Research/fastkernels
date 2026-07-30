@@ -15,6 +15,11 @@ if str(_KB_ROOT) not in sys.path:
 import torch
 
 from fastkernels.validate.worker import run_worker
+from fastkernels.validate.comparison import (
+    alignment_from_similarity,
+    latency_entry,
+    throughput_entry,
+)
 
 THREEDGS_WORKER = r'''
 import json, math, sys, time
@@ -209,6 +214,43 @@ def main() -> None:
     data = run_worker(THREEDGS_WORKER, cfg, "3DGS benchmark", timeout=7200)
     if data is None:
         raise SystemExit(1)
+
+    # Standard comparison shape (fastkernels/validate/comparison.py). Both sides
+    # already timed the Rendering.single_render latency workload, but nothing
+    # compared them, so the sweep summary showed throughput only and no
+    # per-scenario speedup field at all.
+    ours = data.get("ours") or {}
+    ref = data.get("reference") or {}
+    cmp = data.get("comparison") or {}
+    scenarios: list[dict] = []
+    latency_scenarios: list[dict] = []
+    if ref:
+        scenarios.append(throughput_entry(
+            "render", ours.get("images_per_second"), ref.get("images_per_second"),
+            metric="images_per_s",
+            alignment=alignment_from_similarity(
+                "rgb_cosine", cmp.get("rgb_cosine", 0.0), threshold=0.99,
+                rgb_mae=cmp.get("rgb_mae"),
+                alpha_cosine=cmp.get("alpha_cosine"),
+                alpha_mae=cmp.get("alpha_mae"),
+            ),
+            num_cameras=args.num_cameras,
+            resolution=data.get("resolution"),
+        ))
+        ours_lat = ours.get("latency") or {}
+        ref_lat = ref.get("latency") or {}
+        if ours_lat and ref_lat:
+            latency_scenarios.append(latency_entry(
+                "single-render",
+                ours_lat.get("median_seconds_per_image"),
+                ref_lat.get("median_seconds_per_image"),
+                num_cameras=args.num_cameras,
+                iterations=ours_lat.get("iterations"),
+            ))
+    data["scenarios"] = scenarios
+    data["latency_scenarios"] = latency_scenarios
+    data["reference_name"] = ref.get("baseline_name") or None
+
     output_path = os.path.join(args.output_dir, "results.json")
     with open(output_path, "w") as f:
         json.dump(data, f, indent=2)

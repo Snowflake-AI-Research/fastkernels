@@ -177,12 +177,39 @@ def main():
         max_running_requests=cfg.get("max_running_requests", 64),
         random_seed=cfg["seed"],
         log_level="error",
-        cuda_graph_max_bs=cfg.get("cuda_graph_max_bs", 16),
-        attention_backend=cfg.get("attention_backend", "fa3"),
         disable_radix_cache=True,
         context_length=cfg.get("max_model_len", 2048),
         dtype="bfloat16",
     )
+
+    # ``cuda_graph_max_bs`` was split into per-phase knobs
+    # (``cuda_graph_max_bs_decode`` / ``_prefill``); passing the old name to a
+    # current SGLang raises
+    # ``TypeError: ServerArgs.__init__() got an unexpected keyword argument``.
+    # Introspect so this works against either generation.
+    _cg_max_bs = cfg.get("cuda_graph_max_bs", 16)
+    if _cg_max_bs is not None:
+        import dataclasses as _dc
+
+        from sglang.srt.server_args import ServerArgs as _ServerArgs
+
+        _fields = {f.name for f in _dc.fields(_ServerArgs)}
+        if "cuda_graph_max_bs" in _fields:
+            engine_kwargs["cuda_graph_max_bs"] = _cg_max_bs
+        else:
+            for _name in ("cuda_graph_max_bs_decode", "cuda_graph_max_bs_prefill"):
+                if _name in _fields:
+                    engine_kwargs[_name] = _cg_max_bs
+
+    # Let SGLang pick its own attention backend unless explicitly overridden.
+    # The previous hardcoded "fa3" is Hopper-only, so on Blackwell it forces a
+    # backend SGLang would not have chosen -- the same mistake that had
+    # fastkernels silently falling back to the PyPI flash_attn build (see
+    # docs/vllm-0.26-alignment-audit.md section 1).
+    _attn_backend = cfg.get("attention_backend")
+    if _attn_backend:
+        engine_kwargs["attention_backend"] = _attn_backend
+
     if cfg.get("disable_cuda_graph", False):
         engine_kwargs["disable_cuda_graph"] = True
     engine = sgl.Engine(**engine_kwargs)
@@ -666,7 +693,18 @@ def main():
             python_executable=args.sglang_python,
         )
         if sgl_raw is None:
-            print("  WARNING: sglang subprocess failed -- continuing with fastkernels only")
+            # Do not silently degrade to a fastkernels-only run: the summary
+            # then prints "SGLANG N/A / SPEEDUP N/A" and the job still exits 0,
+            # so the runner records a PASS for a scenario that never compared
+            # against its reference. SGLang is this scenario's SOTA baseline, so
+            # its absence is a failure.
+            raise SystemExit(
+                "ERROR: the SGLang reference did not run, so there is nothing "
+                "to compare against. Create the benchmark env with "
+                "`bash tests/setup_sglang_env.sh` (or point --sglang-python at "
+                "an interpreter that has sglang installed). Pass "
+                "--skip-sglang to intentionally run fastkernels alone."
+            )
 
     # ------------------ fastkernels ------------------
     kb_raw = None

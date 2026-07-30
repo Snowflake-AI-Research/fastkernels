@@ -13,6 +13,8 @@ No vLLM imports.
 from __future__ import annotations
 
 import atexit
+import contextlib
+import itertools
 import json
 import os
 import pickle
@@ -76,6 +78,38 @@ def _load_tokenizer(model_name: str):
             trust_remote_code=True,
             extra_special_tokens=extra_map,
         )
+
+
+@contextlib.contextmanager
+def _flashinfer_autotune():
+    """Run the enclosed forward with FlashInfer's autotuner recording.
+
+    FlashInfer ships several tactics per op and picks by heuristic unless it has
+    been tuned; the tuned choice is cached and reused by later calls. vLLM does
+    this once at startup (``kernel_warmup.flashinfer_autotune``, gated on
+    ``KernelConfig.enable_flashinfer_autotune``, which defaults to True on
+    Hopper/Blackwell) by running ``_dummy_run`` at
+    ``max_num_batched_tokens`` inside the context -- tuning at *m* tokens covers
+    every count up to *m*. Skipping it leaves ops like the trtllm-gen MXFP4 MoE
+    on heuristic tactics, so the warmup pass here enters the same context.
+
+    A no-op when FlashInfer is absent or its autotuner API is unavailable, and
+    tolerant of tuning failures: a bad tactic search must not stop startup.
+    """
+    if os.environ.get("FASTKERNELS_FLASHINFER_AUTOTUNE", "1") == "0":
+        yield
+        return
+    try:
+        from flashinfer import autotune as _fi_autotune
+    except Exception:
+        yield
+        return
+    try:
+        with _fi_autotune(True):
+            yield
+    except Exception as exc:  # pragma: no cover - tuning is best-effort
+        print(f"  FlashInfer autotune skipped: {exc}", flush=True)
+        yield
 
 
 def _detect_scheduling_defaults() -> tuple[int, int]:
@@ -450,13 +484,6 @@ class ModelRunner:
         )
         self.is_whisper = getattr(self.config, "is_encoder_decoder", False)
         self.is_deepseek_mla = hasattr(self.config, "kv_lora_rank")
-        if self.is_qwen3_next:
-            if self.max_num_batched_tokens <= _DEFAULT_MAX_NUM_BATCHED_TOKENS:
-                _, total_mem = torch.cuda.mem_get_info()
-                if total_mem >= 70 * (1 << 30):
-                    self.max_num_batched_tokens = max(
-                        self.max_num_batched_tokens, 32768,
-                    )
         if self.is_whisper:
             self.enforce_eager = True
             self.max_model_len = min(
@@ -559,8 +586,11 @@ class ModelRunner:
 
         # TP shared memory setup
         if world_size > 1:
+            self._init_shm_layout()
             if rank == 0:
-                self.shm = SharedMemory(name=shm_name, create=True, size=2**20)
+                self.shm = SharedMemory(
+                    name=shm_name, create=True, size=self._SHM_SIZE,
+                )
                 self.shm.buf[self._SHM_FLAG_OFFSET] = 0
                 self.shm.buf[self._SHM_SEQ_OFFSET:self._SHM_SEQ_OFFSET+4] = (0).to_bytes(4, "little")
                 self.shm.buf[self._SHM_ACK_OFFSET:self._SHM_SEQ_OFFSET] = bytes(
@@ -594,9 +624,71 @@ class ModelRunner:
     #                              3=hybrid recurrent decode_greedy
     # bytes[-5:-1] (_SHM_SEQ_OFFSET): 4-byte little-endian sequence counter
     # bytes[-37:-5] (_SHM_ACK_OFFSET): per-rank consumed-sequence counters
-    _SHM_FLAG_OFFSET = 2**20 - 1
-    _SHM_SEQ_OFFSET = 2**20 - 5
-    _SHM_ACK_OFFSET = 2**20 - 5 - 4 * 8
+    #
+    # The data region below _SHM_ACK_OFFSET must hold the largest decode
+    # payload any dispatch path can produce.  ``_init_shm_layout`` sizes it
+    # from the *final* scheduler/cache config, so the offsets are instance
+    # attributes rather than constants -- a fixed 1 MiB region silently
+    # truncated the block-table field once
+    # ``max_num_seqs * max_num_blocks * 4`` exceeded it, and the resulting
+    # short-slice assignment surfaced as an opaque
+    # "memoryview assignment: lvalue and rvalue have different structures".
+    _SHM_CONTROL_BYTES = 5 + 4 * 8
+
+    def _init_shm_layout(self) -> None:
+        """Size the TP shared-memory segment for the worst-case decode payload.
+
+        Every rank derives the layout from the same already-finalized config
+        (``max_num_seqs``, ``max_model_len``, block size, MRoPE/MLA dtypes),
+        so rank 0's ``create=True`` size and the workers' offsets agree
+        without any extra handshake.
+        """
+        max_bs = self.max_num_seqs
+        max_num_blocks = (self.max_model_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+
+        # ``n`` and ``max_bt`` are 2-byte header fields in every decode
+        # payload, so both counts must stay addressable there.
+        if max_bs > 0xFFFF or max_num_blocks > 0xFFFF:
+            raise RuntimeError(
+                f"TP decode SHM header cannot address max_num_seqs={max_bs} / "
+                f"max_num_blocks={max_num_blocks} (2-byte fields, limit 65535)"
+            )
+
+        # Attention decode: [n(2)][max_bt(2)][ids][pos][sm][cl][bt]
+        pos_elems = 3 * max_bs if self.is_qwen_vl else max_bs
+        sm_bytes = max_bs * (8 if self.is_deepseek_mla else 4)
+        attn_bytes = (
+            4
+            + max_bs * 8            # ids   (int64)
+            + pos_elems * 8         # pos   (int64, 3x for MRoPE)
+            + sm_bytes              # slot_mapping (int64 for MLA, else int32)
+            + max_bs * 4            # context_lens (int32)
+            + max_bs * max_num_blocks * 4   # block_tables (int32)
+        )
+
+        # Hybrid (Kimi-Linear / Qwen3-Next) decode:
+        #   [n(2)][max_blocks(2)][ids(8)][pos(8)][si(4)][sl(4)][slot(4)][bt]
+        hybrid_bytes = (
+            4 + max_bs * (8 + 8 + 4 + 4 + 4) + max_bs * max_num_blocks * 4
+        )
+
+        # Mamba decode: [n(2)][_(2)][ids(8)][pos(8)][si(4)]
+        mamba_bytes = 4 + max_bs * (8 + 8 + 4)
+
+        # ``call()`` also pickles arbitrary method payloads through the same
+        # region; keep a floor so small-model configs retain the historical
+        # 1 MiB of headroom for those.
+        data_bytes = max(attn_bytes, hybrid_bytes, mamba_bytes, 2**20)
+
+        # Page-align the total so the mapping stays a whole number of pages.
+        total = data_bytes + self._SHM_CONTROL_BYTES
+        page = 4096
+        total = ((total + page - 1) // page) * page
+
+        self._SHM_SIZE = total
+        self._SHM_FLAG_OFFSET = total - 1
+        self._SHM_SEQ_OFFSET = total - 5
+        self._SHM_ACK_OFFSET = total - 5 - 4 * 8
 
     def loop(self):
         """Worker loop: spin-wait on SHM sequence counter for decode, event for generic."""
@@ -682,6 +774,17 @@ class ModelRunner:
         )
         for layer in self._attn_layers:
             layer.set_trtllm_workspace(trtllm_workspace)
+        # Hybrid models (Qwen3-Next, Kimi-Linear) keep their KV cache in the
+        # engine's state manager rather than on the layer, so those layers
+        # carry no ``k_cache`` attribute and are not in ``_attn_layers``.
+        # Hand them the shared workspace too -- otherwise every such layer
+        # holds the 512 MiB buffer it allocated in its own __init__.
+        seen = {id(layer) for layer in self._attn_layers}
+        for module in self.model.modules():
+            if id(module) in seen:
+                continue
+            if hasattr(module, "set_trtllm_workspace"):
+                module.set_trtllm_workspace(trtllm_workspace)
         torch.cuda.empty_cache()
 
     def _share_activation_buffers(self):
@@ -728,7 +831,8 @@ class ModelRunner:
             warmup_len = min(self.max_model_len, self.max_num_batched_tokens)
             num_seqs = min(self.max_num_batched_tokens // warmup_len, self.max_num_seqs)
             seqs = [Sequence([0] * warmup_len) for _ in range(num_seqs)]
-            self.run(seqs, True)
+            with _flashinfer_autotune():
+                self.run(seqs, True)
 
         torch.cuda.empty_cache()
 
@@ -1008,13 +1112,13 @@ class ModelRunner:
         del inputs, messages, text
 
     def _init_fa3_decode_buffers(self):
-        """Pre-allocate cu_seqlens_q buffers for FA3 decode to avoid
-        allocations during CUDA graph capture."""
+        """Pre-allocate cu_seqlens_q buffers for the FlashAttention decode
+        path to avoid allocations during CUDA graph capture."""
         try:
-            from ..tasks.baseline.L1.flash_attn_decode import _FA3_AVAILABLE
+            from ..tasks.baseline.L1.flash_attn_decode import VLLM_FA_AVAILABLE
         except ImportError:
             return
-        if not _FA3_AVAILABLE:
+        if not VLLM_FA_AVAILABLE:
             return
         max_bs = self.max_num_seqs
         for module in self.model.modules():
@@ -1074,7 +1178,15 @@ class ModelRunner:
             self.cross_blocks_per_seq = cross_blocks_per_seq
             self.max_encoder_tokens = max_encoder_tokens
 
-            if ATTN_BACKEND_CONFIG.kv_layout == "HND":
+            # Cross-attention layers declare their own layout (they read the
+            # cache with FlashAttention, i.e. NHD, even when the global
+            # backend is trtllm/HND for self-attention).
+            cross_layout = ATTN_BACKEND_CONFIG.kv_layout
+            if self._cross_attn_layers:
+                cross_layout = getattr(
+                    self._cross_attn_layers[0], "kv_layout", cross_layout,
+                )
+            if cross_layout == "HND":
                 self.cross_kv_cache = torch.empty(
                     2, num_cross_attn_layers, num_cross_blocks,
                     num_kv_heads, BLOCK_SIZE, head_dim,
@@ -1173,7 +1285,13 @@ class ModelRunner:
         self.num_blocks = num_blocks
         self.kv_cache = []
         for layer in self._attn_layers:
-            if ATTN_BACKEND_CONFIG.kv_layout == "HND":
+            # Each layer allocates in the layout its own selected backend
+            # indexes: trtllm-gen reads HND, FlashAttention and the Triton
+            # unified kernel read NHD.  Gemma4 mixes both in one model.
+            layer_layout = getattr(
+                layer, "kv_layout", ATTN_BACKEND_CONFIG.kv_layout,
+            )
+            if layer_layout == "HND":
                 cache = torch.empty(
                     2, num_blocks, layer.num_kv_heads, BLOCK_SIZE,
                     layer.head_size,
@@ -1193,8 +1311,13 @@ class ModelRunner:
                 f"{num_blocks * BLOCK_SIZE} token slots (per-layer shapes)",
             )
             cfg = ATTN_BACKEND_CONFIG
+            layouts = sorted({
+                getattr(layer, "kv_layout", cfg.kv_layout)
+                for layer in self._attn_layers
+            })
             print(f"  Attention backend: {cfg.backend} "
-                  f"(block_size={cfg.block_size}, kv_layout={cfg.kv_layout})")
+                  f"(block_size={cfg.block_size}, "
+                  f"kv_layout={'/'.join(layouts)})")
 
         if hasattr(self, '_warmup_encoder_cache'):
             del self._warmup_encoder_cache
@@ -1485,7 +1608,13 @@ class ModelRunner:
             )
             if use_decode_graph:
                 self._kimi_pad_state_slot = usable_slots
-                self.mamba_state_manager._free_slots = deque(range(usable_slots))
+                # ``range(1, ...)``: slot 0 is the null slot. The FLA recurrent
+                # kernels and vLLM's causal-conv kernels both read state index 0
+                # as "skip this sequence", so a sequence placed there gets NaN
+                # output and a frozen recurrent state. Keep this in step with
+                # ``KimiLinearStateManager.__init__``, which reserves it too --
+                # this assignment replaces that deque wholesale.
+                self.mamba_state_manager._free_slots = deque(range(1, usable_slots))
             else:
                 self._kimi_pad_state_slot = self._KIMI_PAD_SLOT_ID
             self.num_state_slots = usable_slots
@@ -1573,7 +1702,13 @@ class ModelRunner:
             )
             if use_decode_graph:
                 self._kimi_pad_state_slot = usable_slots
-                self.mamba_state_manager._free_slots = deque(range(usable_slots))
+                # ``range(1, ...)``: slot 0 is the null slot. The FLA recurrent
+                # kernels and vLLM's causal-conv kernels both read state index 0
+                # as "skip this sequence", so a sequence placed there gets NaN
+                # output and a frozen recurrent state. Keep this in step with
+                # ``KimiLinearStateManager.__init__``, which reserves it too --
+                # this assignment replaces that deque wholesale.
+                self.mamba_state_manager._free_slots = deque(range(1, usable_slots))
                 if self.mamba_state_manager._free_blocks is not None:
                     self._kimi_pad_block_id = self.mamba_state_manager._free_blocks.pop()
                 else:
@@ -1685,8 +1820,15 @@ class ModelRunner:
         ):
             sm = self.mamba_state_manager
             pad_slot = getattr(self, "_kimi_pad_state_slot", self._KIMI_PAD_SLOT_ID)
+            # Skip slot 0 as well as the pad slot: the FLA recurrent kernels and
+            # vLLM's causal-conv kernels read state index 0 as "skip this
+            # sequence" (``NULL_BLOCK_ID`` is 0), so a sequence placed there gets
+            # NaN output and a recurrent state that never advances -- measured on
+            # ``fused_recurrent_kda``: slot 0 -> NaN with zero state delta, slots
+            # 1 and 3 -> clean with delta ~0.088. vLLM's block allocator reserves
+            # block 0 for the same reason.
             sm._free_slots = deque(
-                slot for slot in range(sm.num_slots) if slot != pad_slot
+                slot for slot in range(1, sm.num_slots) if slot != pad_slot
             )
             sm._in_use.clear()
             if sm._free_blocks is not None:
@@ -1778,12 +1920,31 @@ class ModelRunner:
     # ------------------------------------------------------------------
     _KIMI_PAD_SLOT_ID = -1
 
+    def _pad_page_table_cols(self, n_cols: int) -> int:
+        """Round a page-table width up to the trtllm-gen MLA granularity.
+
+        ``flashinfer``'s ``trtllm_batch_decode_with_kv_cache_mla`` rejects a
+        page table whose column count is not a multiple of
+        ``ceil(128 / page_size)`` ("Expected block_num % (128 / block_size)
+        == 0").  The width follows ``max_model_len``, which the harness derives
+        from the dataset, so without this a run trips the check for some
+        prompt sets and not others.  The extra columns hold the pad block id
+        and are never read -- the kernel bounds its walk by ``seq_lens``.
+        """
+        if not (self.is_kimi_linear or self.is_deepseek_mla):
+            return n_cols
+        block_size = self.block_size or 1
+        gran = max(1, -(-128 // block_size))
+        return ((n_cols + gran - 1) // gran) * gran
+
     def _init_kimi_decode_buffers(self):
         """Pre-allocate persistent buffers for hybrid decode CUDA graphs."""
         max_bs = self.max_num_seqs
         block_size = self.mamba_state_manager.block_size
         # max blocks any seq could possibly need at decode time
-        max_blocks = (self.max_model_len + block_size - 1) // block_size
+        max_blocks = self._pad_page_table_cols(
+            (self.max_model_len + block_size - 1) // block_size,
+        )
         dev = f"cuda:{self.rank}"
 
         self._kd_max_bs = max_bs
@@ -1972,15 +2133,20 @@ class ModelRunner:
 
         graph_max_default = self.max_num_seqs
         max_bs = min(self.max_num_seqs, graph_max_default)
-        bs_candidates = [
-            1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 160, 192, 224, 256,
-        ]
-        if max_bs > 256:
-            bs_candidates.extend(range(272, max_bs + 1, 16))
-            if bs_candidates[-1] != max_bs:
-                bs_candidates.append(max_bs)
+        # Same bucket shape as vLLM's ``cudagraph_capture_sizes`` and as our own
+        # ``graph_bs_list`` for the non-hybrid path: [1, 2, 4] then by 8 up to
+        # 256, then by 16. The previous list stepped 16 -> 32 -> 48 -> 64 -> 96
+        # -> 128 -> 160, so a decode batch of 100 padded to 128 (28% of the work
+        # wasted) where vLLM pads to 104 (4%).
+        bs_candidates = [i for i in (1, 2, 4) if i <= max_bs]
+        if max_bs >= 8:
+            bs_candidates += list(range(8, min(max_bs + 1, 256), 8))
+        if max_bs >= 256:
+            bs_candidates += list(range(256, max_bs + 1, 16))
         bs_list = sorted(set(bs_candidates))
         bs_list = [b for b in bs_list if b <= max_bs]
+        if bs_list and bs_list[-1] != max_bs:
+            bs_list.append(max_bs)
         if not bs_list:
             return
         self._kimi_graph_bs_list = bs_list
@@ -2383,7 +2549,8 @@ class ModelRunner:
         return self.run_kimi_decode_fast_async(decode_data)
 
     @torch.inference_mode()
-    def _run_kimi_linear_batch(self, seqs, is_prefill: bool):
+    def _run_kimi_linear_batch(self, seqs, is_prefill: bool,
+                               prefill_chunk_lens=None):
         if not seqs:
             return None
 
@@ -2392,11 +2559,16 @@ class ModelRunner:
         device = torch.device(f"cuda:{self.rank}")
         sm_ = self.mamba_state_manager
 
-        for seq in seqs:
+        if is_prefill and prefill_chunk_lens is None:
+            prefill_chunk_lens = [
+                len(seq.token_ids) - seq.num_computed_tokens for seq in seqs
+            ]
+
+        for i, seq in enumerate(seqs):
             if seq.state_slot is None:
                 raise RuntimeError("Kimi-Linear sequence has no allocated state slot")
             total_after = (
-                len(seq.token_ids) if is_prefill
+                seq.num_computed_tokens + prefill_chunk_lens[i] if is_prefill
                 else seq.num_computed_tokens + 1
             )
             sm_.ensure_blocks_for(seq, total_after)
@@ -2414,11 +2586,17 @@ class ModelRunner:
         max_blocks = 0
         block_size = sm_.block_size
 
-        for seq in seqs:
+        for i, seq in enumerate(seqs):
             if is_prefill:
-                tokens = list(seq.token_ids)
-                start_pos = 0
-                init_state = False
+                # Chunked prefill: resume where the previous chunk stopped and
+                # let the KDA conv/recurrent state continue via
+                # ``has_initial_state`` (the same contract vLLM's GDN/KDA
+                # metadata uses).
+                start_pos = seq.num_computed_tokens
+                tokens = list(
+                    seq.token_ids[start_pos:start_pos + prefill_chunk_lens[i]],
+                )
+                init_state = start_pos > 0
             else:
                 tokens = [seq.last_token]
                 start_pos = seq.num_computed_tokens
@@ -2480,7 +2658,8 @@ class ModelRunner:
                 (batch_size, 1), dtype=torch.int32, device=device,
             )
         else:
-            bt = np.full((batch_size, max_blocks), -1, dtype=np.int32)
+            bt_cols = self._pad_page_table_cols(max_blocks)
+            bt = np.full((batch_size, bt_cols), -1, dtype=np.int32)
             for i, row in enumerate(block_tables_rows):
                 if row:
                     bt[i, :len(row)] = row
@@ -2525,6 +2704,17 @@ class ModelRunner:
             md.batch_ptr = batch_ptr
             md.token_chunk_offset_ptr = token_chunk_offset_ptr
 
+        # Kimi's full-attention layers are MLA: a prefill chunk that resumes
+        # mid-prompt attends to its own new tokens with the dense causal
+        # kernel and to the already-cached prefix through the gather+merge
+        # context path (vLLM's MLACommonImpl._compute_prefill_context). Without
+        # this metadata the chunk would silently drop the prefix.
+        chunked_context = None
+        if is_prefill and any(seq.num_computed_tokens > 0 for seq in seqs):
+            chunked_context = self._build_chunked_context(
+                seqs, prefill_chunk_lens, block_tables_t, device,
+            )
+
         set_context(
             is_prefill,
             cu_seqlens_q=cu_gpu.to(torch.int32),
@@ -2535,6 +2725,7 @@ class ModelRunner:
             context_lens=seq_lens_t,
             block_tables=block_tables_t,
             max_context_len=max_seq_len,
+            chunked_context=chunked_context,
         )
         ctx = get_context()
         ctx.kda_state = sm_
@@ -2549,24 +2740,40 @@ class ModelRunner:
         last_hidden = hidden_states.index_select(0, logit_idx_t)
         logits = self.model.compute_logits(last_hidden)
 
-        for seq in seqs:
+        for i, seq in enumerate(seqs):
             if is_prefill:
-                seq.num_computed_tokens = len(seq.token_ids)
+                seq.num_computed_tokens += prefill_chunk_lens[i]
             else:
                 seq.num_computed_tokens += 1
         return logits
 
     @torch.inference_mode()
-    def run_qwen3_next_mixed(self, prefill_seqs, decode_seqs):
+    def run_qwen3_next_mixed(self, prefill_seqs, decode_seqs,
+                             prefill_chunk_lens=None):
         """Run Qwen3-Next with flat GDN state and paged MHA KV cache.
 
         If a batch contains any prefill sequence, all sequences in the step
         use the GDN chunk path. This mirrors vLLM's GDN metadata behavior for
         mixed batches and avoids a separate decode-first token layout.
+
+        ``prefill_chunk_lens`` gives the number of prompt tokens to run for
+        each entry of ``prefill_seqs`` this step (chunked prefill, matching
+        vLLM's scheduler).  ``None`` means "the whole remainder", i.e. the
+        single-shot behaviour.
         """
         seqs = list(prefill_seqs) + list(decode_seqs)
         if not seqs:
             return None
+
+        if prefill_chunk_lens is None:
+            prefill_chunk_lens = [
+                len(seq.token_ids) - seq.num_computed_tokens
+                for seq in prefill_seqs
+            ]
+        chunk_by_seq = {
+            id(seq): chunk
+            for seq, chunk in zip(prefill_seqs, prefill_chunk_lens)
+        }
 
         reset_context()
         device = torch.device(f"cuda:{self.rank}")
@@ -2582,6 +2789,7 @@ class ModelRunner:
         seq_lens: list[int] = []
         has_initial_state: list[bool] = []
         block_tables_rows: list[list[int]] = []
+        consumed: list[tuple["Sequence", int]] = []
         max_query_len = 0
         max_seq_len = 0
         max_blocks = 0
@@ -2589,9 +2797,10 @@ class ModelRunner:
         for seq in seqs:
             if seq.state_slot is None:
                 raise RuntimeError("Qwen3-Next sequence has no allocated state slot")
-            if seq in prefill_seqs:
+            chunk = chunk_by_seq.get(id(seq))
+            if chunk is not None:
                 start_pos = seq.num_computed_tokens
-                tokens = list(seq.token_ids[start_pos:])
+                tokens = list(seq.token_ids[start_pos:start_pos + chunk])
                 if not tokens:
                     continue
                 seq_total = start_pos + len(tokens)
@@ -2603,6 +2812,7 @@ class ModelRunner:
             sm_.ensure_blocks_for(seq, seq_total)
 
             n_tok = len(tokens)
+            consumed.append((seq, n_tok))
             ids.extend(tokens)
             positions.extend(range(start_pos, start_pos + n_tok))
             cu.append(cu[-1] + n_tok)
@@ -2727,16 +2937,15 @@ class ModelRunner:
         last_hidden = hidden_states.index_select(0, logit_idx_t)
         logits = self.model.compute_logits(last_hidden)
 
-        prefill_ids = {id(seq) for seq in prefill_seqs}
-        for seq in seqs:
-            if id(seq) in prefill_ids:
-                seq.num_computed_tokens = len(seq.token_ids)
-            else:
-                seq.num_computed_tokens += 1
+        for seq, n_tok in consumed:
+            seq.num_computed_tokens += n_tok
         return logits
 
-    def _run_qwen3_next_batch(self, seqs, is_prefill: bool):
-        return self.run_qwen3_next_mixed(seqs if is_prefill else [], [] if is_prefill else seqs)
+    def _run_qwen3_next_batch(self, seqs, is_prefill: bool,
+                              prefill_chunk_lens=None):
+        if is_prefill:
+            return self.run_qwen3_next_mixed(seqs, [], prefill_chunk_lens)
+        return self.run_qwen3_next_mixed([], seqs)
 
     @torch.inference_mode()
     def _warmup_qwen3_next_prefill(self):
@@ -3617,6 +3826,7 @@ class ModelRunner:
             workspace=self._mla_chunked_prefill_workspace,
             token_to_seq=token_to_seq_cpu.to(device, non_blocking=True),
             chunk_total_token=chunk_total_token.tolist(),
+            has_empty_context=(chunk_seq_lens == 0).any(dim=1).tolist(),
         )
     def prepare_prefill(self, seqs):
         input_ids, positions = [], []
@@ -4095,7 +4305,19 @@ class ModelRunner:
             positions = self._eager_positions[:n]
         slot_mapping = self._eager_slot_mapping[:n]
         context_lens = self._eager_context_lens[:n]
-        block_tables = self._eager_block_tables[:n, :bt_cols]
+        if ATTN_BACKEND_CONFIG.use_trtllm:
+            # Full width, NOT ``[:n, :bt_cols]``. FlashInfer's trtllm-gen launcher
+            # derives the page-table row stride from ``size(-1)``, not ``stride(0)``,
+            # so a column slice of a wider allocation makes every row but row 0 read
+            # the wrong KV pages. The consuming ops defensively call
+            # ``block_table.contiguous()``, which repairs the stride but pays a copy
+            # per layer per step; handing over the full width makes that a no-op and
+            # protects any consumer that lacks the guard. The kernel walks only
+            # ``ceil(seq_len/page)`` columns per row -- exactly the ones copied above
+            # -- so the untouched tail is never read.
+            block_tables = self._eager_block_tables[:n]
+        else:
+            block_tables = self._eager_block_tables[:n, :bt_cols]
 
         req_id_per_token = getattr(self, "_decode_req_id_buf", None)
         if req_id_per_token is not None:
@@ -4325,16 +4547,28 @@ class ModelRunner:
 
     def _write_decode_shm(self, n, ids_np, pos_np, sm_np, cl_np, bt_np):
         """Write decode arrays directly into SHM with binary layout.
-        
+
         Layout: [n(2)][max_bt(2)][ids(n*8)][pos(n*8 or 3*n*8)][sm(n*4)][cl(n*4)][bt(n*max_bt*4)]
         pos_np is (n,) for standard models or (3, n) for MRoPE models.
         """
         max_bt = bt_np.shape[1]
         buf = self.shm.buf
+        arrays = (ids_np, pos_np.ravel(), sm_np, cl_np, bt_np)
+        payload_bytes = 4 + sum(arr.nbytes for arr in arrays)
+        if payload_bytes > self._SHM_ACK_OFFSET:
+            # Assigning past the data region would silently truncate the
+            # lvalue slice and raise an opaque memoryview structure error,
+            # so fail with the numbers needed to diagnose it.
+            raise RuntimeError(
+                f"Decode SHM payload too large: {payload_bytes} bytes for "
+                f"n={n}, max_bt={max_bt} (limit {self._SHM_ACK_OFFSET}); "
+                f"_init_shm_layout sized for max_num_seqs="
+                f"{self.max_num_seqs}, max_model_len={self.max_model_len}"
+            )
         buf[0:2] = n.to_bytes(2, "little")
         buf[2:4] = max_bt.to_bytes(2, "little")
         off = 4
-        for arr in (ids_np, pos_np.ravel(), sm_np, cl_np, bt_np):
+        for arr in arrays:
             nb = arr.nbytes
             buf[off:off+nb] = arr.tobytes()
             off += nb
@@ -4413,11 +4647,15 @@ class ModelRunner:
             return self.run_decode_greedy_fast_async(decode_data)
         return self.run_decode_greedy_fast_async(decode_data)
 
-    def run(self, seqs, is_prefill):
+    def run(self, seqs, is_prefill, prefill_chunk_lens=None):
         if self.is_kimi_linear:
-            return self._run_kimi_linear_batch(seqs, is_prefill)
+            return self._run_kimi_linear_batch(
+                seqs, is_prefill, prefill_chunk_lens,
+            )
         if self.is_qwen3_next:
-            return self._run_qwen3_next_batch(seqs, is_prefill)
+            return self._run_qwen3_next_batch(
+                seqs, is_prefill, prefill_chunk_lens,
+            )
         input_ids, positions = (
             self.prepare_prefill(seqs) if is_prefill
             else self.prepare_decode(seqs)
@@ -4855,7 +5093,7 @@ class ModelRunner:
         """
         from .compilation import compile_model, configure_post_grad_passes
 
-        configure_post_grad_passes()
+        configure_post_grad_passes(model_dtype=self.dtype)
         # Mamba2 owns a dedicated decode-cudagraph path, so keep the
         # compile stack's generic cudagraph wrapper off for it.
         cudagraph_enabled = not self.is_mamba2
@@ -4890,7 +5128,12 @@ class ModelRunner:
             positions = torch.zeros(max_bs, dtype=torch.int64)
         sm_torch_dtype = torch.int64 if self.is_deepseek_mla else torch.int32
         slot_mapping = torch.full((max_bs,), -1, dtype=sm_torch_dtype)
-        context_lens = torch.zeros(max_bs, dtype=torch.int32)
+        # One cached token per dummy request, not zero: vLLM's uniform-decode
+        # dummy run sets ``seq_lens = max_query_len`` (== 1) and only zeroes the
+        # padded tail (``gpu_model_runner._dummy_run``).  A zero context length
+        # is not a state any real decode step reaches, so capturing against it
+        # warms a shape the kernels never see again.
+        context_lens = torch.ones(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         # Persistent arange buffer for per-token request id mapping during
         # pure-decode (token i -> sequence i).  Captured into decode CUDA
@@ -5699,57 +5942,99 @@ class LlamaEngine:
             final_len = prompt_len + seq.max_tokens
             return (final_len + block_size - 1) // block_size
 
-        while waiting or running:
-            prefill_seqs: list[Sequence] = []
-            prefill_tokens = 0
-            committed_blocks = (
-                sum(_worst_case_blocks(seq) for seq in running)
-                if total_kv_blocks and waiting
-                else 0
-            )
+        # Admitted but not yet fully prefilled (chunked prefill in flight).
+        prefilling: list[Sequence] = []
+
+        while waiting or running or prefilling:
+            # --- Admission -------------------------------------------------
+            # Sequences move waiting -> prefilling (claiming one recurrent
+            # state slot each) gated only by slot availability and the
+            # worst-case KV block reservation; the per-step token budget is
+            # handled by the chunk planner below, so a prompt longer than the
+            # budget spans several steps instead of being admitted whole.
             blocked_by_kv = False
-            while (
-                waiting
-                and len(prefill_seqs) < max_num_seqs
-                and len(running) + len(prefill_seqs) < max_num_seqs
-                and mr.can_allocate_mamba_state()
-            ):
-                seq_len = len(waiting[0].token_ids)
-                if (
-                    prefill_seqs
-                    and prefill_tokens + seq_len > max_batched_tokens
+            if waiting:
+                committed_blocks = (
+                    sum(
+                        _worst_case_blocks(seq)
+                        for seq in itertools.chain(running, prefilling)
+                    )
+                    if total_kv_blocks
+                    else 0
+                )
+                admitted: list[Sequence] = []
+                while (
+                    waiting
+                    and len(running) + len(prefilling) + len(admitted) < max_num_seqs
+                    and mr.can_allocate_mamba_state()
                 ):
-                    break
-                if total_kv_blocks:
-                    candidate_blocks = _worst_case_blocks(waiting[0])
-                    must_admit = len(running) + len(prefill_seqs) == 0
-                    if (
-                        not must_admit
-                        and committed_blocks + candidate_blocks > block_budget
-                    ):
-                        blocked_by_kv = True
-                        break
-                    committed_blocks += candidate_blocks
-                seq = waiting.popleft()
+                    if total_kv_blocks:
+                        candidate_blocks = _worst_case_blocks(waiting[0])
+                        must_admit = not (running or prefilling or admitted)
+                        if (
+                            not must_admit
+                            and committed_blocks + candidate_blocks > block_budget
+                        ):
+                            blocked_by_kv = True
+                            break
+                        committed_blocks += candidate_blocks
+                    admitted.append(waiting.popleft())
+                if admitted:
+                    slots = mr.call("allocate_mamba_state_batch", len(admitted))
+                    for seq, slot in zip(admitted, slots):
+                        seq.state_slot = slot
+                    prefilling.extend(admitted)
+
+            # --- Chunk planner ---------------------------------------------
+            # Fill max_num_batched_tokens with prefill chunks in FIFO order.
+            # A prompt longer than the budget is split across steps; its
+            # GDN/KDA conv + recurrent state continues via has_initial_state
+            # and num_computed_tokens (vLLM's chunked-prefill contract), so a
+            # 128K prompt never materializes a full-sequence chunk-scan
+            # transient.
+            prefill_seqs: list[Sequence] = []
+            prefill_chunk_lens: list[int] = []
+            budget_left = max_batched_tokens
+            for seq in prefilling:
+                remaining = seq.num_remaining_prefill
+                if remaining <= 0:
+                    continue
+                if remaining <= budget_left:
+                    chunk = remaining
+                elif prefill_seqs:
+                    break               # no room left; next step
+                else:
+                    chunk = budget_left  # guarantee progress
                 prefill_seqs.append(seq)
-                prefill_tokens += seq_len
+                prefill_chunk_lens.append(chunk)
+                budget_left -= chunk
+                if budget_left <= 0:
+                    break
 
             if prefill_seqs:
                 decode_bt_dirty = True
-                slots = mr.call("allocate_mamba_state_batch", len(prefill_seqs))
-                for seq, slot in zip(prefill_seqs, slots):
-                    seq.state_slot = slot
-
-                logits = mr.call("run", prefill_seqs, True)
+                logits = mr.call(
+                    "run", prefill_seqs, True, prefill_chunk_lens,
+                )
+                # The runner advanced num_computed_tokens by each chunk, so a
+                # sequence with prefill left keeps its carried state and waits
+                # for the next step; only a finished prompt yields a token.
+                scheduled = {id(seq) for seq in prefill_seqs}
+                prefilling = [
+                    seq for seq in prefill_seqs if seq.num_remaining_prefill > 0
+                ] + [seq for seq in prefilling if id(seq) not in scheduled]
                 if logits is not None:
-                    if collect_logits:
-                        for i, seq in enumerate(prefill_seqs):
-                            seq_logits[id(seq)].append(logits[i:i + 1].cpu())
                     finished_payloads: list[tuple[int, list[int]]] = []
                     next_running: list[Sequence] = list(running)
+                    sampled: list[Sequence] = []
                     for i, seq in enumerate(prefill_seqs):
+                        if seq.num_remaining_prefill > 0:
+                            continue
+                        if collect_logits:
+                            seq_logits[id(seq)].append(logits[i:i + 1].cpu())
                         tid = self._sample(logits[i:i + 1], seq_sp[id(seq)])[0]
                         seq.append_token(tid)
+                        sampled.append(seq)
                         done = len(seq.generated_ids) >= seq.max_tokens
                         if not seq.ignore_eos:
                             done = done or tid == eos
@@ -5760,7 +6045,7 @@ class LlamaEngine:
                     if finished_payloads:
                         mr.call("deallocate_mamba_state_batch", finished_payloads)
                         finished_slots = {slot for slot, _ in finished_payloads}
-                        for seq in prefill_seqs:
+                        for seq in sampled:
                             if seq.state_slot in finished_slots:
                                 seq.block_table = []
                                 seq.state_slot = None
@@ -5772,7 +6057,7 @@ class LlamaEngine:
                 continue
 
             if (
-                waiting
+                (waiting or prefilling)
                 and not blocked_by_kv
                 and all_greedy
                 and all(seq.ignore_eos for seq in running)

@@ -41,7 +41,13 @@ import numpy as np
 import torch
 from transformers import AutoTokenizer
 
-from .context import get_attn_backend_config, set_context, set_forward_context
+from .context import (
+    AttnBackendConfig,
+    get_attn_backend_config,
+    set_attn_backend_config,
+    set_context,
+    set_forward_context,
+)
 from .weight_loader import load_eagle3_draft_model, load_model
 from ..tasks.baseline.L1.eagle_tree_ops import (
     build_tree_kernel_efficient_with_metadata,
@@ -210,6 +216,31 @@ class LlamaEagle3Engine:
         torch.set_default_dtype(dtype)
         torch.set_default_device("cuda")
 
+        # EAGLE-3's reference library is SGLang, not vLLM.  Its verify step
+        # (``TreeAttnPrefill``) reproduces SGLang's two-pass cascade: a paged
+        # prefix pass plus a token-level expand pass, combined by
+        # softmax-LSE merging (SGLang's ``merge_state_v2``).  That requires a
+        # backend which (a) returns the LSE and (b) reads the paged cache as
+        # NHD [num_blocks, block_size, num_kv_heads, head_dim].  trtllm-gen --
+        # the auto-detected default on Blackwell -- does neither: it returns
+        # no LSE and reads HND.  So pin the whole engine (target + draft +
+        # tree verify) to the flash_attn/NHD backend, matching the
+        # FlashAttention cascade SGLang itself runs for spec decode.
+        default_cfg = get_attn_backend_config()
+        if default_cfg.kv_layout != "NHD":
+            set_attn_backend_config(
+                AttnBackendConfig(
+                    backend="flash_attn",
+                    block_size=default_cfg.block_size,
+                    kv_layout="NHD",
+                )
+            )
+            print(
+                f"[EAGLE-3] Pinning attention backend to flash_attn/NHD "
+                f"(auto-detected {default_cfg.backend}/{default_cfg.kv_layout} "
+                f"cannot return the softmax LSE the tree-verify cascade merges)"
+            )
+
         attn_cfg = get_attn_backend_config()
         self.block_size = attn_cfg.block_size
         self.kv_layout = attn_cfg.kv_layout
@@ -325,12 +356,13 @@ class LlamaEagle3Engine:
         if self._target_verify_runner is not None:
             return
 
-        from ..tasks.baseline.L1.tree_attn_prefill import _FA3_AVAILABLE
+        from ..tasks.baseline.L1.tree_attn_prefill import _VLLM_FA_AVAILABLE
 
-        if not _FA3_AVAILABLE:
+        if not _VLLM_FA_AVAILABLE:
             print(
-                "[EAGLE-3] Skipping CUDA graph capture: FA3 paged tree "
-                "attention is unavailable in this environment."
+                "[EAGLE-3] Skipping CUDA graph capture: vLLM's bundled "
+                "FlashAttention (paged tree attention) is unavailable in "
+                "this environment."
             )
             return
 
@@ -1528,8 +1560,40 @@ class LlamaEagle3Engine:
                 )
                 active.extend(live_pairs)
 
-        _admit_requests()
-        while active:
+        # Drain both the queue and the in-flight set.  ``while active`` alone
+        # was wrong: an admission round whose sequences all finish during
+        # prefill leaves ``active`` empty while ``idx_pool`` still holds
+        # requests, so the loop exited early and those requests were never
+        # generated -- their slots in ``all_outputs`` stayed None.
+        #
+        # That is not a corner case: it is exactly what ``max_tokens=1`` does.
+        # ``_target_prefill`` appends the first sampled token, so
+        # ``len(generated_ids) == 1 >= max_tokens`` finishes the request before
+        # any draft/verify step runs -- matching SGLang, whose
+        # ``Req.update_finish_state`` finishes on
+        # ``len(self.output_ids) >= sampling_params.max_new_tokens``
+        # (srt/managers/schedule_batch.py). bench_sglang issues exactly such a
+        # max_tokens=1 pass to pre-absorb Triton JIT/autotune before timing.
+        while idx_pool or active:
+            queued_before = len(idx_pool)
+            _admit_requests()
+
+            if not active:
+                if len(idx_pool) < queued_before:
+                    # Admitted a batch that finished entirely during prefill.
+                    # They are finalized, so this *is* forward progress --
+                    # keep draining the queue.
+                    continue
+                if idx_pool:
+                    raise RuntimeError(
+                        f"EAGLE-3 scheduler stalled with {len(idx_pool)} "
+                        f"request(s) queued and none admissible "
+                        f"(max_num_seqs={self.max_num_seqs}, "
+                        f"target_kv_free={self.target_kv.num_free_blocks()}, "
+                        f"draft_kv_free={self.draft_kv.num_free_blocks()})"
+                    )
+                break
+
             self._eagle3_step([seq for _, seq in active], eos_id)
 
             kept: list[tuple[int, _Eagle3Sequence]] = []
@@ -1539,10 +1603,16 @@ class LlamaEagle3Engine:
                 else:
                     kept.append((src_i, seq))
             active = kept
-            _admit_requests()
 
         if pbar is not None:
             pbar.close()
 
-        assert all(o is not None for o in all_outputs)
+        missing = [i for i, o in enumerate(all_outputs) if o is None]
+        if missing:
+            raise RuntimeError(
+                f"EAGLE-3 produced no output for {len(missing)} of "
+                f"{len(all_outputs)} requests (indices {missing[:16]}"
+                f"{'...' if len(missing) > 16 else ''}); "
+                f"{len(idx_pool)} still queued, {len(active)} still active"
+            )
         return all_outputs

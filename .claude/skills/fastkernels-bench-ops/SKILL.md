@@ -1,7 +1,7 @@
 ---
 name: fastkernels-bench-ops
 description: Benchmark each new/modified fastkernels operator against its SOTA-reference counterpart for correctness (same init/inputs -> same output) and performance (>= reference); fix and iterate. Invoke with /fastkernels-bench-ops <model/arch> [reference lib].
-disable-model-invocation: true
+disable-model-invocation: false
 ---
 
 # Benchmark fastkernels ops vs the SOTA reference

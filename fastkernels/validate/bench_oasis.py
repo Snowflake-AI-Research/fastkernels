@@ -69,6 +69,11 @@ from fastkernels.workloads import (  # noqa: E402
     OASIS_THROUGHPUT_WORKLOADS,
     OasisWorkload,
 )
+from fastkernels.validate.comparison import (  # noqa: E402
+    alignment_from_similarity,
+    latency_entry,
+    throughput_entry,
+)
 
 from fastkernels import THIRD_PARTY_DIR  # noqa: E402
 
@@ -737,7 +742,7 @@ def _print_results_summary(results: dict[str, Any]) -> None:
     print(f"  DType      : {results['dtype']}")
     print(f"  Correctness: {results['correctness_dtype']}")
     print(f"  Dataset    : {results['input']['name']} ({results['input']['split']})")
-    print(f"  Scenarios  : {', '.join(s['name'] for s in results['scenarios'])}")
+    print(f"  Scenarios  : {', '.join(s['name'] for s in results['workloads'])}")
     print(f"{'=' * 110}")
 
     if throughput:
@@ -848,7 +853,9 @@ def main() -> None:
         "dtype": str(dtype),
         "correctness_dtype": str(torch.float32),
         "input": input_info,
-        "scenarios": [s.__dict__ for s in scenarios],
+        # Renamed from "scenarios": that key now carries the standard throughput
+        # comparison entries shared with the other harnesses.
+        "workloads": [s.__dict__ for s in scenarios],
     }
 
     if scenarios:
@@ -941,6 +948,57 @@ def main() -> None:
                     )
             throughput_results.append(item)
         results["performance"] = throughput_results
+
+    # Standard comparison shape (see fastkernels/validate/comparison.py). Before
+    # this, oasis reported 5 throughput speedups but no latency speedup at all,
+    # because latency_ratio_p50 lived only inside `performance`.
+    std_throughput: list[dict[str, Any]] = []
+    std_latency: list[dict[str, Any]] = []
+    for item in results.get("performance", []):
+        scenario = item.get("scenario") or {}
+        name = scenario.get("name")
+        ours = item.get("fastkernels") or {}
+        ref = item.get("open_oasis") or {}
+        if not ref:
+            continue
+        if scenario.get("kind") == "latency":
+            std_latency.append(latency_entry(
+                name,
+                ours.get("latency_ms_p50", 0.0) / 1000.0,
+                ref.get("latency_ms_p50", 0.0) / 1000.0,
+                batch_clips=scenario.get("batch_clips"),
+                num_frames=scenario.get("num_frames"),
+                ddim_steps=scenario.get("ddim_steps"),
+            ))
+            continue
+        correctness = item.get("correctness") or {}
+        alignment = None
+        cosines = [
+            v["cosine"] for v in correctness.values()
+            if isinstance(v, dict) and isinstance(v.get("cosine"), (int, float))
+        ]
+        if cosines:
+            alignment = alignment_from_similarity(
+                "min_cosine", min(cosines),
+                threshold=0.99,
+                overall_pass=correctness.get("overall_pass"),
+                per_tensor={
+                    key: value.get("cosine")
+                    for key, value in correctness.items()
+                    if isinstance(value, dict)
+                },
+            )
+        std_throughput.append(throughput_entry(
+            name,
+            ours.get("videos_per_second"), ref.get("videos_per_second"),
+            metric="videos_per_s", alignment=alignment,
+            batch_clips=scenario.get("batch_clips"),
+            num_frames=scenario.get("num_frames"),
+            ddim_steps=scenario.get("ddim_steps"),
+        ))
+    results["scenarios"] = std_throughput
+    results["latency_scenarios"] = std_latency
+    results["reference_name"] = "open-oasis"
 
     output_dir = Path(args.output_dir) if args.output_dir else Path("tests/results") / _detect_gpu_name() / "oasis-500m"
     output_dir.mkdir(parents=True, exist_ok=True)

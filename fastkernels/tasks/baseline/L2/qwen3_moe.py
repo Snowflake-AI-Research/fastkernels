@@ -182,12 +182,20 @@ class Qwen3MoE(nn.Module):
             block_shape=self.block_shape,
         )
 
-        if self.tp_size > 1:
+        if self.tp_size > 1 and not self._use_custom_op:
             out = self.allreduce(out)
 
         return out.view(orig_shape)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self._use_custom_op:
-            return torch.ops.fastkernels.moe_forward(hidden_states, self._layer_name)
+            # The all-reduce stays *outside* the opaque op: inside it Inductor
+            # cannot see the collective, so ``AllReduceFusedAddRMSNormPass`` has
+            # nothing to match at the MoE end of the layer -- half of every
+            # layer's collectives. vLLM keeps its MoE reduction in traced Python
+            # for the same reason (``moe_runner._maybe_reduce_final_output``).
+            out = torch.ops.fastkernels.moe_forward(hidden_states, self._layer_name)
+            if self.tp_size > 1:
+                out = self.allreduce(out)
+            return out
         return self.forward_impl(hidden_states)

@@ -28,6 +28,11 @@ sys.path.insert(0, str(_PROJECT_ROOT))
 
 from fastkernels import THIRD_PARTY_DIR
 from fastkernels.validate.worker import run_worker
+from fastkernels.validate.comparison import (
+    alignment_from_token_ids,
+    latency_entry,
+    throughput_entry,
+)
 
 
 DEFAULT_TASK = "humaneval"
@@ -624,6 +629,70 @@ def main():
 
     out_file = out_dir / _result_filename(args, input_info, resolved_reference_backends)
     out_file.write_text(json.dumps(results, indent=2))
+
+    # Standard results.json alongside the detailed scenario-named file. Without
+    # it the runner found no artifact for this row (it looks for results.json)
+    # and aggregate sweep queries saw no speedup/alignment for LLaDA.
+    scenarios: list[dict] = []
+    latency_scenarios: list[dict] = []
+    for backend, ref in references.items():
+        if not ref:
+            continue
+        alignment = alignment_from_token_ids(
+            [o["token_ids"] for o in ours["outputs"]],
+            [o["token_ids"] for o in ref["outputs"]],
+        )
+        cmp = comparisons.get(backend) or {}
+        alignment.update({
+            "token_match_rate": cmp.get("token_match_rate"),
+            "sequence_exact_match_rate": cmp.get("sequence_exact_match_rate"),
+            "logits_cosine": cmp.get("logits_cosine"),
+        })
+        scenarios.append(throughput_entry(
+            f"{input_info['task']}-{backend}",
+            ours.get("tokens_per_second"), ref.get("tokens_per_second"),
+            metric="tokens_per_s", alignment=alignment,
+            reference_backend=backend,
+            batch_size=args.batch_size,
+            num_samples=input_info["num_samples"],
+            avg_nfe_per_batch=ours.get("avg_nfe_per_batch"),
+            reference_avg_nfe_per_batch=ref.get("avg_nfe_per_batch"),
+        ))
+        # dLLM times one batched sweep rather than per-request, so the latency
+        # figure is mean wall-clock per batch. Both sides use identical batch
+        # composition, so the ratio is like-for-like.
+        ours_batches = max(ours.get("num_batches") or 0, 1)
+        ref_batches = max(ref.get("num_batches") or 0, 1)
+        latency_scenarios.append(latency_entry(
+            f"{input_info['task']}-{backend}-batch{args.batch_size}",
+            (ours.get("elapsed") or 0.0) / ours_batches,
+            (ref.get("elapsed") or 0.0) / ref_batches,
+            metric="mean_batch_s",
+            reference_backend=backend,
+            batch_size=args.batch_size,
+        ))
+
+    # Summary only: the per-sample token ids and logit samples stay in the
+    # detailed file, which is ~5 MB on HumanEval and would otherwise be written
+    # twice.
+    def _light(backend_result):
+        if not backend_result:
+            return backend_result
+        return {
+            key: value for key, value in backend_result.items()
+            if key not in {"outputs", "logits_sample"}
+        }
+
+    standard = {
+        **{k: v for k, v in results.items() if k not in {"ours", "references"}},
+        "ours": _light(ours),
+        "references": {name: _light(ref) for name, ref in references.items()},
+        "reference_name": resolved_reference_backends if not args.skip_reference else None,
+        "scenarios": scenarios,
+        "latency_scenarios": latency_scenarios,
+        "detailed_results_file": out_file.name,
+    }
+    (out_dir / "results.json").write_text(json.dumps(standard, indent=2))
     print(
         json.dumps(
             {

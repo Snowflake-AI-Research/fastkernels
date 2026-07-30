@@ -242,6 +242,75 @@ if _max_layers_env:
 
             _dl.DefaultModelLoader.get_all_weights = _get_all_weights_capped
             _dl.DefaultModelLoader._fastkernels_max_layers = True
+
+# FASTKERNELS_ALIGN_PROFILING_KV_BLOCKS -- work around an upstream vLLM 0.26
+# bug that stops Kimi-Linear (and any hybrid MLA model whose attention page gets
+# padded above 128) from starting on Blackwell.
+#
+# FlashInfer's trtllm-gen MLA decode kernel validates the *block-table width*:
+#     block_num = page_table.shape[-1]; block_size = page_size
+#     if block_num % (128 / block_size) != 0: raise
+# (flashinfer/mla/_core.py:686-696), where ``page_size`` is the *kernel* page
+# size (64 here).
+#
+# vLLM does align that width -- but against the wrong quantity:
+#     max_num_blocks = [cdiv(n, 128 // bs) * (128 // bs) if bs <= 128 else n
+#                       for n, bs in zip(max_num_blocks, block_sizes)]
+# (v1/worker/block_table.py, upstream #39324). ``block_sizes`` holds the *spec*
+# block size, and for Kimi-Linear the hybrid allocator pads attention up to the
+# mamba page ("Setting attention block size to 960 tokens to ensure that
+# attention page size is >= mamba page size"). 960 > 128, so the ``else n``
+# branch skips alignment entirely -- while the kernel still demands
+# ``width % 2 == 0`` against its 64-token page. cdiv(max_len, 960) then lands on
+# an odd 135 and startup aborts:
+#     ValueError: Expected block_num % (128 / block_size) == 0,
+#                 got block_num=135 and block_size=64
+#
+# The fix is the one-line upstream correction: align against
+# ``kernel_block_sizes``, which is what the kernel actually reads. Rounding the
+# width *up* only adds a couple of unused (-1 padded) block-table columns, so it
+# changes no kernel, no page size, no KV capacity and no scheduler setting --
+# notably FLASHINFER_MLA is retained. Substituting a slower MLA backend would
+# make each reported Kimi speedup a comparison against a handicapped reference.
+#
+# Drop this once vLLM aligns against kernel_block_sizes upstream.
+if os.environ.get("FASTKERNELS_ALIGN_PROFILING_KV_BLOCKS") == "1":
+    try:
+        import inspect as _inspect
+
+        from vllm.v1.worker.block_table import (
+            MultiGroupBlockTable as _MGBT,
+        )
+    except Exception:
+        pass
+    else:
+        if not getattr(_MGBT, "_fastkernels_kernel_aligned_width", False):
+            _orig_mgbt_init = _MGBT.__init__
+            _mgbt_sig = _inspect.signature(_orig_mgbt_init)
+
+            def _mgbt_init_kernel_aligned(self, *args, _orig=_orig_mgbt_init,
+                                          _sig=_mgbt_sig, **kwargs):
+                try:
+                    bound = _sig.bind(self, *args, **kwargs)
+                    kbs = bound.arguments.get("kernel_block_sizes")
+                    mnb = bound.arguments.get("max_num_blocks")
+                    if kbs and mnb and len(kbs) == len(mnb):
+                        aligned = []
+                        for n, kbs_i in zip(mnb, kbs):
+                            align = 128 // kbs_i if 0 < kbs_i <= 128 else 1
+                            if align > 1 and n % align:
+                                n += align - (n % align)
+                            aligned.append(n)
+                        if aligned != list(mnb):
+                            bound.arguments["max_num_blocks"] = aligned
+                            args = bound.args[1:]
+                            kwargs = bound.kwargs
+                except Exception:
+                    pass
+                return _orig(self, *args, **kwargs)
+
+            _MGBT.__init__ = _mgbt_init_kernel_aligned
+            _MGBT._fastkernels_kernel_aligned_width = True
 ''')
 
     current = os.environ.get("PYTHONPATH", "")
@@ -436,6 +505,25 @@ _PER_MODEL_DEFAULTS: dict[str, dict] = {
         "gpu_memory_utilization": 0.80,
     },
 }
+
+
+# vLLM reference engines run with vLLM's *own* backend selection, page size
+# and config. We deliberately do not override them: substituting a different
+# attention backend (e.g. pinning Kimi-Linear's MLA decode to TRITON_MLA to
+# dodge the FLASHINFER_MLA block-count assertion) makes the reference slower
+# than vLLM actually is, so any reported fastkernels speedup would be measured
+# against a handicapped baseline rather than like-for-like.
+#
+# Known consequence: Kimi-Linear's reference currently cannot start on
+# Blackwell. vLLM 0.26 selects FLASHINFER_MLA, whose trtllm-gen decode kernel
+# requires ``block_num % (128 // block_size) == 0``; vLLM aligns the
+# per-request block-table width to that multiple
+# (v1/worker/block_table.py, upstream #39324) but not the total
+# ``num_gpu_blocks``, so CUDA-graph memory profiling aborts with
+#     ValueError: Expected block_num % (128 / block_size) == 0,
+#                 got block_num=2055 and block_size=64
+# That is an upstream vLLM bug, and it is reported as a reference-side failure
+# rather than worked around here. See docs/vllm-0.26-alignment-audit.md.
 
 
 def _apply_per_model_defaults(model_name: str, args) -> dict[str, str]:
@@ -641,6 +729,8 @@ def main():
         llm_kwargs["load_format"] = cfg["load_format"]
     if cfg.get("max_layers") is not None:
         llm_kwargs["hf_overrides"] = _fastkernels_limit_layers
+    # Reference-only backend overrides for models vLLM's default selection
+    # cannot run on this hardware (see _REFERENCE_ENGINE_OVERRIDES).
     llm = LLM(**llm_kwargs)
 
     # Warmup -- ignore_eos so all 16 decode steps run (parity with the engines).
@@ -1251,7 +1341,10 @@ def main():
         # timing; with the cache on, the timed generate() would hit cached
         # pixel_values and skip the CPU preprocessing that the fastkernels
         # engine re-runs inside its own timed region.
-        disable_mm_preprocessor_cache=True,
+        # vLLM 0.26 removed ``disable_mm_preprocessor_cache``; the equivalent
+        # is sizing the multi-modal processor cache to 0 GiB, which
+        # MultiModalConfig documents as disabling it completely.
+        mm_processor_cache_gb=0,
         trust_remote_code=True,
     )
     if cfg.get("trust_remote_code"):
@@ -1801,7 +1894,8 @@ def main():
         # See the VLM worker: the per-scenario warmup replays the identical
         # audio prompts before timing, so leave the mm preprocessor cache off
         # to keep the timed region paying for audio preprocessing.
-        disable_mm_preprocessor_cache=True,
+        # vLLM 0.26 removed ``disable_mm_preprocessor_cache``; 0 GiB disables.
+        mm_processor_cache_gb=0,
     )
     if cfg.get("trust_remote_code"):
         llm_kwargs["trust_remote_code"] = True
@@ -2341,6 +2435,13 @@ def main():
             # ``layers.{i>=N}`` tensors (hf_overrides only shrinks the model).
             os.environ["FASTKERNELS_MAX_LAYERS"] = str(args.max_layers)
             need_sitecustomize = True
+        # Align the throwaway CUDA-graph-profiling KV cache's block count so
+        # vLLM's own default MLA decode backend can start (upstream bug; see
+        # the sitecustomize body). Always on: it is a no-op for every model
+        # whose page size already yields alignment == 1, and it never changes a
+        # measured config -- so it does not need to be model-gated.
+        os.environ["FASTKERNELS_ALIGN_PROFILING_KV_BLOCKS"] = "1"
+        need_sitecustomize = True
         if need_sitecustomize:
             _install_bench_sitecustomize()
 

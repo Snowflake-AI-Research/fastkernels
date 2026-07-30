@@ -15,6 +15,11 @@ if str(_KB_ROOT) not in sys.path:
     sys.path.insert(0, str(_KB_ROOT))
 
 from fastkernels.validate.worker import run_worker
+from fastkernels.validate.comparison import (
+    alignment_from_similarity,
+    latency_entry,
+    throughput_entry,
+)
 
 
 INSTANTNGP_WORKER = r'''
@@ -234,6 +239,40 @@ def main() -> None:
             "rgba_mae": rgba_mae,
             "image_shape": ours_data["result"]["image_shape"],
         }
+
+    # Standard comparison shape (fastkernels/validate/comparison.py). Both sides
+    # already timed the Rendering.single_render latency workload, but nothing
+    # compared them, so the sweep summary showed throughput only and no
+    # per-scenario speedup field at all.
+    ours = result.get("ours") or {}
+    ref = result.get("reference") or {}
+    cmp = result.get("comparison") or {}
+    scenarios: list[dict] = []
+    latency_scenarios: list[dict] = []
+    if ref:
+        scenarios.append(throughput_entry(
+            "render", ours.get("images_per_second"), ref.get("images_per_second"),
+            metric="images_per_s",
+            alignment=alignment_from_similarity(
+                "rgba_cosine", cmp.get("rgba_cosine", 0.0), threshold=0.99,
+                rgba_mae=cmp.get("rgba_mae"),
+            ),
+            num_views=args.num_views,
+            resolution=result.get("resolution"),
+        ))
+        ours_lat = ours.get("latency") or {}
+        ref_lat = ref.get("latency") or {}
+        if ours_lat and ref_lat:
+            latency_scenarios.append(latency_entry(
+                "single-render",
+                ours_lat.get("median_seconds_per_image"),
+                ref_lat.get("median_seconds_per_image"),
+                num_views=args.num_views,
+                iterations=ours_lat.get("iterations"),
+            ))
+    result["scenarios"] = scenarios
+    result["latency_scenarios"] = latency_scenarios
+    result["reference_name"] = ref.get("baseline_name") or None
 
     output_path = os.path.join(args.output_dir, "results.json")
     with open(output_path, "w") as f:

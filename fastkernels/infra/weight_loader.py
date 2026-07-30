@@ -1290,6 +1290,41 @@ def _detect_quant_config(model_name: str) -> dict | None:
     return qc.to_dict() if hasattr(qc, "to_dict") else {"quant_method": "fp8"}
 
 
+def _move_preserving_param_dtypes(
+    model: torch.nn.Module,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> None:
+    """Move to ``device`` and cast to ``dtype`` *except* declared-FP32 tensors.
+
+    ``model.to(device, dtype)`` casts every parameter and buffer, which silently
+    demotes the ones a model declared FP32 on purpose. vLLM never does a blanket
+    cast: each parameter keeps the dtype its layer declared. That matters for
+    the hybrid linear-attention models, whose recurrence parameters are FP32 in
+    vLLM and whose kernels upcast from whatever they are handed:
+
+    * Kimi-Linear KDA: ``A_log``, ``dt_bias`` (``dtype=torch.float32``) and the
+      three ``{q,k,v}_conv1d`` weights (``params_dtype=torch.float32``).
+    * Qwen3-Next GDN: ``A_log`` (``dtype=torch.float32``); its ``dt_bias`` and
+      ``conv1d`` weight are model dtype in vLLM too.
+
+    Casting those to BF16 rounds the decay gate and the causal-conv weights
+    before the kernel ever sees them, which is amplified by the recurrence.
+    """
+    for param in model.parameters():
+        if param.dtype == torch.float32:
+            if param.data.device != device:
+                param.data = param.data.to(device=device)
+        elif param.data.device != device or param.dtype != dtype:
+            param.data = param.data.to(device=device, dtype=dtype)
+    for buf in model.buffers():
+        if buf.dtype == torch.float32:
+            if buf.device != device:
+                buf.data = buf.data.to(device=device)
+        elif buf.device != device or buf.dtype != dtype:
+            buf.data = buf.data.to(device=device, dtype=dtype)
+
+
 def _restore_mamba_ssm_params(
     model: torch.nn.Module,
     model_type: str,
@@ -1622,6 +1657,8 @@ def load_model(
         if model_type in ("deepseek_v3", "kimi_linear"):
             _compute_mla_absorbed_weights(model)
         _postprocess_fp8_weights(model)
+    elif model_type in ("kimi_linear", "qwen3_next"):
+        _move_preserving_param_dtypes(model, device, dtype)
     elif model_type != "gpt_oss":
         model = model.to(device=device, dtype=dtype)
 
@@ -1647,6 +1684,26 @@ def load_model(
             _override_bitnet_bf16_with_master(model, model_name, device)
 
     _maybe_tie_word_embeddings(model, model_name, config)
+
+    # Post-load fixups every attention layer needs regardless of model type
+    # (currently: the FP32 attention-sink copy trtllm-gen requires).  Mirrors
+    # vLLM calling ``process_weights_after_loading`` on each attention impl.
+    from ..tasks.baseline.L2.attention_impl import Attention as _FkAttention
+    for mod in model.modules():
+        if isinstance(mod, _FkAttention):
+            mod.process_weights_after_loading()
+
+    # Same for the BF16 MoE layers whose experts run on trtllm-gen: the kernel
+    # needs its weights pre-shuffled into the 4D BlockMajorK layout, which vLLM
+    # does once in ``convert_to_unquantized_kernel_format``. No-op when the
+    # trtllm path is not selected.
+    from ..tasks.baseline.L2.kimi_moe import KimiMoE as _FkKimiMoE
+    from ..tasks.baseline.L2.shared_expert_moe import (
+        SharedExpertMoE as _FkSharedExpertMoE,
+    )
+    for mod in model.modules():
+        if isinstance(mod, (_FkKimiMoE, _FkSharedExpertMoE)):
+            mod.process_weights_after_loading()
 
     model.eval()
     return model, config

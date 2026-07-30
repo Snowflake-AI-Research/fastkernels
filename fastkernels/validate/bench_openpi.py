@@ -58,6 +58,11 @@ _PROJECT_ROOT = _PACKAGE_DIR.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from fastkernels.validate.worker import run_worker
+from fastkernels.validate.comparison import (
+    alignment_from_similarity,
+    latency_entry,
+    throughput_entry,
+)
 from fastkernels.validate.provision import (
     OPENPI_ASSETS_DIR,
     OPENPI_CHECKPOINTS,
@@ -2394,6 +2399,65 @@ def main():
     with open(summary_path, "w") as f:
         json.dump(all_results, f, indent=2)
     print(f"\nAll results: {summary_path}")
+
+    # Also emit the standard top-level results.json every other harness writes,
+    # aggregated across datasets. Previously only summary.json existed, so the
+    # runner needed a bench_openpi special case and aggregate sweep queries
+    # found no speedup/alignment for this row.
+    scenarios: list[dict] = []
+    latency_scenarios: list[dict] = []
+
+    def _median(row):
+        vals = sorted(row.get("latencies") or [])
+        return vals[len(vals) // 2] if vals else None
+
+    for dataset_name, result in all_results.items():
+        ours = result.get("fastkernels") or {}
+        ref = result.get("reference") or {}
+        correctness = result.get("correctness") or {}
+        ref_tp = {r.get("name"): r for r in (ref.get("throughput") or [])}
+        for row in ours.get("throughput") or []:
+            peer = ref_tp.get(row.get("name"))
+            if not peer:
+                continue
+            corr = correctness.get(row.get("name"))
+            alignment = None
+            if corr:
+                alignment = alignment_from_similarity(
+                    "mean_cosine_sim", corr.get("mean_cosine_sim", 0.0),
+                    threshold=0.99, mean_mse=corr.get("mean_mse"),
+                    num_samples=corr.get("num_samples"),
+                )
+            scenarios.append(throughput_entry(
+                row["name"], row.get("inferences_per_second"),
+                peer.get("inferences_per_second"),
+                metric="inferences_per_s", alignment=alignment,
+                dataset=dataset_name,
+                num_requests=row.get("num_requests"),
+            ))
+        ref_lat = {r.get("name"): r for r in (ref.get("latency") or [])}
+
+        for row in ours.get("latency") or []:
+            peer = ref_lat.get(row.get("name"))
+            if not peer:
+                continue
+            latency_scenarios.append(latency_entry(
+                row["name"], _median(row), _median(peer),
+                dataset=dataset_name, batch_size=row.get("batch_size"),
+            ))
+
+    standard_path = os.path.join(args.output_dir, "results.json")
+    with open(standard_path, "w") as f:
+        json.dump({
+            "model": args.model,
+            "gpu": gpu_name,
+            "seed": args.seed,
+            "reference_name": args.reference,
+            "scenarios": scenarios,
+            "latency_scenarios": latency_scenarios,
+            "datasets": all_results,
+        }, f, indent=2)
+    print(f"Standard results: {standard_path}")
 
 
 if __name__ == "__main__":

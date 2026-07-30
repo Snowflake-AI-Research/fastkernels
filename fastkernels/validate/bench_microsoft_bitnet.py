@@ -10,35 +10,65 @@ batched generate path.  This is the only implementation that runs the
 GPU; the HuggingFace ``transformers`` integration falls back to bf16
 matmul and is roughly 5-6x slower, so it is *not* a useful SOTA target.
 
-Both engines run the same 3-scenario LLM workload from
-``adding-arch-instructions.md``:
+Workloads come from the scenario file's declared ``workloads`` list, passed as
+``--workloads``. Each is resolved through ``fastkernels.workloads``, so the
+throughput/latency split and the datasets are whatever the scenario declares:
 
-  * prefill-heavy (1024 prefill / 512 decode)
-  * balanced     ( 512 prefill / 512 decode)
-  * decode-heavy ( 512 prefill / 1024 decode)
+  * ``LLM.mixed``          throughput, 1000 reqs, wildchat-mixed-1k
+  * ``LLM.long_context``   throughput,   64 reqs, longbench-longctx
+  * ``LLM.single_request`` latency,  bs=1,  128 out
+  * ``LLM.fixed_batch_32`` latency,  bs=32, 128 out
 
-with 1000 requests per scenario.  fastkernels uses paged scheduling across
-the full request set.  The official Microsoft decode GEMM only implements
-``M == 1`` kernels, so the SOTA worker must use ``--gen-bsz 1`` and loop
-requests one-by-one.
+The official Microsoft decode GEMM only implements ``M == 1`` kernels, so the
+SOTA worker must use ``--gen-bsz 1`` and loop requests one-by-one -- and a
+``batch_size > 1`` latency probe has **no** like-for-like reference at all. Those
+rows record ``speedup: null`` with ``reference_unsupported_reason`` rather than
+comparing a batched fastkernels run against a serial reference loop, which would
+read as a kernel win when it only reflects upstream having no batched kernel.
 
-Both engines run greedy decoding (temperature 0, ignore_eos) on the
-**same** real WildChat-derived natural-language prompts, tokenized with
-the BitNet tokenizer and normalized to the fixed scenario lengths.  They
-return per-request output token ids.  Throughput is measured against the
-official CUDA-graph path, while alignment is computed against the same
-official models run with fresh per-step attention metadata.  This avoids
-comparing fastkernels against a known Microsoft FastGen CUDA-graph metadata
-bug where generated tokens are not represented correctly in the replayed
-attention bias.
+Because the reference pins ``(gen_bsz, prompt_length, gen_length)`` at
+CUDA-graph build time and asserts uniform input *and* output lengths per
+scenario, each workload becomes one fixed-shape regime. Prompt *content* is the
+workload's real dataset; the fixed input length is the **mean** real prompt
+length of the sampled set, applied by suffix-keep / left-pad. Mean rather than
+median because these are throughput workloads and the mean preserves the trace's
+total prefill token count -- wildchat-mixed is mostly short prompts (p50 60 vs
+mean ~150), so a median-length ``mixed`` would have no prefill work at all.
+
+The length is then clamped to what the model can represent: bitnet-b1.58-2B-4T
+has ``max_position_embeddings=4096`` while longbench-longctx prompts are >= 8185
+tokens, so ``long-context`` runs at the model's ceiling minus the output length
+rather than at the real mean. Clamping is reported in the ``[data]`` line and in
+``results.json``.
+
+Both engines run greedy decoding (temperature 0, ignore_eos) on the **same**
+prompts and return per-request output token ids, so speed and correctness are
+measured in the *same* run, in the same execution mode. fastkernels runs
+non-eager by default, matching bench_vllm.py and the reference's own CUDA-graph
+timing path; pass ``--enforce-eager`` to disable graphs. Timing an eager
+fastkernels against a graph-replaying reference understated this row by ~13x
+(0.089x vs 1.17-1.30x like-for-like on B200).
+
+Alignment is computed against the official models run with fresh per-step
+attention metadata, which avoids comparing fastkernels against a known Microsoft
+FastGen CUDA-graph metadata bug where generated tokens are not represented
+correctly in the replayed attention bias.
 
 Setup (one-time):
 -----------------
-The Microsoft GPU kernel + checkpoint conversion must be done first::
+Provisioned automatically -- the sweep does this for you, or run it directly::
+
+    python -m fastkernels.validate.provision bitnet
+
+That clones microsoft/BitNet under ``$FASTKERNELS_HOME/third_party``, builds
+``libbitnet.so`` for the *local* compute capability (upstream's compile.sh
+hardcodes ``compute_80`` PTX, which would leave the reference JIT-ing sm_80 code
+on a newer GPU), installs the ``xformers`` the reference's ``model.py`` imports,
+and runs the two-step checkpoint conversion. The equivalent by hand::
 
     cd /path/to/microsoft/BitNet/gpu
     bash bitnet_kernels/compile.sh
-    huggingface-cli download microsoft/bitnet-b1.58-2B-4T-bf16 \\
+    hf download microsoft/bitnet-b1.58-2B-4T-bf16 \\
         --local-dir checkpoints/bitnet-b1.58-2B-4T-bf16
     python convert_safetensors.py \\
         --safetensors_file checkpoints/bitnet-b1.58-2B-4T-bf16/model.safetensors \\
@@ -50,13 +80,16 @@ Usage:
 ------
 ::
 
-    # full benchmark (fastkernels + Microsoft BitNet GPU on all 3 scenarios,
-    # 1000 reqs each) -- requires BITNET_REPO env or --bitnet-repo flag.
-    BITNET_REPO=/path/to/microsoft/BitNet \\
-        python tests/bench_microsoft_bitnet.py
+    # full benchmark (fastkernels + Microsoft BitNet GPU on every workload
+    # the scenario declares) -- reference provisioned by `provision bitnet`.
+    python tests/bench_microsoft_bitnet.py \\
+        --workloads mixed,long-context,single-request,fixed-batch-32
 
     # smoke run using fastkernels's continuous scheduler
     python tests/bench_microsoft_bitnet.py --num-prompts 32 --kb-bsz 0 --skip-sota
+
+    # one workload, throughput only
+    python tests/bench_microsoft_bitnet.py --workloads mixed --skip-latency
 
     # fastkernels only
     python tests/bench_microsoft_bitnet.py --skip-sota
@@ -71,7 +104,14 @@ import random
 import subprocess
 import sys
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
+
+from fastkernels.validate.comparison import (  # noqa: E402
+    latency_entry,
+    throughput_entry,
+)
+from fastkernels.validate.provision import BITNET_DIR  # noqa: E402
 
 
 _THIS_DIR = Path(__file__).resolve().parent
@@ -82,11 +122,61 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 MODEL_ID = "microsoft/bitnet-b1.58-2B-4T"
 
-SCENARIOS = [
-    {"name": "prefill-heavy", "input_len": 1024, "output_len": 512},
-    {"name": "balanced",      "input_len": 512,  "output_len": 512},
-    {"name": "decode-heavy",  "input_len": 512,  "output_len": 1024},
-]
+# Default workloads when the caller names none. These are the LLM workloads
+# full.yaml declares for this row; the sweep passes them explicitly via
+# --workloads.
+DEFAULT_WORKLOADS = ("mixed", "long-context", "single-request", "fixed-batch-32")
+
+# Output length for throughput workloads whose spec leaves decode_cap unset
+# (LLM.long_context). The reference pins gen_length at CUDA-graph build time, so
+# some concrete value is required.
+DEFAULT_LONG_CONTEXT_OUTPUT_LEN = 128
+
+
+def _resolve_workloads(names: Sequence[str]) -> tuple[list[dict], list[dict]]:
+    """Split declared workload names into throughput and latency descriptors.
+
+    The reference builds one CUDA graph per ``(gen_bsz, prompt_length,
+    gen_length)`` and asserts uniform input *and* output lengths per scenario, so
+    each workload becomes a single fixed-shape regime rather than a
+    variable-length trace. Prompt *content* still comes from the workload's real
+    dataset; only the lengths are normalized.
+    """
+    from fastkernels.workloads import WORKLOAD_SPECS, LLM, Purpose
+
+    by_value = {w.value: w for w in LLM}
+    throughput: list[dict] = []
+    latency: list[dict] = []
+    for name in names:
+        workload = by_value.get(name)
+        if workload is None:
+            raise SystemExit(
+                f"ERROR: unknown workload {name!r} for bench_microsoft_bitnet. "
+                f"Known LLM workloads: {', '.join(sorted(by_value))}."
+            )
+        spec = WORKLOAD_SPECS[workload]
+        params = spec.params
+        if spec.purpose is Purpose.THROUGHPUT:
+            throughput.append({
+                "name": name,
+                "num_requests": params.num_requests,
+                "dataset_name": params.dataset_name,
+                "output_len": (
+                    params.decode_cap
+                    if params.decode_cap is not None
+                    else DEFAULT_LONG_CONTEXT_OUTPUT_LEN
+                ),
+            })
+        else:
+            latency.append({
+                "name": name,
+                "batch_size": params.batch_size,
+                "output_len": params.output_len,
+                "dataset_name": params.dataset_name,
+                "num_warmup": params.num_warmup,
+                "num_iters": params.num_iters,
+            })
+    return throughput, latency
 
 
 def _detect_gpu_name() -> str:
@@ -129,11 +219,13 @@ def _build_real_token_prompts(
     tokenizer,
     scenario_name: str,
     num_prompts: int,
-    input_len: int,
+    input_len: int | None,
     output_len: int,
     seed: int,
     split: str,
-) -> tuple[list[list[int]], str, tuple[int, int, int]]:
+    dataset_name: str | None = None,
+    max_input_len: int | None = None,
+) -> tuple[list[list[int]], str, tuple[int, int, int], int, float]:
     try:
         from datasets import disable_progress_bars
 
@@ -162,10 +254,11 @@ def _build_real_token_prompts(
         pad_id = 1
 
     # The Microsoft BitNet GPU kernel captures one CUDA graph per fixed prompt
-    # length, so each scenario is a fixed (input_len, output_len) regime. The
-    # underlying tokens are drawn from the real WildChat ``mixed`` set and then
-    # normalized to the scenario length (suffix-keep / left-pad).
-    dataset_id = DEFAULT_WORKLOAD_DATASETS["mixed"]
+    # length, so each workload becomes a single fixed (input_len, output_len)
+    # regime. The tokens come from that workload's own dataset -- ``mixed`` ->
+    # wildchat-mixed-1k, ``long-context`` -> longbench-longctx -- and are then
+    # normalized to the regime length (suffix-keep / left-pad).
+    dataset_id = dataset_name or DEFAULT_WORKLOAD_DATASETS["mixed"]
     samples = load_real_prompt_workload(
         scenario_name,
         tokenizer,
@@ -176,12 +269,24 @@ def _build_real_token_prompts(
         seed=seed,
     )
     raw_lens = sorted(len(sample.prompt_token_ids) for sample in samples)
+    mean_len = sum(raw_lens) / len(raw_lens)
+    length_stats = (raw_lens[0], raw_lens[len(raw_lens) // 2], raw_lens[-1])
+    # With no explicit length, use the *mean* real prompt length, clamped to what
+    # the model can represent. Mean rather than median because these are
+    # throughput workloads: the mean preserves the total prefill token count of
+    # the real trace, so the fixed-shape run does the same aggregate prefill work.
+    # The median looked more principled but destroys that -- wildchat-mixed is
+    # mostly short prompts (p50 60 vs mean ~150), so a median-length `mixed`
+    # becomes a pure-decode workload with no prefill at all.
+    if input_len is None:
+        input_len = max(int(round(mean_len)), 1)
+    if max_input_len is not None:
+        input_len = max(min(input_len, max_input_len), 1)
     prompts = [
         _normalize_prompt_len(sample.prompt_token_ids, input_len, int(pad_id))
         for sample in samples
     ]
-    length_stats = (raw_lens[0], raw_lens[len(raw_lens) // 2], raw_lens[-1])
-    return prompts, dataset_id, length_stats
+    return prompts, dataset_id, length_stats, input_len, mean_len
 
 
 # ---------------------------------------------------------------------------
@@ -248,9 +353,53 @@ for sc in cfg["scenarios"]:
           f"throughput={(n_in + n_out)/elapsed:>8.1f} tok/s",
           flush=True)
 
+# Latency phase: one fixed batch, timed repeatedly, median reported. Separate
+# from the throughput phase above because the metric is per-batch wall clock
+# rather than aggregate tokens/s.
+latency_results = []
+for sc in cfg.get("latency_scenarios") or []:
+    prompts = sc["prompt_token_ids"]
+    out_lens = sc["output_lens"]
+    sps = [
+        SamplingParams(temperature=0.0, max_tokens=ol, ignore_eos=True)
+        for ol in out_lens
+    ]
+    for _ in range(int(sc.get("num_warmup", 3))):
+        engine.block_manager.reset()
+        engine.generate(prompts, sps, use_tqdm=False)
+    torch.cuda.synchronize()
+    samples = []
+    outs = None
+    for _ in range(int(sc.get("num_iters", 5))):
+        engine.block_manager.reset()
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        outs = engine.generate(prompts, sps, use_tqdm=False)
+        torch.cuda.synchronize()
+        samples.append(time.perf_counter() - t0)
+    samples_sorted = sorted(samples)
+    median = samples_sorted[len(samples_sorted) // 2]
+    n_out = sum(len(o.token_ids) for o in outs) if outs else 0
+    latency_results.append({
+        "name": sc["name"],
+        "batch_size": sc.get("batch_size", len(prompts)),
+        "output_len": out_lens[0] if out_lens else 0,
+        "num_iters": len(samples),
+        "median": median,
+        "mean": sum(samples) / len(samples),
+        "p99": samples_sorted[-1],
+        "latencies": samples,
+        "ms_per_token": (median * 1000.0 / max(out_lens[0], 1)) if out_lens else None,
+        "outputs": [{"token_ids": list(o.token_ids)} for o in (outs or [])],
+    })
+    print(f"[kb-lat] {sc['name']:>14}: median={median * 1000:8.2f}ms  "
+          f"bs={sc.get('batch_size')}  out={out_lens[0] if out_lens else 0}  "
+          f"n_out={n_out}", flush=True)
+
 with open(cfg["output_file"], "w") as f:
     json.dump({
         "throughput": results,
+        "latency": latency_results,
         "memory_gb": round(torch.cuda.max_memory_reserved() / 1e9, 2),
     }, f)
 '''
@@ -561,9 +710,65 @@ for sc in cfg["scenarios"]:
     del g
     torch.cuda.empty_cache()
 
+# Latency phase. The official int2 decode kernels dispatch only for M == 1, so
+# the reference can only serve one sequence at a time: a batch_size > 1 probe has
+# no like-for-like reference here and is skipped with a machine-readable reason
+# rather than silently compared against a serial loop.
+latency_results = []
+for sc in cfg.get("latency_scenarios") or []:
+    bs = int(sc.get("batch_size", 1))
+    prompts = sc["prompt_token_ids"]
+    out_lens = sc["output_lens"]
+    in_len = len(prompts[0])
+    out_len = out_lens[0]
+    if bs != 1:
+        latency_results.append({
+            "name": sc["name"], "batch_size": bs, "output_len": out_len,
+            "unsupported": True,
+            "reason": ("official int2 decode kernel dispatches only for M == 1; "
+                       "the reference cannot batch"),
+        })
+        print(f"[sota-lat] {sc['name']:>14}: SKIPPED (bs={bs} > 1, "
+              f"reference is M == 1 only)", flush=True)
+        continue
+
+    print(f"[sota-lat] building FastGen for gen_bsz=1, prompt_len={in_len}, "
+          f"gen_len={out_len}...", flush=True)
+    largs = _bitnet_generate.GenArgs(
+        prompt_length=in_len, gen_length=out_len, gen_bsz=1,
+    )
+    g = _bitnet_generate.FastGen.build(ckpt_dir, largs, "cuda:0")
+    g.tokenizer.eot_id = -1
+    for _ in range(int(sc.get("num_warmup", 3))):
+        generate_all_fixed(g, [prompts[0]], use_cuda_graphs=True,
+                           use_sampling=False)
+    torch.cuda.synchronize()
+    samples = []
+    for _ in range(int(sc.get("num_iters", 5))):
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        generate_all_fixed(g, [prompts[0]], use_cuda_graphs=True,
+                           use_sampling=False)
+        torch.cuda.synchronize()
+        samples.append(time.perf_counter() - t0)
+    samples_sorted = sorted(samples)
+    median = samples_sorted[len(samples_sorted) // 2]
+    latency_results.append({
+        "name": sc["name"], "batch_size": bs, "output_len": out_len,
+        "num_iters": len(samples), "median": median,
+        "mean": sum(samples) / len(samples), "p99": samples_sorted[-1],
+        "latencies": samples,
+        "ms_per_token": median * 1000.0 / max(out_len, 1),
+    })
+    print(f"[sota-lat] {sc['name']:>14}: median={median * 1000:8.2f}ms",
+          flush=True)
+    del g
+    torch.cuda.empty_cache()
+
 with open(cfg["output_file"], "w") as f:
     json.dump({
         "throughput": results,
+        "latency": latency_results,
         "memory_gb": round(torch.cuda.max_memory_reserved() / 1e9, 2),
     }, f)
 
@@ -884,7 +1089,8 @@ def _persist_results(output_dir: str, model: str, num_prompts: int,
                      sota_data: dict | None, kb_data: dict | None,
                      alignments: dict[str, dict],
                      topk_alignments: dict[str, dict] | None,
-                     scenarios: list[dict]) -> None:
+                     scenarios: list[dict],
+                     enforce_eager: bool = False) -> None:
     summary = {
         "model": model,
         "num_prompts_per_scenario": num_prompts,
@@ -899,10 +1105,78 @@ def _persist_results(output_dir: str, model: str, num_prompts: int,
             for sc in scenarios
         ],
         "sota": sota_data,
+        # One run per phase: these throughput numbers and the alignment block
+        # below come from the same fastkernels run, in the same execution mode.
         "fastkernels": kb_data,
+        "execution_mode": "eager" if enforce_eager else "cudagraph",
         "alignment": alignments,
         "topk_alignment": topk_alignments,
     }
+    timed = kb_data
+
+    # Standard comparison shape shared with the other harnesses: a per-scenario
+    # `speedup` plus the existing prefix-alignment block. Previously only the
+    # raw per-engine numbers were stored, so an aggregate query over a sweep
+    # found no speedup for this row.
+    scenarios: list[dict] = []
+    latency_scenarios: list[dict] = []
+
+    def _tps(row):
+        el = row.get("elapsed") or 0
+        if el <= 0:
+            return None
+        return (row.get("total_input_tokens", 0)
+                + row.get("total_output_tokens", 0)) / el
+
+    def _sec_per_request(row):
+        el = row.get("elapsed") or 0
+        n = row.get("num_prompts") or 0
+        return (el / n) if el > 0 and n > 0 else None
+
+    if sota_data and timed:
+        for sr, kr in zip(sota_data.get("throughput") or [],
+                          timed.get("throughput") or []):
+            if sr.get("name") != kr.get("name"):
+                continue
+            scenarios.append(throughput_entry(
+                sr["name"], _tps(kr), _tps(sr), metric="tok_per_s",
+                alignment=alignments.get(sr["name"]),
+                num_seqs=kr.get("num_prompts") or kr.get("num_seqs"),
+            ))
+            # The official BitNet GPU decode kernels only dispatch for M == 1,
+            # so gen_bsz is pinned to 1 and the fastkernels side matches with
+            # max_num_seqs=1. Both engines therefore serve these prompts one at
+            # a time, which makes elapsed/num_prompts a real per-request
+            # latency rather than a batched-throughput artifact.
+    # Latency phase rows come from the dedicated latency workloads, not from
+    # dividing a throughput run: the probe times one fixed batch repeatedly.
+    kb_lat = {r["name"]: r for r in ((kb_data or {}).get("latency") or [])}
+    sota_lat = {r["name"]: r for r in ((sota_data or {}).get("latency") or [])}
+    for name, kr in kb_lat.items():
+        peer = sota_lat.get(name) or {}
+        if peer.get("unsupported"):
+            # Report the gap explicitly instead of comparing our batched run
+            # against a serial reference loop, which would read as a kernel win
+            # when it only reflects the reference having no batched kernel.
+            latency_scenarios.append(latency_entry(
+                name, kr.get("median"), None, metric="median_s",
+                batch_size=kr.get("batch_size"),
+                output_len=kr.get("output_len"),
+                fastkernels_ms_per_token=kr.get("ms_per_token"),
+                reference_unsupported=True,
+                reference_unsupported_reason=peer.get("reason"),
+            ))
+            continue
+        latency_scenarios.append(latency_entry(
+            name, kr.get("median"), peer.get("median"), metric="median_s",
+            batch_size=kr.get("batch_size"),
+            output_len=kr.get("output_len"),
+            fastkernels_ms_per_token=kr.get("ms_per_token"),
+            reference_ms_per_token=peer.get("ms_per_token"),
+        ))
+    summary["reference_name"] = "microsoft-bitnet-gpu"
+    summary["scenarios"] = scenarios
+    summary["latency_scenarios"] = latency_scenarios
     with open(os.path.join(output_dir, "results.json"), "w") as f:
         json.dump(summary, f, indent=2)
 
@@ -933,9 +1207,22 @@ def _persist_results(output_dir: str, model: str, num_prompts: int,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=MODEL_ID)
-    ap.add_argument("--num-prompts", type=int, default=1000,
-                    help="Requests per scenario (default 1000 per "
-                         "adding-arch-instructions.md)")
+    ap.add_argument("--num-prompts", type=int, default=None,
+                    help="Override the request count for throughput "
+                         "workloads. Default: each workload's declared "
+                         "num_requests (mixed=1000, long-context=64). Latency "
+                         "workloads always use their declared batch_size.")
+    ap.add_argument("--workloads", type=str,
+                    default=",".join(DEFAULT_WORKLOADS),
+                    help="Comma-separated LLM workload names to run, as "
+                         "declared in the scenario file (e.g. "
+                         "'mixed,long-context,single-request'). Throughput and "
+                         "latency workloads are split automatically by their "
+                         "declared purpose.")
+    ap.add_argument("--skip-throughput", action="store_true",
+                    help="Skip the throughput phase (latency only)")
+    ap.add_argument("--skip-latency", action="store_true",
+                    help="Skip the latency phase (throughput only)")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--vocab-size", type=int, default=128256)
     ap.add_argument("--max-model-len", type=int, default=2048)
@@ -952,10 +1239,11 @@ def main():
     ap.add_argument("--bitnet-repo",
                     default=os.environ.get(
                         "BITNET_REPO",
-                        "/home/yak/vllm_repo/BitNet"),
+                        str(BITNET_DIR)),
                     help="Path to the Microsoft BitNet repo "
                          "(must contain gpu/checkpoints/model_state_int2.pt and "
-                         "gpu/bitnet_kernels/libbitnet.so)")
+                         "gpu/bitnet_kernels/libbitnet.so). Provisioned by "
+                         "`python -m fastkernels.validate.provision bitnet`.")
     ap.add_argument("--gen-bsz", type=int, default=1,
                     help="CUDA-graph batch size for the Microsoft BitNet "
                          "GPU worker. Must be 1: the official int2 decode "
@@ -969,9 +1257,11 @@ def main():
                          "Default 1 matches the Microsoft BitNet GPU "
                          "baseline's M==1 decode limit; use 0 to benchmark "
                          "fastkernels's continuous scheduler over all prompts.")
-    ap.add_argument("--use-kb-cudagraph", action="store_true",
-                    help="Enable fastkernels CUDA graphs for debugging. The "
-                         "default eager path is the alignment reference.")
+    ap.add_argument("--enforce-eager", action="store_true", default=False,
+                    help="Disable fastkernels CUDA graphs. Default is "
+                         "non-eager, matching bench_vllm.py and the "
+                         "reference, which times its own CUDA-graph path. "
+                         "Correctness and speed are measured in the same run.")
     ap.add_argument("--skip-topk-alignment", action="store_true",
                     help="Skip teacher-forced top-k scoring under the "
                          "official direct-decode reference")
@@ -1011,41 +1301,125 @@ def main():
             args.model, trust_remote_code=False,
         )
 
-    scenarios = []
-    for idx, sc in enumerate(SCENARIOS):
-        if args.prompt_source == "real":
-            assert tokenizer is not None
-            prompt_ids, dataset_id, length_stats = _build_real_token_prompts(
-                tokenizer,
-                sc["name"],
-                args.num_prompts,
-                sc["input_len"],
-                sc["output_len"],
-                args.seed,
-                args.dataset_split,
+    tp_workloads, lat_workloads = _resolve_workloads(
+        [w.strip() for w in args.workloads.split(",") if w.strip()]
+    )
+    if args.skip_throughput:
+        tp_workloads = []
+    if args.skip_latency:
+        lat_workloads = []
+    if not tp_workloads and not lat_workloads:
+        raise SystemExit(
+            "ERROR: no workloads left to run. --workloads selected none, or "
+            "both --skip-throughput and --skip-latency were passed."
+        )
+
+    # bitnet-b1.58-2B-4T has max_position_embeddings=4096, but longbench-longctx
+    # prompts are >= 8185 tokens. Normalizing to the real mean would ask the model
+    # to represent positions it was never trained for (and would exceed
+    # --max-model-len), so every workload's fixed input length is clamped to what
+    # the model can actually represent.
+    model_ctx = None
+    try:
+        from transformers import AutoConfig
+
+        cfg_obj = AutoConfig.from_pretrained(args.model, trust_remote_code=False)
+        model_ctx = int(getattr(cfg_obj, "max_position_embeddings", 0)) or None
+    except Exception as exc:  # pragma: no cover - config always present in CI
+        print(f"[warn] could not read max_position_embeddings: {exc}", flush=True)
+
+    def _scenarios_for(descriptors: list[dict], kind: str) -> list[dict]:
+        built = []
+        for idx, wl in enumerate(descriptors):
+            n = args.num_prompts if args.num_prompts is not None else (
+                wl.get("num_requests") or wl.get("batch_size") or 1
             )
-            print(
-                f"[data] {sc['name']:>14}: {dataset_id} "
-                f"raw_prompt_len(min/p50/max)="
-                f"{length_stats[0]}/{length_stats[1]}/{length_stats[2]} "
-                f"normalized={sc['input_len']}",
-                flush=True,
-            )
-        else:
-            prompt_ids = _build_random_token_prompts(
-                args.num_prompts,
-                sc["input_len"],
-                args.vocab_size,
-                args.seed + idx,
-            )
-            dataset_id = "deterministic-random-token-ids"
-        scenarios.append({
-            "name": sc["name"],
-            "prompt_token_ids": prompt_ids,
-            "output_lens": [sc["output_len"]] * args.num_prompts,
-            "prompt_source": args.prompt_source,
-            "dataset": dataset_id,
-        })
+            if kind == "latency":
+                # A latency probe times one fixed batch repeatedly, so it needs
+                # exactly batch_size prompts regardless of --num-prompts.
+                n = wl["batch_size"]
+            out_len = wl["output_len"]
+            cap = None
+            if model_ctx is not None:
+                cap = max(model_ctx - out_len, 1)
+            if args.prompt_source == "real":
+                assert tokenizer is not None
+                prompt_ids, dataset_id, length_stats, input_len, mean_len = (
+                    _build_real_token_prompts(
+                        tokenizer, wl["name"], n, None, out_len,
+                        args.seed, args.dataset_split,
+                        dataset_name=wl.get("dataset_name"),
+                        max_input_len=cap,
+                    )
+                )
+                clamped = (
+                    " (clamped to model ctx "
+                    f"{model_ctx}-{out_len})"
+                    if cap is not None and int(round(mean_len)) > cap
+                    else ""
+                )
+                print(
+                    f"[data] {wl['name']:>14}: {dataset_id} "
+                    f"raw_prompt_len(min/p50/max/mean)="
+                    f"{length_stats[0]}/{length_stats[1]}/{length_stats[2]}/"
+                    f"{mean_len:.0f} "
+                    f"normalized={input_len}{clamped} out={out_len} n={n}",
+                    flush=True,
+                )
+            else:
+                input_len = wl.get("input_len") or 512
+                if cap is not None:
+                    input_len = max(min(input_len, cap), 1)
+                prompt_ids = _build_random_token_prompts(
+                    n, input_len, args.vocab_size, args.seed + idx,
+                )
+                dataset_id = "deterministic-random-token-ids"
+                length_stats = (input_len, input_len, input_len)
+                mean_len = float(input_len)
+            entry = {
+                "name": wl["name"],
+                "kind": kind,
+                "prompt_token_ids": prompt_ids,
+                "output_lens": [out_len] * n,
+                "prompt_source": args.prompt_source,
+                "dataset": dataset_id,
+                "raw_prompt_len_min_p50_max": list(length_stats),
+                "raw_prompt_len_mean": mean_len,
+                "input_len": input_len,
+                "model_max_position_embeddings": model_ctx,
+            }
+            if kind == "latency":
+                entry.update({
+                    "batch_size": wl["batch_size"],
+                    "num_warmup": wl["num_warmup"],
+                    "num_iters": wl["num_iters"],
+                })
+            built.append(entry)
+        return built
+
+    throughput_scenarios = _scenarios_for(tp_workloads, "throughput")
+    latency_scenarios_cfg = _scenarios_for(lat_workloads, "latency")
+    scenarios = throughput_scenarios
+
+    # --max-model-len must cover the longest (input + output) actually built. The
+    # sweep never passes it, and the 2048 default cannot hold `long-context`
+    # (3968 in + 128 out), so raise it to fit -- bounded by what the model can
+    # represent, which is the same ceiling the input lengths were clamped to.
+    needed = max(
+        (sc["input_len"] + sc["output_lens"][0]
+         for sc in (*throughput_scenarios, *latency_scenarios_cfg)
+         if sc["output_lens"]),
+        default=args.max_model_len,
+    )
+    if model_ctx is not None:
+        needed = min(needed, model_ctx)
+    if needed > args.max_model_len:
+        print(
+            f"[cfg] raising --max-model-len {args.max_model_len} -> {needed} "
+            f"to fit the longest workload shape",
+            flush=True,
+        )
+        args.max_model_len = needed
 
     sota_data = None
     if not args.skip_sota:
@@ -1053,8 +1427,18 @@ def main():
         fp16_pt = os.path.join(ckpt_dir, "model_state_fp16.pt")
         missing = [p for p in (kernel_so, int2_pt, fp16_pt) if not os.path.isfile(p)]
         if missing:
-            print(f"\n[skip-sota] Microsoft BitNet GPU artifacts missing: "
-                  f"{missing}.  See module docstring for setup instructions.\n")
+            # Do not warn-and-continue: that produced a results.json with empty
+            # `scenarios`/`latency_scenarios` and exit 0, i.e. a PASS with no
+            # comparison at all. Skipping the reference has to be explicit.
+            raise SystemExit(
+                "ERROR: Microsoft BitNet GPU reference artifacts missing:\n"
+                + "\n".join(f"  {p}" for p in missing)
+                + "\n\nProvision them with:\n"
+                "  python -m fastkernels.validate.provision bitnet\n"
+                "or point --bitnet-repo / $BITNET_REPO at an existing "
+                "checkout. Pass --skip-sota to intentionally run fastkernels "
+                "alone (no speedup or alignment will be recorded)."
+            )
         else:
             with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
                 sota_out = f.name
@@ -1063,6 +1447,7 @@ def main():
                 "scenarios": scenarios, "output_file": sota_out,
                 "bitnet_repo": args.bitnet_repo, "ckpt_dir": ckpt_dir,
                 "gen_bsz": args.gen_bsz,
+                "latency_scenarios": latency_scenarios_cfg,
                 "alignment_prompts": args.alignment_prompts,
             }
             sota_data = run_worker(
@@ -1075,26 +1460,47 @@ def main():
                     sota_data)
 
     kb_data = None
-    if not args.skip_kb:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+    if not args.skip_kb and (scenarios or latency_scenarios_cfg):
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False,
+        ) as f:
             kb_out = f.name
         kb_cfg = {
             "model": args.model, "seed": args.seed, "tp": args.tp,
             "scenarios": scenarios, "output_file": kb_out,
+            "latency_scenarios": latency_scenarios_cfg,
             "max_model_len": args.max_model_len,
             "project_root": str(_PROJECT_ROOT),
-            "enforce_eager": not args.use_kb_cudagraph,
+            # Non-eager by default, matching bench_vllm.py and the reference,
+            # which times its own CUDA-graph path. Timing our eager path against
+            # a graph-replaying reference understated this row by ~13x (0.089x
+            # vs 1.17-1.30x like-for-like on B200): eager decode costs ~29
+            # ms/step against ~2 ms/step replayed.
+            "enforce_eager": args.enforce_eager,
             "kb_bsz": args.kb_bsz,
-            "bitnet_kernel_so": kernel_so if os.path.isfile(kernel_so) else "",
+            "bitnet_kernel_so": (
+                kernel_so if os.path.isfile(kernel_so) else ""
+            ),
         }
-        kb_data = run_worker(KB_WORKER, kb_cfg, f"fastkernels [{args.model}]")
-        if kb_data:
-            kb_kernel = (
-                "official ladder decode"
-                if os.path.isfile(kernel_so) else "Triton fallback"
+        kb_data = run_worker(
+            KB_WORKER, kb_cfg, f"fastkernels [{args.model}] throughput",
+        )
+        if kb_data is None:
+            # Do not fall through to "skip the comparison and exit 0": that is
+            # how a failed engine got recorded as PASS with no results at all.
+            raise SystemExit(
+                f"ERROR: the fastkernels engine failed for {args.model}, so "
+                f"there is nothing to benchmark or compare. See the traceback "
+                f"above."
             )
-            _print_throughput_table(f"fastkernels (W1.58A8 {kb_kernel})",
-                                    kb_data)
+        kb_kernel = (
+            "official ladder decode"
+            if os.path.isfile(kernel_so) else "Triton fallback"
+        )
+        mode = "eager" if args.enforce_eager else "cudagraph"
+        _print_throughput_table(
+            f"fastkernels (W1.58A8 {kb_kernel}, {mode})", kb_data,
+        )
 
     alignments: dict[str, dict] = {}
     topk_alignments = None
@@ -1152,6 +1558,7 @@ def main():
         _persist_results(
             args.output_dir, args.model, args.num_prompts,
             sota_data, kb_data, alignments, topk_alignments, scenarios,
+            enforce_eager=args.enforce_eager,
         )
 
 

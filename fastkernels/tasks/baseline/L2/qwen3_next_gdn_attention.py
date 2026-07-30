@@ -37,7 +37,7 @@ import torch
 import torch.nn as nn
 from vllm.third_party.flash_linear_attention.ops import (
     chunk_gated_delta_rule as _vllm_chunk_gated_delta_rule,
-    fused_recurrent_gated_delta_rule as _vllm_fused_recurrent_gdn,
+    fused_sigmoid_gating_delta_rule_update as _vllm_fused_sigmoid_gating_update,
 )
 from vllm.third_party.flash_linear_attention.ops.chunk import l2norm_fwd
 from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
@@ -237,8 +237,13 @@ class Qwen3NextGDNAttention(nn.Module):
             segment_sizes=[self.key_dim, self.key_dim, self.value_dim],
         )
 
-        # Decay parameters (sharded across TP)
-        self.A_log = nn.Parameter(torch.empty(self.local_v_heads))
+        # Decay parameters (sharded across TP). ``A_log`` is FP32 in vLLM
+        # (``qwen_gdn_linear_attn``: ``dtype=torch.float32``) while ``dt_bias``
+        # is model dtype (``torch.ones(...)``); ``-exp(A_log)`` is the decay
+        # rate, so rounding it costs precision the recurrence then compounds.
+        self.A_log = nn.Parameter(
+            torch.empty(self.local_v_heads, dtype=torch.float32),
+        )
         self.A_log.weight_loader = self._sharded_weight_loader
         self.dt_bias = nn.Parameter(torch.empty(self.local_v_heads))
         self.dt_bias.weight_loader = self._sharded_weight_loader
@@ -383,12 +388,16 @@ class Qwen3NextGDNAttention(nn.Module):
         k_4d = k_conv.view(1, N, self.local_k_heads, self.head_k_dim)
         v_4d = v_conv.view(1, N, self.local_v_heads, self.head_v_dim)
 
-        # 3. Gating: g = -exp(A_log) * softplus(a + dt_bias), beta=sigmoid(b).
-        # Keep this fused to match vLLM's Qwen3-Next hot path.
-        g, beta = _fused_gdn_gating(self.A_log, a, b, self.dt_bias)
-
+        # 3. Gating. Prefill materializes g/beta because the chunk kernel takes
+        # them as inputs; decode does not -- vLLM's
+        # ``fused_sigmoid_gating_delta_rule_update`` takes A_log/a/b/dt_bias and
+        # keeps g and beta in fp32 registers inside the recurrent kernel. Our
+        # ``_fused_gdn_gating`` wrote beta out in model dtype (bf16), and the
+        # recurrent state is multiplied by exp(g) every step, so that rounding
+        # compounds over a 512-token decode.
         recurrent_full = state_manager.recurrent[self.layer_idx]
         if md.num_prefills > 0:
+            g, beta = _fused_gdn_gating(self.A_log, a, b, self.dt_bias)
             state_idx = md.non_spec_state_indices_tensor.long()
             init_state = recurrent_full.index_select(0, state_idx).contiguous()
             if md.has_initial_state is not None:
@@ -404,7 +413,7 @@ class Qwen3NextGDNAttention(nn.Module):
                     beta=beta.contiguous(),
                     initial_state=init_state,
                     output_final_state=True,
-                    cu_seqlens=md.non_spec_query_start_loc.to(torch.long),
+                    cu_seqlens=md.non_spec_query_start_loc.to(torch.int32),
                 )
             else:
                 o, final_state = _vllm_chunk_gated_delta_rule(
@@ -415,7 +424,7 @@ class Qwen3NextGDNAttention(nn.Module):
                     beta=beta.contiguous(),
                     initial_state=init_state,
                     output_final_state=True,
-                    cu_seqlens=md.non_spec_query_start_loc.to(torch.long),
+                    cu_seqlens=md.non_spec_query_start_loc.to(torch.int32),
                     use_qk_l2norm_in_kernel=True,
                 )
             recurrent_full.index_copy_(
@@ -424,20 +433,20 @@ class Qwen3NextGDNAttention(nn.Module):
                 final_state.to(recurrent_full.dtype),
             )
         else:
-            o, _ = _vllm_fused_recurrent_gdn(
+            o, _ = _vllm_fused_sigmoid_gating_update(
+                A_log=self.A_log,
+                a=a,
+                b=b,
+                dt_bias=self.dt_bias,
                 q=q_4d.contiguous(),
                 k=k_4d.contiguous(),
                 v=v_4d.contiguous(),
-                g=g.contiguous(),
-                beta=beta.contiguous(),
                 initial_state=recurrent_full,
                 inplace_final_state=True,
                 cu_seqlens=md.non_spec_query_start_loc[
                     : md.num_decodes + 1
-                ].to(torch.long),
-                ssm_state_indices=md.non_spec_state_indices_tensor[
-                    : md.num_decodes
-                ],
+                ].to(torch.int32),
+                ssm_state_indices=md.non_spec_state_indices_tensor,
                 use_qk_l2norm_in_kernel=True,
             )
 
