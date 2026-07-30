@@ -30,6 +30,8 @@ Mirrors ``TrtLlmMxfp4ExpertsMonolithic.apply``
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 
@@ -74,7 +76,15 @@ def trtllm_mxfp4_moe_supported() -> bool:
 
     Same gate as vLLM's ``TrtLlmMxfp4ExpertsBase._supports_current_device``:
     CUDA, SM100 family, FlashInfer present.
+
+    ``FASTKERNELS_TRTLLM_MXFP4_MOE=0`` forces the Triton path instead. This
+    kernel segfaults inside ``flashinfer::FP4BlockScaleLauncher::run`` on the
+    first autotune profile for gpt-oss-120b at tp=1 with a 16384-token chunk
+    (fine at tp=2, and fine at tp=1 with short prompts), so a switch is needed
+    to isolate it and to keep that configuration runnable.
     """
+    if os.environ.get("FASTKERNELS_TRTLLM_MXFP4_MOE", "1") == "0":
+        return False
     if not _TRTLLM_MXFP4_MOE_AVAILABLE or not torch.cuda.is_available():
         return False
     return torch.cuda.get_device_capability()[0] == 10

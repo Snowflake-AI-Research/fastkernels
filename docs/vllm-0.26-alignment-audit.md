@@ -3258,3 +3258,69 @@ ours-only from this profile is the ~2.1 ms of all-reduce clones (73 x 28.5 us,
 vLLM-side kernel profile; torch.profiler cannot see vLLM V1's kernels (they run
 on a separate engine thread), so this requires nsys with
 `--cuda-graph-trace=node`.
+
+## 23. Correction: long-context is a decode gap, not a prefill gap
+
+Section 22 concluded long-context was prefill-bound. That was inferred from a
+throughput ratio plus a 2048-token prefill measurement, and it is wrong. The
+factorial at the shape the scenario actually runs (24576-token prompts,
+`/tmp/fkdev/longctx_factorial.py`) says:
+
+| 24576 tok | ours prefill | vLLM prefill | ratio | ours decode | vLLM decode | ratio |
+| --- | --- | --- | --- | --- | --- | --- |
+| tp=2 compiled | 238.3 | 237.3 | **1.00x** | 2.556 | 2.365 | **0.925x** |
+| tp=2 eager | 254.2 | 488.4 | 1.92x | 45.863 | 42.870 | 0.935x |
+| tp=1 compiled | segfault (§24) | 395.3 | -- | -- | 2.784 | -- |
+| tp=1 eager | 420.6 | 754.3 | 1.79x | 41.799 | 37.907 | 0.907x |
+
+**Prefill is at parity compiled and 1.8-1.9x faster than vLLM in eager.** The
+0.86x prefill ratio in §22 was a 2048-token artefact that does not survive at
+24576: vLLM's prefill gains 2.06x from compilation (488.4 -> 237.3) where ours
+gains 1.07x (254.2 -> 238.3), so its compiled prefill catches up to where we
+already were. The long-context deficit is therefore in **decode**, the same place
+as the mixed-scenario gap, and §22a-22c's prefill hunt (NCCL protocol, symm_mem,
+MoE padding, the all-reduce clone) was aimed at the wrong phase.
+
+The decode deficit is ~7% in both compiled and eager, and vLLM's decode scales
+2.784 -> 2.365 (1.18x) from tp=1 to tp=2 where ours scaled 2.561 -> 2.462 (1.04x)
+at 2048 tokens against vLLM's 1.22x -- and at tp=1 we are *faster* than vLLM
+(2.561 vs 2.789). So it remains a TP-scaling problem in decode.
+
+**Measurement bug found in the process.** `gptoss_factorial.py` never set
+`enable_prefix_caching=False`, and `timeit()` replays the same prompt, so vLLM
+served runs 2 and 3 from its prefix cache while our engine (which has no prefix
+cache at all) recomputed every time. Every vLLM *prefill* number from that script
+is invalid. The 46.4 ms figure quoted in §22 happens to survive because it came
+from `vllm_fuse_ab.py`, which does disable it.
+
+## 24. gpt-oss tp=1 compiled segfaults in the trtllm MXFP4 MoE at long prefill
+
+`SIGSEGV` inside `flashinfer::FP4BlockScaleLauncher::run` ->
+`TrtllmGenBatchedGemmRunner::run` -> `BatchedGemmInterface::run`, on the **first**
+autotune profile (0/12), for gpt-oss-120b at tp=1 with a 24576-token prompt
+(16384-token chunk). Four things it is not:
+
+- **Not an OOM.** Reproduces identically at `gpu_memory_utilization` 0.90 and
+  0.75, and no allocator or out-of-memory message appears anywhere in the log.
+- **Not a concurrency race.** An earlier instance was blamed on two 120B
+  processes sharing FlashInfer's autotune cache; it reproduces in a strictly
+  sequential run.
+- **Not shape-independent.** tp=1 compiled is fine at 2048 tokens (48.7 ms
+  prefill) and tp=1 *eager* is fine at 24576 (420.6 ms); tp=2 completes all 12
+  autotune profiles at 24576.
+- **Not vLLM's problem.** vLLM at tp=1 compiled, 24576 tokens, runs fine (prefill
+  395.3 ms, decode 2.784 ms/step) through the same
+  `flashinfer::trtllm_fp4_block_scale_moe`.
+
+Isolated to our call into that kernel: with `FASTKERNELS_TRTLLM_MXFP4_MOE=0`
+(added for this, mirroring the bf16 switch) the Triton path runs the same cell
+successfully -- prefill 568.4 ms, decode 5.684 ms/step, the decode figure showing
+why Triton is not a real alternative.
+
+Since vLLM calls the same kernel with the same `tune_max_num_tokens`
+(`max_capture_size`, 1024) and the same 256-alignment, the difference is in our
+argument set for the tp=1 shape specifically. The one shape that distinguishes
+tp=1 from the working tp=2 case is the unsharded intermediate:
+`I_pad = round_up(2880, 256) = 3072` versus 1536. That is where to look next --
+diff our `trtllm_fp4_block_scale_moe` kwargs against
+`TrtLlmMxfp4ExpertsMonolithic.apply` at tp=1, not at tp=2 where both agree.
