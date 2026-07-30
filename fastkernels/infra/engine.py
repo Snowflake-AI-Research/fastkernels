@@ -4412,18 +4412,38 @@ class ModelRunner:
         self._greedy_arange = torch.arange(max_bs, device=dev)
 
         max_num_blocks = (self.max_model_len + BLOCK_SIZE - 1) // BLOCK_SIZE
-        self._np_ids = np.empty(max_bs, dtype=np.int64)
+        # Back the per-step decode staging arrays with *pinned* host memory.
+        #
+        # These are written as numpy and then handed to
+        # ``device_tensor.copy_(torch.from_numpy(arr), non_blocking=True)``.
+        # ``cudaMemcpyAsync`` from *pageable* memory is synchronous, so
+        # ``non_blocking=True`` was a no-op and every per-step H2D copy blocked
+        # the host. A batch-64 x 8192 decode trace measured 2114 ms across 15318
+        # ``cudaMemcpyAsync`` calls (~138 us each) against vLLM's 13 ms across
+        # 1848 calls (~7 us) -- vLLM stages through pinned buffers, so its copies
+        # are genuinely async. Keeping the torch tensor alive and exposing a
+        # ``.numpy()`` view leaves every existing call site unchanged while
+        # making the copies actually asynchronous.
+        def _pinned(shape, torch_dtype):
+            # device="cpu" is required: the engine sets a CUDA default device, and
+            # pin_memory only applies to CPU tensors.
+            t = torch.empty(shape, dtype=torch_dtype, device="cpu",
+                            pin_memory=True)
+            return t, t.numpy()
+
+        self._pin_ids, self._np_ids = _pinned(max_bs, torch.int64)
         if self.is_qwen_vl:
-            self._np_pos = np.empty((3, max_bs), dtype=np.int64)
+            self._pin_pos, self._np_pos = _pinned((3, max_bs), torch.int64)
         else:
-            self._np_pos = np.empty(max_bs, dtype=np.int64)
+            self._pin_pos, self._np_pos = _pinned(max_bs, torch.int64)
         # DeepSeek MLA FP8 KV cache stores require int64 slot_mapping;
         # the FA3 path only needs int32.
         sm_np_dtype = np.int64 if self.is_deepseek_mla else np.int32
         sm_torch_dtype = torch.int64 if self.is_deepseek_mla else torch.int32
-        self._np_sm = np.empty(max_bs, dtype=sm_np_dtype)
-        self._np_cl = np.empty(max_bs, dtype=np.int32)
-        self._np_bt = np.full((max_bs, max_num_blocks), -1, dtype=np.int32)
+        self._pin_sm, self._np_sm = _pinned(max_bs, sm_torch_dtype)
+        self._pin_cl, self._np_cl = _pinned(max_bs, torch.int32)
+        self._pin_bt, self._np_bt = _pinned((max_bs, max_num_blocks), torch.int32)
+        self._np_bt.fill(-1)
 
         self._eager_input_ids = torch.zeros(max_bs, dtype=torch.int64, device=dev)
         if self.is_qwen_vl:
