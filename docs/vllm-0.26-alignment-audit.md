@@ -3435,3 +3435,48 @@ Next measurements, in order:
    D2H copy on one rank only.
 3. Only then consider moving `embed_tokens` inside the compiled boundary, which
    removes one collective but does not by itself fix pacing.
+
+### 25c. Not host starvation: the GPU is saturated, the skew is in step launch
+
+Same 200-step batch-1 decode at tp=2, wall-clock: 539.4 ms, 2.697 ms/step, against
+601 ms/rank of GPU kernel time from the nsys run. The GPU is saturated, so the
+host loop is not starving it and "reduce per-step Python work" is not the answer.
+(The two figures are close enough that the per-rank split is approximate; the
+point is only that GPU busy time is not far below wall time.)
+
+Counting the tail instead of averaging it locates the stall precisely. Our excess
+is 111 ms over 200 steps with a 2707 us worst case: at a few hundred microseconds
+per slow call that is **about one slow all-reduce per step**, not a per-call cost.
+vLLM shows the same shape -- 6.4 ms of excess, 571.9 us worst case, also roughly
+one per step -- but roughly 15x smaller. That is the signature of the *first*
+collective in each step waiting on the peer rank's graph launch: within a replayed
+graph the remaining 71 all-reduces execute back-to-back and cannot drift.
+
+So the open question is narrow: **why do our two ranks begin a step up to ~500 us
+apart when vLLM's begin within ~30 us?** The leading suspect is how per-step work
+reaches the ranks. There is no `dist.broadcast` of decode metadata in our engine
+(the only broadcast sites are the multimodal visual/audio paths); work is handed
+to rank workers through shared memory, so rank 0 writes and the other rank polls,
+and polling latency and jitter become launch skew. vLLM V1 broadcasts scheduler
+output to workers each step, which bounds skew by a collective's latency.
+
+Confirming and fixing, in order:
+1. Timestamp the start of each rank's graph launch (a cheap `torch.cuda.Event`
+   recorded before replay on each rank, gathered afterwards) and histogram the
+   delta. This directly measures the skew and shows whether it is periodic.
+2. If the shared-memory handoff is the source, replace the per-step wakeup with a
+   collective-based one (broadcast the step descriptor, or a device-side flag)
+   so both ranks leave the barrier together.
+3. Independently worth doing and already understood: move `embed_tokens` inside
+   the compiled boundary and add the no-residual `AllReduceRMSNormPattern`, which
+   removes the standalone 119.73 us embedding all-reduce and matches vLLM's
+   compilation boundary. This removes one eager collective from the inter-step
+   critical path, though on its own it relocates the skew rather than removing it.
+
+**Status: the long-context target is not met.** mixed 0.95x (met), long-context
+0.91x. Everything on the axes this investigation covered -- all-reduce backend,
+all-reduce under compilation, compute/communication overlap, dtypes, fusions,
+CUDA-graph settings, prefill chunk size -- is now aligned with vLLM, and the fused
+all-reduce is at parity in the median. The residual is inter-rank step-launch
+skew, which is an engine scheduling property rather than a kernel or compilation
+difference, and it is not closed.
