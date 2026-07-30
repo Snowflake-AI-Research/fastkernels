@@ -3324,3 +3324,114 @@ tp=1 from the working tp=2 case is the unsharded intermediate:
 `I_pad = round_up(2880, 256) = 3072` versus 1536. That is where to look next --
 diff our `trtllm_fp4_block_scale_moe` kwargs against
 `TrtLlmMxfp4ExpertsMonolithic.apply` at tp=1, not at tp=2 where both agree.
+
+## 25. The decode gap is all-reduce *kernel time*, not launch count
+
+`nsys --cuda-graph-trace=node` over 200 batch-1 decode steps, gpt-oss-120b tp=2,
+profiling only the decode region via `cudaProfilerApi`
+(`/tmp/fkdev/decode_launch_count.py`). Counts and times are summed across both
+ranks.
+
+**Launch count is not the problem.** 206,934 kernel instances for us against
+208,828 for vLLM -- vLLM launches slightly *more* kernels (1044 vs 1035 per step
+across two ranks). The "ours 3121 vs vLLM 2590 launches/step" figure that
+motivated §21g does not reproduce, and the launch-bound reading built on it was
+wrong. What differs is total kernel time: 1202.3 ms vs 1045.9 ms, +156 ms.
+
+| bucket | ours | vLLM | delta | ours/step | vLLM/step |
+| --- | --- | --- | --- | --- | --- |
+| allreduce (fused) | 280.2 ms | 161.5 ms | **+118.7** | 144 | 146 |
+| reduce (incl. custom AR) | 93.2 | 37.3 | **+55.9** | 78 | 74 |
+| nvjet dense GEMMs | 330.2 | 312.7 | +17.5 | 218 | 218 |
+| bmm (MoE mxfp4) | 250.6 | 250.1 | +0.5 | 144 | 144 |
+| fmha | 82.0 | 86.5 | -4.5 | 72 | 72 |
+| routing | 43.2 | 49.7 | -6.5 | 72 | 72 |
+| kv-cache store | 19.8 | 36.2 | -16.4 | 72 | 72 |
+
+The all-reduce bucket alone is 76% of the gap, at the same call count. Naming the
+kernels shows why that is surprising:
+
+| kernel | ours | vLLM |
+| --- | --- | --- |
+| `flashinfer::trtllm_mnnvl_allreduce::oneshotAllreduceFusionKernel` | 144/step, **avg 9.73 us** | 146/step, **avg 5.53 us** |
+| `cross_device_reduce_1stage` | 2/step, **avg 119.73 us**, 47.9 ms | **absent** |
+
+It is the *same* kernel -- same backend, same one-shot path -- running 1.76x
+slower per call for us. Every documented argument matches vLLM's
+(`use_oneshot=None` for mnnvl, `fp32_acc=True`, `launch_with_pdl=True`,
+`trigger_completion_at_end = num_tokens > 16`, `max_token_num=11650`).
+
+### 25a. The extra collective, and why it likely causes both rows
+
+We run one `cross_device_reduce_1stage` per rank per step that vLLM does not run
+at all. Its source is `VocabParallelEmbedding.forward`
+(`L2/parallel_embedding.py:50`): our engine computes embeddings *outside* the
+compiled graph, so that collective stays a standalone eager custom all-reduce.
+vLLM puts `@support_torch_compile` on `GptOssModel` **including** `embed_tokens`,
+so its embedding all-reduce is a graph node that the `AllReduceRMSNormPattern`
+(the no-residual variant, which we skipped as "one site, negligible") fuses into
+layer 0's `input_layernorm`. That is the `Replaced 1 patterns` piece observed in
+§21a -- it is the embedding, not a layer.
+
+119.73 us for a 5.7 KB message (batch 1 x 2880 bf16) is not transfer time; the
+IPC one-shot should be ~5 us. It is a barrier absorbing rank skew. And because
+FlashInfer's one-shot Lamport all-reduce busy-waits on peer flags, *residual*
+skew is charged to every subsequent fused AR -- which is a coherent single
+explanation for both rows: a slow per-step synchronisation point inflates the
+standalone AR to 119.73 us and each of the 72 fused ARs from 5.53 to 9.73 us.
+
+So the two candidate root causes, in order:
+
+1. **Per-step rank desynchronisation.** Something our engine does once per step
+   that is not symmetric across ranks (sampling, scheduler bookkeeping, or a
+   host<->device copy) leaves rank 1 waiting. Confirm by timing each rank's step
+   independently, or by inserting a `dist.barrier()` before the embedding and
+   watching whether the 9.73 us drops toward 5.53 us -- if the barrier absorbs
+   the cost and the fused ARs speed up, skew is proven.
+2. **Embedding outside the compiled graph.** Moving `embed_tokens` inside the
+   compiled boundary and adding the no-residual `AllReduceRMSNormPattern` would
+   remove the standalone collective entirely, matching vLLM. This is worth doing
+   regardless of (1), and is the narrower change.
+
+Note the two non-AR items that go the other way and are worth keeping in mind as
+credit already banked: our kv-cache store is 16.4 ms cheaper and routing 6.5 ms
+cheaper than vLLM's.
+
+### 25b. Correction: the kernel is at parity in the median; the gap is a tail
+
+"1.76x slower per call" above is a mean, and the mean is misleading here. The
+distribution of `oneshotAllreduceFusionKernel` over 28,800 / 29,200 instances:
+
+| | avg | **median** | min | **max** | stddev |
+| --- | --- | --- | --- | --- | --- |
+| ours | 9.73 | **5.86** | 4.58 | **2707.64** | **78.69** |
+| vLLM | 5.53 | **5.31** | 4.06 | 571.90 | 4.97 |
+
+The medians are within 10%, and standalone the kernel costs 4.43-4.48 us at this
+shape with ranks in lockstep. So the kernel, the backend and the arguments are all
+fine -- `(9.73 - 5.86) x 28800 = 111 ms` of the 118.7 ms all-reduce delta lives in
+a tail whose worst case is 2.7 ms, about one entire decode step. A rank
+occasionally falls a full step behind and the one-shot Lamport busy-wait charges
+that to whichever all-reduce is executing.
+
+Buffer aliasing is ruled out as a cause: timed inside a CUDA graph at the decode
+shape, in-place (vLLM's form) is 4.48 us/call and distinct output buffers (ours)
+4.43 us/call (`/tmp/fkdev/fi_ar_inplace_timing.py`).
+
+This reframes the remaining work. It is not a kernel, fusion, dtype or argument
+difference -- those are now aligned. It is **per-step pacing**: our two ranks
+drift and periodically resynchronise, and the stall is charged to the collectives.
+The 119.73 us standalone embedding all-reduce (§25a) is the same phenomenon at the
+step boundary. Both point at host-side per-step work -- our decode is ~2.5 ms of
+GPU time per step, so any comparable Python/scheduler cost per rank starves the
+GPU and any jitter between the two ranks' host loops becomes collective wait time.
+
+Next measurements, in order:
+1. Histogram the per-step wall time per rank to see whether the drift is periodic
+   (e.g. every Nth step, suggesting a host sync, allocator growth, or a logging or
+   bookkeeping path) or continuous.
+2. Trace the host side (`--trace=cuda,osrt,nvtx`) and compare our per-step CPU
+   work against vLLM's; look for a `cudaStreamSynchronize`, a `.item()`, or a
+   D2H copy on one rank only.
+3. Only then consider moving `embed_tokens` inside the compiled boundary, which
+   removes one collective but does not by itself fix pacing.
