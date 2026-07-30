@@ -95,6 +95,21 @@ def _flashinfer_autotune():
 
     A no-op when FlashInfer is absent or its autotuner API is unavailable, and
     tolerant of tuning failures: a bad tactic search must not stop startup.
+
+    One op is excluded at world_size 1: tuning
+    ``flashinfer::trtllm_fp4_block_scale_moe`` segfaults inside
+    ``BatchedGemmInterface::run`` for gpt-oss-120b's tp=1 shape, where the
+    intermediate is unsharded and equals the hidden width after 256-alignment
+    (both 3072). The crash is non-deterministic -- roughly two runs in three at
+    ``max_model_len`` 24736, and it disappears entirely under cuda-gdb -- so it is
+    a latent timing- or layout-sensitive fault rather than a bad shape. It is not
+    memory (reproduces at gpu_memory_utilization 0.90, 0.75 and 0.50), it is not
+    reachable from a standalone call to the same op with the same shapes (12/12
+    tuning profiles pass), and vLLM does not hit it. Disabling tuning for this op
+    avoids it; ``skip_ops`` is the same mechanism vLLM uses to exclude ops whose
+    tuning misbehaves (``_flashinfer_autotune_skip_ops``). Scoped to world_size 1
+    so tensor-parallel runs keep full tuning, since the fault has never appeared
+    there.
     """
     if os.environ.get("FASTKERNELS_FLASHINFER_AUTOTUNE", "1") == "0":
         yield
@@ -104,7 +119,28 @@ def _flashinfer_autotune():
     except Exception:
         yield
         return
+
+    kwargs: dict = {}
     try:
+        import torch.distributed as _dist
+
+        single_rank = not (_dist.is_available() and _dist.is_initialized()) or (
+            _dist.get_world_size() == 1
+        )
+    except Exception:
+        single_rank = True
+    if single_rank:
+        # Both spellings: the autotuner logs the namespaced name, and it is not
+        # contractual which form skip_ops matches against.
+        kwargs["skip_ops"] = {
+            "trtllm_fp4_block_scale_moe",
+            "flashinfer::trtllm_fp4_block_scale_moe",
+        }
+    try:
+        with _fi_autotune(True, **kwargs):
+            yield
+    except TypeError:
+        # Older FlashInfer without skip_ops: tune everything rather than nothing.
         with _fi_autotune(True):
             yield
     except Exception as exc:  # pragma: no cover - tuning is best-effort
