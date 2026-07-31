@@ -3480,3 +3480,199 @@ CUDA-graph settings, prefill chunk size -- is now aligned with vLLM, and the fus
 all-reduce is at parity in the median. The residual is inter-rank step-launch
 skew, which is an engine scheduling property rather than a kernel or compilation
 difference, and it is not closed.
+
+---
+
+## 26. gemma-4-26B-A4B: the throughput gap is admission control, not kernels
+
+`20260731-000103/005` reported mixed **0.859x** and long-context **0.925x**
+while *both* latency scenarios won (single-request 1.070x, fixed-batch-32
+1.074x). Winning at batch 1 and 32 but losing at 1000 sequences points away
+from kernels before any profiling: a per-kernel deficit would show up in the
+latency probes too.
+
+### Phase split
+
+`tests/debug/profile_gemma4_phases.py --engine {fastkernels,vllm} --scenario ...`
+times `max_tokens=1` against the full run to separate prefill from decode:
+
+| mixed | fastkernels | vLLM |
+| --- | --- | --- |
+| prefill | 5.971s | 4.129s (fk 1.45x slower) |
+| decode | 36.623s | 32.569s (fk 1.12x slower) |
+| total | 42.595s | 36.698s |
+
+Both phases were behind, decode carrying 69% of the absolute gap. Note the KV
+pools were the same size in this run (526,560 vs 509,272 token slots, because
+`max_model_len` is only 9,990 for the mixed set), so capacity was *not* the
+mixed-scenario cause.
+
+### Kernel census: our decode is faster
+
+`tests/debug/profile_gemma4_kernels.py` profiles two decode lengths and diffs
+the censuses, so the prefill phase -- and the decode steps chunked prefill
+interleaves into it -- cancels exactly. A 1-vs-N diff does not cancel them and
+inflates the decode launch counts ~3x; that artifact initially read as
+"fastkernels launches attention 3.2x per layer", which is false.
+
+At batch 256, 64 decode steps:
+
+| | fastkernels | vLLM |
+| --- | --- | --- |
+| device time | **17.31 ms/step** | 18.11 ms/step |
+| `kernel_unified_attention` | 10.67 | 10.02 |
+| MoE | 2.88 (Triton) | 4.40 (cutlass) |
+| launches | 640/step | 709/step |
+| host idle | ~0% | 0.3% |
+
+Decode is fully GPU-bound on both sides and our kernels are *faster* in
+aggregate. So the decode phase being 12% slower end-to-end had to be fewer or
+smaller batches, not slower steps.
+
+### Cause 1: admission reserved each request's final length
+
+The waiting-queue gate summed `ceil((num_prompt_tokens + max_tokens)/block_size)`
+over every in-flight sequence and refused admission once that exceeded the whole
+pool. vLLM's equivalent (`full_sequence_must_fit`, on by default via
+`scheduler_reserve_full_isl`) reserves `min(request.num_tokens, max_model_len)`
+-- prompt + tokens generated *so far*, i.e. just the prompt at admission. Its
+purpose is only to stop chunked prefill admitting a 100k prompt on the strength
+of its first chunk; it never reserves ungenerated tokens, and growth past that
+point is handled by preemption.
+
+The reservation bound gemma-4 specifically because its pool is small (32,910
+blocks -- see Cause 3), so the 46,549-block worst case exceeded it and capped
+admission at 692 of 1000 requests. Replaying both policies through
+`capture.py::_simulate_continuous_batching` (analytic, no GPU):
+
+| mixed | old policy | new policy |
+| --- | --- | --- |
+| gemma-4 (pool 32,910 < 46,549 worst case) | 1432 steps, mean batch 279.3 | **1044 steps, mean 383.1** |
+| Llama-3.1-8B (pool 71,175 > 45,277) | 1044 steps, mean 372.4 | **identical** |
+
+1044 is the floor (`max(output_len)` = 1024 decode steps + ~20 prefill-only
+steps), and the simulated 1432 matches the measured 1468. Preemption fires
+**zero** times either way on both throughput scenarios, so the reservation was
+pure loss. Llama's schedule is bit-identical, so the change is provably a no-op
+wherever the pool was already large enough.
+
+Preemption was also made faithful while it became reachable: vLLM evicts
+`self.running.pop()` -- the *newest* request -- and loops until the allocation
+fits. fastkernels evicted whichever sequence it was iterating (the oldest),
+which discards the most work and can starve the head of the queue.
+
+`FASTKERNELS_STEP_PROFILE=1` now prints a preemption count, because
+`Sequence.preempt()` resets to the prompt and drops `generated_ids` rather than
+keeping them like vLLM's `_preempt_request`. Greedy decoding makes the replayed
+tokens identical so output is unaffected, but each preemption costs a re-prefill
+plus a replay of every decode step already taken. It is worth fixing only if
+that counter is ever nonzero.
+
+### Cause 2: `max_num_batched_tokens` was pinned to 2048
+
+`LlamaEngine.__init__` special-cased gemma-4 to 2048 (no comment, present since
+the initial commit) where vLLM logs `Chunked prefill is enabled with
+max_num_batched_tokens=16384`. At 2048 a 256x512 prefill needed 64 chunks
+instead of 8:
+
+| prefill, bs=256 x len 512 | fk @2048 | fk @16384 | vLLM |
+| --- | --- | --- | --- |
+| device time | 1411 ms | 1242 ms | 1081 ms |
+| wall time | 1952 ms | 1287 ms | 1093 ms |
+| host idle | **27.7%** | 3.5% | 1.1% |
+| launches | 41,280 | 5,160 | 6,651 |
+
+An `FASTKERNELS_MAX_NUM_BATCHED_TOKENS` override is kept for A/B.
+
+The residual 161 ms of device time is three kernels, not the MoE or attention
+(both level or faster): `triton_poi_fused_4` (+84 ms), an unfused `aten::sum`
+(+54 ms), and `_C::gelu_tanh_and_mul` vs vLLM's Inductor-fused
+`triton_poi_fused_gelu_mul_slice_1` (+28 ms). The `aten::sum` was
+`moe_sum.cu`'s `default:` branch -- it specialised only `topk` 2/3/4 and
+gemma-4 has `top_k_experts=8`, so it fell back to `at::sum_out`. A
+float-accumulating `case 8` (matching `at::sum_out`'s `acc_type` and k-order, so
+no accuracy change) removes it.
+
+### Cause 3 (documented, not fixed): sliding-window KV capacity
+
+25 of gemma-4's 30 layers are `sliding_attention` with a 1024 window.
+`_allocate_variable_kv_cache` gives every layer the same block count indexed by
+one shared `seq.block_table`, so a sequence holds its full length even in the
+sliding layers. vLLM puts them in a `SlidingWindowSpec` group whose
+`SlidingWindowManager.remove_skipped_blocks` frees out-of-window blocks on every
+`allocate_slots`, capping a request at
+`cdiv(sliding_window - 1 + max_in_flight_tokens, block_size) + 1` blocks there.
+Hence 498,272 token slots against vLLM's 1,862,998.
+
+This costs *capacity only*. The per-layer mask is right (`sliding_window` is
+plumbed to `window_size=(1023, 0)`), so the resident extra KV is never attended
+to, and vLLM's Triton kernel bounds its tile loop by `SLIDING_WINDOW`
+(`loop_lo`/`loop_hi`) so it is not read either. Closing it needs per-layer-group
+block tables threaded through CUDA-graph capture, which assumes a single
+`block_tables` tensor. It buys nothing on these workloads (mixed averages 737
+tokens, inside the window; long-context is 89% prefill) but it is what made
+gemma-4 uniquely exposed to Cause 1.
+
+**Attention parity was verified otherwise complete for all 30 layers:**
+head_dim 256/512, kv heads 8/2 (`attention_k_eq_v`), `scale=1.0` (gemma-4 does
+*not* use `query_pre_attn_scalar`), no attention softcap
+(`attn_logit_softcapping` absent; `final_logit_softcapping=30.0` is the LM-head
+one), per-layer-type RoPE theta and `partial_rotary_factor`, and
+`num_kv_shared_layers=0`. vLLM logs an intent to use FA4 for all layers, then
+`FA4 on Blackwell does not support head_size=256/512 due to TMEM capacity
+limits` and resolves to `TRITON_ATTN` for every layer -- which is what
+`prefer_triton=True` already forces. The only compute-side divergence is the MoE
+backend (vLLM: `FlashInferExperts` CUTLASS, chosen over trtllm-gen because
+gemma-4's activation is `gelu_pytorch_tanh` not gated swiglu; ours: Triton
+grouped GEMM), and ours is faster at decode shapes.
+
+### Method note
+
+This host drifts 3-8% between runs of identical code (Llama-3.1-8B mixed came
+out 21,504 / 19,662 / 20,849 tok/s on three full runs; vLLM's own
+single-request median moved 4%). A suspected 8% Llama regression from the
+scheduler change was noise: fastkernels' *batch-1* median moved 0.4557 ->
+0.4564s, and an admission-control change cannot affect a single-sequence run at
+all. Confirm scheduler changes with the analytic simulator, and A/B only under
+identical invocation.
+
+### Acceptance (tp=1, compiled, B200)
+
+| scenario | original | scheduler + mnbt | + `moe_sum` case 8 |
+| --- | --- | --- | --- |
+| mixed | 0.859x | 0.996x | **1.016x** |
+| long-context | 0.925x | 1.002x | **1.005x** |
+| single-request | 1.070x | 1.123x | **1.156x** |
+| fixed-batch-32 | 1.074x | 1.146x | **1.132x** |
+
+Output token counts are identical throughout (400,938 mixed / 16,384
+long-context). Mixed alignment is unchanged (72.53 -> 72.86 avg prefix match
+over 1000 requests). Long-context alignment reads 83.5 -> 73.3, but that set is
+64 requests with a per-request prefix-match sd of ~63, i.e. stderr ~8 per run
+and ~11 on the difference -- the change is inside one standard error and is not
+evidence of a numerics regression. Any perturbation reshuffles this metric,
+because greedy decoding on a 26B MoE diverges chaotically: fastkernels-vs-vLLM
+prefix match is only ~18% of output length even at baseline, and two
+fastkernels runs differing only in the `moe_sum` reduction order agreed on
+19.7% of tokens with 158/1000 sequences bit-identical.
+
+### tp=2: the gap was never TP-specific
+
+Every measurement above is tp=1, where the original gap reproduced in full, so
+`tp>1` was ruled out as the trigger early. Re-running with both fixes at tp=2
+confirms there is more headroom there, not less:
+
+| scenario | tp=1 | tp=2 |
+| --- | --- | --- |
+| mixed | 1.016x | **1.127x** |
+| long-context | 1.005x | **1.105x** |
+| single-request | 1.156x | 1.099x |
+| fixed-batch-32 | 1.132x | 1.076x |
+
+tp=2 mixed is 26.97s against vLLM's 30.39s; long-context 87.15s against 96.34s.
+Long-context alignment reads 83.28 avg prefix match at tp=2 -- back at the
+pre-change 83.5 -- which supports reading the tp=1 value of 73.3 as sampling
+noise on a 64-request set rather than a numerics regression. Backend selection
+is unchanged at tp=2: the same `FA4 on Blackwell does not support head_size=...`
+fallback to `TRITON_ATTN` for every layer. vLLM turns on `fuse_allreduce_rms` at
+tp>1, which fastkernels already matches (sections 20-21).

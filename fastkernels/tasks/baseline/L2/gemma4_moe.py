@@ -86,6 +86,21 @@ class Gemma4MoE(nn.Module):
         self.w2.weight_loader = self._w2_weight_loader
 
         self.routing = Gemma4Routing()
+        # Backend divergence from vLLM, which logs "Using FlashInfer CUTLASS
+        # Unquantized MoE backend out of potential backends: ['FlashInfer
+        # TRTLLM', 'FlashInfer CUTLASS', 'TRITON', 'BATCHED_TRITON']" and then
+        # "Using FlashInferExperts MoE backend". It skips trtllm-gen because
+        # that kernel only implements the gated swiglu activation
+        # (``ACTIVATION_SWIGLU``; see ``L1/trtllm_bf16_moe.py``) and Gemma4 is
+        # ``gelu_pytorch_tanh``, so ``L1/trtllm_bf16_moe.py`` -- wired up for
+        # Qwen3-Next and Kimi -- is not the faithful path here either.
+        #
+        # We run Triton grouped GEMM (``_fused_moe_kernel``) instead. Measured
+        # on B200, that is *faster* than vLLM's CUTLASS at decode shapes
+        # (2.88 vs 4.40 ms/step at batch 256, where each expert sees ~15
+        # tokens) and roughly level in prefill (460 vs 464 ms for a 256x512
+        # prefill). The residual mixed-scenario prefill gap of ~0.4s is the
+        # place to look if this is ever revisited.
         self.fused_experts = FusedExperts(
             activation="gelu_tanh",
             config_style="vllm",

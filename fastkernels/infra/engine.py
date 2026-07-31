@@ -1328,7 +1328,38 @@ class ModelRunner:
             torch.cuda.empty_cache()
 
     def _allocate_variable_kv_cache(self):
-        """Allocate per-layer KV caches for models with non-uniform KV shape."""
+        """Allocate per-layer KV caches for models with non-uniform KV shape.
+
+        Every layer gets ``num_blocks`` blocks and every layer is indexed by the
+        same ``seq.block_table``, so a sequence of length L holds ceil(L/16)
+        blocks in *all* layers.
+
+        This is a known divergence from vLLM for Gemma4, whose 25 of 30 layers
+        are ``sliding_attention`` with a 1024-token window. vLLM puts those in a
+        ``SlidingWindowSpec`` group whose ``SlidingWindowManager`` frees blocks
+        that fall out of the window on every ``allocate_slots``, capping a
+        request at ``cdiv(sliding_window - 1 + max_in_flight_tokens,
+        block_size) + 1`` blocks in each sliding layer no matter how long the
+        sequence gets. Holding the full length there instead costs capacity:
+        498,272 token slots against vLLM's 1,862,998 on a B200 at
+        gpu_memory_utilization=0.9.
+
+        It costs *capacity only*, not correctness or compute:
+          - the per-layer mask is still right (``sliding_window`` is passed
+            through to ``window_size=(1023, 0)``), so the extra resident KV is
+            simply never attended to;
+          - vLLM's Triton unified-attention kernel bounds its tile loop by
+            ``SLIDING_WINDOW`` (``loop_lo``/``loop_hi``), so the out-of-window
+            blocks are not read either.
+
+        Closing it needs per-layer-group block tables (one for the sliding
+        group, one for the full group) threaded through the CUDA-graph capture,
+        which today assumes a single ``block_tables`` tensor. Measured on the
+        mixed scenario it would buy nothing (sequences average ~737 tokens, so
+        nothing ever leaves the 1024 window) and on long-context the phase is
+        89% prefill, so it only starts to pay at higher long-sequence
+        concurrency than either workload reaches.
+        """
         free, total = torch.cuda.mem_get_info()
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
@@ -5585,8 +5616,16 @@ class LlamaEngine:
     ):
         self.model_name = model_name
         self.seed = seed
-        if max_num_batched_tokens is None and "gemma-4" in model_name.lower():
-            max_num_batched_tokens = 2048
+        # Gemma4 used to be pinned to 2048 here. vLLM schedules it at the
+        # B200 default of 16384 (``Chunked prefill is enabled with
+        # max_num_batched_tokens=16384``), and 2048 costs 8x the prefill
+        # chunks: 41,280 kernel launches for a 256x512 prefill against vLLM's
+        # 6,651, and 28% of prefill wall time spent host-bound rather than on
+        # the GPU. Measured on the mixed scenario, lifting the cap takes
+        # prefill from 6.00s to 4.57s.
+        _env_mnbt = os.environ.get("FASTKERNELS_MAX_NUM_BATCHED_TOKENS")
+        if _env_mnbt:
+            max_num_batched_tokens = int(_env_mnbt)
         self.max_num_seqs = max_num_seqs if max_num_seqs is not None else _DEFAULT_MAX_NUM_SEQS
         self.max_num_batched_tokens = max_num_batched_tokens if max_num_batched_tokens is not None else _DEFAULT_MAX_NUM_BATCHED_TOKENS
         self._set_seeds(seed)
@@ -5651,6 +5690,9 @@ class LlamaEngine:
             self.cross_blocks_per_seq = self.model_runner.cross_blocks_per_seq
         self.max_num_seqs = self.model_runner.max_num_seqs
         self.max_num_batched_tokens = self.model_runner.max_num_batched_tokens
+        # Mirrored for the scheduler's admission gate, which caps a request's
+        # reservation at the context window the way vLLM's does.
+        self.max_model_len = self.model_runner.max_model_len
         print(f"  Scheduling: max_num_seqs={self.max_num_seqs}, "
               f"max_num_batched_tokens={self.max_num_batched_tokens}")
 
@@ -7135,8 +7177,24 @@ class LlamaEngine:
             "pure_text_prefill": 0, "text_prefill_tokens": 0,
             "mixed_mm": 0, "mixed_mm_pf_tokens": 0, "mixed_mm_dc_tokens": 0, "mixed_mm_time": 0.0,
             "mixed_text": 0, "mixed_text_pf_tokens": 0, "mixed_text_dc_tokens": 0,
+            "preempted": 0, "preempted_tokens": 0,
         }
         _step_profile_active = os.environ.get("FASTKERNELS_STEP_PROFILE") == "1"
+
+        def _record_preemption(seq: Sequence) -> None:
+            """Count recompute preemptions and the decode work they discard.
+
+            ``Sequence.preempt()`` resets to the prompt and drops
+            ``generated_ids``, so every preemption costs a re-prefill *and* a
+            replay of every decode step the sequence had already taken. Greedy
+            decoding makes the replayed tokens identical, so output is
+            unaffected -- but a nonzero count here means wasted work, and is the
+            signal to make preempt() resume from prompt+generated the way
+            vLLM's ``_preempt_request`` does (it keeps ``_all_token_ids`` and
+            only resets ``num_computed_tokens``).
+            """
+            step_profile["preempted"] += 1
+            step_profile["preempted_tokens"] += len(seq.generated_ids)
 
         def _finish_seq(seq: Sequence) -> None:
             nonlocal _pbar_pending, _pbar_pending_in, _pbar_pending_out
@@ -7186,13 +7244,9 @@ class LlamaEngine:
                 return False
 
             decode_need_blocks = 0
-            total_peak = 0
             for i, seq in enumerate(running):
                 if i < decode_count and len(seq) % block_size == 1:
                     decode_need_blocks += 1
-                total_peak += (
-                    seq.num_prompt_tokens + seq.max_tokens + block_size - 1
-                ) // block_size
 
             free_after_decode = len(bm.free_block_ids) - decode_need_blocks
             if free_after_decode < 0:
@@ -7222,8 +7276,22 @@ class LlamaEngine:
             if free_after_decode < blocks_needed + watermark_blocks:
                 return True
 
-            seq_peak = (prompt_len + seq.max_tokens + block_size - 1) // block_size
-            if total_peak + seq_peak > num_blocks:
+            # vLLM's ``full_sequence_must_fit`` admission gate (on by default
+            # via ``scheduler_reserve_full_isl``) requires the request's
+            # *current* length -- ``min(request.num_tokens, max_model_len)``,
+            # i.e. prompt + tokens generated so far -- to fit in the free
+            # blocks. It exists so chunked prefill cannot admit a 100k prompt
+            # on the strength of its first 2k chunk alone. It deliberately does
+            # *not* reserve the tokens the request has yet to generate, and it
+            # is a per-request check against free blocks rather than a global
+            # sum over everything in flight. Reserving the final length
+            # (prompt + max_tokens) for every in-flight sequence instead caps
+            # concurrency at a fraction of max_num_seqs; growth past this point
+            # is handled by preemption in ``_schedule_decode_tokens``, exactly
+            # as vLLM handles it.
+            full_blocks = (min(prompt_len, self.max_model_len)
+                           + block_size - 1) // block_size
+            if free_after_decode < full_blocks + watermark_blocks:
                 return True
 
             if decode_count + 1 > self.max_num_seqs:
@@ -7449,6 +7517,44 @@ class LlamaEngine:
             # --- 1. Allocate blocks for decode seqs that need a new block ---
             decode_seqs: list[Sequence] = []
             new_running: deque[Sequence] = deque()
+            def _preempt_newest(exclude: Sequence) -> bool:
+                """Free the newest in-flight sequence to make room. vLLM's
+                ``schedule()`` does ``preempted_req = self.running.pop()`` --
+                the *last* running request -- and loops until the allocation
+                fits, giving up only when the request needing blocks is itself
+                the newest. Preempting the newest discards the least computed
+                work and keeps the oldest sequences advancing, so the queue
+                always drains. Returns False when nothing else can be freed.
+                """
+                # ``running`` is ordered oldest-to-newest and this loop pops from
+                # its left, so whatever is left in ``running`` is the newest;
+                # ``new_running`` (deferred by max_num_seqs) and ``decode_seqs``
+                # (already scheduled this step) hold progressively older ones.
+                for pool in (running, new_running):
+                    while pool:
+                        victim = pool.pop()
+                        if victim is exclude:
+                            pool.append(victim)
+                            break
+                        _record_preemption(victim)
+                        bm.deallocate(victim)
+                        bm.deallocate_cross(victim)
+                        victim.preempt()
+                        waiting.appendleft(victim)
+                        return True
+                for i in range(len(decode_seqs) - 1, -1, -1):
+                    victim = decode_seqs[i]
+                    if victim is exclude:
+                        continue
+                    del decode_seqs[i]
+                    _record_preemption(victim)
+                    bm.deallocate(victim)
+                    bm.deallocate_cross(victim)
+                    victim.preempt()
+                    waiting.appendleft(victim)
+                    return True
+                return False
+
             def _schedule_decode_tokens() -> None:
                 nonlocal token_budget, running, decode_seqs, new_running
                 while running:
@@ -7458,7 +7564,13 @@ class LlamaEngine:
                         continue
                     needs_block = (len(seq) % block_size == 1)
                     if needs_block:
+                        while not bm.free_block_ids:
+                            if not _preempt_newest(seq):
+                                break
                         if not bm.free_block_ids:
+                            # Nothing left to evict: this sequence is the only
+                            # one in flight, so preempting it would livelock.
+                            _record_preemption(seq)
                             bm.deallocate(seq)
                             bm.deallocate_cross(seq)
                             seq.preempt()
@@ -7502,16 +7614,6 @@ class LlamaEngine:
             prefilling = still_prefilling
 
             # --- 3. Admit new seqs from waiting queue ---
-            total_peak = 0
-            for seq in decode_seqs:
-                total_peak += (seq.num_prompt_tokens + seq.max_tokens
-                               + block_size - 1) // block_size
-            for seq in running:
-                total_peak += (seq.num_prompt_tokens + seq.max_tokens
-                               + block_size - 1) // block_size
-            for seq in prefilling:
-                total_peak += (seq.num_prompt_tokens + seq.max_tokens
-                               + block_size - 1) // block_size
             encoder_budget = self._max_encoder_tokens()
             merge_size = self._vision_merge_size()
             mm_admitted = 0
@@ -7548,9 +7650,14 @@ class LlamaEngine:
                 free = len(bm.free_block_ids)
                 if free < blocks_needed + watermark_blocks:
                     break
-                seq_peak = (prompt_len + seq.max_tokens
-                            + block_size - 1) // block_size
-                if total_peak + seq_peak > num_blocks:
+                # vLLM's ``full_sequence_must_fit`` gate: the request's
+                # *current* length must fit in the free blocks, so a chunked
+                # prefill cannot admit a long prompt on the strength of its
+                # first chunk. Tokens not yet generated are not reserved --
+                # see the matching comment in ``_prefill_blocked_by_capacity``.
+                full_blocks = (min(prompt_len, self.max_model_len)
+                               + block_size - 1) // block_size
+                if free < full_blocks + watermark_blocks:
                     break
                 num_scheduled = len(prefill_seqs) + len(decode_seqs)
                 if is_bitnet:
@@ -7571,7 +7678,6 @@ class LlamaEngine:
                 prefill_seqs.append(seq)
                 prefill_chunk_sizes.append(chunk)
                 token_budget -= chunk
-                total_peak += seq_peak
                 if has_mm:
                     encoder_budget -= seq_encoder_tokens
                     mm_admitted += 1
@@ -7825,6 +7931,8 @@ class LlamaEngine:
             print(f"  pure_mm_prefill:   {sp['pure_mm_prefill']:6d} steps, {sp['mm_prefill_tokens']:10d} tokens, {sp['mm_prefill_time']:.3f}s")
             print(f"  mixed_text:        {sp['mixed_text']:6d} steps, pf={sp['mixed_text_pf_tokens']:10d} dc={sp['mixed_text_dc_tokens']:10d}")
             print(f"  mixed_mm:          {sp['mixed_mm']:6d} steps, pf={sp['mixed_mm_pf_tokens']:10d} dc={sp['mixed_mm_dc_tokens']:10d}, {sp['mixed_mm_time']:.3f}s")
+            print(f"  preemptions:       {sp['preempted']:6d} seqs, "
+                  f"{sp['preempted_tokens']:10d} decode tokens discarded")
             fp = getattr(self, "_fast_path_profile", None)
             if fp is not None and fp["n"]:
                 print(
