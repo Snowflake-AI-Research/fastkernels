@@ -130,6 +130,15 @@ class MambaStateManager:
     deterministically pops slots in the same order, so the per-step
     state slot indices match across ranks without any cross-rank
     communication.
+
+    Slot 0 is reserved and never handed out.  vLLM's varlen prefill kernel
+    ``_causal_conv1d_fwd_kernel`` returns early for any sequence whose cache
+    index equals ``null_block_id``, which defaults to ``NULL_BLOCK_ID == 0``;
+    vLLM never passes 0 because its block allocator reserves block 0.  A
+    sequence placed on slot 0 therefore gets no conv output at all and a conv
+    state that is never written -- measured on mamba-2.8b: slot 0 produced
+    ``argmax=8808`` and an all-zero layer-0 conv state where slots 1, 2, 5, 17
+    all produced a bit-identical ``argmax=11``.
     """
 
     def __init__(
@@ -145,7 +154,7 @@ class MambaStateManager:
     ):
         self.num_slots = num_slots
         self.conv_kernel = conv_kernel
-        self._free_slots: deque[int] = deque(range(num_slots))
+        self._free_slots: deque[int] = deque(range(1, num_slots))
         self._in_use: set[int] = set()
         self._slot_views: dict[int, MambaSlotCache] = {}
 
@@ -180,9 +189,25 @@ class MambaStateManager:
         return bool(self._free_slots)
 
     def reset_slot(self, slot: int) -> None:
-        for layer_idx in range(len(self.conv_states)):
-            self.conv_states[layer_idx][slot].zero_()
-            self.ssm_states[layer_idx][slot].zero_()
+        self.reset_slots([slot])
+
+    def reset_slots(self, slots: list[int]) -> None:
+        """Zero every layer's state for ``slots`` in one pass per tensor.
+
+        Per-slot ``zero_()`` costs ``2 * num_layers`` kernel launches, so
+        admitting ~45 sequences in a step (the steady state of a 1000-prompt
+        run at 64 layers) issued nearly 6k launches -- tens of milliseconds of
+        pure launch overhead per step.  Indexing with the whole slot list keeps
+        it at ``2 * num_layers`` launches regardless of batch size.
+        """
+        if not slots:
+            return
+        idx = torch.as_tensor(
+            slots, dtype=torch.long, device=self.conv_states[0].device,
+        )
+        for conv_state, ssm_state in zip(self.conv_states, self.ssm_states):
+            conv_state[idx] = 0
+            ssm_state[idx] = 0
 
     def allocate(self, seq) -> int:
         """Claim a free slot for ``seq``.
@@ -209,7 +234,6 @@ class MambaStateManager:
             return
         if slot in self._in_use:
             self._in_use.remove(slot)
-            self.reset_slot(slot)
             self._free_slots.append(slot)
         seq.state_slot = None
 
@@ -398,15 +422,23 @@ class KimiLinearStateManager:
         return bool(self._free_slots)
 
     def reset_slot(self, slot: int) -> None:
+        self.reset_slots([slot])
+
+    def reset_slots(self, slots: list[int]) -> None:
+        """Batched counterpart of ``MambaStateManager.reset_slots``."""
+        if not slots:
+            return
+        device = self.device
+        idx = torch.as_tensor(slots, dtype=torch.long, device=device)
         for layer_id in range(self.num_layers):
             if self.conv_q[layer_id] is not None:
-                self.conv_q[layer_id][slot].zero_()
-                self.conv_k[layer_id][slot].zero_()
-                self.conv_v[layer_id][slot].zero_()
-                self.recurrent[layer_id][slot].zero_()
+                self.conv_q[layer_id][idx] = 0
+                self.conv_k[layer_id][idx] = 0
+                self.conv_v[layer_id][idx] = 0
+                self.recurrent[layer_id][idx] = 0
             if self.gdn_conv[layer_id] is not None:
-                self.gdn_conv[layer_id][slot].zero_()
-                self.recurrent[layer_id][slot].zero_()
+                self.gdn_conv[layer_id][idx] = 0
+                self.recurrent[layer_id][idx] = 0
 
     def allocate(self, seq) -> int:
         if getattr(seq, "state_slot", None) is not None:
@@ -433,7 +465,6 @@ class KimiLinearStateManager:
         slot = getattr(seq, "state_slot", None)
         if slot is not None and slot in self._in_use:
             self._in_use.remove(slot)
-            self.reset_slot(slot)
             self._free_slots.append(slot)
             seq.state_slot = None
         if self._free_blocks is not None and seq.block_table:

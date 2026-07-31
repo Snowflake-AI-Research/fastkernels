@@ -53,6 +53,11 @@ NCCL_PORT = int(os.environ.get("FASTKERNELS_NCCL_PORT", "29501"))
 # per-step host round trips.
 _BULK_CHUNK_CAP = 512
 
+# Mamba v1 keeps activations channel-major, so a step's token count lands as the
+# contiguous axis of a cuBLAS operand. Keep it 16-byte aligned (8 bf16 elements)
+# -- see ``tasks/baseline/L2/mamba_mixer._padded_token_cat``.
+_MAMBA_GEMM_ALIGN = 8
+
 
 def _load_tokenizer(model_name: str):
     try:
@@ -510,6 +515,22 @@ class ModelRunner:
             or self.is_qwen3_next
         )
         self.model_family = "mamba" if self.is_mamba else "attention"
+        # Granularity a *continuing* prefill chunk must end on.
+        #
+        # Mamba2's SSD scan requires chunk_size-aligned continuations, else the
+        # carried SSM state diverges from a single-shot prefill.  Mamba v1 has
+        # no such constraint -- its conv/ssm state carries token by token -- but
+        # its mixer keeps activations channel-major (``[dim, num_tokens]``), so
+        # the token count lands as the contiguous axis of a cuBLAS operand and
+        # must stay 16-byte aligned or cuBLAS drops to a scalar path (see
+        # ``L2/mamba_mixer._padded_token_cat``).  Rounding v1 to 256 as well
+        # would just throw away 1.5% of every step's token budget.
+        if self.is_mamba2:
+            self._mamba_prefill_align = (
+                getattr(self.config, "chunk_size", 256) or 256
+            )
+        else:
+            self._mamba_prefill_align = _MAMBA_GEMM_ALIGN
         self.is_gpt_oss = model_type == "gpt_oss" or "gpt-oss" in model_name.lower()
         self.is_bitnet = model_type == "bitnet"
         self.is_gemma4 = model_type == "gemma4"
@@ -1455,7 +1476,7 @@ class ModelRunner:
             qsl, dtype=torch.int32, device=device,
         )
         meta.state_indices_p = torch.arange(
-            n_seqs, dtype=torch.int32, device=device,
+            1, n_seqs + 1, dtype=torch.int32, device=device,
         )
         meta.has_initial_states_p = torch.zeros(
             n_seqs, dtype=torch.bool, device=device,
@@ -1535,7 +1556,7 @@ class ModelRunner:
             conv_dim=conv_dim,
             ssm_state_shape=ssm_state_shape,
             conv_kernel=conv_kernel,
-            num_slots=n_seqs,
+            num_slots=n_seqs + 1,   # slot 0 is reserved
             dtype=self.dtype,
             device=device,
         )
@@ -1809,7 +1830,11 @@ class ModelRunner:
             current_alloc + non_torch_overhead + profile_peak + graph_reserve
         )
         budget = max(0, requested_bytes - non_kv_bytes)
-        num_slots = max(1, min(self.max_num_seqs, budget // max(1, per_slot_bytes)))
+        # +1 because MambaStateManager reserves slot 0 (vLLM's prefill conv
+        # kernel reads cache index 0 as "skip this sequence"), so a pool of N
+        # tensors holds N-1 live sequences.
+        capacity = budget // max(1, per_slot_bytes)
+        num_slots = max(2, min(self.max_num_seqs + 1, capacity))
 
         if self.rank == 0:
             print(
@@ -1832,11 +1857,12 @@ class ModelRunner:
             device=torch.device(f"cuda:{self.rank}"),
         )
         self.num_state_slots = num_slots
-        # Cap engine-level scheduling on slot count -- one slot per live seq.
-        self.max_num_seqs = min(self.max_num_seqs, num_slots)
+        # Cap engine-level scheduling on slot count -- one slot per live seq,
+        # minus the reserved slot 0.
+        self.max_num_seqs = min(self.max_num_seqs, num_slots - 1)
         if self.rank == 0:
-            print(f"  Mamba state cache: {num_slots} sequence slots "
-                  f"({per_slot_bytes / (1<<20):.1f} MiB/slot)")
+            print(f"  Mamba state cache: {num_slots - 1} sequence slots "
+                  f"({per_slot_bytes / (1<<20):.1f} MiB/slot, slot 0 reserved)")
 
     def can_allocate_mamba_state(self):
         return self.mamba_state_manager is not None and \
@@ -1906,8 +1932,12 @@ class ModelRunner:
                 raise RuntimeError("No free Mamba state slots")
             slot = sm._free_slots.popleft()
             sm._in_use.add(slot)
-            sm.reset_slot(slot)
             slots.append(slot)
+        # One indexed zero-fill per state tensor for the whole batch: a fresh
+        # sequence's first chunk runs with ``has_initial_states=False`` so the
+        # kernels overwrite rather than read, but zeroing on claim keeps the
+        # "a live slot only ever holds its own sequence's state" invariant.
+        sm.reset_slots(slots)
         return slots
 
     def deallocate_mamba_state_batch(self, slot_ids: list[int] | list[tuple[int, list[int]]]) -> None:
@@ -1916,6 +1946,10 @@ class ModelRunner:
         Batched counterpart of ``allocate_mamba_state_batch`` -- all
         ranks remove the same slot ids from ``_in_use`` and re-append
         them to ``_free_slots`` in lock-step.
+
+        Freed slots are left dirty; ``allocate_mamba_state_batch`` zeroes them
+        when they are claimed again, so zeroing here would just double the work
+        on the hottest path (every finishing sequence).
         """
         sm = self.mamba_state_manager
         if sm is None:
@@ -1927,7 +1961,6 @@ class ModelRunner:
                 slot, block_table = item, []
             if slot in sm._in_use:
                 sm._in_use.remove(slot)
-                sm.reset_slot(slot)
                 sm._free_slots.append(slot)
             if getattr(sm, "_free_blocks", None) is not None and block_table:
                 sm._free_blocks.extend(block_table)
@@ -3066,6 +3099,20 @@ class ModelRunner:
                 input_ids.append(seq.last_token)
                 positions.append(len(seq) - 1)
                 decode_state_indices.append(seq.state_slot)
+            # Round the decode row count up to the mixer's GEMM alignment.  The
+            # chunk planner keeps the *prefill* token count aligned, but the
+            # mixer also cares about the step *total* (prefill + decode), which
+            # is the contiguous axis of the gate and out_proj operands -- and the
+            # number of running sequences is arbitrary.  Padded rows carry the
+            # null state index, which ``causal_conv1d_update`` and
+            # ``selective_state_update`` skip: the same trick
+            # ``capture_mamba_cudagraph`` uses to fill a bucket.  Unlike padding
+            # the prefill side, this costs no extra scan chunk (decode does not
+            # go through the varlen scan), just a handful of skipped rows.
+            for _ in range(-len(decode_seqs) % _MAMBA_GEMM_ALIGN):
+                input_ids.append(0)
+                positions.append(0)
+                decode_state_indices.append(self._MAMBA_PAD_SLOT_ID)
             for i, seq in enumerate(prefill_seqs):
                 start = seq.num_computed_tokens
                 chunk = _chunk_len(i, seq)
@@ -3089,7 +3136,8 @@ class ModelRunner:
                 decode_state_indices.append(seq.state_slot)
 
         num_prefill_tokens = query_start_loc[-1]
-        num_decode_tokens = len(decode_seqs)
+        # Padded: the token count the kernels and the mixer see.
+        num_decode_tokens = len(decode_state_indices)
         num_actual = num_prefill_tokens + num_decode_tokens
 
         input_ids_t = torch.tensor(input_ids, dtype=torch.int64,
@@ -3230,7 +3278,9 @@ class ModelRunner:
                     )
                 )
             else:
-                indices.extend(range(meta.num_decode_tokens))
+                # ``num_decode_tokens`` may include alignment-pad rows; only the
+                # real decode rows produce a token.
+                indices.extend(range(len(decode_seqs)))
             idx_t = torch.tensor(indices, dtype=torch.int64,
                                  device=hidden.device)
             hidden_last = hidden.index_select(0, idx_t)
@@ -3369,6 +3419,49 @@ class ModelRunner:
         return meta
 
     @torch.inference_mode()
+    def _mamba_graph_capacity(self) -> int:
+        """Largest decode batch whose CUDA graph fits the reserved pool.
+
+        A captured decode graph pins the working set of one decode forward, so
+        the private pool is roughly that forward's activation peak.  Measure the
+        peak eagerly at a probe batch and extrapolate linearly (the fixed part
+        of the peak makes this an over-estimate, i.e. conservative) against the
+        headroom ``allocate_mamba_state_cache`` already set aside.
+        """
+        max_bs = self.max_num_seqs
+        if max_bs <= 1:
+            return max(1, max_bs)
+
+        probe = min(max_bs, 256)
+        meta = self._mamba_make_decode_meta(
+            probe, self._md_state_indices[:probe],
+        )
+        set_mamba_context(
+            is_prefill=False,
+            mamba_state=self.mamba_state_manager,
+            mamba_metadata=meta,
+        )
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        baseline = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        try:
+            hidden = self.model(
+                self._md_input_ids[:probe], self._md_positions[:probe],
+            )
+            partial = self.model.lm_head.linear_op(
+                hidden, self.model.lm_head.embedding_op.emb.weight,
+            ).float()
+            partial.max(dim=-1)
+            del hidden, partial
+            torch.cuda.synchronize()
+            peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+        finally:
+            reset_context()
+        per_seq = max(1, (peak - baseline)) / probe
+        affordable = int(self._MAMBA_GRAPH_RESERVE_BYTES / per_seq)
+        return max(1, min(max_bs, affordable))
+
+    @torch.inference_mode()
     def capture_mamba_cudagraph(self):
         """Capture decode-only CUDA graphs for Mamba/Mamba2 at bucket sizes.
 
@@ -3387,27 +3480,37 @@ class ModelRunner:
         """
         from contextlib import nullcontext
 
-        # Cap the largest captured graph: capturing huge buckets (e.g.
-        # bs=1024) eats large amounts of CUDA-graph private-pool memory
-        # for big Mamba2 models (Codestral allocates ~4 GB of conv/ssm
-        # activations per layer at bs=1024 -- 64 layers ⇒ several
-        # hundred GB nominal, even when shared across buckets the peak
-        # working set still OOMs alongside the slot pool).  vLLM defaults
-        # to capturing only up to ``cudagraph_capture_sizes`` (typically
-        # <= 512) for the same reason.
-        max_bs = min(self.max_num_seqs, 256)
-        self._mamba_graph_bs_list = sorted(set(
-            [1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 160, 192, 224, 256]
-        ))
-        self._mamba_graph_bs_list = [
-            b for b in self._mamba_graph_bs_list if b <= max_bs
-        ]
+        # Largest batch worth capturing.  Capturing huge buckets eats CUDA-graph
+        # private-pool memory, which for a big Mamba2 model (Codestral 7B
+        # allocates ~4 GB of conv/ssm activations per layer at bs=1024) can OOM
+        # alongside the slot pool -- vLLM caps at ``max_cudagraph_capture_size``
+        # (512 by default) for the same reason.  The pool a decode graph needs is
+        # about the eager decode forward's activation peak at that batch, so
+        # measure it rather than hardcoding one number for every architecture: a
+        # blanket cap of 256 sent every larger step down the eager path (~30 ms
+        # versus ~7 ms replayed), and a 1000-prompt run spends its whole steady
+        # state with 300-500 sequences decoding.
+        max_bs = self._mamba_graph_capacity()
+        buckets = [1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 160, 192, 224, 256]
+        # Above 256 the decode step is roughly linear in batch, so a coarser
+        # stride costs only the padding up to the next bucket (<= 12%).
+        buckets += list(range(288, 513, 32)) + list(range(576, 4097, 64))
+        self._mamba_graph_bs_list = [b for b in buckets if b <= max_bs]
+        if max_bs > 0 and (
+            not self._mamba_graph_bs_list
+            or self._mamba_graph_bs_list[-1] < max_bs
+        ):
+            # Always cover max_num_seqs exactly so no step falls back to eager.
+            self._mamba_graph_bs_list.append(max_bs)
         if not self._mamba_graph_bs_list:
             self._mamba_graph_bs_for_n = None
             return
 
         lm_head = self.model.lm_head
         weight = lm_head.embedding_op.emb.weight
+        graph_baseline = torch.cuda.memory_stats().get(
+            "reserved_bytes.all.current", 0,
+        )
 
         ar_ctx = (
             self.custom_ar.capture()
@@ -3472,10 +3575,14 @@ class ModelRunner:
                 max_bucket,
             )
         if self.rank == 0:
+            pool_bytes = torch.cuda.memory_stats().get(
+                "reserved_bytes.all.current", 0,
+            ) - graph_baseline
             print(
                 f"  Mamba CUDA graphs: {len(self._mamba_graphs)} buckets "
                 f"(min={self._mamba_graph_bs_list[0]}, "
-                f"max={self._mamba_graph_bs_list[-1]})"
+                f"max={self._mamba_graph_bs_list[-1]}, "
+                f"pool={max(0, pool_bytes) / (1 << 20):.0f} MiB)"
             )
 
     @torch.inference_mode()
@@ -6422,6 +6529,15 @@ class LlamaEngine:
             # state continues via has_initial_states + num_computed_tokens
             # (matching vLLM's chunked-prefill scheduler), so a single long
             # prefill never materializes a full-sequence chunk-scan transient.
+            #
+            # Charged against the *unpadded* decode count even though
+            # ``_mamba_prepare_tensors`` rounds Mamba v1's decode rows up: the
+            # <=7 extra rows are a rounding error against a 16K budget, and
+            # keeping the divisor here means the alignment padding does not move
+            # where long prompts get cut.  Chunk boundaries change which tokens
+            # share a scan accumulation, so moving them reshuffles bf16
+            # tie-breaks and costs ~6% of the reference token agreement for no
+            # throughput gain.
             token_budget = max(
                 getattr(mr, "max_num_batched_tokens", 16384) - len(decode_seqs), 0,
             )
@@ -6429,7 +6545,10 @@ class LlamaEngine:
             # must end on a chunk_size boundary, else the carried SSM state
             # diverges from a single-shot prefill (verified: sub-chunk_size steps
             # mismatch, >=chunk_size match). vLLM enforces the same alignment.
-            ssd_chunk = getattr(getattr(mr, "config", None), "chunk_size", 256) or 256
+            # Mamba v1 has no such constraint and only needs the 16-byte GEMM
+            # alignment its channel-major mixer implies, so it keeps the whole
+            # budget instead of rounding down to 256.
+            chunk_align = getattr(mr, "_mamba_prefill_align", 256)
             prefill_seqs: list[Sequence] = []
             prefill_chunk_lens: list[int] = []
             budget_left = token_budget
@@ -6440,18 +6559,41 @@ class LlamaEngine:
                 if remaining <= budget_left:
                     chunk = remaining                       # final chunk: exact
                 else:
-                    # Continuing chunk: largest chunk_size-aligned block that fits.
-                    aligned = (budget_left // ssd_chunk) * ssd_chunk
+                    # Continuing chunk: largest aligned block that fits.
+                    aligned = (budget_left // chunk_align) * chunk_align
                     if aligned <= 0:
                         if prefill_seqs:
                             break                           # no room; next step
-                        aligned = ssd_chunk                 # guarantee progress
+                        aligned = chunk_align               # guarantee progress
                     chunk = aligned
                 prefill_seqs.append(s)
                 prefill_chunk_lens.append(chunk)
                 budget_left -= chunk
                 if budget_left <= 0:
                     break
+            # A *final* chunk is a prompt's exact remainder, so the step's
+            # prefill token count can still land unaligned -- that count is the
+            # contiguous axis of the x_proj / out_proj operands (see the mixer),
+            # and an odd one costs ~3 ms per layer.  Shaving the tail off the
+            # last chunk keeps the total aligned.  Skipped for Mamba2, whose
+            # token-major mixer is immune and whose chunk boundaries are
+            # load-bearing.
+            if not mr.is_mamba2 and prefill_chunk_lens:
+                excess = sum(prefill_chunk_lens) % _MAMBA_GEMM_ALIGN
+                # Only trim while prefill work outlives this step regardless, so
+                # the trimmed tail rides along in a step that was already going
+                # to run.  If this step would have drained the queue, trimming
+                # would buy a whole extra forward pass instead, and the mixer's
+                # cheap pad is the better trade.
+                if 0 < excess < prefill_chunk_lens[-1] and (
+                    waiting
+                    or len(prefilling) > len(prefill_seqs)
+                    or any(
+                        c < s.num_remaining_prefill
+                        for s, c in zip(prefill_seqs, prefill_chunk_lens)
+                    )
+                ):
+                    prefill_chunk_lens[-1] -= excess
             _t_admit = (time.perf_counter() - _t0) if _profile else 0.0
 
             if not prefill_seqs and not decode_seqs:
@@ -6536,6 +6678,10 @@ class LlamaEngine:
             _t_call = (time.perf_counter() - _t1) if _profile else 0.0
 
             _t1 = time.perf_counter() if _profile else 0.0
+            # Greedy sampling for the whole batch in one argmax + one D2H copy.
+            # Per-row ``argmax().item()`` costs a launch and a device sync each,
+            # which at ~500 rows per mixed step dominated the step's host time.
+            greedy_ids = logits.argmax(dim=-1).tolist() if all_greedy else None
             row = 0
             new_running: list[Sequence] = []
             finished_now: list[Sequence] = []
@@ -6547,11 +6693,14 @@ class LlamaEngine:
             for s, chunk in zip(prefill_seqs, prefill_chunk_lens):
                 s.num_computed_tokens += chunk
                 if s.num_remaining_prefill == 0:
-                    logit_row = logits[row]
                     sp = seq_sp[id(s)]
-                    tok_id = _sample(logit_row, sp)
-                    if collect_logits:
-                        seq_logits[id(s)].append(logit_row.detach().cpu())
+                    if greedy_ids is not None:
+                        tok_id = greedy_ids[row]
+                    else:
+                        logit_row = logits[row]
+                        tok_id = _sample(logit_row, sp)
+                        if collect_logits:
+                            seq_logits[id(s)].append(logit_row.detach().cpu())
                     if _finalize(s, tok_id):
                         finished_now.append(s)
                     else:
@@ -6561,11 +6710,14 @@ class LlamaEngine:
                 row += 1
             # Decode rows follow.
             for s in decode_seqs:
-                logit_row = logits[row]
                 sp = seq_sp[id(s)]
-                tok_id = _sample(logit_row, sp)
-                if collect_logits:
-                    seq_logits[id(s)].append(logit_row.detach().cpu())
+                if greedy_ids is not None:
+                    tok_id = greedy_ids[row]
+                else:
+                    logit_row = logits[row]
+                    tok_id = _sample(logit_row, sp)
+                    if collect_logits:
+                        seq_logits[id(s)].append(logit_row.detach().cpu())
                 row += 1
                 if _finalize(s, tok_id):
                     finished_now.append(s)
