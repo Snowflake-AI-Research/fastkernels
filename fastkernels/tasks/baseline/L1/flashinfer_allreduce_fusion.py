@@ -195,16 +195,28 @@ def destroy_fi_ar_workspaces() -> None:
 
 
 def _unfused(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
-             eps: float) -> tuple[torch.Tensor, torch.Tensor]:
+             eps: float, weight_bias: float = 0.0,
+             ) -> tuple[torch.Tensor, torch.Tensor]:
     """All-reduce then fused_add_rms_norm -- the path this op replaces.
 
     Used above the workspace's token bound and whenever the fusion is
     unavailable. Goes through the same two kernels the unfused graph would, so
     falling back costs nothing beyond not being fused.
+
+    ``weight_bias=1.0`` selects the Gemma convention, where the checkpoint
+    stores the scale as an offset from 1.0 and the norm must apply
+    ``(1 + weight)`` in fp32.
     """
+    out = torch.ops.fastkernels.custom_all_reduce(x)
+    if weight_bias == 1.0:
+        from .gemma_rms_norm import GemmaRMSNorm
+
+        return GemmaRMSNorm._forward_static_with_residual(
+            weight, eps, out, residual,
+        )
+
     from .rms_norm import RMSNorm
 
-    out = torch.ops.fastkernels.custom_all_reduce(x)
     res = residual.clone()
     return RMSNorm.forward_cuda(out, weight, eps, res)
 
@@ -214,8 +226,15 @@ def fused_allreduce_add_rmsnorm(
     residual: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
+    weight_bias: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``all_reduce(x) + residual``, RMSNormed, in one kernel.
+
+    ``weight_bias`` is added to ``rms_gamma`` inside the kernel, in fp32. Pass
+    1.0 for Gemma-convention norms (Qwen3-Next, Gemma) so the ``(1 + weight)``
+    scale is formed at full precision rather than rounded into bf16 by the
+    caller -- the same knob vLLM's ``AllReduceFusedAddGemmaRMSNormPattern``
+    uses.
 
     Returns ``(normed, new_residual)`` where ``new_residual`` is the summed
     activation before normalisation -- the same two values the unfused
@@ -233,7 +252,7 @@ def fused_allreduce_add_rmsnorm(
 
     workspace, max_token_num = get_fi_ar_workspace(hidden_dim, x.dtype)
     if workspace is None or num_tokens > max_token_num:
-        return _unfused(x, residual, weight, eps)
+        return _unfused(x, residual, weight, eps, weight_bias)
 
     x2d = x2d.contiguous()
     res2d = res2d.contiguous()
@@ -251,6 +270,7 @@ def fused_allreduce_add_rmsnorm(
         residual_in=res2d,
         rms_gamma=weight,
         rms_eps=eps,
+        weight_bias=weight_bias,
         # mnnvl sizes its own one-shot workspace around FlashInfer's AUTO
         # strategy, so forcing a choice can request one-shot for a tensor that
         # does not fit it. Let FlashInfer decide (vLLM does the same).
@@ -258,18 +278,56 @@ def fused_allreduce_add_rmsnorm(
         fp32_acc=True,
         # The one-shot Lamport all-reduce signals PDL completion before its
         # output buffer is committed, so a PDL-launched successor can read an
-        # uninitialized buffer and produce NaN. Only reachable at small token
-        # counts, where one-shot is always chosen -- so complete at the end
-        # there. Mirrors vLLM's condition exactly.
-        trigger_completion_at_end=num_tokens > _PDL_ADVANCE_LAUNCH_TOKENS,
+        # uninitialized buffer and produce NaN. vLLM guards this with
+        # ``(use_oneshot is True) or num_tokens > PDL_ADVANCE_LAUNCH_TOKENS``,
+        # which is safe for them because their pass resolves ``use_oneshot`` per
+        # compile range and pins it True on the small-token (decode) range. We
+        # leave the choice to FlashInfer's AUTO strategy -- forcing one-shot can
+        # request a payload mnnvl's one-shot workspace cannot hold -- so we
+        # cannot know here whether one-shot was selected, and the only safe
+        # translation of vLLM's condition is to always complete at the end. The
+        # early signal is only worth anything for the two-shot path at large
+        # token counts, where the collective dwarfs the PDL overlap.
+        trigger_completion_at_end=True,
     )
     return norm_out.view(orig_shape), residual_out.view(residual.shape)
+
+
+def fused_allreduce_add_gemma_rmsnorm(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    norm,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``norm(all_reduce(x), residual)`` for a Gemma-convention norm, fused.
+
+    ``x`` is the *un-reduced* per-rank partial that a ``RowParallelLinear`` (or
+    an MoE's summed expert output) produced with ``reduce_results=False``;
+    ``norm`` is the ``GemmaRMSNorm`` that follows it. The Gemma ``(1 + weight)``
+    scale is formed inside the kernel in fp32 via ``weight_bias=1.0``, so this
+    is not a precision trade against the unfused pair.
+
+    Above the workspace's token bound, or wherever FlashInfer's fused collective
+    is unavailable, this falls back to an explicit all-reduce plus ``norm`` --
+    the same two kernels, and the same numerics, as leaving the linear reducing.
+
+    This is the eager counterpart of what ``AllReduceFusedAddRMSNormPass``
+    rewrites in a compiled graph, and mirrors vLLM's own
+    ``fused_allreduce_gemma_rms_norm`` helper for models that run eager.
+    """
+    hidden_dim = x.shape[-1]
+    workspace, max_token_num = get_fi_ar_workspace(hidden_dim, x.dtype)
+    if workspace is not None and x.reshape(-1, hidden_dim).shape[0] <= max_token_num:
+        return fused_allreduce_add_rmsnorm(
+            x, residual, norm.weight, norm.variance_epsilon, weight_bias=1.0,
+        )
+    return norm(torch.ops.fastkernels.custom_all_reduce(x), residual)
 
 
 def fused_allreduce_rmsnorm(
     x: torch.Tensor,
     weight: torch.Tensor,
     eps: float,
+    weight_bias: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``all_reduce(x)`` then RMSNorm with no residual, in one kernel.
 
@@ -296,9 +354,14 @@ def fused_allreduce_rmsnorm(
     # ``zeros is None`` can only happen if this op runs before the workspace was
     # built; falling back avoids ever allocating it inside a capture.
     if workspace is None or zeros is None or num_tokens > max_token_num:
+        out = torch.ops.fastkernels.custom_all_reduce(x)
+        if weight_bias == 1.0:
+            from .gemma_rms_norm import GemmaRMSNorm
+
+            return GemmaRMSNorm._forward_static_no_residual(weight, eps, out), out
+
         from .rms_norm import RMSNorm
 
-        out = torch.ops.fastkernels.custom_all_reduce(x)
         return RMSNorm.forward_cuda(out, weight, eps), out
 
     x2d = x2d.contiguous()
@@ -315,8 +378,11 @@ def fused_allreduce_rmsnorm(
         residual_in=zeros[:num_tokens],
         rms_gamma=weight,
         rms_eps=eps,
+        weight_bias=weight_bias,
         use_oneshot=None,
         fp32_acc=True,
-        trigger_completion_at_end=num_tokens > _PDL_ADVANCE_LAUNCH_TOKENS,
+        # See fused_allreduce_add_rmsnorm: with AUTO one-shot selection the only
+        # safe value is True.
+        trigger_completion_at_end=True,
     )
     return norm_out.view(orig_shape), ar_out.view(orig_shape)

@@ -136,6 +136,22 @@ class KimiLinearMetadata:
 
     has_initial_state: torch.Tensor | None = None
 
+    # Host-side summary of ``has_initial_state``. The GDN prefill path needs to
+    # know which slots must be zeroed before the chunk kernel reads them;
+    # deriving that on the device costs a stream sync per layer, and the chunk
+    # planner already knows the answer when it builds the step. Defaults say
+    # "some but not all", which routes the layer through the device mask -- the
+    # correct answer for any producer that does not fill these in.
+    all_have_initial_state: bool = False
+    any_have_initial_state: bool = True
+
+    # ``query_start_loc`` as int32 and ``state_indices`` as int64, materialized
+    # once per step instead of once per layer -- the conv, chunk and recurrent
+    # kernels all want int32 cu_seqlens, and the prefill state gather wants int64
+    # indices. ``None`` means "not precomputed"; callers convert themselves.
+    query_start_loc_int32: torch.Tensor | None = None
+    state_indices_long: torch.Tensor | None = None
+
     slot_mapping: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
 

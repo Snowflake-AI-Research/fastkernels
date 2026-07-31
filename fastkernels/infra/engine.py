@@ -576,6 +576,11 @@ class ModelRunner:
             elif self.is_qwen3_next:
                 if rank == 0:
                     print("  [3/6] Allocating Qwen3-Next state/KV cache...", flush=True)
+                # Before the cache sizing, not after: the fused-collective
+                # workspace and its zero-residual buffer are hundreds of MiB, and
+                # claiming them after the KV cache has already taken everything
+                # gpu_memory_utilization allows would OOM.
+                self._init_fi_allreduce_fusion_workspace()
                 self.allocate_mamba_state_cache()
                 if not self.enforce_eager:
                     if rank == 0:
@@ -1864,6 +1869,24 @@ class ModelRunner:
             print(f"  Mamba state cache: {num_slots - 1} sequence slots "
                   f"({per_slot_bytes / (1<<20):.1f} MiB/slot, slot 0 reserved)")
 
+    def _init_fi_allreduce_fusion_workspace(self):
+        """Create the FlashInfer fused-collective workspace before graph capture.
+
+        ``fused_allreduce_add_gemma_rmsnorm`` creates it lazily on first use.
+        That first use would otherwise be the eager warmup inside
+        ``capture_kimi_cudagraph``, and the workspace (plus the zero-residual
+        buffer it allocates) must not land in a graph's private memory pool.
+        Doing it here also means a topology without NVSwitch multicast decides
+        the fallback once, at startup, rather than per step.
+        """
+        if self.world_size <= 1:
+            return
+        from ..tasks.baseline.L1.flashinfer_allreduce_fusion import (
+            get_fi_ar_workspace,
+        )
+
+        get_fi_ar_workspace(self.config.hidden_size, self.dtype)
+
     def can_allocate_mamba_state(self):
         return self.mamba_state_manager is not None and \
             self.mamba_state_manager.has_free_slot()
@@ -1882,6 +1905,7 @@ class ModelRunner:
         ):
             sm = self.mamba_state_manager
             pad_slot = getattr(self, "_kimi_pad_state_slot", self._KIMI_PAD_SLOT_ID)
+            pad_block = getattr(self, "_kimi_pad_block_id", self._KIMI_PAD_SLOT_ID)
             # Skip slot 0 as well as the pad slot: the FLA recurrent kernels and
             # vLLM's causal-conv kernels read state index 0 as "skip this
             # sequence" (``NULL_BLOCK_ID`` is 0), so a sequence placed there gets
@@ -1889,18 +1913,26 @@ class ModelRunner:
             # ``fused_recurrent_kda``: slot 0 -> NaN with zero state delta, slots
             # 1 and 3 -> clean with delta ~0.088. vLLM's block allocator reserves
             # block 0 for the same reason.
-            sm._free_slots = deque(
-                slot for slot in range(1, sm.num_slots) if slot != pad_slot
-            )
-            sm._in_use.clear()
-            if sm._free_blocks is not None:
-                pad_block = getattr(
-                    self, "_kimi_pad_block_id", self._KIMI_PAD_SLOT_ID,
-                )
-                sm._free_blocks = deque(
+            #
+            # The pristine order is fixed for the life of the engine, so it is
+            # built once and copied. Re-running the generator expression cost
+            # 8.0 ms per ``generate()`` at the long-context KV size (239k
+            # blocks) against 1.4 ms to refill from a cached list, and this runs
+            # on every rank on every call.
+            key = (sm.num_slots, pad_slot, sm.num_mla_blocks, pad_block)
+            if getattr(self, "_kimi_free_pool_key", None) != key:
+                self._kimi_free_slot_pool = [
+                    slot for slot in range(1, sm.num_slots) if slot != pad_slot
+                ]
+                self._kimi_free_block_pool = [
                     block for block in range(sm.num_mla_blocks)
                     if block != pad_block
-                )
+                ]
+                self._kimi_free_pool_key = key
+            sm._free_slots = deque(self._kimi_free_slot_pool)
+            sm._in_use.clear()
+            if sm._free_blocks is not None:
+                sm._free_blocks = deque(self._kimi_free_block_pool)
 
     def empty_cuda_cache(self):
         """Drop the PyTorch caching allocator's cached blocks.
@@ -2276,6 +2308,12 @@ class ModelRunner:
                     has_initial_state=has_init_v,
                     slot_mapping=slot32_v,
                     block_tables=bt_v,
+                    # ``cu_q_v`` is already int32, so this only spares the
+                    # layers a no-op ``.to()`` call; decode never needs the
+                    # int64 state indices.
+                    query_start_loc_int32=cu_q_v,
+                    all_have_initial_state=True,
+                    any_have_initial_state=True,
                 )
                 self._kimi_graph_metas[bs] = md
 
@@ -2850,15 +2888,19 @@ class ModelRunner:
         block_size = sm_.block_size
         use_prefill_path = bool(prefill_seqs)
 
-        ids: list[int] = []
-        positions: list[int] = []
         cu: list[int] = [0]
-        slot_mapping: list[int] = []
         state_indices: list[int] = []
         seq_lens: list[int] = []
         has_initial_state: list[bool] = []
         block_tables_rows: list[list[int]] = []
         consumed: list[tuple["Sequence", int]] = []
+        # Per-sequence numpy pieces, concatenated once at the end. A prefill
+        # chunk is up to max_num_batched_tokens long, so building ids /
+        # positions / slot_mapping with a Python loop per token costs several ms
+        # of interpreter time per step on a path that is otherwise GPU-bound.
+        ids_parts: list[np.ndarray] = []
+        pos_parts: list[np.ndarray] = []
+        slot_parts: list[np.ndarray] = []
         max_query_len = 0
         max_seq_len = 0
         max_blocks = 0
@@ -2869,21 +2911,26 @@ class ModelRunner:
             chunk = chunk_by_seq.get(id(seq))
             if chunk is not None:
                 start_pos = seq.num_computed_tokens
-                tokens = list(seq.token_ids[start_pos:start_pos + chunk])
-                if not tokens:
+                n_tok = min(chunk, len(seq.token_ids) - start_pos)
+                if n_tok <= 0:
                     continue
-                seq_total = start_pos + len(tokens)
+                seq_total = start_pos + n_tok
+                token_ids = np.asarray(
+                    seq.token_ids[start_pos:start_pos + n_tok], dtype=np.int64,
+                )
             else:
                 start_pos = len(seq) - 1
-                tokens = [seq.last_token]
+                n_tok = 1
                 seq_total = len(seq)
+                token_ids = np.asarray([seq.last_token], dtype=np.int64)
 
             sm_.ensure_blocks_for(seq, seq_total)
 
-            n_tok = len(tokens)
             consumed.append((seq, n_tok))
-            ids.extend(tokens)
-            positions.extend(range(start_pos, start_pos + n_tok))
+            ids_parts.append(token_ids)
+            pos_parts.append(
+                np.arange(start_pos, start_pos + n_tok, dtype=np.int64),
+            )
             cu.append(cu[-1] + n_tok)
             state_indices.append(seq.state_slot)
             seq_lens.append(seq_total)
@@ -2891,33 +2938,51 @@ class ModelRunner:
             max_query_len = max(max_query_len, n_tok)
             max_seq_len = max(max_seq_len, seq_total)
 
-            for t in range(n_tok):
-                global_pos = start_pos + t
-                block_idx = global_pos // block_size
-                if block_idx < len(seq.block_table):
-                    block_id = seq.block_table[block_idx]
-                    slot_mapping.append(
-                        block_id * block_size + (global_pos % block_size),
-                    )
-                else:
-                    slot_mapping.append(-1)
-            block_tables_rows.append(list(seq.block_table))
+            # slot = block_table[pos // block_size] * block_size + pos % block_size,
+            # with -1 for positions past the allocated blocks (the kernels treat
+            # that as "do not write").
+            row = np.asarray(seq.block_table, dtype=np.int64)
+            gpos = np.arange(start_pos, start_pos + n_tok, dtype=np.int64)
+            blk = gpos // block_size
+            in_range = blk < row.shape[0]
+            slots = np.full(n_tok, -1, dtype=np.int64)
+            if in_range.any():
+                sel = blk[in_range]
+                slots[in_range] = (
+                    row[sel] * block_size + (gpos[in_range] - sel * block_size)
+                )
+            slot_parts.append(slots)
+            block_tables_rows.append(seq.block_table)
             max_blocks = max(max_blocks, len(seq.block_table))
 
-        if not ids:
+        if not ids_parts:
             return None
 
-        n_tokens = len(ids)
+        ids_np = (
+            ids_parts[0] if len(ids_parts) == 1 else np.concatenate(ids_parts)
+        )
+        pos_np = (
+            pos_parts[0] if len(pos_parts) == 1 else np.concatenate(pos_parts)
+        )
+        slot_np = (
+            slot_parts[0] if len(slot_parts) == 1 else np.concatenate(slot_parts)
+        )
+
+        n_tokens = ids_np.shape[0]
         batch_size = len(state_indices)
 
-        ids_t = torch.tensor(ids, dtype=torch.int64, pin_memory=True).to(
+        ids_t = torch.from_numpy(ids_np).pin_memory().to(
             device, non_blocking=True,
         )
-        pos_t = torch.tensor(positions, dtype=torch.int64, pin_memory=True).to(
+        pos_t = torch.from_numpy(pos_np).pin_memory().to(
             device, non_blocking=True,
         )
         cu_cpu = torch.tensor(cu, dtype=torch.int64, pin_memory=True)
         cu_gpu = cu_cpu.to(device, non_blocking=True)
+        # One int32 copy for the whole step: the GDN layers, the conv kernel and
+        # the attention context all want int32 cu_seqlens, and converting per
+        # call was 3 launches per step plus 2 per GDN layer.
+        cu_int32 = cu_gpu.to(torch.int32)
         state_idx_t = torch.tensor(
             state_indices, dtype=torch.int32, pin_memory=True,
         ).to(device, non_blocking=True)
@@ -2927,12 +2992,10 @@ class ModelRunner:
         has_init_t = torch.tensor(
             has_initial_state, dtype=torch.bool, pin_memory=True,
         ).to(device, non_blocking=True)
-        slot_t = torch.tensor(
-            slot_mapping, dtype=torch.int32, pin_memory=True,
-        ).to(device, non_blocking=True)
-        slot_t_mha = torch.tensor(
-            slot_mapping, dtype=torch.int64, pin_memory=True,
-        ).to(device, non_blocking=True)
+        slot_t_mha = torch.from_numpy(slot_np).pin_memory().to(
+            device, non_blocking=True,
+        )
+        slot_t = slot_t_mha.to(torch.int32)
 
         if max_blocks == 0:
             block_tables_t = torch.zeros(
@@ -2973,10 +3036,22 @@ class ModelRunner:
             has_initial_state=has_init_t,
             slot_mapping=slot_t,
             block_tables=block_tables_t,
+            # Precomputed once per step: the GDN layers would otherwise convert
+            # ``query_start_loc`` to int32 and ``state_indices`` to int64 on
+            # every one of the 36 linear-attention layers.
+            query_start_loc_int32=cu_int32,
+            state_indices_long=(
+                state_idx_t.long() if use_prefill_path else None
+            ),
+            all_have_initial_state=all(has_initial_state),
+            any_have_initial_state=any(has_initial_state),
         )
         if num_prefills > 0:
             nums_dict, batch_ptr, token_chunk_offset_ptr = (
-                compute_causal_conv1d_metadata(md.non_spec_query_start_loc)
+                compute_causal_conv1d_metadata(
+                    md.non_spec_query_start_loc,
+                    seqlens_cpu=[cu[i + 1] - cu[i] for i in range(batch_size)],
+                )
             )
             md.nums_dict = nums_dict
             md.batch_ptr = batch_ptr
@@ -2984,8 +3059,8 @@ class ModelRunner:
 
         set_context(
             use_prefill_path,
-            cu_seqlens_q=cu_gpu.to(torch.int32),
-            cu_seqlens_k=cu_gpu.to(torch.int32),
+            cu_seqlens_q=cu_int32,
+            cu_seqlens_k=cu_int32,
             max_seqlen_q=max_query_len,
             max_seqlen_k=max_seq_len,
             slot_mapping=slot_t_mha,
@@ -6155,6 +6230,15 @@ class LlamaEngine:
             # and num_computed_tokens (vLLM's chunked-prefill contract), so a
             # 128K prompt never materializes a full-sequence chunk-scan
             # transient.
+            #
+            # The sequence that runs into the budget is *split* rather than
+            # deferred, so every step is filled exactly. Ending the step short
+            # instead looks harmless but is not: on the LongBench-v2 length mix
+            # (5.8K..131.6K) it left 21% of each step's budget unused and took
+            # 126 forwards where 100 carry the same 1.63M tokens, and a forward
+            # costs the same launch overhead however few tokens are in it. This
+            # is what vLLM's scheduler does -- it fills
+            # ``max_num_batched_tokens`` to the token.
             prefill_seqs: list[Sequence] = []
             prefill_chunk_lens: list[int] = []
             budget_left = max_batched_tokens
@@ -6162,12 +6246,7 @@ class LlamaEngine:
                 remaining = seq.num_remaining_prefill
                 if remaining <= 0:
                     continue
-                if remaining <= budget_left:
-                    chunk = remaining
-                elif prefill_seqs:
-                    break               # no room left; next step
-                else:
-                    chunk = budget_left  # guarantee progress
+                chunk = remaining if remaining <= budget_left else budget_left
                 prefill_seqs.append(seq)
                 prefill_chunk_lens.append(chunk)
                 budget_left -= chunk

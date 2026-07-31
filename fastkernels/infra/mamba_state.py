@@ -23,17 +23,27 @@ import torch
 
 def compute_causal_conv1d_metadata(
     query_start_loc_p: torch.Tensor,
+    seqlens_cpu: list[int] | None = None,
 ) -> tuple[dict, torch.Tensor, torch.Tensor]:
     """Precompute the aux pointers used by vLLM's varlen causal-conv kernel.
 
     This is Mamba v1 prefill metadata, so it lives with the Mamba state
     structs rather than in the generic engine.
+
+    ``seqlens_cpu`` lets a caller that already knows the per-sequence chunk
+    lengths on the host pass them in. Without it the lengths have to be read
+    back off ``query_start_loc_p``, which is two device syncs (the ``.to("cpu")``
+    and the ``.item()``) on a path that runs once per prefill step -- and the
+    engine's chunk planner builds those lengths in Python anyway.
     """
-    seqlens = query_start_loc_p.diff().to(device="cpu", dtype=torch.int32)
+    device = query_start_loc_p.device
+    if seqlens_cpu is None:
+        seqlens = query_start_loc_p.diff().to(device="cpu", dtype=torch.int32)
+    else:
+        seqlens = torch.tensor(seqlens_cpu, dtype=torch.int32, device="cpu")
     nums_dict: dict = {}
     batch_ptr = None
     token_chunk_offset_ptr = None
-    device = query_start_loc_p.device
 
     for block_m in [8]:
         nums = torch.div(
@@ -41,9 +51,10 @@ def compute_causal_conv1d_metadata(
             block_m,
             rounding_mode="floor",
         )
+        nums_list = nums.tolist()
         nums_dict[block_m] = {}
         nums_dict[block_m]["nums"] = nums
-        nums_dict[block_m]["tot"] = nums.sum().item()
+        nums_dict[block_m]["tot"] = sum(nums_list)
 
         mlist = torch.repeat_interleave(
             torch.arange(len(nums), dtype=torch.int32, device="cpu"),
@@ -55,7 +66,7 @@ def compute_causal_conv1d_metadata(
         max_num_programs = max(1024, mlist_len) * 2
 
         offsetlist: list[int] = []
-        for num in nums.tolist():
+        for num in nums_list:
             offsetlist.extend(range(num))
         offsetlist_t = torch.tensor(offsetlist, dtype=torch.int32)
         nums_dict[block_m]["offsetlist"] = offsetlist_t

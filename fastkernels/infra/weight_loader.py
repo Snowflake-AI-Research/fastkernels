@@ -1698,11 +1698,16 @@ def load_model(
     # does once in ``convert_to_unquantized_kernel_format``. No-op when the
     # trtllm path is not selected.
     from ..tasks.baseline.L2.kimi_moe import KimiMoE as _FkKimiMoE
+    from ..tasks.baseline.L2.qwen3_next_gdn_attention import (
+        Qwen3NextGDNAttention as _FkQwen3NextGDN,
+    )
     from ..tasks.baseline.L2.shared_expert_moe import (
         SharedExpertMoE as _FkSharedExpertMoE,
     )
+    # Qwen3-Next's GDN layers use the same hook to alias their two input
+    # projections into one buffer so they run as a single GEMM.
     for mod in model.modules():
-        if isinstance(mod, (_FkKimiMoE, _FkSharedExpertMoE)):
+        if isinstance(mod, (_FkKimiMoE, _FkSharedExpertMoE, _FkQwen3NextGDN)):
             mod.process_weights_after_loading()
 
     model.eval()

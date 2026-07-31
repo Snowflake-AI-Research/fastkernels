@@ -9,6 +9,7 @@ from ....infra.tp import _tp_rank, _tp_size
 from ..L1.allreduce import AllReduce
 from ..L1.gate_linear import GateLinear
 from ..L1.grouped_topk import GroupedTopK
+from ..L1.moe_shared_gate_add import moe_shared_gate_add
 from ..L1.silu_and_mul import SiluAndMul
 from ..L1.trtllm_bf16_moe import (
     TrtLlmBf16MoE,
@@ -92,6 +93,7 @@ class SharedExpertMoE(nn.Module):
         shared_expert_intermediate_size: int = 0,
         shared_expert_attr_name: str = "shared_expert",
         shared_expert_gate: bool = False,
+        reduce_results: bool = True,
     ):
         super().__init__()
         self.num_experts = num_experts
@@ -136,6 +138,9 @@ class SharedExpertMoE(nn.Module):
 
         self.fused_experts = FusedExperts()
         self.allreduce = AllReduce()
+        # ``reduce_results=False`` hands the un-reduced partial sum back to the
+        # caller, which folds the collective into its next norm.
+        self.reduce_results = reduce_results
 
         # trtllm-gen BF16 MoE: what vLLM 0.26 runs for this MoE on Blackwell
         # (``FLASHINFER_TRTLLM`` unquantized backend ->
@@ -252,20 +257,40 @@ class SharedExpertMoE(nn.Module):
             )
         return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
-    def _shared_expert_output(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+    # Token count below which the shared-expert gate projection is folded into
+    # the epilogue kernel instead of run as its own gemv. The gemv is a
+    # ``[hidden] -> [1]`` dot whose 5.33 us is all launch latency, so folding
+    # wins while that dominates; past this the projection is a real GEMM and the
+    # kernel's per-tile recomputation of the dot would start to cost more than
+    # the launch it saves.
+    _FUSE_GATE_MAX_TOKENS = 256
+
+    def _shared_expert_output(
+        self, hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Return ``(shared_output, raw_gate)``, both ``None`` without a shared expert.
+
+        The gate's sigmoid and the scaling are deliberately *not* applied here:
+        the caller folds them into the routed-output add with one kernel (see
+        :func:`moe_shared_gate_add`). ``raw_gate`` is ``None`` when there is
+        nothing for the caller to apply -- either the shared expert has no gate,
+        or the gate projection itself is being folded into that same kernel.
+        """
         if not self.has_shared_expert:
-            return None
+            return None, None
         shared_mlp = getattr(self, self.shared_expert_attr_name)
         out = shared_mlp(hidden_states)
-        if self.shared_expert_gate is not None:
-            out = out * torch.sigmoid(self.shared_expert_gate(hidden_states))
-        return out
+        if self.shared_expert_gate is None:
+            return out, None
+        if hidden_states.shape[0] <= self._FUSE_GATE_MAX_TOKENS:
+            return out, None
+        return out, self.shared_expert_gate(hidden_states)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, self.hidden_size)
 
-        shared_output = self._shared_expert_output(hidden_states)
+        shared_output, shared_gate = self._shared_expert_output(hidden_states)
         if self.gate_linear is not None:
             router_logits = self.gate_linear(
                 hidden_states,
@@ -304,8 +329,25 @@ class SharedExpertMoE(nn.Module):
         # Add the shared expert's *unreduced* partial first, then all-reduce the
         # sum once. Both terms are per-rank partial sums over the same output
         # space, so summing before the reduce is exact, and it halves the
-        # all-reduce count for layers that have a shared expert.
-        output = routed_output if shared_output is None else routed_output + shared_output
-        if self.tp_size > 1:
+        # all-reduce count for layers that have a shared expert. When the shared
+        # expert is gated, its sigmoid, the scaling and the add are a single
+        # kernel -- three separate elementwise launches per layer is what
+        # Inductor fuses away for vLLM, and at batch 1 that is pure overhead.
+        if shared_output is None:
+            output = routed_output
+        elif self.shared_expert_gate is None:
+            output = routed_output + shared_output
+        elif shared_gate is None:
+            # Small batch: the epilogue kernel projects the gate itself.
+            output = moe_shared_gate_add(
+                routed_output, shared_output,
+                hidden_states=hidden_states,
+                gate_weight=self.shared_expert_gate.weight,
+            )
+        else:
+            output = moe_shared_gate_add(
+                routed_output, shared_output, shared_gate,
+            )
+        if self.tp_size > 1 and self.reduce_results:
             output = self.allreduce(output)
         return output.view(orig_shape)

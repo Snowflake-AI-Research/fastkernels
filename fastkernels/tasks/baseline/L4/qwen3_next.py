@@ -54,7 +54,7 @@ from transformers import AutoConfig
 from ..L1.gemma_rms_norm import GemmaRMSNorm
 from ..L1.rotary_emb import RotaryEmbedding
 from ..L2.parallel_embedding import ParallelLMHead, VocabParallelEmbedding
-from ..L3.qwen3_next_decoder import Qwen3NextDecoderLayer
+from ..L3.qwen3_next_decoder import Qwen3NextDecoderLayer, fused_ar_norm
 
 
 def _default_layer_types() -> list[str]:
@@ -230,6 +230,9 @@ class Qwen3NextModel(nn.Module):
              for i in range(config.num_hidden_layers)]
         )
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self._fuse_ar_norm = (
+            self.layers[0].fuse_ar_norm if config.num_hidden_layers else False
+        )
 
         # RoPE: partial rotary (only rotary_dim = partial_rotary_factor * head_dim)
         rotary_dim = int(config.head_dim * config.partial_rotary_factor)
@@ -258,7 +261,11 @@ class Qwen3NextModel(nn.Module):
             )
 
         if residual is not None:
-            hidden_states, _ = self.norm(hidden_states, residual)
+            # The last layer's MoE handed back an un-reduced partial when TP
+            # fusion is on; this norm closes that contract.
+            hidden_states, _ = fused_ar_norm(
+                self.norm, hidden_states, residual, self._fuse_ar_norm,
+            )
         else:
             hidden_states = self.norm(hidden_states)
         return hidden_states
