@@ -501,7 +501,16 @@ _PER_MODEL_DEFAULTS: dict[str, dict] = {
         },
     },
     "qwen2-vl": {
-        "env": {"FASTKERNELS_MAX_ENCODER_TOKENS": "4096"},
+        # No FASTKERNELS_MAX_ENCODER_TOKENS override. vLLM sets
+        # ``max_num_encoder_input_tokens = encoder_cache_size =
+        # max_num_batched_tokens`` (16384 here, config/scheduler.py), charged in
+        # post-merge multimodal embedding tokens -- the same unit fastkernels'
+        # has_mm admission path uses. Capping ours at 4096 admitted 4x fewer
+        # images per step (measured: 5.7 vs 22.5 on VisionArena, so 176 prefill
+        # steps instead of ~45), which lengthened the ramp and cost ~15% of the
+        # image scenario. It was also inconsistent with our own memory profiling:
+        # _warmup_vision_encoder already sizes the multimodal reserve for a
+        # *full* max_num_batched_tokens encoder batch.
         "gpu_memory_utilization": 0.80,
     },
 }
@@ -1228,6 +1237,8 @@ def _filter_and_prepare(mm_data, processor, max_input_tokens):
             images_for_proc = None
             videos_for_proc = None
             audios_for_proc = None
+            video_metadata = None
+            do_sample_frames = None
             if item["audio"] is not None:
                 messages[0]["content"].append(
                     {"type": "audio", "audio": item["audio"]})
@@ -1238,13 +1249,18 @@ def _filter_and_prepare(mm_data, processor, max_input_tokens):
                         {"type": "image", "image": img})
                 images_for_proc = item["images"]
             if item["video_frames"] is not None:
-                frames_pil = [
-                    Image.fromarray(item["video_frames"][j]).convert("RGB")
-                    for j in range(item["video_frames"].shape[0])
-                ]
+                # Count tokens the way both engines will actually process the
+                # clip: frames + metadata. Counting a metadata-less PIL frame
+                # list instead understates Qwen3-VL video by ~7x, because the
+                # HF video processor then re-samples 32 frames down to 4.
+                meta = item["video_metadata"] or {}
                 messages[0]["content"].append(
-                    {"type": "video", "video": frames_pil})
-                videos_for_proc = [frames_pil]
+                    {"type": "video", "video": item["video_frames"]})
+                videos_for_proc = [item["video_frames"]]
+                do_sample_frames = bool(meta.get("do_sample_frames", False))
+                video_metadata = [
+                    {k: v for k, v in meta.items() if k != "do_sample_frames"}
+                ]
             messages[0]["content"].append(
                 {"type": "text", "text": item["prompt"]})
             text = processor.apply_chat_template(
@@ -1256,6 +1272,9 @@ def _filter_and_prepare(mm_data, processor, max_input_tokens):
                 return_tensors="pt",
                 padding=True,
             )
+            if video_metadata is not None:
+                processor_kwargs["video_metadata"] = video_metadata
+                processor_kwargs["do_sample_frames"] = do_sample_frames
             if audios_for_proc is not None:
                 processor_kwargs["audio"] = audios_for_proc
             inputs = processor(**processor_kwargs)
@@ -1625,11 +1644,14 @@ def main():
                 else:
                     batch_images.append(None)
                 if item["video_frames"] is not None:
-                    frames_pil = [
-                        Image.fromarray(item["video_frames"][j]).convert("RGB")
-                        for j in range(item["video_frames"].shape[0])
-                    ]
-                    batch_videos.append([frames_pil])
+                    # Same (frames, metadata) pair the vLLM worker passes as
+                    # multi_modal_data["video"]. Handing fastkernels bare PIL
+                    # frames instead would drop the metadata the HF video
+                    # processor needs, and for Qwen3-VL that silently reduces
+                    # 32 frames to 4 (~490 video tokens vs vLLM's ~3520).
+                    batch_videos.append([
+                        (item["video_frames"], item["video_metadata"])
+                    ])
                 else:
                     batch_videos.append(None)
                 if item["audio"] is not None:
@@ -1718,11 +1740,9 @@ def main():
             if item["images"] is not None:
                 lat_images = [item["images"]]
             if item["video_frames"] is not None:
-                lat_frames_pil = [
-                    Image.fromarray(item["video_frames"][j]).convert("RGB")
-                    for j in range(item["video_frames"].shape[0])
-                ]
-                lat_videos = [[lat_frames_pil]]
+                lat_videos = [[
+                    (item["video_frames"], item["video_metadata"])
+                ]]
             if item["audio"] is not None:
                 lat_audios = [[item["audio"]]]
             def run_fn(p=item["prompt"], imgs=lat_images, vids=lat_videos,
