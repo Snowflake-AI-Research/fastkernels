@@ -7912,11 +7912,13 @@ class LlamaEngine:
             if u > step_profile.get("kv_peak_blocks", 0):
                 step_profile["kv_peak_blocks"] = u
 
-        def _record_decode_time(dt: float) -> None:
-            b = step_profile.get("_dc_band")
-            if b is not None:
-                step_profile.setdefault("dc_time_hist", [0.0] * 8)[b] += dt
-                step_profile["_dc_band"] = None
+        # No per-band time accumulation. It was attempted and removed: a step's
+        # band is recorded before the forward and its duration after, but the
+        # untimed step categories break the pairing, so the split dropped or
+        # misassigned time (403 steps in the top occupancy band were credited
+        # 1.1s while fast_decode alone measured 16.07s over 511 steps). The batch
+        # histogram below is sound and is what localised the preemption tail; the
+        # per-category totals are what to reason from for time.
 
         def _record_decode_batch(n: int) -> None:
             """Histogram of decode batch sizes.
@@ -7931,7 +7933,6 @@ class LlamaEngine:
             b = min(7, (n * 8) // cap)
             h[b] += 1
             _record_kv_usage()
-            step_profile["_dc_band"] = b
             step_profile["dc_max"] = max(step_profile.get("dc_max", 0), n)
 
         def _record_preemption(seq: Sequence) -> None:
@@ -8237,9 +8238,7 @@ class LlamaEngine:
                                     _fp['post'] += _fp_t4 - _fp_t3
                                     _fp['n'] += 1
                     if _step_profile_active:
-                        _dt = time.perf_counter() - _spt0
-                        step_profile["decode_time"] += _dt
-                        _record_decode_time(_dt)
+                        step_profile["decode_time"] += time.perf_counter() - _spt0
                     continue
 
             elif running and not waiting and not prefilling:
@@ -8689,9 +8688,7 @@ class LlamaEngine:
                     )
                     if _step_profile_active:
                         torch.cuda.synchronize()
-                        _dt = time.perf_counter() - _spt0
-                        step_profile["mixed_mm_time"] += _dt
-                        _record_decode_time(_dt)
+                        step_profile["mixed_mm_time"] += time.perf_counter() - _spt0
                 elif self.is_whisper:
                     input_ids_t, positions_t = self.model_runner.prepare_mixed_batch(
                         prefill_seqs, prefill_chunk_sizes, decode_seqs,
@@ -8784,14 +8781,6 @@ class LlamaEngine:
                 print(f"  decode_batch:      avg={tot_dc / max(1, nsteps):.0f} "
                       f"max={sp.get('dc_max', 0)} over {nsteps} steps "
                       f"(cap {cap}); bands {bands}")
-                th = sp.get("dc_time_hist")
-                if th:
-                    per = " ".join(
-                        f"{i*cap//8}-{(i+1)*cap//8}:{th[i]:.1f}s"
-                        f"/{th[i]/c*1e3:.0f}ms"
-                        for i, c in enumerate(sp["dc_hist"]) if c and th[i]
-                    )
-                    print(f"  decode_time/band:  {per}")
             if sp.get("vis_calls"):
                 print(f"  vision_encoder:    {sp['vis_calls']:6d} calls, "
                       f"{sp['vis_time']:.3f}s "
