@@ -8055,6 +8055,17 @@ class LlamaEngine:
             return False
 
         def _can_enter_decode_fast_path() -> bool:
+            # Note: the stagger in ``_admit_stride`` blocks admission outright on
+            # non-stride steps, so those steps carry decode and nothing else, and
+            # it is tempting to route them here (94 of 673 steps on the Qwen3-VL
+            # image scenario take the scheduler path only to admit nothing).
+            # Measured: catastrophic. Skipping the scheduler also skips
+            # ``_schedule_decode_tokens``, which is what promotes sequences whose
+            # prefill just finished into ``running`` and grows their block
+            # tables, so the fast path replays against a nearly empty batch --
+            # 673 steps became 7714 at 66 decode tokens per step instead of 760,
+            # KV peaked at 19.8% instead of 97.9%, and the scenario went
+            # 0.93x -> 0.51x. The scheduler pass on those steps is not waste.
             return (
                 running
                 and use_greedy
@@ -8063,9 +8074,39 @@ class LlamaEngine:
 
         _loop_t0 = time.perf_counter()
         _step_index = -1
+        # Kernel-level profile over a window of engine steps:
+        # FASTKERNELS_TORCH_PROFILE="<first_step>:<num_steps>". Diffing this
+        # table against vLLM's is what located the vision encoder's excess
+        # ``direct_copy`` traffic (55% of a 21ms/call deficit), so keep it
+        # available rather than re-deriving it each time.
+        _tp_win = os.environ.get("FASTKERNELS_TORCH_PROFILE")
+        _torch_prof = None
+        if _tp_win and num_prompts >= 100:
+            # Warmup and alignment call generate() with a handful of prompts and
+            # reset the step index each time, so an ungated window profiles those
+            # instead of the timed run.
+            _tp_start, _tp_count = (int(x) for x in _tp_win.split(":"))
+        else:
+            _tp_win = None
         while (waiting or running or prefilling
                or not _produce_done.is_set()):
             _step_index += 1
+            if _tp_win:
+                if _step_index == _tp_start:
+                    _torch_prof = torch.profiler.profile(
+                        activities=[torch.profiler.ProfilerActivity.CUDA],
+                        record_shapes=False, with_stack=False,
+                    )
+                    _torch_prof.__enter__()
+                elif _torch_prof is not None and \
+                        _step_index == _tp_start + _tp_count:
+                    _torch_prof.__exit__(None, None, None)
+                    print(f"\n[Torch Profile] steps "
+                          f"[{_tp_start}, {_step_index}) "
+                          f"({_tp_count} steps)")
+                    print(_torch_prof.key_averages().table(
+                        sort_by="self_cuda_time_total", row_limit=45))
+                    _torch_prof = None
             if _produce_error:
                 break
             if pbar is not None:
@@ -8416,6 +8457,14 @@ class LlamaEngine:
                         break
                 elif has_mm:
                     chunk = min(prompt_len, token_budget)
+                    # Refusing to split a prompt that would have fit in a full
+                    # step was tried here and reverted. It does what it says --
+                    # under the stagger the remainder otherwise gets a forward
+                    # pass of its own, so Qwen3-VL image went from 67 mixed steps
+                    # averaging 8.2k prefill tokens to 36 averaging 15.2k, and
+                    # total steps 673 -> 638 -- but the time simply moved from
+                    # prefill into decode: throughput fell 16,689 -> 16,330 tok/s
+                    # against the same reference. vLLM splits freely; so do we.
                     seq_encoder_tokens = _seq_encoder_tokens(seq, merge_size)
                     if mm_admitted and seq_encoder_tokens > encoder_budget:
                         _admit_stop = "encoder_budget"
