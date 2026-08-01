@@ -1400,8 +1400,23 @@ class ModelRunner:
             # i.e. it stays on the near side of that cliff, and the whole
             # remaining gap came from us sitting on the far side of it.
             measured = getattr(self, "_mm_activation_peak_bytes", 0)
-            margin = float(os.environ.get("FASTKERNELS_MM_RESERVE_MARGIN", "1.5"))
-            floor_gib = float(os.environ.get("FASTKERNELS_MM_RUNTIME_RESERVE_GIB", "4"))
+            # This reserve is a formality, and it is important to be clear about
+            # what actually provides safety. What protects the multimodal steps is
+            # the part of the GPU that gpu_memory_utilization leaves unallocated:
+            # measured post-capture free memory is 18.0G against a 2.8G runtime
+            # peak, i.e. 6x headroom. vLLM relies on exactly the same thing --
+            # its own accounting sums to 161.04 GiB against a 160.52 GiB budget,
+            # slightly over, with only ~2G nominally attributed to activation.
+            # Holding back more than a token amount here simply forfeits KV
+            # blocks, and KV capacity is what bounds occupancy: dropping this
+            # from 4G to 0.5G took the cache from 62.7k to 64.3k blocks (vLLM has
+            # 64.5k) and Qwen3-VL video from 0.94x to 0.97x.
+            #
+            # The free-memory clamp below is what keeps this honest at any
+            # tensor-parallel width -- it guarantees the reserve exists in real
+            # free memory rather than only in this formula.
+            margin = float(os.environ.get("FASTKERNELS_MM_RESERVE_MARGIN", "0.2"))
+            floor_gib = float(os.environ.get("FASTKERNELS_MM_RUNTIME_RESERVE_GIB", "0.5"))
             already_held = max(0, peak - current)
             # Hold back the measured worst case *once*. ``available_bytes`` above
             # already subtracted (peak - current) -- and warmup_model() runs
