@@ -30,7 +30,9 @@ class VisionPatchMerger(nn.Module):
         self.hidden_size = context_dim * (spatial_merge_size ** 2)
         self.use_postshuffle_norm = use_postshuffle_norm
         norm_dim = self.hidden_size if use_postshuffle_norm else context_dim
-        self.norm = LayerNorm(norm_dim, eps=eps)
+        # See VisionBlock: vLLM's vision path uses plain nn.LayerNorm on
+        # bf16, and our fp32 promotion costs two full-tensor copies here.
+        self.norm = LayerNorm(norm_dim, eps=eps, promote_fp32=False)
         self.fc1 = ColumnParallelLinear(self.hidden_size, self.hidden_size, bias=True)
         self.act = GELU()
         self.fc2 = RowParallelLinear(self.hidden_size, d_model, bias=True)

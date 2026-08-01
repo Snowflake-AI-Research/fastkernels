@@ -921,11 +921,50 @@ class ModelRunner:
             for module in mamba2_modules:
                 module.set_shared_ssm_out_buffer(shared_ssm_out)
 
+    def _init_deepstack_buffers(self):
+        """Persistent DeepStack input buffers, as vLLM registers at init.
+
+        Qwen3-VL adds a per-level residual to the first N decoder layers, so a
+        multimodal prefill step needs one (num_tokens, hidden) tensor per level.
+        Allocating those fresh each step costs 402MB of alloc/free per step at a
+        full 16384-token budget (3 x 16384 x 4096 x 2B) -- it inflates the
+        per-step activation peak, which is charged against the KV cache, and it
+        churns the allocator, which is where the "2.32 GiB reserved but
+        unallocated" in the video OOM came from.
+
+        vLLM sizes these once to max_num_batched_tokens
+        (Qwen3VLForConditionalGeneration.__init__ -> deepstack_input_embeds) and
+        reuses them, zeroing only the rows it used. Allocating here -- before
+        allocate_kv_cache() runs -- means the KV budget accounts for them once,
+        exactly as vLLM's does, instead of leaving them to fight the KV cache for
+        headroom at runtime.
+        """
+        self._deepstack_bufs = None
+        model = getattr(self, "model", None)
+        visual = getattr(model, "visual", None)
+        if visual is None or not hasattr(visual, "deepstack_merger_list"):
+            return
+        num_levels = len(visual.deepstack_visual_indexes)
+        if num_levels <= 0:
+            return
+        rows = int(self.max_num_batched_tokens)
+        hidden = self.config.hidden_size
+        self._deepstack_bufs = [
+            torch.zeros(rows, hidden, device=f"cuda:{self.rank}",
+                        dtype=self.dtype)
+            for _ in range(num_levels)
+        ]
+        if self.rank == 0:
+            print(f"  DeepStack buffers: {num_levels} x {rows}x{hidden} "
+                  f"({num_levels * rows * hidden * 2 / 2**30:.2f}G persistent)",
+                  flush=True)
+
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
         if self.is_qwen_vl:
+            self._init_deepstack_buffers()
             self._warmup_vision_encoder()
 
         if self.is_whisper:
@@ -1249,6 +1288,24 @@ class ModelRunner:
             self._allocate_variable_kv_cache()
             return
 
+        # Free the vision warmup's encoder outputs *before* measuring. Nothing
+        # reads them, and they used to be dropped at the end of this method --
+        # i.e. after the KV cache had already been sized around them. For
+        # Qwen3-VL that is a 16384-token image's embeddings plus three DeepStack
+        # levels plus a 32-frame clip, so the KV cache was sized to avoid
+        # roughly a GiB of memory that was about to be released.
+        if hasattr(self, '_warmup_encoder_cache'):
+            del self._warmup_encoder_cache
+            import gc
+            gc.collect()
+
+        # Return the warmup's freed activations to the driver before measuring.
+        # mem_get_info() reports allocator-cached blocks as *used*, so without
+        # this the budget below silently forfeits everything warmup_model() left
+        # in the cache -- measured at several GB, which on the VLM scenarios is
+        # the difference between holding all 1000 requests and preempting 47 of
+        # them into a second decode wave.
+        torch.cuda.empty_cache()
         free, total = torch.cuda.mem_get_info()
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
@@ -1324,15 +1381,45 @@ class ModelRunner:
             # own accounting for Qwen3-VL-8B on this GPU reports "16.97 GiB for
             # weight, 1.51 GiB for peak activation, 0.23 GiB for non-torch
             # memory, and 0.52 GiB for CUDAGraph memory", i.e. ~2.3G of headroom,
-            # and it sizes 1,032,592 KV tokens where we sized 624,720. At that
-            # size Qwen3-VL thrashed: 412 preemptions and 107,670 decode tokens
-            # (21% of the scenario's output) discarded and recomputed. Measured
-            # here after the fact, the multimodal steps' real runtime headroom is
-            # reported as ``mm_runtime_peak`` by FASTKERNELS_STEP_PROFILE=1.
+            # and it sizes 1,032,592 KV tokens where we sized 624,720. Measured
+            # after the fact, the multimodal steps' real runtime headroom is
+            # ~3.0G (reported as ``mm_runtime_peak`` by FASTKERNELS_STEP_PROFILE).
+            #
+            # ``available_bytes`` above already subtracts (peak - current), and
+            # warmup_model() runs _warmup_vision_encoder() *before* this, so that
+            # term already carries the worst-case encoder activation. Reserving
+            # ``measured * margin`` on top double-counts it. Only the shortfall
+            # beyond what is already held back is charged here.
+            #
+            # This matters because KV capacity is a cliff, not a gradient: with
+            # 1000 VisionArena requests at ~1062 tokens each, holding them all
+            # means one decode wave, and holding 905 of them means two -- 95
+            # preemptions, 44k output tokens recomputed, and ~494 of 1034 decode
+            # steps running at under 128 sequences. vLLM's own stats on this
+            # scenario show "Running: 1000 reqs" with KV usage peaking at 95.2%,
+            # i.e. it stays on the near side of that cliff, and the whole
+            # remaining gap came from us sitting on the far side of it.
             measured = getattr(self, "_mm_activation_peak_bytes", 0)
-            margin = float(os.environ.get("FASTKERNELS_MM_RESERVE_MARGIN", "1.3"))
-            floor_frac = float(os.environ.get("FASTKERNELS_MM_RUNTIME_RESERVE", "0.05"))
-            mm_reserve = max(int(measured * margin), int(total * floor_frac))
+            margin = float(os.environ.get("FASTKERNELS_MM_RESERVE_MARGIN", "1.5"))
+            floor_gib = float(os.environ.get("FASTKERNELS_MM_RUNTIME_RESERVE_GIB", "4"))
+            already_held = max(0, peak - current)
+            # Hold back the measured worst case *once*. ``available_bytes`` above
+            # already subtracted (peak - current) -- and warmup_model() runs
+            # _warmup_vision_encoder() before this, so that term is largely the
+            # same encoder activation the reserve is for. Stacking both held back
+            # 3.6G where vLLM holds back 2.03G ("1.51 GiB for peak activation ...
+            # 0.52 GiB for CUDAGraph memory"), and that difference is most of why
+            # its KV is 141.81 GiB against our 137.7 GiB out of the same budget.
+            # Giving the generic term back and charging a single holdback keeps
+            # the guarantee while recovering the KV blocks that decide whether
+            # all 1000 requests fit in one decode wave.
+            # The floor has to clear the *runtime* peak with room for allocator
+            # fragmentation, not just the profiled encoder peak: mm_runtime_peak
+            # measures 3.0G on the image scenario, and a 2.4G reserve OOM'd once
+            # the text scenario had run first and left 2.3G reserved-but-
+            # unallocated. 4G clears both with ~700 KV blocks still spare.
+            available_bytes += already_held
+            mm_reserve = max(int(measured * margin), int(floor_gib * (1 << 30)))
             available_bytes -= mm_reserve
             # Make the reserve a guarantee about *actual* free memory rather than
             # about the budget formula above. That formula
@@ -1347,8 +1434,9 @@ class ModelRunner:
             self._mm_reserve_bytes = mm_reserve
             if self.rank == 0:
                 print(f"  Multimodal runtime reserve: {mm_reserve / 2**30:.1f}G "
-                      f"(measured encoder peak {measured / 2**30:.1f}G, "
-                      f"floor {floor_frac:.0%} of {total / 2**30:.0f}G)", flush=True)
+                      f"(measured encoder peak {measured / 2**30:.1f}G x{margin}, "
+                      f"generic holdback {already_held / 2**30:.1f}G returned, "
+                      f"floor {floor_gib:.0f}G)", flush=True)
 
         self_attn_block_bytes = (
             2 * num_self_attn_layers * BLOCK_SIZE * num_kv_heads * head_dim * elem_size
@@ -1393,11 +1481,6 @@ class ModelRunner:
             print(f"  Attention backend: {cfg.backend} "
                   f"(block_size={cfg.block_size}, kv_layout={cfg.kv_layout})")
 
-        if hasattr(self, '_warmup_encoder_cache'):
-            del self._warmup_encoder_cache
-            import gc
-            gc.collect()
-            torch.cuda.empty_cache()
 
     def _allocate_variable_kv_cache(self):
         """Allocate per-layer KV caches for models with non-uniform KV shape.
@@ -4453,6 +4536,26 @@ class ModelRunner:
     def run_model(self, input_ids, positions, is_prefill, inputs_embeds=None,
                   deepstack_embeds=None, encoder_outputs=None,
                   skip_final_softcap=False):
+        # One traced signature for the compiled inner model. DeepStack adds a
+        # residual at the first few decoder layers; vLLM keeps that inside its
+        # compiled graph, reading from persistent buffers that it zeroes after
+        # each multimodal step (_clear_deepstack_input_embeds). We used to route
+        # any forward carrying deepstack_embeds to an *uncompiled* model instead,
+        # which cost ~27% of Qwen3-VL's prefill throughput (52k tok/s against
+        # 81.5k for compiled Qwen2-VL on the same run, ~71k after normalising for
+        # model size). Passing zeroed buffer slices when there is no vision keeps
+        # the graph structurally identical between decode and multimodal prefill,
+        # so there is exactly one artifact and no guard-dispatch hazard -- the
+        # earlier attempt to just hand deepstack_embeds to the graph traced
+        # without them silently reused the wrong graph and dropped the residual.
+        # The no-op adds touch only len(deepstack_visual_indexes)=3 layers, i.e.
+        # 3 adds of (num_tokens, hidden) per step, negligible against the ~113GB
+        # of KV a full decode step reads.
+        if deepstack_embeds is None:
+            _ds_bufs = getattr(self, "_deepstack_bufs", None)
+            if _ds_bufs:
+                _n = input_ids.shape[0]
+                deepstack_embeds = [b[:_n] for b in _ds_bufs]
         if is_prefill or self.enforce_eager or input_ids.size(0) > self.graph_bs_list[-1]:
             model = self.model
             if is_prefill and self.is_bitnet and self._compiled:
@@ -4468,40 +4571,11 @@ class ModelRunner:
             if self.is_qwen_vl and self._compiled and inputs_embeds is None:
                 inputs_embeds = self.model.get_input_embeddings()(input_ids)
             if inputs_embeds is not None:
+                kwargs = {"inputs_embeds": inputs_embeds}
                 if deepstack_embeds is not None:
-                    # Multimodal prefill with actual vision features — use the
-                    # uncompiled inner model since the compiled graph is warmed
-                    # up with synthetic inputs_embeds and no deepstack_embeds.
-                    #
-                    # Measured, since DeepStack is Qwen3-VL-only and this is
-                    # every Qwen3-VL multimodal prefill step: routing it through
-                    # the compiled inner model instead is worth nothing on the
-                    # bench_vllm image scenario (mixed_mm 15.72s -> 15.65s,
-                    # 0.76x -> 0.77x, both inside run-to-run noise, because
-                    # prefill at these token counts is FLOP-bound rather than
-                    # launch-bound) *and* it silently corrupts the output --
-                    # generated-token alignment against vLLM collapsed from
-                    # 148.3 to 44.6 tokens per request, since the compile stack
-                    # drops Dynamo guards and so reuses the no-DeepStack graph.
-                    # So this is not a gap to close: keep it eager.
-                    inner = getattr(self, '_eager_inner_model', None)
-                    if inner is not None:
-                        kwargs = {"inputs_embeds": inputs_embeds}
-                        if deepstack_embeds is not None:
-                            kwargs["deepstack_embeds"] = deepstack_embeds
-                        hidden = inner(input_ids, positions, **kwargs)
-                        return self._compute_logits(
-                            hidden, skip_final_softcap=skip_final_softcap,
-                        )
-                    kwargs = {"inputs_embeds": inputs_embeds}
-                    if deepstack_embeds is not None:
-                        kwargs["deepstack_embeds"] = deepstack_embeds
-                    return self._compute_logits(
-                        model(input_ids, positions, **kwargs),
-                        skip_final_softcap=skip_final_softcap,
-                    )
+                    kwargs["deepstack_embeds"] = deepstack_embeds
                 return self._compute_logits(
-                    model(input_ids, positions, inputs_embeds=inputs_embeds),
+                    model(input_ids, positions, **kwargs),
                     skip_final_softcap=skip_final_softcap,
                 )
             if encoder_outputs is not None:
@@ -4672,7 +4746,15 @@ class ModelRunner:
         try:
             if self.is_qwen_vl and self._compiled:
                 inputs_embeds = model.get_input_embeddings()(input_ids)
-                hidden = model(input_ids, positions, inputs_embeds=inputs_embeds)
+                # Same uniform signature as run_model: the compiled graph was
+                # traced with deepstack_embeds present, so every entry point has
+                # to supply them (zeroed here -> no-op adds).
+                _ds_bufs = getattr(self, "_deepstack_bufs", None)
+                _kw = ({"deepstack_embeds":
+                        [b[:input_ids.shape[0]] for b in _ds_bufs]}
+                       if _ds_bufs else {})
+                hidden = model(input_ids, positions,
+                               inputs_embeds=inputs_embeds, **_kw)
             else:
                 hidden = model(input_ids, positions)
             lm_head = model.lm_head
@@ -5225,11 +5307,23 @@ class ModelRunner:
                               else np.concatenate(ds_rows))
                 ds_rows_t = torch.from_numpy(ds_rows_np).pin_memory().to(
                     device, non_blocking=True)
+                bufs = getattr(self, "_deepstack_bufs", None)
+                if (bufs is None or len(bufs) < num_levels
+                        or bufs[0].shape[0] < total_tokens
+                        or bufs[0].shape[1] != hidden_dim):
+                    # Fallback / grow: shapes beyond what _init_deepstack_buffers
+                    # sized for (only reachable if max_num_batched_tokens was
+                    # raised after init).
+                    bufs = [
+                        torch.zeros(total_tokens, hidden_dim, device=device,
+                                    dtype=inputs_embeds.dtype)
+                        for _ in range(num_levels)
+                    ]
+                    self._deepstack_bufs = bufs
                 deepstack_embeds = []
                 for level in range(num_levels):
-                    level_dst = torch.zeros(
-                        total_tokens, hidden_dim,
-                        device=device, dtype=inputs_embeds.dtype)
+                    level_dst = bufs[level][:total_tokens]
+                    level_dst.zero_()
                     parts = [d[level] for d in ds_level_embeds
                              if level < len(d)]
                     if parts:
@@ -5244,6 +5338,13 @@ class ModelRunner:
         result = self.run_model(input_ids, positions, True,
                                 inputs_embeds=inputs_embeds,
                                 deepstack_embeds=deepstack_embeds)
+        if deepstack_embeds is not None:
+            # Zero the rows we just filled, mirroring vLLM's
+            # _clear_deepstack_input_embeds. The decode CUDA graphs were captured
+            # reading these same persistent buffers, so anything left behind here
+            # would be added as a stale residual on the next decode replay.
+            for buf in deepstack_embeds:
+                buf.zero_()
         reset_context()
         return result
 
@@ -5259,18 +5360,21 @@ class ModelRunner:
         device = torch.device("cuda")
         vis_dtype = self.model.visual.patch_embed.proj.weight.dtype
         if self.rank == 0:
-            # Cast on the host first, then stage through pinned memory: the
-            # batched pixel values for one step are tens of MB (a VisionArena
-            # image is ~2800 patches x 1176 float32), and a pageable H2D of
-            # that size runs at roughly a fifth of the pinned bandwidth.
+            # _dispatch_vision_encoder normally hands this over already on the
+            # device, cast to vis_dtype by _stage_pixel_values, so there is
+            # nothing left to do. The host path is for callers that build
+            # _mm_pv directly, e.g. _warmup_vision_encoder.
             src = self._mm_pv
-            if src.dtype != vis_dtype:
-                src = src.to(dtype=vis_dtype)
-            if not src.is_pinned():
-                staged = torch.empty_like(src, pin_memory=True)
-                staged.copy_(src)
-                src = staged
-            bpv = src.to(device=device, non_blocking=True)
+            if src.is_cuda:
+                bpv = src if src.dtype == vis_dtype else src.to(dtype=vis_dtype)
+            else:
+                if src.dtype != vis_dtype:
+                    src = src.to(dtype=vis_dtype)
+                if not src.is_pinned():
+                    staged = torch.empty_like(src, pin_memory=True)
+                    staged.copy_(src)
+                    src = staged
+                bpv = src.to(device=device, non_blocking=True)
             bthw = (self._mm_thw.clone() if isinstance(self._mm_thw, torch.Tensor)
                     else torch.tensor(self._mm_thw, dtype=torch.long)).to(device)
             self._mm_pv = None
@@ -5618,6 +5722,15 @@ class ModelRunner:
                       if self.is_qwen_vl else positions[:largest_bs])
         warmup_ie = (vl_inputs_embeds[:largest_bs]
                      if vl_inputs_embeds is not None else None)
+        # DeepStack buffers must be part of the traced graph, so the same graph
+        # serves decode (buffers zeroed -> no-op adds) and multimodal prefill
+        # (buffers filled). See run_model.
+        _ds_all = getattr(self, "_deepstack_bufs", None)
+
+        def _ds(n):
+            return [b[:n] for b in _ds_all] if _ds_all else None
+
+        warmup_ds = _ds(largest_bs)
         if self._compiled and not self._mark_dynamic_done:
             torch._dynamo.mark_dynamic(warmup_ids, 0)
             if self.is_qwen_vl:
@@ -5626,11 +5739,21 @@ class ModelRunner:
                 torch._dynamo.mark_dynamic(warmup_pos, 0)
             if warmup_ie is not None:
                 torch._dynamo.mark_dynamic(warmup_ie, 0)
+            if warmup_ds is not None:
+                # Same token dim as inputs_embeds. Without marking these, the
+                # slices come in as a *static* size and the solver reports a
+                # ConstraintViolationError against the dynamic inputs_embeds dim.
+                for _t in warmup_ds:
+                    torch._dynamo.mark_dynamic(_t, 0)
             self._mark_dynamic_done = True
+
         if self.is_qwen_vl:
             warmup_ie.copy_(vl_embed_fn(warmup_ids))
+            _kw = {"inputs_embeds": warmup_ie}
+            if warmup_ds is not None:
+                _kw["deepstack_embeds"] = warmup_ds
             outputs[:largest_bs] = self.model(
-                warmup_ids, warmup_pos, inputs_embeds=warmup_ie,
+                warmup_ids, warmup_pos, **_kw,
             )
         else:
             outputs[:largest_bs] = self.model(warmup_ids, warmup_pos)
@@ -5689,6 +5812,7 @@ class ModelRunner:
                     outputs[:bs] = self.model(
                         ids_slice, pos_slice,
                         inputs_embeds=ie_slice,
+                        **({"deepstack_embeds": _ds(bs)} if _ds_all else {}),
                     )
                 else:
                     outputs[:bs] = self.model(ids_slice, pos_slice)
@@ -5702,6 +5826,7 @@ class ModelRunner:
                         outputs[:bs] = self.model(
                             ids_slice, pos_slice,
                             inputs_embeds=ie_slice,
+                            **({"deepstack_embeds": _ds(bs)} if _ds_all else {}),
                         )
                     else:
                         outputs[:bs] = self.model(ids_slice, pos_slice)
@@ -6008,7 +6133,7 @@ class LlamaEngine:
                 video_pixel_values, video_grid_thw, video_second_per_grid,
                 input_audio_features, audio_feature_lengths)
 
-    def _dispatch_vision_encoder(self, seqs):
+    def _dispatch_vision_encoder(self, seqs, chunk_sizes=None):
         """Dispatch vision encoder to all TP ranks and build vis_cache_map.
 
         For each sequence with images/videos, broadcasts pixel values via NCCL
@@ -6021,18 +6146,93 @@ class LlamaEngine:
         mr = self.model_runner
         model = mr.model
         merge_size = model.config.vision.spatial_merge_size
+        vis_dtype = model.visual.patch_embed.proj.weight.dtype
+
+        def _stage_pixel_values(pv_list):
+            """Concatenate + cast + upload the step's pixel values in one pass.
+
+            The HF processor hands back float32, and the encoder wants bf16 on
+            the GPU. Doing that as cat -> .to(dtype) -> pinned copy walks the
+            data three times on the host: for the MMVU video scenario that is
+            ~83MB of float32 per clip and ~3 clips per step, so ~390GB of host
+            memcpy over the run -- measured as ~15ms per clip of pure CPU time
+            on top of a 44ms encoder forward. Copying each sequence straight
+            into its slice of a persistent pinned bf16 buffer casts and packs in
+            a single pass, and reuses the (expensive) cudaHostAlloc across steps.
+
+            Result is bit-identical: copy_ applies the same float32->bf16
+            rounding the old .to(dtype) did.
+
+            Two buffers, each with an event recorded after its upload, so a
+            buffer is never refilled while its own async H2D is still in flight.
+            In practice the wait is free -- per-step sampling reads token ids
+            back, so the host cannot run more than a step ahead of the GPU --
+            but the events make that independent of the sampling path.
+            """
+            rows = sum(t.shape[0] for t in pv_list)
+            feat = pv_list[0].shape[1]
+            bufs = getattr(self, "_mm_stage_bufs", None)
+            if bufs is None:
+                bufs = self._mm_stage_bufs = [None, None]
+                self._mm_stage_evts = [None, None]
+                self._mm_stage_idx = 0
+            idx = self._mm_stage_idx
+            self._mm_stage_idx = 1 - idx
+            evt = self._mm_stage_evts[idx]
+            if evt is not None:
+                evt.synchronize()
+            buf = bufs[idx]
+            if (buf is None or buf.shape[0] < rows or buf.shape[1] != feat
+                    or buf.dtype != vis_dtype):
+                buf = torch.empty((rows, feat), dtype=vis_dtype,
+                                  pin_memory=True)
+                bufs[idx] = buf
+            staged = buf[:rows]
+            off = 0
+            for t in pv_list:
+                n = t.shape[0]
+                staged[off:off + n].copy_(t)
+                off += n
+            gpu = staged.to(device=f"cuda:{mr.rank}", non_blocking=True)
+            evt = torch.cuda.Event()
+            evt.record()
+            self._mm_stage_evts[idx] = evt
+            return gpu
 
         mr._vis_cache = []
         vis_cache_map = []
         cache_idx = 0
-
         seq_entries = []
+
+        # Reuse encoder output across a sequence's chunked prefill steps, as
+        # vLLM's encoder_cache does. Without this, any prefill that spans more
+        # than one step re-runs the whole vision tower: with staggered admission
+        # that turned 37 admission steps into 69 encoder calls and cost 3.5s on
+        # the Qwen3-VL image scenario. Entries are dropped by _finish_seq and on
+        # preemption.
+        #
+        # tp=1 only: at tp>1 every rank keeps its own _vis_cache, populated by
+        # _broadcast_visual, so skipping the encode on rank 0 would desynchronise
+        # the ranks. Chunked multimodal prefill is rare without the stagger, so
+        # tp>1 keeps re-encoding rather than growing the SHM protocol.
+        _enc_reuse = (mr.world_size == 1)
+        if _enc_reuse:
+            for i, seq in enumerate(seqs):
+                hit = self.encoder_cache.get(id(seq))
+                if hit is None:
+                    continue
+                embeds, modality = hit
+                mr._vis_cache.append(embeds)
+                seq_entries.append((i, cache_idx, modality, 0, embeds.shape[0]))
+                cache_idx += 1
+
         image_pv_list = []
         image_thw_list = []
         image_entries = []
         image_embed_start = 0
         for i, seq in enumerate(seqs):
-            if seq.pixel_values is not None:
+            if seq.pixel_values is not None and not (
+                    _enc_reuse and id(seq) in self.encoder_cache):
                 thw = seq.image_grid_thw
                 if not isinstance(thw, torch.Tensor):
                     thw = torch.tensor(thw, dtype=torch.long)
@@ -6043,7 +6243,7 @@ class LlamaEngine:
                 image_embed_start += embed_count
 
         if image_pv_list:
-            batched_pv = torch.cat(image_pv_list, dim=0)
+            batched_pv = _stage_pixel_values(image_pv_list)
             batched_thw = torch.cat(image_thw_list, dim=0).cpu()
             mr._mm_pv = batched_pv
             mr._mm_thw = batched_thw
@@ -6063,7 +6263,8 @@ class LlamaEngine:
         video_entries = []
         video_embed_start = 0
         for i, seq in enumerate(seqs):
-            if seq.video_pixel_values is not None:
+            if seq.video_pixel_values is not None and not (
+                    _enc_reuse and id(seq) in self.encoder_cache):
                 grid_thw = seq.video_grid_thw
                 if not isinstance(grid_thw, torch.Tensor):
                     grid_thw = torch.tensor(grid_thw, dtype=torch.long)
@@ -6076,7 +6277,7 @@ class LlamaEngine:
                 video_embed_start += embed_count
 
         if video_pv_list:
-            batched_pv = torch.cat(video_pv_list, dim=0)
+            batched_pv = _stage_pixel_values(video_pv_list)
             batched_thw = torch.cat(video_thw_list, dim=0).cpu()
             mr._mm_pv = batched_pv
             mr._mm_thw = batched_thw
@@ -6090,6 +6291,38 @@ class LlamaEngine:
                     (i, cache_idx, "video", embed_start, embed_count),
                 )
             cache_idx += 1
+
+        if _enc_reuse:
+            # Populate the reuse cache with this step's fresh encodes, sliced per
+            # sequence -- but only for sequences whose prefill continues into a
+            # later step, which is the only case that would re-encode.
+            #
+            # Caching unconditionally is a memory leak, not just waste: the entry
+            # would then live until the sequence *finishes decoding*, and a
+            # 32-frame clip's embeddings are ~145MB (4423 merged tokens x 4096 x
+            # 2 bytes, x3 DeepStack levels). With hundreds of clips in flight
+            # that is tens of GB, and it OOM'd the video scenario outright.
+            for i, c_idx, modality, e_start, e_count in seq_entries:
+                seq = seqs[i]
+                if id(seq) in self.encoder_cache:
+                    continue
+                if chunk_sizes is None or i >= len(chunk_sizes):
+                    continue
+                if seq.num_computed_tokens + chunk_sizes[i] >= len(seq.token_ids):
+                    continue  # prefill completes this step; nothing to reuse
+                full = mr._vis_cache[c_idx]
+                self.encoder_cache[id(seq)] = (
+                    full[e_start:e_start + e_count], modality,
+                )
+
+        if _enc_reuse and chunk_sizes is not None:
+            # Drop entries whose sequence finishes prefilling on this step -- the
+            # placeholders are all consumed, so nothing will read them again.
+            for i, seq in enumerate(seqs):
+                if i < len(chunk_sizes) and id(seq) in self.encoder_cache \
+                        and seq.num_computed_tokens + chunk_sizes[i] \
+                        >= len(seq.token_ids):
+                    self.encoder_cache.pop(id(seq), None)
 
         audio_seqs = [
             (i, seq) for i, seq in enumerate(seqs)
@@ -7443,6 +7676,205 @@ class LlamaEngine:
         }
         _step_profile_active = os.environ.get("FASTKERNELS_STEP_PROFILE") == "1"
 
+        _admit_stride_cache: list = [False, 1, False]
+
+        def _reserve_full() -> bool:
+            _admit_stride()
+            return _admit_stride_cache[2]
+
+        def _admit_stride() -> int:
+            """Admit a full batch every Nth step instead of every step.
+
+            When a batch cannot be held at full length, admitting it as fast as
+            the producer can supply it is the worst schedule: every request
+            reaches its final size at about the same step, KV hits 100%, and the
+            scheduler evicts the overflow, which re-prefills and runs as a
+            second decode wave 512 steps long at a handful of sequences. On the
+            Qwen3-VL image scenario that wave is 491 of 1030 decode steps for
+            ~10% of the tokens.
+
+            Staggering admission fixes the peak, because at the peak step a
+            request admitted at step t holds ceil((prompt + max_tokens - t)/block)
+            rather than the full amount. Summed over a spread of S steps the peak
+            is N*F - N*S/(2*block), so the spread that just fits is
+            S >= 2*block*(N*F - usable)/N.
+
+            Spreading by admitting *fewer per step* was measured and is a net
+            loss (0.83x -> 0.79x): the vision encoder batches per step, so going
+            from 25 images per call to 7 raised per-image encoder cost 27% and
+            tripled the number of decode-bearing prefill steps. Striding instead
+            keeps every encoder call full and simply leaves gaps between them.
+
+            vLLM gets the same stagger for free -- its frontend renders
+            multimodal prompts serially, ~9s of a 28s run, so admission spreads
+            over ~320 steps and its KV peaks at 97.9% having never preempted.
+
+            Returns 1 (admit every step) when the batch already fits.
+            """
+            if _admit_stride_cache[0]:
+                return _admit_stride_cache[1]
+            _env = os.environ.get("FASTKERNELS_MM_ADMIT_STRIDE")
+            if _env:
+                _admit_stride_cache[0] = True
+                _admit_stride_cache[1] = max(1, int(_env))
+                return _admit_stride_cache[1]
+            # On by default, but the sign of this trade-off depends on how
+            # expensive a prefill step is, so it has moved twice under
+            # measurement. Striding holds KV under 100% and drives preemptions
+            # to 0, paying for it with ~50% more mixed prefill steps, each
+            # carrying its own encoder call and decode pass. With DeepStack
+            # prefill still running eagerly that was a net loss (0.83x -> 0.80x);
+            # once prefill went through the compiled graph (+40% prefill
+            # throughput) it became a clear win (0.78x -> 0.89x on the Qwen3-VL
+            # image scenario). Note this has no counterpart in vLLM -- its
+            # admission spread is an incidental consequence of a serial frontend,
+            # not a policy -- so it is a deliberate divergence, justified only by
+            # the measurement above and by the guard below that keeps it off
+            # where a modest stagger cannot help.
+            # 256, not fewer. A smaller sample resolves the regime sooner --
+            # which does help video reach zero preemptions -- but it estimates the
+            # mean block count too noisily and flips the regime decision on the
+            # image scenarios, which sit near the boundary: at 32 both regressed
+            # (Qwen2-VL image 0.96x -> 0.92x, Qwen3-VL image 0.89x -> 0.85x) while
+            # video moved only 0.94x -> 0.93x. The residual preemptions video
+            # keeps at 256 are not what limits it.
+            _MIN_SAMPLE = 256
+            if len(waiting) < _MIN_SAMPLE and not _produce_done.is_set():
+                return 1
+            sample = list(itertools.islice(waiting, _MIN_SAMPLE))
+            if not sample or num_prompts <= 1:
+                return 1
+            merge = self._vision_merge_size()
+            f_blocks = sum(
+                (min(s.num_prompt_tokens + s.max_tokens, self.max_model_len)
+                 + block_size - 1) // block_size
+                for s in sample
+            ) / len(sample)
+            mean_prompt = sum(s.num_prompt_tokens for s in sample) / len(sample)
+            mean_enc = max(1.0, sum(_seq_encoder_tokens(s, merge)
+                                    for s in sample) / len(sample))
+            usable = num_blocks - watermark_blocks
+            stride = 1
+            deficit = num_prompts * f_blocks - usable
+            spread = 2 * block_size * max(0.0, deficit) / num_prompts
+            # Only stagger when a *modest* stagger is enough. If the batch needs
+            # far more KV than exists -- MMVU clips want ~254k blocks against
+            # 63k, i.e. several unavoidable decode waves -- no admission order
+            # avoids preemption, and spreading would merely delay all the work
+            # (the derivation asks for a 6000-step spread there). Requiring the
+            # spread to fit inside half the decode length keeps this to the case
+            # it was measured on, where it is worth 1030 steps -> 658.
+            mean_max_tokens = sum(s.max_tokens for s in sample) / len(sample)
+            # 1.25x margin on the required spread. The bound is derived from a
+            # uniform-admission model, and reality is noisier: the same derived
+            # stride of 4 landed at 98.0% KV with 0 preemptions on one run and
+            # 100% with 18 preemptions on the next (0.89x vs 0.86x). Since
+            # crossing 100% costs a 512-step low-occupancy wave while a slightly
+            # longer stagger costs only a few extra prefill steps, the asymmetry
+            # is worth paying for.
+            # 2x margin on the derived spread. The bound comes from a uniform
+            # admission model and consistently under-predicts the real peak by
+            # ~1600 blocks, because admission is bursty (a full batch every Nth
+            # step) and chunked prefill lengthens lifetimes. Measured on the
+            # Qwen3-VL image scenario: the 1x spread (stride 4-5) landed at 100%
+            # KV with 11-18 preemptions and 0.86x, while ~2x (stride 10) held
+            # 87.5% with zero preemptions and 0.89x. Crossing 100% costs a full
+            # 512-step low-occupancy wave even for 11 evictions, so err long.
+            # This also lands close to vLLM's own effective spread (~320 steps,
+            # from its serial frontend), which is where its KV peaks at 97.9%
+            # having never preempted.
+            spread *= 2.0
+            _admit_stride_cache[2] = bool(
+                deficit > 0 and spread > 0.75 * mean_max_tokens)
+            if deficit > 0 and spread <= 0.75 * mean_max_tokens:
+                # How many requests one step can actually take, i.e. what keeps
+                # the encoder calls full.
+                per_step = max(1.0, min(
+                    self.max_num_batched_tokens / max(1.0, mean_prompt),
+                    self._max_encoder_tokens() / mean_enc,
+                ))
+                steps_needed = max(1.0, num_prompts / per_step)
+                stride = max(1, int(round(spread / steps_needed)))
+            _admit_stride_cache[0] = True
+            _admit_stride_cache[1] = stride
+            if stride > 1 and self.model_runner.rank == 0 \
+                    and os.environ.get("FASTKERNELS_STEP_PROFILE") == "1":
+                print(f"  mm_admit_stride:   mean {f_blocks:.1f} blocks/seq x "
+                      f"{num_prompts} = {num_prompts * f_blocks:.0f} vs "
+                      f"{usable} usable -> spread {spread:.0f} steps, "
+                      f"{per_step:.0f}/batch -> admit every {stride} steps",
+                      flush=True)
+            return stride
+        def _seq_final_blocks(seq) -> int:
+            """Blocks this sequence will hold once it has generated max_tokens."""
+            return (min(seq.num_prompt_tokens + seq.max_tokens,
+                        self.max_model_len) + block_size - 1) // block_size
+
+        # Reserve final length at admission, but only when the batch cannot fit
+        # no matter how it is ordered. Which of the three regimes applies is
+        # decided by the same sample as the stagger (see _admit_stride):
+        #
+        #   N*F <= capacity        no constraint. Qwen2-VL image peaks at 52% of
+        #                          its cache; gating it is a pure loss
+        #                          (measured 0.96x -> 0.92x).
+        #   N*F slightly over      a stagger fixes the peak while keeping every
+        #                          request in flight -> use the stagger.
+        #                          Reserving here just converts preemption into
+        #                          an equivalent hold-back queue and costs more
+        #                          (Qwen3-VL image 0.85x -> 0.76x).
+        #   N*F far over           several decode waves are unavoidable, so
+        #                          holding requests back costs nothing that
+        #                          capacity was not already costing -- and it
+        #                          buys back everything preemption wastes.
+        #                          Qwen3-VL video: 85 preemptions -> 0, prefill
+        #                          3.84M -> 3.54M tokens, 0.91x -> 0.94x.
+        #
+        # vLLM reserves only the current length in all three regimes and eats the
+        # preemption; that is cheaper for it than for us because an evicted
+        # multimodal request re-runs its vision encoder as well as its prefill.
+        _committed = [0]
+
+        # Track unconditionally, enforce conditionally. Gating the *accounting*
+        # on _reserve_full() undercounts badly: the flag needs a 256-sequence
+        # sample to resolve, and on the video scenarios several hundred requests
+        # are admitted before that, so the running total could never reach the
+        # threshold and the gate never bound (86 preemptions, unchanged 0.91x).
+        def _commit(seq) -> None:
+            _committed[0] += _seq_final_blocks(seq)
+
+        def _uncommit(seq) -> None:
+            _committed[0] = max(0, _committed[0] - _seq_final_blocks(seq))
+
+        def _record_kv_usage() -> None:
+            """Peak KV blocks in use. Preemption starts when this hits
+            num_blocks, so it says whether the cache is genuinely full or
+            whether blocks are being held/leaked somewhere."""
+            u = num_blocks - len(bm.free_block_ids)
+            if u > step_profile.get("kv_peak_blocks", 0):
+                step_profile["kv_peak_blocks"] = u
+
+        def _record_decode_time(dt: float) -> None:
+            b = step_profile.get("_dc_band")
+            if b is not None:
+                step_profile.setdefault("dc_time_hist", [0.0] * 8)[b] += dt
+                step_profile["_dc_band"] = None
+
+        def _record_decode_batch(n: int) -> None:
+            """Histogram of decode batch sizes.
+
+            Total output tokens are fixed, so wall clock is driven by how many
+            *steps* they are spread over, i.e. by occupancy. A run whose average
+            batch is well under what the KV cache can hold is paying for a long
+            low-occupancy tail rather than for slow kernels.
+            """
+            h = step_profile.setdefault("dc_hist", [0] * 8)
+            cap = max(1, self.max_num_seqs)
+            b = min(7, (n * 8) // cap)
+            h[b] += 1
+            _record_kv_usage()
+            step_profile["_dc_band"] = b
+            step_profile["dc_max"] = max(step_profile.get("dc_max", 0), n)
+
         def _record_preemption(seq: Sequence) -> None:
             """Count recompute preemptions and the decode work they discard.
 
@@ -7461,6 +7893,7 @@ class LlamaEngine:
         def _finish_seq(seq: Sequence) -> None:
             nonlocal _pbar_pending, _pbar_pending_in, _pbar_pending_out
             seq.status = SeqStatus.FINISHED
+            _uncommit(seq)
             bm.deallocate(seq)
             bm.deallocate_cross(seq)
             self.encoder_cache.pop(id(seq), None)
@@ -7568,8 +8001,11 @@ class LlamaEngine:
                 and _prefill_blocked_by_capacity()
             )
 
+        _loop_t0 = time.perf_counter()
+        _step_index = -1
         while (waiting or running or prefilling
                or not _produce_done.is_set()):
+            _step_index += 1
             if _produce_error:
                 break
             if pbar is not None:
@@ -7622,6 +8058,7 @@ class LlamaEngine:
                         _spt0 = time.perf_counter()
                         step_profile["fast_decode"] = step_profile.get("fast_decode", 0) + 1
                         step_profile["fast_decode_tokens"] = step_profile.get("fast_decode_tokens", 0) + len(running)
+                        _record_decode_batch(len(running))
                     if _PROFILE:
                         _fp_t0 = time.perf_counter()
                     decode_seqs = list(running)
@@ -7692,6 +8129,7 @@ class LlamaEngine:
                             if _step_profile_active:
                                 step_profile["fast_decode"] = step_profile.get("fast_decode", 0) + 1
                                 step_profile["fast_decode_tokens"] = step_profile.get("fast_decode_tokens", 0) + n_dc
+                                _record_decode_batch(n_dc)
                             for seq in decode_seqs:
                                 if len(seq) % block_size == 1:
                                     seq.block_table.append(
@@ -7740,7 +8178,9 @@ class LlamaEngine:
                                     _fp['post'] += _fp_t4 - _fp_t3
                                     _fp['n'] += 1
                     if _step_profile_active:
-                        step_profile["decode_time"] += time.perf_counter() - _spt0
+                        _dt = time.perf_counter() - _spt0
+                        step_profile["decode_time"] += _dt
+                        _record_decode_time(_dt)
                     continue
 
             elif running and not waiting and not prefilling:
@@ -7802,8 +8242,10 @@ class LlamaEngine:
                             pool.append(victim)
                             break
                         _record_preemption(victim)
+                        _uncommit(victim)
                         bm.deallocate(victim)
                         bm.deallocate_cross(victim)
+                        self.encoder_cache.pop(id(victim), None)
                         victim.preempt()
                         waiting.appendleft(victim)
                         return True
@@ -7813,8 +8255,10 @@ class LlamaEngine:
                         continue
                     del decode_seqs[i]
                     _record_preemption(victim)
+                    _uncommit(victim)
                     bm.deallocate(victim)
                     bm.deallocate_cross(victim)
+                    self.encoder_cache.pop(id(victim), None)
                     victim.preempt()
                     waiting.appendleft(victim)
                     return True
@@ -7836,8 +8280,10 @@ class LlamaEngine:
                             # Nothing left to evict: this sequence is the only
                             # one in flight, so preempting it would livelock.
                             _record_preemption(seq)
+                            _uncommit(seq)
                             bm.deallocate(seq)
                             bm.deallocate_cross(seq)
+                            self.encoder_cache.pop(id(seq), None)
                             seq.preempt()
                             waiting.appendleft(seq)
                             continue
@@ -7883,7 +8329,13 @@ class LlamaEngine:
             merge_size = self._vision_merge_size()
             mm_admitted = 0
             _admit_stop = None
-            while waiting and token_budget > 0:
+            _stride = _admit_stride()
+            # Note: check decode_seqs, not running -- _schedule_decode_tokens
+            # has already drained running into decode_seqs by this point, so
+            # ``not running`` is true every step and would disable the stride.
+            _admit_ok = (_stride == 1 or (_step_index % _stride) == 0
+                         or not (decode_seqs or prefilling))
+            while waiting and token_budget > 0 and _admit_ok:
                 seq = waiting[0]
                 prompt_len = seq.num_prompt_tokens
 
@@ -7928,6 +8380,12 @@ class LlamaEngine:
                 if free < full_blocks + watermark_blocks:
                     _admit_stop = "kv_full_seq"
                     break
+                if (_committed[0]
+                        and _committed[0] + _seq_final_blocks(seq)
+                        > num_blocks - watermark_blocks
+                        and _reserve_full()):
+                    _admit_stop = "reserved"
+                    break
                 num_scheduled = len(prefill_seqs) + len(decode_seqs)
                 if is_bitnet:
                     # BitNet may intentionally leave running decode seqs
@@ -7940,6 +8398,7 @@ class LlamaEngine:
                     _admit_stop = "max_num_seqs"
                     break
                 waiting.popleft()
+                _commit(seq)
                 bm.allocate_n(seq, blocks_needed)
                 if is_whisper_seq and cross_blocks_needed > 0:
                     for _ in range(cross_blocks_needed):
@@ -7994,6 +8453,7 @@ class LlamaEngine:
                 if n_pf == 0:
                     _sp["pure_decode"] += 1
                     _sp["decode_tokens"] += n_dc
+                    _record_decode_batch(n_dc)
                     _sp_cat = "decode_time"
                 elif n_dc == 0 and has_mm_step:
                     _sp["pure_mm_prefill"] += 1
@@ -8006,6 +8466,7 @@ class LlamaEngine:
                     _sp["mixed_mm"] += 1
                     _sp["mixed_mm_pf_tokens"] += sum(prefill_chunk_sizes)
                     _sp["mixed_mm_dc_tokens"] += n_dc
+                    _record_decode_batch(n_dc)
                     _sp_cat = "mixed_mm_time"
                 else:
                     _sp["mixed_text"] += 1
@@ -8103,7 +8564,7 @@ class LlamaEngine:
                 if has_mm:
                     if _step_profile_active:
                         _vt0 = time.perf_counter()
-                    vis_cache_map, _ = self._dispatch_vision_encoder(prefill_seqs)
+                    vis_cache_map, _ = self._dispatch_vision_encoder(prefill_seqs, prefill_chunk_sizes)
                     if _step_profile_active:
                         torch.cuda.synchronize()
                         step_profile["vis_time"] = (
@@ -8153,7 +8614,7 @@ class LlamaEngine:
                 if has_mm:
                     if _step_profile_active:
                         _vt0 = time.perf_counter()
-                    vis_cache_map, _ = self._dispatch_vision_encoder(prefill_seqs)
+                    vis_cache_map, _ = self._dispatch_vision_encoder(prefill_seqs, prefill_chunk_sizes)
                     if _step_profile_active:
                         torch.cuda.synchronize()
                         step_profile["vis_time"] = (
@@ -8169,7 +8630,9 @@ class LlamaEngine:
                     )
                     if _step_profile_active:
                         torch.cuda.synchronize()
-                        step_profile["mixed_mm_time"] += time.perf_counter() - _spt0
+                        _dt = time.perf_counter() - _spt0
+                        step_profile["mixed_mm_time"] += _dt
+                        _record_decode_time(_dt)
                 elif self.is_whisper:
                     input_ids_t, positions_t = self.model_runner.prepare_mixed_batch(
                         prefill_seqs, prefill_chunk_sizes, decode_seqs,
@@ -8218,6 +8681,7 @@ class LlamaEngine:
                 else:
                     running.extend(decode_seqs)
 
+        _loop_t0_elapsed = time.perf_counter() - _loop_t0
         if _producer is not None:
             _producer.join()
         if _produce_error:
@@ -8228,6 +8692,7 @@ class LlamaEngine:
             pbar.close()
 
         if _step_profile_active:
+            print(f"  engine_loop_total: {_loop_t0_elapsed:.3f}s")
             sp = step_profile
             fd = sp.get("fast_decode", 0)
             fdt = sp.get("fast_decode_tokens", 0)
@@ -8243,6 +8708,31 @@ class LlamaEngine:
             print(f"  mixed_mm:          {sp['mixed_mm']:6d} steps, pf={sp['mixed_mm_pf_tokens']:10d} dc={sp['mixed_mm_dc_tokens']:10d}, {sp['mixed_mm_time']:.3f}s")
             print(f"  preemptions:       {sp['preempted']:6d} seqs, "
                   f"{sp['preempted_tokens']:10d} decode tokens discarded")
+            if sp.get("kv_peak_blocks"):
+                print(f"  kv_peak:           {sp['kv_peak_blocks']} of "
+                      f"{num_blocks} blocks "
+                      f"({sp['kv_peak_blocks'] / num_blocks:.1%}), "
+                      f"{num_prompts} seqs")
+            if sp.get("dc_hist"):
+                cap = max(1, self.max_num_seqs)
+                bands = " ".join(
+                    f"{i*cap//8}-{(i+1)*cap//8}:{c}"
+                    for i, c in enumerate(sp["dc_hist"]) if c
+                )
+                tot_dc = (sp.get("fast_decode_tokens", 0) + sp["decode_tokens"]
+                          + sp["mixed_mm_dc_tokens"] + sp["mixed_text_dc_tokens"])
+                nsteps = sum(sp["dc_hist"])
+                print(f"  decode_batch:      avg={tot_dc / max(1, nsteps):.0f} "
+                      f"max={sp.get('dc_max', 0)} over {nsteps} steps "
+                      f"(cap {cap}); bands {bands}")
+                th = sp.get("dc_time_hist")
+                if th:
+                    per = " ".join(
+                        f"{i*cap//8}-{(i+1)*cap//8}:{th[i]:.1f}s"
+                        f"/{th[i]/c*1e3:.0f}ms"
+                        for i, c in enumerate(sp["dc_hist"]) if c and th[i]
+                    )
+                    print(f"  decode_time/band:  {per}")
             if sp.get("vis_calls"):
                 print(f"  vision_encoder:    {sp['vis_calls']:6d} calls, "
                       f"{sp['vis_time']:.3f}s "
@@ -8284,7 +8774,8 @@ class LlamaEngine:
                 }
 
         # Return in original order
-        return [
+        _detok_t0 = time.perf_counter()
+        outputs = [
             GenerationOutput(
                 prompt=(prompts[i] if isinstance(prompts[i], str) else ""),
                 generated_text=(
@@ -8300,6 +8791,13 @@ class LlamaEngine:
             )
             for i in range(len(prompts))
         ]
+        if _step_profile_active:
+            # Detokenization is a serial post-pass here, inside the caller's
+            # timed region; vLLM detokenizes incrementally in its frontend while
+            # the engine core keeps stepping, so it pays ~none of this.
+            print(f"  output_detokenize: {time.perf_counter() - _detok_t0:.3f}s "
+                  f"for {len(outputs)} seqs")
+        return outputs
 
     def _process_prefill_logits(
         self, logits, prefill_seqs, prefill_chunk_sizes,

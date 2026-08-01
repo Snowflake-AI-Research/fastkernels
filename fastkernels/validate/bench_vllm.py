@@ -1366,6 +1366,13 @@ def main():
         mm_processor_cache_gb=0,
         trust_remote_code=True,
     )
+    if os.environ.get("FASTKERNELS_VLLM_LOG_STATS") == "1":
+        # Diagnostic only: makes vLLM log "Running: N reqs / Waiting: M reqs /
+        # GPU KV cache usage: X%" so its occupancy curve can be compared against
+        # fastkernels' decode_batch histogram. Adds a little overhead to vLLM's
+        # loop, so don't read speedups off a run with this enabled.
+        llm_kwargs["disable_log_stats"] = False
+        os.environ.setdefault("VLLM_LOG_STATS_INTERVAL", "1.0")
     if cfg.get("trust_remote_code"):
         llm_kwargs["trust_remote_code"] = True
     if cfg["tp"] > 1:
