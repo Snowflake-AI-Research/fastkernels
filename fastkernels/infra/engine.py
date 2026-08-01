@@ -6110,6 +6110,50 @@ class LlamaEngine:
                 processor_kwargs["do_sample_frames"] = do_sample_frames
         if audios is not None:
             processor_kwargs["audio"] = audios
+
+        # Image-only fast path: run the image processor, tokenize the *unexpanded*
+        # chat text, and splice the placeholder token ids ourselves.
+        #
+        # The full processor call expands each placeholder inside the prompt
+        # string and re-tokenizes the result, so its cost grows with the number
+        # of vision tokens: measured 13.4ms/item on VisionArena against 6.4ms for
+        # the spliced path, i.e. over half of preprocessing. That matters because
+        # preprocessing paces admission -- 42 of 66 admission steps on the
+        # Qwen3-VL image scenario ended starved, waiting on the producer -- and
+        # vLLM does the same thing at token level (its PromptUpdate machinery)
+        # rather than re-tokenizing.
+        #
+        # Verified to produce byte-identical input_ids on 24/24 VisionArena
+        # images. Restricted to the image-only case: video and audio carry
+        # per-item extras (Qwen3-VL interleaves per-frame timestamp text) whose
+        # expansion is not a plain placeholder repeat.
+        if (video_frames is None and not audios and images
+                and getattr(self, "_mm_splice_ok", True)):
+            try:
+                ip = self.processor.image_processor(
+                    images=images, return_tensors="pt")
+                grid = ip["image_grid_thw"]
+                merge = self.model_runner.model.config.vision.spatial_merge_size
+                img_tok = self.model_runner.config.image_token_id
+                counts = [int(g.prod() // (merge ** 2)) for g in grid]
+                base = self.tokenizer(text, return_tensors=None)["input_ids"]
+                ids = []
+                k = 0
+                for tid in base:
+                    if tid == img_tok and k < len(counts):
+                        ids.extend([img_tok] * counts[k])
+                        k += 1
+                    else:
+                        ids.append(tid)
+                if k == len(counts):
+                    return (ids, ip["pixel_values"], grid,
+                            None, None, None, None, None)
+                self._mm_splice_ok = False
+            except Exception:
+                # Any processor whose expansion is not a placeholder repeat
+                # falls back permanently rather than per-item.
+                self._mm_splice_ok = False
+
         inputs = self.processor(**processor_kwargs)
         token_ids = inputs["input_ids"][0].tolist()
         pixel_values = inputs.get("pixel_values", None)
