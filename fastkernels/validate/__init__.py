@@ -160,6 +160,10 @@ _EAGER_OK = {
 # fixed_batch_32, so the run summary claimed coverage that never happened.
 _WORKLOADS_FLAG = {
     "bench_microsoft_bitnet": "--workloads",
+    # Same reason: bench_vjepa2 defaults to --task predictor, so before this the
+    # sweep ran one forward while full.yaml advertised predictor + encoder +
+    # single_video and the summary showed no row for any of them.
+    "bench_vjepa2": "--workloads",
 }
 _HF_MODEL_ARG = {
     "bench_vllm",

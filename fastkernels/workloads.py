@@ -124,12 +124,7 @@ class WorldModel(Workload):
 
 class Segmentation(Workload):
     """Promptable concept segmentation (e.g. SAM3)."""
-    gold_metaclip_nps = "gold-metaclip-nps"
-    gold_wiki_common = "gold-wiki-common"
-    gold_crowded = "gold-crowded"
-    veval_sav_val = "veval-sav-val"
-    veval_yt1b_val = "veval-yt1b-val"
-    sav_val_video = "sav-val-video"
+    full_pipeline = "full-pipeline"
     smartglasses_val_video = "smartglasses-val-video"
     single_image_1008 = "single-image-1008"
     batch_4_image_1008 = "batch-4-image-1008"
@@ -667,12 +662,18 @@ class SegmentationVideoWorkload:
     text_prompt: str = "objects"
 
 
+# bench_sam makes exactly two throughput measurements, and these declare them.
+# It pools SACo-Gold images with SACo-VEval frames and times one pass over the
+# pooled set ("full-pipeline"), then tracks SACo-VEval clips and reports
+# frames/sec. The five per-dataset image rows this table used to declare
+# (gold-metaclip-nps, gold-wiki-common, gold-crowded, veval-sav-val,
+# veval-yt1b-val) were never run -- bench_sam imported the list and ignored it,
+# so the sweep advertised seven throughput workloads and produced none. Only
+# sav-val-video is dropped: the clip pass runs one --veval-subset, the default.
 SEGMENTATION_THROUGHPUT_WORKLOADS: list[SegmentationThroughputWorkload] = [
-    SegmentationThroughputWorkload("gold-metaclip-nps", 1008, 500, "facebook/SACo-Gold", "metaclip_nps"),
-    SegmentationThroughputWorkload("gold-wiki-common", 1008, 500, "facebook/SACo-Gold", "wiki_common"),
-    SegmentationThroughputWorkload("gold-crowded", 1008, 500, "facebook/SACo-Gold", "crowded"),
-    SegmentationThroughputWorkload("veval-sav-val", 1008, 100, "facebook/SACo-VEval", "sav_val", modality="video"),
-    SegmentationThroughputWorkload("veval-yt1b-val", 1008, 100, "facebook/SACo-VEval", "yt1b_val", modality="video"),
+    SegmentationThroughputWorkload(
+        "full-pipeline", 1008, 500, "facebook/SACo-Gold", "metaclip", modality="image"
+    ),
 ]
 
 SEGMENTATION_LATENCY_WORKLOADS: list[SegmentationLatencyWorkload] = [
@@ -681,9 +682,12 @@ SEGMENTATION_LATENCY_WORKLOADS: list[SegmentationLatencyWorkload] = [
     SegmentationLatencyWorkload("single-video-frame-1008", 1008, 1, "facebook/SACo-VEval", "smartglasses_val", modality="video"),
 ]
 
+# Clip counts match bench_sam's _save_video_clips_for_workers(max_clips=10,
+# max_frames=16).
 SEGMENTATION_VIDEO_WORKLOADS: list[SegmentationVideoWorkload] = [
-    SegmentationVideoWorkload("sav-val-video", 1008, 10, 16, "facebook/SACo-VEval", "sav_val"),
-    SegmentationVideoWorkload("smartglasses-val-video", 1008, 10, 16, "facebook/SACo-VEval", "smartglasses_val"),
+    SegmentationVideoWorkload(
+        "smartglasses-val-video", 1008, 10, 16, "facebook/SACo-VEval", "smartglasses_val"
+    ),
 ]
 
 

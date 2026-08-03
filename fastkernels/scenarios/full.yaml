@@ -130,11 +130,14 @@ scenarios:
     dtype: bfloat16
     workloads: [Diffusion.res_1024, Diffusion.res_512, Diffusion.single_1024, Diffusion.single_512]
   # SAM 3.1 (table.tex: SAM 3): the reference builds an fp32 model and patches
-  # sam3's fused addmm_act so it does not force bfloat16.
+  # sam3's fused addmm_act so it does not force bfloat16. bench_sam makes two
+  # throughput measurements: one pass over a pooled SACo-Gold + SACo-VEval
+  # sample set ("full-pipeline"), and clip tracking on --veval-subset. It
+  # measures no per-dataset image throughput, so none is declared.
   - model: facebook/sam3.1
     tp: 1
     dtype: float32
-    workloads: [Segmentation.gold_metaclip_nps, Segmentation.gold_wiki_common, Segmentation.gold_crowded, Segmentation.veval_sav_val, Segmentation.veval_yt1b_val, Segmentation.sav_val_video, Segmentation.smartglasses_val_video, Segmentation.single_image_1008, Segmentation.batch_4_image_1008, Segmentation.single_video_frame_1008]
+    workloads: [Segmentation.full_pipeline, Segmentation.smartglasses_val_video, Segmentation.single_image_1008, Segmentation.batch_4_image_1008, Segmentation.single_video_frame_1008]
   - model: openai/whisper-large-v3
     tp: 1
     dtype: float16
@@ -268,7 +271,12 @@ scenarios:
     tp: 1
     dtype: float16   # bench_oasis hardcodes float16 on cuda
     workloads: [WorldModel.short_bs4_16f_4ddim, WorldModel.medium_bs8_24f_4ddim, WorldModel.long_bs8_32f_4ddim, WorldModel.denoise_bs4_16f_8ddim, WorldModel.latency_bs1_8f_4ddim]
+  # V-JEPA 2: classification is omitted deliberately. This checkpoint is the
+  # pretrain-only release (config architectures: ["VJEPA2Model"], no pooler or
+  # classifier weights in model.safetensors), so bench_vjepa2 refuses --task
+  # classification rather than compare two randomly initialized heads. Declare
+  # it only alongside a fine-tuned release (facebook/vjepa2-*-ssv2 / -diving48).
   - model: facebook/vjepa2-vitl-fpc64-256
     tp: 1
     dtype: bfloat16
-    workloads: [VideoRepresentation.predictor, VideoRepresentation.encoder, VideoRepresentation.classification, VideoRepresentation.single_video]
+    workloads: [VideoRepresentation.predictor, VideoRepresentation.encoder, VideoRepresentation.single_video]

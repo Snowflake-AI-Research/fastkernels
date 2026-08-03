@@ -81,7 +81,7 @@ scenarios:
   - model: facebook/sam3.1
     tp: 1
     dtype: float32
-    legacy_workloads: [gold-metaclip-nps, gold-wiki-common, gold-crowded, veval-sav-val, veval-yt1b-val, sav-val-video, smartglasses-val-video, single-image-1008, batch-4-image-1008, single-video-frame-1008]
+    legacy_workloads: [full-pipeline, smartglasses-val-video, single-image-1008, batch-4-image-1008, single-video-frame-1008]
   - model: openai/whisper-large-v3
     tp: 1
     dtype: float16
@@ -186,7 +186,10 @@ scenarios:
     tp: 1
     dtype: float16
     legacy_workloads: [short-bs4-16f-4ddim, medium-bs8-24f-4ddim, long-bs8-32f-4ddim, denoise-bs4-16f-8ddim, latency-bs1-8f-4ddim]
+  # V-JEPA 2: classification is omitted deliberately -- this pretrain-only
+  # checkpoint carries no classifier head, so bench_vjepa2 refuses the workload
+  # rather than compare two randomly initialized heads. See full.yaml.
   - model: facebook/vjepa2-vitl-fpc64-256
     tp: 1
     dtype: bfloat16
-    legacy_workloads: [predictor, encoder, classification, single-video]
+    legacy_workloads: [predictor, encoder, single-video]

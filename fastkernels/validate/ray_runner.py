@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import signal
+import statistics
 import subprocess
 import sys
 import threading
@@ -693,6 +694,162 @@ def _cosine_summary(items: list[float]) -> str:
     return f"min_cos={min(values):.4f}" if values else "-"
 
 
+# Correctness blocks name their cosine field differently per harness
+# ("cosine", "mean_cosine_sim", "mean_cos", "min_cosine_similarity"), and some
+# nest it one level under a tensor name. One suffix list covers all of them.
+_COSINE_SUFFIXES = ("cosine", "cosine_sim", "cosine_similarity", "cos")
+
+
+def _collect_cosines(block) -> list[float]:
+    """Every cosine-like float in a correctness block, nesting one level deep."""
+    values: list[float] = []
+    if not isinstance(block, dict):
+        return values
+    for key, value in block.items():
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if key.endswith(_COSINE_SUFFIXES):
+                values.append(float(value))
+        elif isinstance(value, dict):
+            for inner_key, inner in value.items():
+                if (
+                    isinstance(inner, (int, float))
+                    and not isinstance(inner, bool)
+                    and inner_key.endswith(_COSINE_SUFFIXES)
+                ):
+                    values.append(float(inner))
+    return values
+
+
+def _speedup_ratio(numerator, denominator) -> float | None:
+    """``numerator / denominator``, or None unless both are usable positives."""
+    if not isinstance(numerator, (int, float)) or isinstance(numerator, bool):
+        return None
+    if not isinstance(denominator, (int, float)) or isinstance(denominator, bool):
+        return None
+    if denominator <= 0 or numerator <= 0:
+        return None
+    return float(numerator) / float(denominator)
+
+
+def _entry_speedup(entry: dict) -> float | None:
+    """The speedup a harness recorded on one scenario entry.
+
+    bench_sglang names its ratio after the library it compares against
+    (``speedup_vs_sglang``) rather than the plain ``speedup`` every other
+    harness writes, so both spellings are accepted.
+    """
+    if not isinstance(entry, dict):
+        return None
+    value = entry.get("speedup")
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    for key, value in entry.items():
+        if key.startswith("speedup_vs_") and isinstance(value, (int, float)):
+            return float(value)
+    return None
+
+
+# Per-item rate field, whose name follows the unit each harness counts in.
+_RATE_KEYS = (
+    "images_per_second",
+    "videos_per_second",
+    "utterances_per_second",
+    "items_per_second",
+    "samples_per_second",
+    "pairs_per_second",
+    "frames_per_second",
+    "items_per_sec",
+    "frames_per_sec",
+    "throughput_req_s",
+)
+
+
+def _throughput_rate(entry: dict) -> float | None:
+    if not isinstance(entry, dict):
+        return None
+    for key in _RATE_KEYS:
+        value = entry.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+            return float(value)
+    return None
+
+
+_MEDIAN_SECONDS_KEYS = ("median_s", "median", "p50_s")
+_MEDIAN_MS_KEYS = ("p50_ms", "latency_ms_p50", "median_ms")
+
+
+def _median_seconds(entry: dict) -> float | None:
+    """Median latency in seconds, however the harness recorded it.
+
+    Harnesses variously write a precomputed median (``median_s``, ``median``),
+    a millisecond percentile (``p50_ms``), or only the raw ``latencies`` list.
+    The raw-list case uses statistics.median, matching the ``np.percentile(50)``
+    each harness prints in its own comparison table.
+    """
+    if not isinstance(entry, dict):
+        return None
+    for key in _MEDIAN_SECONDS_KEYS:
+        value = entry.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+            return float(value)
+    for key in _MEDIAN_MS_KEYS:
+        value = entry.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+            return float(value) / 1000.0
+    samples = [
+        float(value)
+        for value in (entry.get("latencies") or [])
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+    ]
+    return statistics.median(samples) if samples else None
+
+
+# Harnesses that write two sibling blocks -- ours and the reference -- each
+# holding a "throughput" and a "latency" list of entries keyed by "name". Only
+# the reference block's key differs, so one pairing helper serves them all.
+_TWO_SIDED_REFERENCE_KEY = {
+    "bench_vllm_omni": "vllm_omni",
+    "bench_diffusers": "diffusers",
+    "bench_timm": "timm",
+    "bench_detection": "reference",
+    "bench_dp3": "reference",
+}
+
+# bench_recsys keys its results by model rather than by workload; each model has
+# exactly one batched throughput scenario, named here as full.yaml declares it.
+_RECSYS_THROUGHPUT_WORKLOAD = {
+    "dlrmv2": "ctr-batch",
+    "lightgcn": "recommend-batch",
+}
+
+
+def _two_sided_pairs(
+    data: dict,
+    harness: str,
+    section: str,
+) -> list[tuple[str | None, dict, dict]]:
+    """(name, ours, reference) per scenario, matched by name then by position."""
+    ours_items = (data.get("fastkernels") or {}).get(section) or []
+    reference_items = (
+        data.get(_TWO_SIDED_REFERENCE_KEY[harness]) or {}
+    ).get(section) or []
+    by_name = {
+        entry.get("scenario") or entry.get("name"): entry
+        for entry in reference_items
+        if isinstance(entry, dict)
+    }
+    pairs: list[tuple[str | None, dict, dict]] = []
+    for index, entry in enumerate(ours_items):
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("scenario") or entry.get("name")
+        reference_entry = by_name.get(name)
+        if reference_entry is None and index < len(reference_items):
+            reference_entry = reference_items[index]
+        pairs.append((name, entry, reference_entry or {}))
+    return pairs
+
+
 def _reference_name(harness: str) -> str:
     return {
         "bench_vllm": "vLLM",
@@ -706,6 +863,10 @@ def _reference_name(harness: str) -> str:
         "bench_openfold3": "reference",
         "bench_embedding": "vLLM",
         "bench_oasis": "open-oasis",
+        "bench_sam": "sam3",
+        "bench_dp3": "3D-Diffusion-Policy",
+        "bench_vjepa2": "transformers",
+        "bench_recsys": "torchrec/PyG",
         # Harnesses standardized on comparison.py also write "reference_name"
         # into results.json, which wins over this table; these are the fallbacks
         # for older result files that predate that field.
@@ -734,86 +895,108 @@ def _throughput_rows_for_result(
                     "model": model,
                     "workload": item.get("scenario") or item.get("name"),
                     "reference": reference,
-                    "speedup": item.get("speedup"),
+                    "speedup": _entry_speedup(item),
                     "correctness": _alignment_summary(item.get("alignment")),
+                    **_unsupported_fields(item),
                 }
             )
-    elif harness == "bench_vllm_omni":
+    elif harness in _TWO_SIDED_REFERENCE_KEY:
         correctness = data.get("correctness") or {}
-        for item in data.get("fastkernels", {}).get("throughput", []):
-            name = item.get("scenario") or item.get("name")
-            reference_item = next(
-                (
-                    entry
-                    for entry in data.get("vllm_omni", {}).get("throughput", [])
-                    if (entry.get("scenario") or entry.get("name")) == name
-                ),
-                {},
+        for name, item, reference_item in _two_sided_pairs(
+            data, harness, "throughput"
+        ):
+            speedup = _speedup_ratio(
+                _throughput_rate(item), _throughput_rate(reference_item)
             )
-            fastkernels_rate = (
-                item.get("images_per_second")
-                or item.get("items_per_second")
-                or item.get("samples_per_second")
-            )
-            reference_rate = (
-                reference_item.get("images_per_second")
-                or reference_item.get("items_per_second")
-                or reference_item.get("samples_per_second")
-            )
-            item_correctness = (
-                correctness.get(name, {}) if isinstance(correctness, dict) else {}
-            )
-            cosines: list[float] = []
-            if isinstance(item_correctness, dict):
-                for key, value in item_correctness.items():
-                    if isinstance(value, dict) and isinstance(
-                        value.get("cosine"), (int, float)
-                    ):
-                        cosines.append(value["cosine"])
-                    elif (
-                        key.endswith(("cosine", "cosine_sim"))
-                        and isinstance(value, (int, float))
-                    ):
-                        cosines.append(value)
+            if speedup is None:
+                speedup = _entry_speedup(item)
+            if harness == "bench_detection":
+                # One whole-run correctness block covers every scenario.
+                cell = (
+                    f"boxes={correctness.get('boxes_cosine', 0):.4f}; "
+                    f"scores={correctness.get('scores_cosine', 0):.4f}; "
+                    "labels="
+                    f"{correctness.get('labels_match_rate', 0) * 100:.1f}%"
+                )
+            else:
+                cell = _cosine_summary(
+                    _collect_cosines(
+                        correctness.get(name)
+                        if isinstance(correctness, dict)
+                        else None
+                    )
+                )
             rows.append(
                 {
                     "model": model,
                     "workload": name,
-                    "reference": reference,
-                    "speedup": (
-                        fastkernels_rate / reference_rate
-                        if fastkernels_rate and reference_rate
-                        else item.get("speedup")
-                    ),
-                    "correctness": _cosine_summary(cosines),
+                    "reference": data.get("reference_name") or reference,
+                    "speedup": speedup,
+                    "correctness": cell,
                 }
             )
-    elif harness == "bench_detection":
-        correctness = data.get("correctness") or {}
-        reference_items = data.get("reference", {}).get("throughput", [])
-        for index, item in enumerate(
-            data.get("fastkernels", {}).get("throughput", [])
-        ):
-            reference_item = (
-                reference_items[index] if index < len(reference_items) else {}
+    elif harness == "bench_sam" and not data.get("scenarios"):
+        # Legacy shape, before bench_sam emitted comparison.py's scenarios list:
+        # one flat top-level image-pass rate, and no video throughput at all.
+        speedup = _speedup_ratio(
+            data.get("fastkernels_items_per_sec"), data.get("ref_items_per_sec")
+        )
+        if speedup is None:
+            speedup = _entry_speedup(data)
+        if speedup is not None:
+            cosines = _collect_cosines(data.get("correctness")) + _collect_cosines(
+                data.get("video_correctness")
             )
-            fastkernels_rate = item.get("images_per_second")
-            reference_rate = reference_item.get("images_per_second")
             rows.append(
                 {
                     "model": model,
-                    "workload": item.get("name"),
-                    "reference": reference,
-                    "speedup": (
-                        fastkernels_rate / reference_rate
-                        if fastkernels_rate and reference_rate
-                        else item.get("speedup")
+                    "workload": "full-pipeline",
+                    "reference": data.get("reference_name") or reference,
+                    "speedup": speedup,
+                    "correctness": _cosine_summary(cosines),
+                }
+            )
+    elif harness == "bench_recsys":
+        for name, entry in (data.get("models") or {}).items():
+            throughput = (entry or {}).get("throughput") or {}
+            speedup = _speedup_ratio(
+                _throughput_rate(throughput.get("ours")),
+                _throughput_rate(throughput.get("reference_metrics")),
+            )
+            if speedup is None:
+                ratio = throughput.get("ratio_vs_reference")
+                if isinstance(ratio, (int, float)) and math.isfinite(float(ratio)):
+                    speedup = float(ratio)
+            rows.append(
+                {
+                    "model": model,
+                    "workload": _RECSYS_THROUGHPUT_WORKLOAD.get(name, name),
+                    "reference": throughput.get("reference") or reference,
+                    "speedup": speedup,
+                    "correctness": _cosine_summary(
+                        _collect_cosines((entry or {}).get("alignment"))
                     ),
-                    "correctness": (
-                        f"boxes={correctness.get('boxes_cosine', 0):.4f}; "
-                        f"scores={correctness.get('scores_cosine', 0):.4f}; "
-                        "labels="
-                        f"{correctness.get('labels_match_rate', 0) * 100:.1f}%"
+                }
+            )
+    elif harness == "bench_vjepa2" and not data.get("scenarios"):
+        # Legacy single-task shape, before bench_vjepa2 took --workloads and
+        # started emitting comparison.py's scenarios list.
+        throughput = data.get("throughput") or {}
+        speedup = _speedup_ratio(
+            _throughput_rate(throughput.get("ours")),
+            _throughput_rate(throughput.get("reference")),
+        )
+        if speedup is not None:
+            rows.append(
+                {
+                    "model": model,
+                    # The task under test is itself the declared workload
+                    # (predictor / encoder / classification).
+                    "workload": data.get("task") or "predictor",
+                    "reference": data.get("reference_name") or reference,
+                    "speedup": speedup,
+                    "correctness": _cosine_summary(
+                        _collect_cosines((data.get("alignment") or {}).get("metrics"))
                     ),
                 }
             )
@@ -890,8 +1073,9 @@ def _throughput_rows_for_result(
                     "model": model,
                     "workload": item.get("scenario") or item.get("name"),
                     "reference": data.get("reference_name") or reference,
-                    "speedup": item.get("speedup"),
+                    "speedup": _entry_speedup(item),
                     "correctness": _alignment_summary(item.get("alignment")),
+                    **_unsupported_fields(item),
                 }
             )
     return rows
@@ -917,51 +1101,78 @@ def _latency_rows_for_result(
                     "model": model,
                     "workload": item.get("scenario") or item.get("name"),
                     "reference": reference,
-                    "speedup": item.get("speedup"),
+                    "speedup": _entry_speedup(item),
+                    **_unsupported_fields(item),
                 }
             )
-    elif harness == "bench_vllm_omni":
-        reference_items = data.get("vllm_omni", {}).get("latency", [])
-        for index, item in enumerate(
-            data.get("fastkernels", {}).get("latency", [])
-        ):
-            reference_item = (
-                reference_items[index] if index < len(reference_items) else {}
+    elif harness in _TWO_SIDED_REFERENCE_KEY:
+        for name, item, reference_item in _two_sided_pairs(data, harness, "latency"):
+            speedup = _speedup_ratio(
+                _median_seconds(reference_item), _median_seconds(item)
             )
-            fastkernels_median = item.get("median_s")
-            reference_median = reference_item.get("median_s")
+            if speedup is None:
+                speedup = _entry_speedup(item)
             rows.append(
                 {
                     "model": model,
-                    "workload": item.get("scenario") or item.get("name"),
-                    "reference": reference,
-                    "speedup": (
-                        reference_median / fastkernels_median
-                        if fastkernels_median and reference_median
-                        else item.get("speedup")
-                    ),
+                    "workload": name,
+                    "reference": data.get("reference_name") or reference,
+                    "speedup": speedup,
                 }
             )
-    elif harness == "bench_detection":
-        reference_items = data.get("reference", {}).get("latency", [])
-        for index, item in enumerate(
-            data.get("fastkernels", {}).get("latency", [])
-        ):
-            reference_item = (
-                reference_items[index] if index < len(reference_items) else {}
+    elif harness == "bench_recsys":
+        for name, entry in (data.get("models") or {}).items():
+            throughput = (entry or {}).get("throughput") or {}
+            speedup = _speedup_ratio(
+                _median_seconds(throughput.get("reference_metrics")),
+                _median_seconds(throughput.get("ours")),
             )
-            fastkernels_median = item.get("median_s")
-            reference_median = reference_item.get("median_s")
+            if speedup is None:
+                continue
             rows.append(
                 {
                     "model": model,
-                    "workload": item.get("name"),
-                    "reference": reference,
-                    "speedup": (
-                        reference_median / fastkernels_median
-                        if fastkernels_median and reference_median
-                        else item.get("speedup")
+                    # The p50 of the same batch the throughput row measures;
+                    # bench_recsys runs no separate single-request probe, so
+                    # this must not be labelled as the declared single-request.
+                    "workload": (
+                        f"{_RECSYS_THROUGHPUT_WORKLOAD.get(name, name)}-p50"
                     ),
+                    "reference": throughput.get("reference") or reference,
+                    "speedup": speedup,
+                }
+            )
+    elif harness == "bench_vjepa2" and not data.get("latency_scenarios"):
+        # Legacy shape; see the throughput side.
+        latency = data.get("latency") or {}
+        reference_results = (latency.get("reference") or {}).get("results") or []
+        by_batch = {
+            entry.get("batch_size"): entry
+            for entry in reference_results
+            if isinstance(entry, dict)
+        }
+        for index, item in enumerate((latency.get("ours") or {}).get("results") or []):
+            if not isinstance(item, dict):
+                continue
+            reference_item = by_batch.get(item.get("batch_size"))
+            if reference_item is None and index < len(reference_results):
+                reference_item = reference_results[index]
+            speedup = _speedup_ratio(
+                _median_seconds(reference_item or {}), _median_seconds(item)
+            )
+            if speedup is None:
+                continue
+            batch_size = item.get("batch_size")
+            rows.append(
+                {
+                    "model": model,
+                    "workload": (
+                        "single-video"
+                        if batch_size == 1
+                        else f"video-batch-{batch_size}"
+                    ),
+                    "reference": data.get("reference_name") or reference,
+                    "speedup": speedup,
                 }
             )
     elif harness == "bench_openfold3":
@@ -971,7 +1182,8 @@ def _latency_rows_for_result(
                     "model": model,
                     "workload": item.get("scenario"),
                     "reference": reference,
-                    "speedup": item.get("speedup"),
+                    "speedup": _entry_speedup(item),
+                    **_unsupported_fields(item),
                 }
             )
     if not rows:
@@ -985,7 +1197,8 @@ def _latency_rows_for_result(
                     "model": model,
                     "workload": item.get("scenario") or item.get("name"),
                     "reference": data.get("reference_name") or reference,
-                    "speedup": item.get("speedup"),
+                    "speedup": _entry_speedup(item),
+                    **_unsupported_fields(item),
                 }
             )
     return rows
@@ -1032,11 +1245,146 @@ def _result_artifact_path(run_dir: Path, harness: str | None) -> Path:
     return run_dir / "summary.json"
 
 
+# Harnesses whose row names legitimately do not correspond 1:1 to the workload
+# names the scenario table declares, so per-name coverage cannot be checked.
+# They are held to the weaker bar of having produced some measured row at all.
+# Shrinking this table -- by teaching a harness the declared names, or by
+# declaring what it actually measures -- is how coverage checking gets stricter.
+_COVERAGE_ALIAS_HARNESSES = {
+    "bench_sglang": (
+        "runs its own EAGLE-3 speculative-decoding scenarios instead of the "
+        "declared LLM workloads"
+    ),
+    "bench_ttt_e2e": (
+        "names rows after the TTT variant (pretrain / meta) instead of the "
+        "declared LLM workloads"
+    ),
+    "bench_image_cls": (
+        "names its throughput row after the dataset and its latency rows after "
+        "batch size"
+    ),
+    "bench_dllm": "names rows after the Fast-dLLM decoding mode",
+}
+
+# Workloads a scenario table declares that no harness implements yet. These are
+# always reported, never silent, but do not fail the run: the fix is either to
+# build the probe or to drop the declaration, and both belong to whoever owns
+# the row rather than to the summary writer.
+_UNIMPLEMENTED_WORKLOADS = {
+    ("bench_recsys", "single-request"): (
+        "bench_recsys times one large batch and derives both its throughput and "
+        "its p50 from it; no batch-1 probe exists"
+    ),
+    ("bench_recsys", "fixed-batch-32"): (
+        "bench_recsys times one large batch; no batch-32 probe exists"
+    ),
+}
+
+
+def _unsupported_reason(entry: dict) -> str | None:
+    """Why a harness deliberately recorded no speedup for this scenario.
+
+    bench_microsoft_bitnet's bs>1 latency probe is the case this exists for: the
+    official int2 decode GEMM only implements M == 1, so there is no like-for-like
+    reference to divide by, and the harness records ``speedup: null`` with a
+    reason rather than comparing a batched run against a serial reference loop.
+    A blank cell carrying a reason is a documented gap, not a parsing failure.
+    """
+    if not isinstance(entry, dict):
+        return None
+    if not entry.get("reference_unsupported"):
+        return None
+    return str(entry.get("reference_unsupported_reason") or "reference cannot run it")
+
+
+def _unsupported_fields(entry: dict) -> dict:
+    reason = _unsupported_reason(entry)
+    return {"reference_unsupported_reason": reason} if reason else {}
+
+
+def _coverage_for_model(
+    harness: str,
+    declared: list[str],
+    rows: list[dict],
+) -> dict:
+    """Which declared workloads actually produced a value in the summary table.
+
+    A workload is covered when some row carries its name *and* a speedup: a row
+    whose speedup is None renders as a blank cell, which is the same failure as
+    having no row at all. Both were how bench_sam's clip-tracking throughput and
+    bench_vjepa2's encoder task went missing from a whole sweep unnoticed.
+    """
+    measured = sorted(
+        {
+            row["workload"]
+            for row in rows
+            if row.get("workload") and row.get("speedup") is not None
+        }
+    )
+    # Rows the harness deliberately left without a speedup because the reference
+    # cannot run them. Category (a): report the gap, do not fail on it.
+    unsupported = {
+        row["workload"]: row["reference_unsupported_reason"]
+        for row in rows
+        if row.get("workload")
+        and row.get("speedup") is None
+        and row.get("reference_unsupported_reason")
+    }
+    blank = sorted(
+        {
+            row["workload"]
+            for row in rows
+            if row.get("workload")
+            and row.get("speedup") is None
+            and row["workload"] not in unsupported
+        }
+    )
+    coverage: dict = {"declared": list(declared), "measured": measured}
+    if blank:
+        coverage["blank"] = blank
+    if unsupported:
+        coverage["reference_unsupported"] = [
+            {"workload": name, "reason": reason}
+            for name, reason in unsupported.items()
+        ]
+
+    alias_reason = _COVERAGE_ALIAS_HARNESSES.get(harness)
+    if alias_reason:
+        coverage["alias_reason"] = alias_reason
+        # Only "produced nothing at all" is detectable for these; a row that
+        # exists but has no value is already reported as blank.
+        coverage["missing"] = (
+            [] if (measured or blank or unsupported) else list(declared)
+        )
+        return coverage
+
+    missing: list[str] = []
+    unimplemented: list[dict] = []
+    for workload in declared:
+        # A blank or explicitly-unsupported row gets the more specific
+        # diagnosis, not both.
+        if workload in measured or workload in blank or workload in unsupported:
+            continue
+        reason = _UNIMPLEMENTED_WORKLOADS.get((harness, workload))
+        if reason:
+            unimplemented.append({"workload": workload, "reason": reason})
+        else:
+            missing.append(workload)
+    coverage["missing"] = missing
+    if unimplemented:
+        coverage["unimplemented"] = unimplemented
+    undeclared = [name for name in measured if name not in declared]
+    if undeclared:
+        coverage["undeclared"] = undeclared
+    return coverage
+
+
 def _build_summary(root: Path, scenarios, results: dict[int, str]) -> dict:
     task_results = _load_task_results(root)
     throughput: list[dict] = []
     latency: list[dict] = []
     models: list[dict] = []
+    coverage_gaps: list[dict] = []
     for index, scenario in enumerate(scenarios):
         task = task_results.get(index, {})
         harness = task.get("harness") or _harness_for(
@@ -1056,6 +1404,7 @@ def _build_summary(root: Path, scenarios, results: dict[int, str]) -> dict:
         model = data.get("model") or task.get("name") or scenario.hf_name
         status = results.get(index, task.get("status", "?"))
         draft_model = getattr(scenario, "draft_model", None)
+        declared = list(_scenario_workloads(scenario))
         models.append(
             {
                 "index": index,
@@ -1065,7 +1414,7 @@ def _build_summary(root: Path, scenarios, results: dict[int, str]) -> dict:
                 "reference": _reference_name(harness or ""),
                 "tp": data.get("tp") or task.get("tp") or scenario.tp,
                 "dtype": scenario.dtype,
-                "workloads": list(_scenario_workloads(scenario)),
+                "workloads": declared,
                 "status": status,
                 "paths": {
                     "run_log": str(run_dir / "run.log") if run_dir else None,
@@ -1073,28 +1422,82 @@ def _build_summary(root: Path, scenarios, results: dict[int, str]) -> dict:
                 },
             }
         )
+        model_rows: list[dict] = []
         if data and harness:
+            model_rows = _throughput_rows_for_result(
+                model, harness, data
+            ) + _latency_rows_for_result(model, harness, data)
             throughput.extend(_throughput_rows_for_result(model, harness, data))
             latency.extend(_latency_rows_for_result(model, harness, data))
+        # A job that failed already reports why; its empty table is a symptom of
+        # that failure, not a separate coverage bug.
+        if status.startswith("PASS"):
+            coverage = _coverage_for_model(harness or "", declared, model_rows)
+            if (
+                coverage.get("missing")
+                or coverage.get("blank")
+                or coverage.get("unimplemented")
+                or coverage.get("reference_unsupported")
+            ):
+                coverage_gaps.append(
+                    {"index": index, "model": model, "harness": harness, **coverage}
+                )
     passed = sum(model["status"].startswith("PASS") for model in models)
+    # A declared workload with no value is a failure even when every job exits 0:
+    # that is exactly how a sweep can look green while the table is full of holes.
+    incomplete = [
+        gap for gap in coverage_gaps if gap.get("missing") or gap.get("blank")
+    ]
     return {
         "run": {
             "status": (
                 "PASS"
-                if models and passed == len(models)
+                if models and passed == len(models) and not incomplete
                 else "FAIL"
             ),
             "root": str(root),
             "models_total": len(models),
             "models_passed": passed,
+            "models_incomplete": len(incomplete),
         },
         "models": models,
         "throughput": throughput,
         "latency": latency,
+        "coverage_gaps": coverage_gaps,
     }
 
 
-def _write_summary(root: Path, scenarios, results: dict[int, str]) -> None:
+def _format_coverage_gaps(coverage_gaps: list[dict]) -> str:
+    lines: list[str] = []
+    for gap in coverage_gaps:
+        missing = gap.get("missing") or []
+        blank = gap.get("blank") or []
+        unimplemented = gap.get("unimplemented") or []
+        unsupported = gap.get("reference_unsupported") or []
+        header = f"  {gap['model']} [{gap['harness']}]"
+        lines.append(header)
+        if missing:
+            lines.append(f"    no row: {', '.join(missing)}")
+            if gap.get("undeclared"):
+                lines.append(
+                    f"    rows present under other names: "
+                    f"{', '.join(gap['undeclared'])}"
+                )
+        if blank:
+            lines.append(f"    row with no speedup: {', '.join(blank)}")
+        for entry in unimplemented:
+            lines.append(
+                f"    not implemented: {entry['workload']} -- {entry['reason']}"
+            )
+        for entry in unsupported:
+            lines.append(
+                f"    no reference: {entry['workload']} -- {entry['reason']}"
+            )
+    return "\n".join(lines)
+
+
+def _write_summary(root: Path, scenarios, results: dict[int, str]) -> int:
+    """Write summary.json and print the tables. Returns 1 on a coverage gap."""
     summary = _build_summary(root, scenarios, results)
     path = root / "summary.json"
     path.write_text(json.dumps(summary, indent=2) + "\n")
@@ -1126,6 +1529,26 @@ def _write_summary(root: Path, scenarios, results: dict[int, str]) -> None:
                 ],
             )
         )
+    if summary["coverage_gaps"]:
+        incomplete = [
+            gap
+            for gap in summary["coverage_gaps"]
+            if gap.get("missing") or gap.get("blank")
+        ]
+        label = (
+            "DECLARED WORKLOADS WITH NO RESULT"
+            if incomplete
+            else "DECLARED WORKLOADS WITH NO COMPARABLE REFERENCE"
+        )
+        print(f"\n{_c(label, '1;31' if incomplete else '1;33')}")
+        print(_format_coverage_gaps(summary["coverage_gaps"]))
+        if incomplete:
+            print(
+                f"\n{len(incomplete)} model(s) exited 0 but left a declared "
+                "workload with no value in the table above."
+            )
+            return 1
+    return 0
 
 
 def _print_summary(scenarios, results: dict[int, str]) -> int:
@@ -1206,6 +1629,9 @@ def run_validation(scenarios, args, gpus: list[str], root: Path) -> int:
         )
     if not jobs:
         rc = _print_summary(scenarios, results)
+        # Coverage gaps fail the run too, so the summary must be written before
+        # the run_finished status is decided.
+        rc = rc or _write_summary(root, scenarios, results)
         _append_run_event(
             root,
             {
@@ -1214,7 +1640,6 @@ def run_validation(scenarios, args, gpus: list[str], root: Path) -> int:
                 "results": results,
             },
         )
-        _write_summary(root, scenarios, results)
         return rc
 
     try:
@@ -1361,6 +1786,7 @@ def run_validation(scenarios, args, gpus: list[str], root: Path) -> int:
         for index in range(len(scenarios)):
             results.setdefault(index, "FAIL(cancelled)")
     rc = _print_summary(scenarios, results)
+    rc = rc or _write_summary(root, scenarios, results)
     _append_run_event(
         root,
         {
@@ -1369,5 +1795,4 @@ def run_validation(scenarios, args, gpus: list[str], root: Path) -> int:
             "results": results,
         },
     )
-    _write_summary(root, scenarios, results)
     return 130 if interrupted else rc

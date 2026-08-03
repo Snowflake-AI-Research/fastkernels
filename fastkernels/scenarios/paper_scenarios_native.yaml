@@ -127,7 +127,7 @@ scenarios:
   - model: facebook/sam3.1
     tp: 1
     dtype: float32
-    workloads: [Segmentation.gold_metaclip_nps, Segmentation.gold_wiki_common, Segmentation.gold_crowded, Segmentation.veval_sav_val, Segmentation.veval_yt1b_val, Segmentation.sav_val_video, Segmentation.smartglasses_val_video, Segmentation.single_image_1008, Segmentation.batch_4_image_1008, Segmentation.single_video_frame_1008]
+    workloads: [Segmentation.full_pipeline, Segmentation.smartglasses_val_video, Segmentation.single_image_1008, Segmentation.batch_4_image_1008, Segmentation.single_video_frame_1008]
   - model: openai/whisper-large-v3
     tp: 1
     dtype: float16
@@ -261,7 +261,10 @@ scenarios:
     tp: 1
     dtype: float16   # bench_oasis hardcodes float16 on cuda
     workloads: [WorldModel.short_bs4_16f_4ddim, WorldModel.medium_bs8_24f_4ddim, WorldModel.long_bs8_32f_4ddim, WorldModel.denoise_bs4_16f_8ddim, WorldModel.latency_bs1_8f_4ddim]
+  # V-JEPA 2: classification is omitted deliberately -- this pretrain-only
+  # checkpoint carries no classifier head, so bench_vjepa2 refuses the workload
+  # rather than compare two randomly initialized heads. See full.yaml.
   - model: facebook/vjepa2-vitl-fpc64-256
     tp: 1
     dtype: bfloat16
-    workloads: [VideoRepresentation.predictor, VideoRepresentation.encoder, VideoRepresentation.classification, VideoRepresentation.single_video]
+    workloads: [VideoRepresentation.predictor, VideoRepresentation.encoder, VideoRepresentation.single_video]
