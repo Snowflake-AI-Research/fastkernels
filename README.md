@@ -66,10 +66,10 @@ request that agree with the reference.
 
 | workload | requests | fastkernels | vLLM | ratio | prefix match |
 |---|---|---|---|---|---|
-| mixed | 1000 | 3,426 tok/s | 4,188 tok/s | 0.82x | 13.1 / 388 |
-| long-context | 64 | 88 tok/s | 248 tok/s | 0.35x | 25.6 / 256 |
-| single-request (bs=1) | — | 11.53 ms/tok | 8.98 ms/tok | 0.78x | — |
-| fixed-batch-32 | — | 0.61 ms/tok | 0.51 ms/tok | 0.84x | — |
+| mixed | 1000 | 3,535 tok/s | 4,188 tok/s | 0.84x | 13.1 / 388 |
+| long-context | 64 | 80 tok/s | 248 tok/s | 0.32x | 41.8 / 256 |
+| single-request (bs=1) | — | 10.09 ms/tok | 8.98 ms/tok | 0.89x | — |
+| fixed-batch-32 | — | 0.57 ms/tok | 0.51 ms/tok | 0.91x | — |
 
 At 4 layers / tp=1 the greedy output is byte-identical to vLLM's, and on the full
 model 23 of the 1000 mixed requests match for all 388 tokens; the averages above

@@ -3787,10 +3787,10 @@ it. They are now materialised from KV-cache allocation via `ensure_workspaces`.
 
 | workload | requests | fastkernels tok/s | vLLM tok/s | ratio | avg prefix match |
 |---|---|---|---|---|---|
-| mixed | 1000 | 3,426 | 4,188 | 0.82x | 13.1 / 388 |
-| long-context | 64 | 88 | 248 | 0.35x | 25.6 / 256 |
-| single-request (bs=1) | — | 11.53 ms/tok | 8.98 ms/tok | 0.78x | — |
-| fixed-batch-32 | — | 0.61 ms/tok | 0.51 ms/tok | 0.84x | — |
+| mixed | 1000 | 3,535 | 4,188 | 0.84x | 13.1 / 388 |
+| long-context | 64 | 80 | 248 | 0.32x | 41.8 / 256 |
+| single-request (bs=1) | — | 10.09 ms/tok | 8.98 ms/tok | 0.89x | — |
+| fixed-batch-32 | — | 0.57 ms/tok | 0.51 ms/tok | 0.91x | — |
 
 Correctness is not in doubt at the operator level: at 4 layers / tp=1 the greedy
 output is **byte-identical** to vLLM's for the same prompt, and on the full model
@@ -3819,3 +3819,54 @@ on the mixed workload are 227.6 s vs 11.5 s. Closing long-context therefore mean
 teaching the engine to capture mixed-batch graphs (piecewise, with the indexer as
 a split point), which is a general engine feature rather than anything specific to
 NVFP4 -- it would lift GLM-5.2 and GLM-5.2-FP8 identically.
+
+### 27g. Where the latency gap was, kernel by kernel
+
+Profiled both engines at the single-request shape (bs=1, 1024 prompt, 128 decode,
+tp=8, rank 0), then diffed the kernel tables.
+
+**First: it is kernel time, not host time.** fastkernels' summed self-CUDA was
+**103% of wall** at bs=1 -- the GPU is saturated, so Python, launch overhead and
+idle were all ruled out in one measurement. (bs=32 read 75%, but that run's wall
+included a 32k-token prefill; it is not a clean decode number.)
+
+fastkernels 12.182 ms/token of GPU time vs vLLM 10.325. Two entries with no vLLM
+counterpart accounted for almost all of it:
+
+| kernel | fastkernels | vLLM | note |
+|---|---|---|---|
+| `aten::copy_` `[1048576, 64]` | **139.7 ms** | — | RoPE cache re-cast per call |
+| MoE epilogue elementwise x2 | 29.1 ms | 14.2 ms (1 fused) | `out*scale` then `+shared` |
+
+The first is the whole story of the gap. GLM-5.2's
+`max_position_embeddings` is 1,048,576, so a `[1048576, 64]` fp32 cos/sin cache is
+268 MiB. `YarnRotaryEmbedding.forward` casts the cache to the query dtype whenever
+they differ; the main rope avoids that by taking `cache_dtype` and casting once at
+init, but the per-compute-layer indexer rope was constructed without it. So ~21
+layers each converted 268 MiB -> 134 MiB on every decode step: 9% of all GPU time,
+the single largest kernel in the profile. Both fixed (27h).
+
+**After the fixes**: GPU 10.671 ms/token (within 3.4% of vLLM's 10.325), wall
+10.360 vs 9.094 -> 0.89x on single-request and 0.91x on fixed-batch-32.
+
+**What remains is overlap, not kernels.** fastkernels' wall is 97% of its summed
+kernel time; vLLM's is 88%. vLLM hides ~12% of its kernel work behind concurrent
+streams where we hide ~3%, so our exposed critical path is longer even though the
+total work now matches.
+
+Smaller residual deltas, all fusion differences (fastkernels / vLLM):
+
+* `CatArrayBatchedCopy` 28.9 / ~0 -- our `torch.cat` for the absorbed query and
+  the indexer concats; vLLM folds them into Triton kernels (and into
+  `_DecodeConcatQuantFP8`, which fuses the cat with the fp8 quant).
+* `act_and_mul` 20.2 / 13.3 (`triton_poi_fused_mul_silu_slice`).
+* `scaled_fp8_quant` 23.7 / 18.0 (`triton_poi_fused__to_copy_cat_clamp_mul_reciprocal`).
+* the two absorbed BMMs: our `TNN`+`NNN` 115.7 / vLLM's `TNN` twice 110.6 -- a
+  weight-layout difference in `W_UV`.
+
+And where fastkernels is **ahead**: RMSNorm reductions (20.9 vs vLLM's ~68.6
+across three Triton kernels), both NVFP4 MoE GEMMs, the decode all-reduce
+(127.1 vs 142.2 -- same `oneshotAllreduceFusionKernel`, same 19,939 calls), and
+the prefill all-reduce (NCCL RING_LL 16.9 vs torch multimem 30.6). Collective
+*count* is identical at 2 per layer per step, so this is not a sync-count
+difference.
