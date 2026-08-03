@@ -1376,6 +1376,12 @@ class BenchmarkScenario:
     workloads: list[Workload]
     enforce_eager: bool = False
     max_num_seqs: int | None = None
+    # Paged-KV cache dtype, passed verbatim to BOTH engines (fastkernels'
+    # ``LlamaEngine(kv_cache_dtype=...)`` and vLLM's ``LLM(kv_cache_dtype=...)``).
+    # ``None`` leaves each side on its own default ("auto" = the model's compute
+    # dtype). Distinct from ``dtype``, which names the WEIGHT quantization: a
+    # checkpoint can be NVFP4 with an fp8 KV cache, as nvidia/GLM-5.2-NVFP4 is.
+    kv_cache_dtype: str | None = None
     draft_model: str | None = None
     variant: str | None = None
     scene: str | None = None
@@ -1403,7 +1409,7 @@ class BenchmarkScenario:
 # "all" shorthand -- every workload is spelled out.
 
 _WORKLOAD_FAMILIES: dict[str, type[Workload]] = {c.__name__: c for c in _ALL_FAMILIES}
-_ALLOWED_DTYPES = {"bfloat16", "float16", "float32", "fp8", "mxfp4"}
+_ALLOWED_DTYPES = {"bfloat16", "float16", "float32", "fp8", "mxfp4", "nvfp4"}
 
 
 def _resolve_workload_token(token: str) -> Workload:
@@ -1429,7 +1435,7 @@ def _resolve_workload_token(token: str) -> Workload:
 _SCENARIO_KEYS = frozenset(
     {
         "model", "tp", "dtype", "workloads",
-        "enforce_eager", "max_num_seqs",
+        "enforce_eager", "max_num_seqs", "kv_cache_dtype",
         "draft_model", "variant", "scene", "reference_checkpoint",
     }
 )
@@ -1473,6 +1479,7 @@ def _scenario_from_mapping(entry: Mapping[str, Any], *, source: str) -> Benchmar
         model, tp, dtype, workloads,
         enforce_eager=bool(entry.get("enforce_eager", False)),
         max_num_seqs=entry.get("max_num_seqs"),
+        kv_cache_dtype=entry.get("kv_cache_dtype"),
         draft_model=entry.get("draft_model"),
         variant=entry.get("variant"),
         scene=entry.get("scene"),

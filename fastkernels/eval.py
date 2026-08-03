@@ -257,6 +257,8 @@ def _run_impl(scenario, args, throughput_runs, latency_runs, max_seq_len):
         max_num_seqs=scenario.max_num_seqs,
         max_layers=args.max_layers,
     )
+    if getattr(scenario, "kv_cache_dtype", None):
+        engine_kwargs["kv_cache_dtype"] = scenario.kv_cache_dtype
     if max_seq_len:
         engine_kwargs["max_model_len"] = max_seq_len
     engine = LlamaEngine(**engine_kwargs)

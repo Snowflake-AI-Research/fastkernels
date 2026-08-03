@@ -25,7 +25,17 @@ dependencies = [
     "openai>=2.48.0",
     "quack-kernels>=0.6.1",
     "ray[default]",
-    "deep-gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@v2.1.1.post3",
+    # Pin the exact DeepGEMM commit vLLM 0.26 vendors (its __version__ is 2.5.0),
+    # so fastkernels and vLLM use the identical fp8 GEMM / MQA-logits kernels.
+    # Kept in sync with vllm's cmake/external_projects/deepgemm.cmake
+    # (_DEEPGEMM_UPSTREAM_TAG) and tools/install_deepgemm.sh (DEEPGEMM_GIT_REF).
+    #
+    # v2.1.1.post3 (the previous pin) is NOT enough for the DSA models: vLLM
+    # 0.26's sparse indexer calls the unified ``fp8_fp4_mqa_logits``, which
+    # v2.1.1 does not export, so GLM-5.2 / DeepSeek-V3.2 fail at the first
+    # prefill with "DeepGEMM backend is unavailable". This commit is a strict
+    # superset -- it still exports fp8_mqa_logits / fp8_paged_mqa_logits.
+    "deep-gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@a6b593d2826719dcf4892609af7b84ee23aaf32a",
     "decord",
     "mlflow>=2.10",
     "datasets",

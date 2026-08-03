@@ -77,6 +77,12 @@ class DeepSeekV3Config:
     # scheduler_config.max_num_batched_tokens; this is not an HF-config field, so
     # the engine threads its real value in via load_model before construction.
     max_num_batched_tokens: int = 16384
+    # MLA paged-KV cache dtype, which also selects the attention backend:
+    # ``"auto"`` (BF16 cache -> FlashMLA sparse), ``"fp8_ds_mla"`` (DeepSeek's
+    # 656-byte block-scaled cache), ``"fp8_e4m3"`` (plain per-tensor fp8 ->
+    # vLLM's FLASHINFER_MLA_SPARSE). ``None`` defers to
+    # ``FASTKERNELS_KV_CACHE_DTYPE`` (default ``"auto"``).
+    kv_cache_dtype: Optional[str] = None
 
     # YARN RoPE params
     rope_parameters: dict = field(default_factory=lambda: {
@@ -265,6 +271,7 @@ class DeepSeekV3Model(nn.Module):
                 is_v32=is_v32,
                 skip_topk=_layer_skip_topk(i),
                 topk_indices_buffer=self.topk_indices_buffer,
+                kv_cache_dtype=getattr(config, "kv_cache_dtype", None),
             )
             for i in range(config.num_hidden_layers)
         ])

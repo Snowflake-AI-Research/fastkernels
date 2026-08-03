@@ -32,6 +32,7 @@ except ImportError:
 from concurrent.futures import ThreadPoolExecutor
 
 from .tp import _tp_size
+from .quant_scheme import is_nvfp4 as _is_nvfp4
 # Only the (lightweight) Llama config/model is imported eagerly. Every other
 # architecture is imported lazily inside ``load_model`` / the EAGLE-3 loader so
 # that loading a plain Llama checkpoint does not require optional, arch-specific
@@ -67,10 +68,26 @@ _EXPERT_RE = re.compile(
     r"(.+\.block_sparse_moe)\.experts\.(\d+)\.(w[123])\.weight"
 )
 
-# DeepSeek-V3 per-expert weight and scale pattern
+# DeepSeek-V3 per-expert weight and scale pattern.
+#
+# ``weight_scale_inv`` is the block-FP8 spelling; ``weight_scale`` /
+# ``weight_scale_2`` / ``input_scale`` are the ModelOpt NVFP4 ones (per-16 block
+# scale, per-expert global weight scale, per-expert static activation scale).
+# The two schemes never coexist in one checkpoint, and the suffixes are disjoint,
+# so one regex plus the ``_EXPERT_ATTR_TO_PARAM`` table covers both.
 _DEEPSEEK_EXPERT_RE = re.compile(
-    r"(.+\.mlp)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.(weight_scale_inv|weight)$"
+    r"(.+\.mlp)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\."
+    r"(weight_scale_inv|weight_scale_2|weight_scale|input_scale|weight)$"
 )
+
+# Checkpoint suffix -> (w13 param suffix, w2 param suffix) on ``DeepSeekMoE``.
+_EXPERT_ATTR_TO_PARAM = {
+    "weight": ("w13", "w2"),
+    "weight_scale_inv": ("w13_weight_scale_inv", "w2_weight_scale_inv"),
+    "weight_scale": ("w13_weight_scale", "w2_weight_scale"),
+    "weight_scale_2": ("w13_weight_scale_2", "w2_weight_scale_2"),
+    "input_scale": ("w13_input_scale", "w2_input_scale"),
+}
 
 _DEEPSEEK_SHARED_EXPERT_RE = re.compile(
     r"(.+\.mlp)\.shared_experts\.(gate_proj|up_proj|down_proj)\.(weight|weight_scale_inv)"
@@ -897,22 +914,17 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
         if m_ds:
             moe_prefix, expert_id_str, proj_name, attr = m_ds.groups()
             expert_id = int(expert_id_str)
+            w13_suffix, w2_suffix = _EXPERT_ATTR_TO_PARAM[attr]
             if proj_name in ("gate_proj", "up_proj"):
                 is_w1 = (proj_name == "gate_proj")
-                if attr == "weight":
-                    param_name = f"{moe_prefix}.w13"
-                else:
-                    param_name = f"{moe_prefix}.w13_weight_scale_inv"
+                param_name = f"{moe_prefix}.{w13_suffix}"
                 try:
                     param = model.get_parameter(param_name)
                 except AttributeError:
                     continue
                 param.weight_loader(param, _get_tensor(), expert_id, is_w1=is_w1)
             else:
-                if attr == "weight":
-                    param_name = f"{moe_prefix}.w2"
-                else:
-                    param_name = f"{moe_prefix}.w2_weight_scale_inv"
+                param_name = f"{moe_prefix}.{w2_suffix}"
                 try:
                     param = model.get_parameter(param_name)
                 except AttributeError:
@@ -1126,6 +1138,39 @@ def _postprocess_moe_fp8_weights(module) -> int:
     return count
 
 
+def _postprocess_nvfp4_weights(model: torch.nn.Module) -> None:
+    """Transform loaded NVFP4 expert weights into TRTLLM-gen kernel layout.
+
+    The NVFP4 analogue of :func:`_postprocess_fp8_weights`: there are no
+    quantized linears to touch (the checkpoint excludes every one), so this only
+    walks the MoE modules and hands each one to
+    ``DeepSeekMoE.prepare_fp4_weights``, which mirrors
+    ``ModelOptNvFp4FusedMoE.process_weights_after_loading``.
+    """
+    import time as _time
+
+    from ..tasks.baseline.L2.deepseek_moe import DeepSeekMoE
+
+    modules = [
+        m for m in model.modules()
+        if isinstance(m, DeepSeekMoE) and getattr(m, "use_nvfp4", False)
+    ]
+    if not modules:
+        return
+    _t0 = _time.perf_counter()
+    print("  Post-processing NVFP4 MoE weights for TRTLLM-gen...", flush=True)
+    total = len(modules)
+    for j, module in enumerate(modules):
+        module.prepare_fp4_weights()
+        if j % max(1, total // 5) == 0 or j == total - 1:
+            print(f"    NVFP4 MoE postprocess {j+1}/{total} "
+                  f"({(j+1)*100//total}%, "
+                  f"{_time.perf_counter()-_t0:.1f}s)", flush=True)
+    torch.cuda.empty_cache()
+    print(f"  Post-processed {total} NVFP4 MoE layers "
+          f"({_time.perf_counter()-_t0:.1f}s total).", flush=True)
+
+
 def _postprocess_fp8_weights(model: torch.nn.Module) -> None:
     """Re-quantize FP8 weights to UE8M0 format and transform scale layout for DeepGEMM.
 
@@ -1282,7 +1327,23 @@ def _detect_model_type(model_name: str) -> str:
 
 
 def _detect_quant_config(model_name: str) -> dict | None:
-    """Detect FP8 quantization config from HuggingFace config."""
+    """Detect the checkpoint's quantization config from its HuggingFace config.
+
+    Recognizes two schemes (see ``infra/quant_scheme.py``):
+
+    * ``quant_method == "fp8"`` -- DeepSeek / Qwen block-FP8 W8A8.
+    * ``quant_method == "modelopt"`` with ``quant_algo == "NVFP4"`` -- ModelOpt
+      NVFP4 W4A4 (nvidia/GLM-5.2-NVFP4). vLLM reads the same
+      ``config.json:quantization_config`` block for this: its
+      "compressed-tensors style" branch in ``ModelOptQuantConfigBase.from_config``
+      takes ``quant_algo``, ``group_size``, and the ``ignore`` exclude list from
+      exactly these keys. The separate ``hf_quant_config.json`` is the legacy
+      spelling of the same content and is not consulted when
+      ``quantization_config`` is present.
+
+    Anything else returns ``None`` (treated as unquantized) rather than being
+    silently mapped onto one of the two supported schemes.
+    """
     try:
         hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
     except (ValueError, OSError):
@@ -1291,15 +1352,22 @@ def _detect_quant_config(model_name: str) -> dict | None:
     qc = getattr(hf_config, "quantization_config", None)
     if qc is None:
         return None
-    if isinstance(qc, dict):
-        quant_method = qc.get("quant_method", "")
-    else:
-        quant_method = getattr(qc, "quant_method", "")
-    if quant_method != "fp8":
-        return None
-    if isinstance(qc, dict):
+    if not isinstance(qc, dict):
+        qc = qc.to_dict() if hasattr(qc, "to_dict") else {
+            "quant_method": getattr(qc, "quant_method", "")
+        }
+    quant_method = str(qc.get("quant_method", "")).lower()
+    if quant_method == "fp8":
         return qc
-    return qc.to_dict() if hasattr(qc, "to_dict") else {"quant_method": "fp8"}
+    if quant_method.startswith("modelopt"):
+        algo = str(qc.get("quant_algo", "")).upper()
+        if algo == "NVFP4":
+            return qc
+        raise NotImplementedError(
+            f"{model_name}: ModelOpt quant_algo={algo!r} is not supported; "
+            "only NVFP4 is implemented."
+        )
+    return None
 
 
 def _move_preserving_param_dtypes(
@@ -1412,14 +1480,20 @@ def load_model(
     dtype: torch.dtype = torch.bfloat16,
     max_layers: int | None = None,
     max_num_batched_tokens: int | None = None,
+    kv_cache_dtype: str | None = None,
 ):
     model_path = download_model(model_name)
     model_type = _detect_model_type(model_name)
     quant_config = _detect_quant_config(model_name)
 
     if quant_config:
-        print(f"  Detected FP8 quantization: {quant_config.get('quant_method')}, "
-              f"block_size={quant_config.get('weight_block_size')}")
+        if _is_nvfp4(quant_config):
+            print(f"  Detected NVFP4 quantization: "
+                  f"{quant_config.get('quant_method')}/"
+                  f"{quant_config.get('quant_algo')} (routed experts only)")
+        else:
+            print(f"  Detected FP8 quantization: {quant_config.get('quant_method')}, "
+                  f"block_size={quant_config.get('weight_block_size')}")
 
     if model_type in ("flux", "hunyuan_video"):
         raise ValueError(
@@ -1567,6 +1641,12 @@ def load_model(
         # buffer) is constructed.
         if max_num_batched_tokens is not None:
             config.max_num_batched_tokens = max_num_batched_tokens
+        # KV cache dtype selects the MLA attention backend (see
+        # ``MLAAttention.__init__``): ``auto`` -> FlashMLA sparse over a BF16
+        # cache, ``fp8_e4m3`` -> vLLM's FLASHINFER_MLA_SPARSE over a plain fp8
+        # cache. ``None`` leaves it to ``FASTKERNELS_KV_CACHE_DTYPE``.
+        if kv_cache_dtype is not None:
+            config.kv_cache_dtype = kv_cache_dtype
         _apply_max_layers(config, max_layers)
         print(f"  Allocating DeepSeek-V3.2 / GLM-5.2 (MLA+DSA+MoE) model "
               f"({config.n_routed_experts} experts, "
@@ -1656,7 +1736,30 @@ def load_model(
     else:
         load_weights(model, model_path, model_type)
 
-    if quant_config:
+    if quant_config and _is_nvfp4(quant_config):
+        # ModelOpt NVFP4: only the routed experts are quantized, and their
+        # parameters span three dtypes that a blanket ``.to(dtype)`` would
+        # destroy -- uint8 (packed fp4 values), fp8_e4m3 (per-16 block scales),
+        # and fp32 (per-expert global / input scales). Every other module is
+        # BF16 (the checkpoint's ``ignore`` list covers them all), so those cast
+        # normally.
+        for name, param in model.named_parameters():
+            if param.dtype in (torch.uint8, torch.int8, torch.float8_e4m3fn,
+                               torch.float32):
+                if param.data.device != device:
+                    param.data = param.data.to(device=device)
+            elif param.data.device != device or param.dtype != dtype:
+                param.data = param.data.to(device=device, dtype=dtype)
+        for name, buf in model.named_buffers():
+            if buf.device != device:
+                buf.data = buf.data.to(device=device)
+        if model_type in ("deepseek_v3", "kimi_linear"):
+            # kv_b_proj is BF16 under NVFP4, so this builds W_UV / W_UK_T
+            # directly (the trivial-cast branch) -- there is no fp8 kv_b_proj to
+            # defer to ``_finalize_mla_absorbed_weights``.
+            _compute_mla_absorbed_weights(model)
+        _postprocess_nvfp4_weights(model)
+    elif quant_config:
         for name, param in model.named_parameters():
             if param.dtype == torch.float8_e4m3fn:
                 if not param.is_cuda:

@@ -9,3 +9,13 @@ scenarios:
     tp: 8
     dtype: fp8
     workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+  # NVFP4 weights (routed experts only; attention / shared experts / dense MLPs
+  # stay BF16 per the checkpoint's own exclude list) with an fp8 KV cache. The
+  # KV dtype is what selects vLLM's attention backend here: quantized MLA cache
+  # on Blackwell -> FLASHINFER_MLA_SPARSE (plain 576-byte fp8 slots) instead of
+  # FLASHMLA_SPARSE, plus the TRTLLM_RAGGED MLA prefill backend.
+  - model: nvidia/GLM-5.2-NVFP4
+    tp: 8
+    dtype: nvfp4
+    kv_cache_dtype: fp8_e4m3
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]

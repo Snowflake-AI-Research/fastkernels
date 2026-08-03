@@ -809,6 +809,8 @@ def main():
         }
     if cfg.get("load_format"):
         llm_kwargs["load_format"] = cfg["load_format"]
+    if cfg.get("kv_cache_dtype"):
+        llm_kwargs["kv_cache_dtype"] = cfg["kv_cache_dtype"]
     if cfg.get("max_layers") is not None:
         llm_kwargs["hf_overrides"] = _fastkernels_limit_layers
     # Reference-only backend overrides for models vLLM's default selection
@@ -944,6 +946,8 @@ def main():
         engine_kwargs["max_model_len"] = cfg["max_model_len"]
     if "max_layers" in cfg:
         engine_kwargs["max_layers"] = cfg["max_layers"]
+    if cfg.get("kv_cache_dtype"):
+        engine_kwargs["kv_cache_dtype"] = cfg["kv_cache_dtype"]
     engine = LlamaEngine(**engine_kwargs)
 
     # Warmup -- same 16-token prompt as the vLLM worker, so both sides enter
@@ -1453,6 +1457,8 @@ def main():
         llm_kwargs["distributed_executor_backend"] = "mp"
     if cfg.get("load_format"):
         llm_kwargs["load_format"] = cfg["load_format"]
+    if cfg.get("kv_cache_dtype"):
+        llm_kwargs["kv_cache_dtype"] = cfg["kv_cache_dtype"]
     if cfg.get("limit_mm_per_prompt"):
         llm_kwargs["limit_mm_per_prompt"] = cfg["limit_mm_per_prompt"]
     if cfg.get("max_layers") is not None:
@@ -2004,6 +2010,8 @@ def main():
         llm_kwargs["distributed_executor_backend"] = "mp"
     if cfg.get("load_format"):
         llm_kwargs["load_format"] = cfg["load_format"]
+    if cfg.get("kv_cache_dtype"):
+        llm_kwargs["kv_cache_dtype"] = cfg["kv_cache_dtype"]
     llm = LLM(**llm_kwargs)
 
     from vllm.inputs import ExplicitEncoderDecoderPrompt, TextPrompt
@@ -2444,6 +2452,13 @@ def main():
              "are unaffected. Not supported for Whisper (encoder-decoder).",
     )
     parser.add_argument(
+        "--kv-cache-dtype", default=None,
+        help="Paged-KV cache dtype passed to BOTH engines (e.g. fp8_e4m3). "
+             "Omit to leave each side on its own default ('auto'). This is "
+             "independent of the weight quantization: nvidia/GLM-5.2-NVFP4 has "
+             "NVFP4 weights and an fp8 KV cache.",
+    )
+    parser.add_argument(
         "--trust-remote-code",
         action="store_true",
         help="Pass trust_remote_code=True to the reference vLLM worker when required.",
@@ -2842,6 +2857,7 @@ def main():
         temperature=args.temperature, enforce_eager=args.enforce_eager,
         max_layers=args.max_layers, max_model_len=global_max_seq_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        kv_cache_dtype=args.kv_cache_dtype,
         engine_env=engine_env,
         scenarios=scenario_data, latency=latency_data,
     )
@@ -2880,6 +2896,8 @@ def main():
             }
             if args.max_layers is not None:
                 vllm_config["max_layers"] = args.max_layers
+            if args.kv_cache_dtype:
+                vllm_config["kv_cache_dtype"] = args.kv_cache_dtype
             if is_qwen_omni:
                 vllm_config["limit_mm_per_prompt"] = {
                     "image": 1,
@@ -2946,6 +2964,8 @@ def main():
         }
         if args.max_layers is not None:
             kb_config["max_layers"] = args.max_layers
+        if args.kv_cache_dtype:
+            kb_config["kv_cache_dtype"] = args.kv_cache_dtype
         short_name = args.model.split("/")[-1]
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = str(kb_nccl_port)

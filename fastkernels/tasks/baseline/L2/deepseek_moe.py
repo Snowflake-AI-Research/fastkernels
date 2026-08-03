@@ -20,6 +20,9 @@ import torch
 import torch.nn as nn
 
 from ....infra.tp import _tp_rank, _tp_size
+from ....infra.quant_scheme import (
+    FP8_BLOCK, NVFP4, linear_quant_config, quant_scheme,
+)
 from ..L1.allreduce import AllReduce
 from ..L1.grouped_topk import GroupedTopK
 from ..L1.gate_linear import GateLinear
@@ -30,8 +33,13 @@ from ..L1.fp8_linear import PerTokenGroupQuantFp8
 from ..L1.trtllm_fp8_moe import (
     TrtllmFp8MoE, prepare_trtllm_moe_weights, trtllm_fp8_moe_available,
 )
+from ..L1.trtllm_fp4_moe import (
+    NvFp4Quantize, TrtllmFp4MoE, prepare_trtllm_fp4_moe_weights,
+    trtllm_fp4_moe_available,
+)
 
 _FP8_BLOCK = 128
+_NVFP4_GROUP = 16
 
 
 def _scale_shape(out_dim: int, in_dim: int) -> tuple[int, int]:
@@ -58,7 +66,18 @@ class DeepSeekMoE(nn.Module):
         tp = _tp_size()
         self.tp_size = tp
         self.intermediate_per_tp = config.moe_intermediate_size // tp
-        self.use_fp8 = quant_config is not None
+        # ``quant_scheme`` distinguishes DeepSeek block-FP8 from ModelOpt NVFP4;
+        # ``use_fp8`` keeps its historical meaning (block-FP8 experts) so the
+        # existing Triton / TRTLLM-fp8 branches are untouched.
+        self.quant_scheme = quant_scheme(quant_config)
+        self.use_fp8 = self.quant_scheme == FP8_BLOCK
+        self.use_nvfp4 = self.quant_scheme == NVFP4
+        if self.use_nvfp4 and not trtllm_fp4_moe_available():
+            raise RuntimeError(
+                "NVFP4 experts require a Blackwell (sm100) GPU with "
+                "flashinfer's trtllm_fp4_block_scale_moe -- there is no "
+                "fastkernels fallback kernel for NVFP4 W4A4."
+            )
 
         n_group = getattr(config, 'n_group', 1)
         topk_group = getattr(config, 'topk_group', 1)
@@ -92,9 +111,13 @@ class DeepSeekMoE(nn.Module):
             shared_intermediate = config.moe_intermediate_size * n_shared
             # LlamaMLP with reduce_results=False — the final all-reduce
             # is deferred and runs after routed + shared expert are summed.
+            #
+            # ``linear_quant_config``: under NVFP4 the checkpoint's ``ignore``
+            # list covers ``mlp.shared_experts*`` on every layer, so vLLM gives
+            # the shared expert ``UnquantizedLinearMethod`` and it stays BF16.
             self.shared_expert = LlamaMLP(
                 config,
-                quant_config=quant_config,
+                quant_config=linear_quant_config(quant_config),
                 hidden_size=config.hidden_size,
                 intermediate_size=shared_intermediate,
                 reduce_results=False,
@@ -102,7 +125,49 @@ class DeepSeekMoE(nn.Module):
         else:
             self.shared_expert = None
 
-        if self.use_fp8:
+        if self.use_nvfp4:
+            # ModelOpt NVFP4 expert parameter set, matching
+            # ``ModelOptNvFp4FusedMoE.create_weights`` shard-for-shard:
+            #   w13                [E, 2N, K//2]   uint8   (2 fp4 per byte)
+            #   w2                 [E, K,  N//2]   uint8
+            #   w13_weight_scale   [E, 2N, K//16]  fp8e4m3 (per-16 block scale)
+            #   w2_weight_scale    [E, K,  N//16]  fp8e4m3
+            #   w13_weight_scale_2 [E, 2]          fp32    (per-expert global)
+            #   w2_weight_scale_2  [E]             fp32
+            #   w13_input_scale    [E, 2]          fp32    (static activation)
+            #   w2_input_scale     [E]             fp32
+            E, K, N = config.n_routed_experts, config.hidden_size, self.intermediate_per_tp
+            assert K % _NVFP4_GROUP == 0 and N % _NVFP4_GROUP == 0, (
+                f"NVFP4 needs hidden ({K}) and per-rank intermediate ({N}) "
+                f"divisible by {_NVFP4_GROUP}"
+            )
+            self.w13 = nn.Parameter(
+                torch.empty(E, 2 * N, K // 2, dtype=torch.uint8), requires_grad=False,
+            )
+            self.w2 = nn.Parameter(
+                torch.empty(E, K, N // 2, dtype=torch.uint8), requires_grad=False,
+            )
+            self.w13_weight_scale = nn.Parameter(
+                torch.empty(E, 2 * N, K // _NVFP4_GROUP, dtype=torch.float8_e4m3fn),
+                requires_grad=False,
+            )
+            self.w2_weight_scale = nn.Parameter(
+                torch.empty(E, K, N // _NVFP4_GROUP, dtype=torch.float8_e4m3fn),
+                requires_grad=False,
+            )
+            self.w13_weight_scale_2 = nn.Parameter(
+                torch.empty(E, 2, dtype=torch.float32), requires_grad=False,
+            )
+            self.w2_weight_scale_2 = nn.Parameter(
+                torch.empty(E, dtype=torch.float32), requires_grad=False,
+            )
+            self.w13_input_scale = nn.Parameter(
+                torch.empty(E, 2, dtype=torch.float32), requires_grad=False,
+            )
+            self.w2_input_scale = nn.Parameter(
+                torch.empty(E, dtype=torch.float32), requires_grad=False,
+            )
+        elif self.use_fp8:
             self.w13 = nn.Parameter(torch.empty(
                 config.n_routed_experts, 2 * self.intermediate_per_tp, config.hidden_size,
                 dtype=torch.float8_e4m3fn,
@@ -134,6 +199,17 @@ class DeepSeekMoE(nn.Module):
         if self.use_fp8:
             self.w13_weight_scale_inv.weight_loader = self._w13_scale_loader
             self.w2_weight_scale_inv.weight_loader = self._w2_scale_loader
+        if self.use_nvfp4:
+            # Block scales shard exactly like the weights they belong to (row
+            # shard for w13, packed-column shard for w2) -- vLLM reaches them
+            # through the same ``_load_w13`` / ``_load_w2`` helpers. The
+            # per-expert scalars are replicated.
+            self.w13_weight_scale.weight_loader = self._w13_weight_loader
+            self.w2_weight_scale.weight_loader = self._w2_weight_loader
+            self.w13_weight_scale_2.weight_loader = self._w13_per_tensor_loader
+            self.w2_weight_scale_2.weight_loader = self._w2_per_tensor_loader
+            self.w13_input_scale.weight_loader = self._w13_per_tensor_loader
+            self.w2_input_scale.weight_loader = self._w2_per_tensor_loader
 
         # Routing weights: vLLM always passes ``routed_scaling_factor=1.0``
         # to ``grouped_topk`` and applies the factor *post-experts* (see
@@ -166,6 +242,12 @@ class DeepSeekMoE(nn.Module):
         if self._use_trtllm:
             self.trtllm_moe = TrtllmFp8MoE()
             self.act_quant = PerTokenGroupQuantFp8()
+        if self.use_nvfp4:
+            # NVFP4 has exactly one backend on this hardware (checked in
+            # __init__), so there is no oracle branch to mirror here.
+            self.trtllm_fp4_moe = TrtllmFp4MoE()
+            self.act_quant_fp4 = NvFp4Quantize()
+            self._fp4_weights_ready = False
         self.allreduce = AllReduce()
         # Mirrors vLLM's ``VLLM_DISABLE_SHARED_EXPERTS_STREAM`` env knob
         # (default: stream enabled). When disabled, the shared expert runs
@@ -186,16 +268,49 @@ class DeepSeekMoE(nn.Module):
         self._layer_name = ""
 
     def _w13_weight_loader(self, param, loaded_weight, expert_id: int, is_w1: bool):
-        tp, rank = _tp_size(), _tp_rank()
-        N = self.intermediate_per_tp
-        shard = loaded_weight.narrow(0, rank * N, N)
-        offset = 0 if is_w1 else N
-        param.data[expert_id, offset:offset + N, :].copy_(shard)
+        """Row (output-dim) shard of one expert's gate_proj / up_proj tensor.
+
+        Derives the per-rank row count from the ``param`` rather than from
+        ``intermediate_per_tp`` so the same loader serves the plain weight and
+        the NVFP4 block-scale tensor (whose row count is identical) regardless
+        of how the trailing dim is packed. Mirrors vLLM's ``_load_w13``: shard
+        ``dim 0`` of the loaded 2D tensor, then write into the gate half
+        (offset 0) or up half (offset ``rows``) of the ``[2N, ...]`` param.
+        """
+        rank = _tp_rank()
+        rows = param.data.shape[1] // 2
+        shard = loaded_weight.narrow(0, rank * rows, rows)
+        offset = 0 if is_w1 else rows
+        param.data[expert_id, offset:offset + rows, :].copy_(shard)
 
     def _w2_weight_loader(self, param, loaded_weight, expert_id: int):
-        tp, rank = _tp_size(), _tp_rank()
-        N = self.intermediate_per_tp
-        param.data[expert_id].copy_(loaded_weight.narrow(1, rank * N, N))
+        """Column (input-dim) shard of one expert's down_proj tensor.
+
+        The shard width comes from the ``param``'s own last dim, which is what
+        makes this correct for the NVFP4 tensors: ``w2`` packs two fp4 values
+        per byte (``N//2`` columns) and ``w2_weight_scale`` holds one scale per
+        16 elements (``N//16`` columns), so a width computed from
+        ``intermediate_per_tp`` would over-read both. vLLM shards the same way
+        (``_load_w2``: ``loaded.shape[shard_dim] // tp_size``).
+        """
+        rank = _tp_rank()
+        cols = param.data.shape[2]
+        param.data[expert_id].copy_(loaded_weight.narrow(1, rank * cols, cols))
+
+    def _w13_per_tensor_loader(self, param, loaded_weight, expert_id: int,
+                               is_w1: bool):
+        """Per-expert scalar for gate_proj / up_proj into a ``[E, 2]`` param.
+
+        Matches vLLM's ``_load_per_tensor_weight_scale`` (column 0 for w1,
+        column 1 for w3) and the ModelOpt ``input_scale`` special case in
+        ``RoutedExperts.weight_loader``, which writes the two logical shards to
+        the two columns instead of broadcasting over the row.
+        """
+        param.data[expert_id, 0 if is_w1 else 1] = loaded_weight.reshape(())
+
+    def _w2_per_tensor_loader(self, param, loaded_weight, expert_id: int):
+        """Per-expert scalar for down_proj into a ``[E]`` param."""
+        param.data[expert_id] = loaded_weight.reshape(())
 
     def _w13_scale_loader(self, param, loaded_weight, expert_id: int, is_w1: bool):
         tp, rank = _tp_size(), _tp_rank()
@@ -233,6 +348,33 @@ class DeepSeekMoE(nn.Module):
         # Free the raw [E,2N,K]/[E,K,N] params — the FI buffers replace them.
         del self.w13, self.w2, self.w13_weight_scale_inv, self.w2_weight_scale_inv
         self._trtllm_weights_ready = True
+        torch.cuda.empty_cache()
+
+    def prepare_fp4_weights(self) -> None:
+        """Transform the raw loaded NVFP4 expert weights into TRTLLM-gen layout.
+
+        Called once from the weight postprocess hook. Mirrors
+        ``ModelOptNvFp4FusedMoE.process_weights_after_loading`` plus
+        ``TrtLlmNvFp4ExpertsBase.process_weights_after_loading``: permute /
+        interleave the weights and block scales, collapse the activation scales
+        to a global max, and fold them into the per-expert GEMM alphas. The raw
+        parameters are dropped afterwards — vLLM likewise ``replace_parameter``s
+        them, so nothing downstream reads the pre-transform tensors.
+        """
+        if not self.use_nvfp4 or self._fp4_weights_ready:
+            return
+        prepared = prepare_trtllm_fp4_moe_weights(
+            self.w13.data, self.w13_weight_scale.data,
+            self.w13_weight_scale_2.data, self.w13_input_scale.data,
+            self.w2.data, self.w2_weight_scale.data,
+            self.w2_weight_scale_2.data, self.w2_input_scale.data,
+        )
+        del (self.w13, self.w2, self.w13_weight_scale, self.w2_weight_scale,
+             self.w13_weight_scale_2, self.w2_weight_scale_2,
+             self.w13_input_scale, self.w2_input_scale)
+        for name, tensor in prepared.items():
+            self.register_buffer(f"fp4_{name}", tensor, persistent=False)
+        self._fp4_weights_ready = True
         torch.cuda.empty_cache()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -290,7 +432,30 @@ class DeepSeekMoE(nn.Module):
         router_logits = self.gate(
             hidden_states, self.gate_weight, out_dtype=None,
         )
-        if self._use_trtllm:
+        if self.use_nvfp4:
+            # Blackwell FLASHINFER_TRTLLM NVFP4 path — vLLM's only viable NVFP4
+            # MoE backend here, and it picks the MONOLITHIC variant
+            # (``trtllm_fp4_block_scale_moe``) because all2all and EPLB are off:
+            # routing (sigmoid + noaux_tc grouped top-k + renormalize) runs
+            # inside the kernel from raw ``router_logits``, so ``GroupedTopK``
+            # is not used at all on this path. Activations are quantized with
+            # the checkpoint's STATIC global scale (``a1_gscale``), matching
+            # ``MoEPrepareAndFinalizeNoDPEPMonolithic.prepare``.
+            # ``routed_scaling_factor`` is applied post-experts below.
+            a_fp4, a_scale = self.act_quant_fp4(
+                hidden_states, self.fp4_a1_gscale,
+            )
+            out = self.trtllm_fp4_moe.forward_monolithic(
+                a_fp4, a_scale,
+                self.fp4_w13, self.fp4_w13_scale,
+                self.fp4_w2, self.fp4_w2_scale,
+                self.fp4_g1_alphas, self.fp4_g2_alphas, self.fp4_g1_scale_c,
+                router_logits, self.e_score_correction_bias,
+                self.num_experts, self.top_k, self.n_group, self.topk_group,
+                self.intermediate_per_tp,
+                norm_topk_prob=self.norm_topk_prob,
+            )
+        elif self._use_trtllm:
             # Blackwell FLASHINFER_TRTLLM path (vLLM's oracle choice on sm100).
             # Use the MONOLITHIC kernel (``trtllm_fp8_block_scale_moe``) with
             # routing (sigmoid + noaux_tc grouped top-k + norm) done INSIDE the

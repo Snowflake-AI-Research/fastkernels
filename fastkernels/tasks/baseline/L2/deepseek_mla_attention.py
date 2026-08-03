@@ -31,7 +31,8 @@ class DeepSeekMLAAttention(nn.Module):
                  quant_config: dict | None = None,
                  is_v32: bool = False,
                  skip_topk: bool = False,
-                 topk_indices_buffer: torch.Tensor | None = None):
+                 topk_indices_buffer: torch.Tensor | None = None,
+                 kv_cache_dtype: str | None = None):
         super().__init__()
         tp = _tp_size()
         self.hidden_size = config.hidden_size
@@ -101,6 +102,8 @@ class DeepSeekMLAAttention(nn.Module):
             v_head_dim=self.v_head_dim,
             kv_lora_rank=self.kv_lora_rank,
             is_sparse=self.is_v32,
+            kv_cache_dtype=kv_cache_dtype,
+            topk_tokens=self.topk_tokens,
         )
         # Share the kv_b_proj module so ``MLAAttention.forward_impl`` (and
         # the ``fastkernels::unified_mla_attention`` custom op) can project

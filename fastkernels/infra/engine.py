@@ -419,7 +419,8 @@ class ModelRunner:
                  max_model_len: int = MAX_MODEL_LEN,
                  max_num_seqs: int | None = None,
                  max_num_batched_tokens: int | None = None,
-                 max_layers: int | None = None):
+                 max_layers: int | None = None,
+                 kv_cache_dtype: str | None = None):
         self.model_name = model_name
         self.rank = rank
         self.world_size = world_size
@@ -431,6 +432,9 @@ class ModelRunner:
         self.max_num_seqs = max_num_seqs if max_num_seqs is not None else _DEFAULT_MAX_NUM_SEQS
         self.max_num_batched_tokens = max_num_batched_tokens if max_num_batched_tokens is not None else _DEFAULT_MAX_NUM_BATCHED_TOKENS
         self.max_layers = max_layers
+        # MLA paged-KV cache dtype. Also selects the MLA attention backend, so it
+        # has to reach the model at construction time, not just the allocator.
+        self.kv_cache_dtype = kv_cache_dtype
 
         torch.cuda.set_device(rank)
         self._dist_initialized = False
@@ -519,6 +523,7 @@ class ModelRunner:
             model_name, torch.device(f"cuda:{rank}"), dtype,
             max_layers=self.max_layers,
             max_num_batched_tokens=self.max_num_batched_tokens,
+            kv_cache_dtype=self.kv_cache_dtype,
         )
         model_type = getattr(self.config, "model_type", "")
         self.is_kimi_linear = model_type == "kimi_linear"
@@ -4073,6 +4078,12 @@ class ModelRunner:
           and MoE expert ids are bit-comparable.
         * ``"fp8_ds_mla"``: uint8 cache, shape
           ``[num_blocks, block_size, 656]`` (656 bytes/token).
+        * ``"fp8_e4m3"``: float8_e4m3fn cache, shape
+          ``[num_blocks, block_size, kv_lora_rank + qk_rope_head_dim]``
+          (576 bytes/token) -- the plain per-tensor fp8 layout vLLM's
+          FLASHINFER_MLA_SPARSE backend uses
+          (``FlashInferMLASparseTRTLLMBackend.get_kv_cache_shape``). Same slot
+          width as BF16, one byte per element instead of two.
         """
         from ..tasks.baseline.L2.mla_attention_impl import MLAAttention
         from ..tasks.baseline.L2.sparse_attn_indexer import SparseAttnIndexer
@@ -4103,15 +4114,20 @@ class ModelRunner:
             kv_cache_dtype = "auto"
 
         use_fp8_kv = kv_cache_dtype == "fp8_ds_mla"
+        kv_lora_rank = mla_layers[0].kv_lora_rank if num_layers else 512
+        rope_dim = mla_layers[0].qk_rope_head_dim if num_layers else 64
         if use_fp8_kv:
             cache_last_dim = _FP8_CACHE_BYTES
             cache_torch_dtype = torch.uint8
             bytes_per_slot = _FP8_CACHE_BYTES
             backend_desc = "FP8 KV cache"
+        elif kv_cache_dtype == "fp8_e4m3":
+            cache_last_dim = kv_lora_rank + rope_dim
+            cache_torch_dtype = torch.float8_e4m3fn
+            bytes_per_slot = cache_last_dim  # fp8 = 1 byte/element
+            backend_desc = "FP8-E4M3 KV cache"
         else:
             # BF16: shape = (num_blocks, block_size, kv_lora_rank + rope_dim)
-            kv_lora_rank = mla_layers[0].kv_lora_rank if num_layers else 512
-            rope_dim = mla_layers[0].qk_rope_head_dim if num_layers else 64
             cache_last_dim = kv_lora_rank + rope_dim
             cache_torch_dtype = torch.bfloat16
             bytes_per_slot = cache_last_dim * 2  # BF16 = 2 bytes/element
@@ -4202,7 +4218,14 @@ class ModelRunner:
                 layer._gather_ws_tokens = idx_ws_tokens
 
         if self.rank == 0:
-            print(f"  MLA attention backend: FlashMLA (block_size={_MLA_BLOCK_SIZE}, {backend_desc})")
+            # The cache dtype picks the backend (see ``MLAAttention.__init__``),
+            # so name the one actually in use rather than always "FlashMLA".
+            backend_name = (
+                "FlashInfer sparse MLA (trtllm-gen)"
+                if kv_cache_dtype == "fp8_e4m3" else "FlashMLA"
+            )
+            print(f"  MLA attention backend: {backend_name} "
+                  f"(block_size={_MLA_BLOCK_SIZE}, {backend_desc})")
 
         # Pre-allocate chunked prefill workspace for MLA context gathering.
         # Matches vllm's MLACommonMetadataBuilder workspace sizing.
@@ -5948,6 +5971,7 @@ class LlamaEngine:
         max_num_seqs: int | None = None,
         max_num_batched_tokens: int | None = None,
         max_layers: int | None = None,
+        kv_cache_dtype: str | None = None,
     ):
         self.model_name = model_name
         self.seed = seed
@@ -5974,6 +5998,7 @@ class LlamaEngine:
             max_num_seqs=self.max_num_seqs,
             max_num_batched_tokens=self.max_num_batched_tokens,
             max_layers=max_layers,
+            kv_cache_dtype=kv_cache_dtype,
         )
 
         # Launch non-rank-0 workers

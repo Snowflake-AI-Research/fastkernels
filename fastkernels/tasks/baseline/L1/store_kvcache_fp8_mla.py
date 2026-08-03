@@ -54,22 +54,33 @@ class StoreKVCacheFP8MLA(nn.Module):
     * ``"fp8_ds_mla"``: expects a uint8 cache of shape
       ``[num_blocks, block_size, 656]``; the kernel fuses per-block
       UE8M0 FP8 quantization of ``kv_c_normed`` with BF16 ``k_pe`` storage.
+    * ``"fp8_e4m3"``: expects a ``float8_e4m3fn`` cache of shape
+      ``[num_blocks, block_size, 576]``; the kernel divides both halves by
+      ``k_scale`` and casts to fp8. This is the layout vLLM's
+      FLASHINFER_MLA_SPARSE backend uses -- plain per-tensor fp8, no block
+      scales -- and it is NOT interchangeable with ``fp8_ds_mla``.
 
     Args:
         kv_c_normed: ``[N, 512]`` BF16 — compressed KV after layernorm.
         k_pe: ``[N, 1, 64]`` or ``[N, 64]`` BF16 — RoPE key component.
-        kv_cache: ``[num_blocks, block_size, 576|656]`` (BF16 or uint8).
+        kv_cache: ``[num_blocks, block_size, 576|656]`` (BF16 / fp8 / uint8).
         slot_mapping: ``[N]`` int64 — linear slot index per token (``-1`` skips).
     """
 
     def __init__(self, kv_cache_dtype: str = "auto"):
         super().__init__()
-        assert kv_cache_dtype in ("auto", "fp8_ds_mla"), (
+        assert kv_cache_dtype in ("auto", "fp8_ds_mla", "fp8_e4m3"), (
             f"StoreKVCacheFP8MLA: unsupported kv_cache_dtype={kv_cache_dtype!r}"
         )
         self.kv_cache_dtype = kv_cache_dtype
+        # ``k_scale`` is the per-tensor dequant scale the kernel divides by on
+        # the ``fp8_e4m3`` path (it is ignored for ``auto`` and for the
+        # block-scaled ``fp8_ds_mla`` layout). vLLM initialises ``layer._k_scale``
+        # to 1.0 and only overwrites it from a checkpoint's calibration scales,
+        # which nvidia/GLM-5.2-NVFP4 does not ship -- so ONE, not zero. A zero
+        # here silently turned every stored KV element into inf/nan.
         self.register_buffer(
-            "_k_scale", torch.zeros(1, dtype=torch.float32), persistent=False,
+            "_k_scale", torch.ones(1, dtype=torch.float32), persistent=False,
         )
 
     def forward(
@@ -142,13 +153,17 @@ class GatherAndDequantKVCacheMLA(nn.Module):
 
     def __init__(self, kv_cache_dtype: str = "fp8_ds_mla"):
         super().__init__()
-        assert kv_cache_dtype in ("auto", "fp8_ds_mla"), (
+        assert kv_cache_dtype in ("auto", "fp8_ds_mla", "fp8_e4m3"), (
             f"GatherAndDequantKVCacheMLA: unsupported "
             f"kv_cache_dtype={kv_cache_dtype!r}"
         )
         self.kv_cache_dtype = kv_cache_dtype
+        # ONE, not zero: on the ``fp8_e4m3`` path the kernel MULTIPLIES the
+        # gathered fp8 values by this scale to dequantize (vLLM passes
+        # ``layer._k_scale``, default 1.0). Zero would blank the gathered
+        # context. Ignored for ``auto`` and for the block-scaled ``fp8_ds_mla``.
         self.register_buffer(
-            "_k_scale", torch.zeros(1, dtype=torch.float32), persistent=False,
+            "_k_scale", torch.ones(1, dtype=torch.float32), persistent=False,
         )
 
     def forward(
