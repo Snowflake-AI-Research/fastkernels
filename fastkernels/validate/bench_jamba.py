@@ -864,7 +864,7 @@ def main():
         print(
             f"  {'SCENARIO':<16} {'OUT':>5} "
             f"{'FASTKERNELS tok/s':>15} {f'{ref_name} tok/s':>12} {'SPEEDUP':>9} "
-            f"{'AVG MATCH TOKS':>18}"
+            f"{'AVG PREFIX TOKS':>18}"
         )
         print(f"  {'-' * 95}")
         for r in all_results:

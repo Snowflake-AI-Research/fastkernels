@@ -2289,35 +2289,63 @@ def compute_alignment(
     a_outputs: list[dict],
     b_outputs: list[dict],
 ) -> dict:
-    """Compare per-request token_ids. Returns alignment statistics."""
+    """Compare per-request token_ids. Returns alignment statistics.
+
+    ``avg_matching_tokens_per_request`` is the **matching prefix**: it stops at
+    the first divergence, so a correct token *after* a wrong one never counts.
+    That is the only reading that means anything for greedy decode -- once two
+    near-tied logits pick differently the sequences fork permanently, and
+    position-wise agreement past that point credits coincidental re-alignment.
+    On Mamba-Codestral's 1000-request mixed run the position-wise count read
+    222.9 tokens against a true prefix of 204.8, an 8% overstatement under a
+    name that reads like a prefix.
+
+    The position-wise count is still reported as
+    ``avg_position_matches_per_request``: it separates "diverged and drifted"
+    from "diverged and resynchronised", which is worth seeing.
+
+    Same keys and semantics as ``bench_microsoft_bitnet.compute_alignment`` and
+    ``comparison.alignment_from_token_ids``, so one aggregate query spans every
+    generative harness. bench_jamba, bench_fla, and bench_sglang import this
+    function rather than re-deriving it -- three copies are how the two
+    definitions drifted apart in the first place.
+    """
     total_seqs = len(a_outputs)
     exact_matches = 0
     total_matching_tokens = 0
+    total_position_matches = 0
     total_output_tokens = 0
 
     for a, b in zip(a_outputs, b_outputs):
         a_ids = a["token_ids"]
         b_ids = b["token_ids"]
-        out_len = max(len(a_ids), len(b_ids))
-        total_output_tokens += out_len
+        total_output_tokens += max(len(a_ids), len(b_ids))
+
+        prefix = 0
+        for x, y in zip(a_ids, b_ids):
+            if x != y:
+                break
+            prefix += 1
+        total_matching_tokens += prefix
+        total_position_matches += sum(
+            1 for x, y in zip(a_ids, b_ids) if x == y
+        )
 
         if a_ids == b_ids:
             exact_matches += 1
-            total_matching_tokens += len(a_ids)
-        else:
-            min_len = min(len(a_ids), len(b_ids))
-            matching = sum(1 for j in range(min_len) if a_ids[j] == b_ids[j])
-            total_matching_tokens += matching
 
     avg_matching = total_matching_tokens / total_seqs if total_seqs else 0
+    avg_position = total_position_matches / total_seqs if total_seqs else 0
     avg_output_len = total_output_tokens / total_seqs if total_seqs else 0
 
     return {
         "exact_matches": exact_matches,
         "total_seqs": total_seqs,
         "total_matching_tokens": total_matching_tokens,
+        "total_position_matches": total_position_matches,
         "total_output_tokens": total_output_tokens,
         "avg_matching_tokens_per_request": avg_matching,
+        "avg_position_matches_per_request": avg_position,
         "avg_output_len": avg_output_len,
     }
 
@@ -2936,19 +2964,19 @@ def main():
             header = (
                 f"  {'SCENARIO':<16} {'SEQS':>5} {'AUDIO':>8} {'OUT':>5} "
                 f"{'FASTKERNELS tok/s':>15} {'vLLM tok/s':>12} {'SPEEDUP':>8} "
-                f"{'AVG MATCH TOKS':>15}"
+                f"{'AVG PREFIX TOKS':>15}"
             )
         elif is_vlm or is_qwen_omni:
             header = (
                 f"  {'SCENARIO':<16} {'SEQS':>5} {'OUT':>5} "
                 f"{'FASTKERNELS tok/s':>15} {'vLLM tok/s':>12} {'SPEEDUP':>8} "
-                f"{'AVG MATCH TOKS':>15}"
+                f"{'AVG PREFIX TOKS':>15}"
             )
         else:
             header = (
                 f"  {'SCENARIO':<16} {'SEQS':>5} {'IN':>5} {'OUT':>5} "
                 f"{'FASTKERNELS tok/s':>15} {'vLLM tok/s':>12} {'SPEEDUP':>8} "
-                f"{'AVG MATCH TOKS':>15}"
+                f"{'AVG PREFIX TOKS':>15}"
             )
         print(header)
         print(f"  {'-' * 90}")

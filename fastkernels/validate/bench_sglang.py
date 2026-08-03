@@ -494,36 +494,14 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 # Alignment metric (matches bench_vllm.py).
 # ---------------------------------------------------------------------------
-def compute_alignment(a_outputs: list[dict], b_outputs: list[dict]) -> dict:
-    total_seqs = len(a_outputs)
-    exact_matches = 0
-    total_matching_tokens = 0
-    total_output_tokens = 0
-
-    for a, b in zip(a_outputs, b_outputs):
-        a_ids = a["token_ids"]
-        b_ids = b["token_ids"]
-        out_len = max(len(a_ids), len(b_ids))
-        total_output_tokens += out_len
-
-        if a_ids == b_ids:
-            exact_matches += 1
-            total_matching_tokens += len(a_ids)
-        else:
-            min_len = min(len(a_ids), len(b_ids))
-            matching = sum(1 for j in range(min_len) if a_ids[j] == b_ids[j])
-            total_matching_tokens += matching
-
-    avg_matching = total_matching_tokens / total_seqs if total_seqs else 0
-    avg_output_len = total_output_tokens / total_seqs if total_seqs else 0
-    return {
-        "exact_matches": exact_matches,
-        "total_seqs": total_seqs,
-        "total_matching_tokens": total_matching_tokens,
-        "total_output_tokens": total_output_tokens,
-        "avg_matching_tokens_per_request": avg_matching,
-        "avg_output_len": avg_output_len,
-    }
+# Alignment comes from bench_vllm so every generative harness reports the same
+# metric: the matching *prefix*, stopping at the first divergence. This module
+# used to carry a byte-identical copy that counted position-wise agreement
+# instead, which drifted from bench_microsoft_bitnet's and overstated agreement
+# (222.9 vs 204.8 tokens on a 1000-request Codestral run). bench_vllm's
+# module-level imports are stdlib-only, as bench_jamba and bench_fla already
+# rely on.
+from fastkernels.validate.bench_vllm import compute_alignment  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -746,7 +724,7 @@ def main():
         print(f"{'=' * 100}")
         print(
             f"  {'SCENARIO':<32} {'FASTKERNELS tok/s':>14} {'SGLANG tok/s':>14}"
-            f" {'SPEEDUP':>8} {'AVG MATCH TOKS':>18}"
+            f" {'SPEEDUP':>8} {'AVG PREFIX TOKS':>18}"
         )
         print(f"  {'-' * 96}")
 
