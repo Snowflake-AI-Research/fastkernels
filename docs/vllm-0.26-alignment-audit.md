@@ -3849,10 +3849,50 @@ the single largest kernel in the profile. Both fixed (27h).
 **After the fixes**: GPU 10.671 ms/token (within 3.4% of vLLM's 10.325), wall
 10.360 vs 9.094 -> 0.89x on single-request and 0.91x on fixed-batch-32.
 
-**What remains is overlap, not kernels.** fastkernels' wall is 97% of its summed
-kernel time; vLLM's is 88%. vLLM hides ~12% of its kernel work behind concurrent
-streams where we hide ~3%, so our exposed critical path is longer even though the
-total work now matches.
+**What remains is GPU idle, not overlap.** ``summed self-CUDA / wall`` is a
+misleading ratio: it mixes overlap and idle. Taking the *union* of GPU busy
+intervals from the chrome traces separates them, and overlap turns out to be
+already equal:
+
+| | fastkernels | vLLM |
+|---|---|---|
+| summed kernel busy | 1369.0 ms | 1321.7 ms |
+| union (GPU occupied) | 1123.0 ms | 1069.9 ms |
+| wall | 1323.3 ms | 1164.0 ms |
+| **GPU idle** | **200.3 ms (15.1%)** | **94.1 ms (8.1%)** |
+| overlap factor | 1.219x | 1.235x |
+
+Both engines run the shared-expert MLP on a second stream and get the same ~1.22x
+overlap (vLLM's side stream carries 127.2 ms of `splitK_TNN` / `TNT` /
+`triton_poi_fused_mul_silu_slice`, i.e. gate-up-down plus SiLU). So the remaining
+1.24 ms/token splits as **~0.83 ms/token of excess GPU idle** plus **~0.41 ms/token
+of extra occupancy** (the unfused cat / act_and_mul / fp8-quant kernels and the
+`NNN` BMM layout above).
+
+Attributing the idle to host activity (gap_analysis over the trace): two CPU calls
+cover nearly all of it -- `cudaGraphLaunch` **232 ms** and `cudaEventSynchronize`
+**60 ms**, in 104 gaps of ~3.3 ms each. Those two are the same problem. The decode
+loop is
+
+```
+prepare arrays -> broadcast to workers -> launch graph (async) -> WAIT for tokens
+```
+
+so the host blocks on the sampled token (`_wait_async_tokens` ->
+`_copy_event.synchronize()`) before it can prepare and launch the next step. With
+no run-ahead, the cost of submitting a ~2000-node graph is fully exposed instead
+of being hidden behind the previous step's GPU execution -- hence `cudaGraphLaunch`
+itself sitting in the idle window for ~3.3 ms.
+
+**The fix, not yet implemented.** Feed `input_ids` for step N+1 from the sampler's
+*device* tensor (a D2D copy) instead of from host numpy, and defer the host token
+read -- used only for the EOS / max-tokens check and for recording output -- by one
+step. Positions, context lengths and slot mappings are all derivable without the
+token (`_update_decode_arrays_incremental` already bumps them by +1), and with TP
+every rank already holds the same sampled token on device, so nothing extra needs
+broadcasting. That is what lets vLLM run the host ahead. It is a real scheduler
+change -- deferred stop handling changes block accounting and the step count -- so
+it is called out here rather than landed unverified.
 
 Smaller residual deltas, all fusion differences (fastkernels / vLLM):
 

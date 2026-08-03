@@ -77,11 +77,18 @@ reflect this model family's tie-flip cascade rather than an operator defect (see
 `fastkernels/validate/forced_decode.py`, which measures the per-step agreement
 ceiling at ~88%).
 
-The long-context ratio is a known, localised gap: those steps are always mixed
-prefill+decode batches, which vLLM captures as piecewise CUDA graphs while
-fastkernels captures pure-decode graphs only, so they run eager here. See
-[section 27 of the alignment audit](docs/vllm-0.26-alignment-audit.md) for the
-full analysis.
+Two remaining gaps are localised and measured rather than mysterious:
+
+* **long-context (0.32x)**: those steps are always mixed prefill+decode batches,
+  which vLLM captures as piecewise CUDA graphs while fastkernels captures
+  pure-decode graphs only, so they run eager here.
+* **latency (0.89x / 0.91x)**: not kernel time -- GPU occupancy now matches vLLM
+  to within 3.4% -- but GPU *idle*, 15.1% of wall against vLLM's 8.1%. The decode
+  loop blocks on the sampled token before launching the next step, so the host
+  never runs ahead and the ~2000-node graph submission is fully exposed.
+
+See [section 27 of the alignment audit](docs/vllm-0.26-alignment-audit.md) for the
+full analysis, including the profiling method.
 
 ## Citation
 
