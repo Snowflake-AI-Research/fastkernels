@@ -153,6 +153,15 @@ class DeepSeekMLAAttention(nn.Module):
                 mscale_all_dim=_rp.get("mscale_all_dim", 0.0),
                 is_neox_style=not indexer_interleave,
                 is_plain=indexer_is_plain,
+                # Same as the main rope in ``DeepSeekV3Model``: store the cos/sin
+                # cache in the compute dtype ONCE. Without this the cache stays
+                # fp32 and ``forward`` re-casts it on every call -- and GLM-5.2's
+                # cache is [max_position_embeddings=1048576, 64], i.e. 134 MiB, so
+                # each of the ~21 indexer compute layers copied 134 MiB per decode
+                # step. That single ``aten::copy_`` was the largest kernel in the
+                # whole decode profile (9% of GPU time at bs=1) and has no vLLM
+                # counterpart: vLLM's base ``RotaryEmbedding`` also casts at init.
+                cache_dtype=getattr(config, "dtype", None),
             )
             # Share the rope_emb module with the indexer so its custom op
             # doesn't need a non-tensor argument (same reasoning as

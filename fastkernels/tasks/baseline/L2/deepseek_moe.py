@@ -528,12 +528,19 @@ class DeepSeekMoE(nn.Module):
 
         # ``routed_scaling_factor`` is applied *post-experts*, matching
         # ``vllm/model_executor/models/deepseek_v2.py:378-379``.
-        out = out * self.routed_scaling_factor
-
+        #
+        # Scale and shared-expert add in ONE kernel. vLLM gets the same fusion
+        # from Inductor (its profile shows a single ``triton_poi_fused_add_mul``
+        # where fastkernels showed two separate elementwise kernels costing 2x
+        # the time); fastkernels cannot rely on Inductor here because this whole
+        # block is inside the opaque ``fastkernels::moe_forward`` custom op. One
+        # kernel also rounds once instead of twice, which is what vLLM does.
         if shared_out is not None:
             if use_shared_stream:
                 torch.cuda.current_stream().wait_stream(self._shared_stream)
-            out = out + shared_out
+            out = torch.add(shared_out, out, alpha=self.routed_scaling_factor)
+        else:
+            out = out * self.routed_scaling_factor
 
         if self.tp_size > 1 and not self._use_custom_op:
             out = self.allreduce(out)
