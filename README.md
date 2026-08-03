@@ -52,6 +52,37 @@ fastkernels eval full
 ```
 
 
+## Benchmark Results
+
+End-to-end against the SOTA reference library on the standard workloads
+(`fastkernels validate <scenario>`), 8x NVIDIA B200, compiled with CUDA graphs on
+both sides. "Prefix match" is the average number of leading greedy tokens per
+request that agree with the reference.
+
+### zai-org/GLM-5.2 family vs vLLM 0.26 (tp=8)
+
+`nvidia/GLM-5.2-NVFP4`, NVFP4 routed experts + `kv_cache_dtype=fp8_e4m3`
+(`fastkernels/scenarios/glm5.2.yaml`):
+
+| workload | requests | fastkernels | vLLM | ratio | prefix match |
+|---|---|---|---|---|---|
+| mixed | 1000 | 3,426 tok/s | 4,188 tok/s | 0.82x | 13.1 / 388 |
+| long-context | 64 | 88 tok/s | 248 tok/s | 0.35x | 25.6 / 256 |
+| single-request (bs=1) | — | 11.53 ms/tok | 8.98 ms/tok | 0.78x | — |
+| fixed-batch-32 | — | 0.61 ms/tok | 0.51 ms/tok | 0.84x | — |
+
+At 4 layers / tp=1 the greedy output is byte-identical to vLLM's, and on the full
+model 23 of the 1000 mixed requests match for all 388 tokens; the averages above
+reflect this model family's tie-flip cascade rather than an operator defect (see
+`fastkernels/validate/forced_decode.py`, which measures the per-step agreement
+ceiling at ~88%).
+
+The long-context ratio is a known, localised gap: those steps are always mixed
+prefill+decode batches, which vLLM captures as piecewise CUDA graphs while
+fastkernels captures pure-decode graphs only, so they run eager here. See
+[section 27 of the alignment audit](docs/vllm-0.26-alignment-audit.md) for the
+full analysis.
+
 ## Citation
 
 If you use FastKernels, please cite [our accompanying paper](https://arxiv.org/abs/2605.23215):

@@ -30,6 +30,10 @@ _RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024  # bytes (matches vLLM RADIX_TOPK_WORKS
 # SET *and* ORDER while staying faster than ``torch.topk`` (esp. at long ctx).
 # Enable with ``FASTKERNELS_DSA_DETERMINISTIC_TOPK=1`` (default off = match
 # vLLM's native nondeterministic kernels).
+#
+# DIAGNOSTIC ONLY, and incompatible with decode CUDA graphs: the flashinfer
+# top-k path aborts during graph replay, so use it together with
+# ``--enforce-eager`` (which is how ``forced_decode.py`` drives it).
 _DETERMINISTIC_TOPK = os.environ.get("FASTKERNELS_DSA_DETERMINISTIC_TOPK", "0") != "0"
 try:
     import flashinfer as _flashinfer
