@@ -124,6 +124,7 @@ class DeepSeekMLAAttention(nn.Module):
                 head_dim=config.index_head_dim,
                 rope_dim=self.qk_rope_head_dim,
                 topk_tokens=config.index_topk,
+                max_model_len=getattr(config, "max_model_len", 16384),
                 quant_config=quant_config,
                 topk_indices_buffer=topk_indices_buffer,
             )

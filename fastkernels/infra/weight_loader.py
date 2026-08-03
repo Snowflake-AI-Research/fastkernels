@@ -1481,6 +1481,7 @@ def load_model(
     max_layers: int | None = None,
     max_num_batched_tokens: int | None = None,
     kv_cache_dtype: str | None = None,
+    max_model_len: int | None = None,
 ):
     model_path = download_model(model_name)
     model_type = _detect_model_type(model_name)
@@ -1641,6 +1642,8 @@ def load_model(
         # buffer) is constructed.
         if max_num_batched_tokens is not None:
             config.max_num_batched_tokens = max_num_batched_tokens
+        if max_model_len is not None:
+            config.max_model_len = max_model_len
         # KV cache dtype selects the MLA attention backend (see
         # ``MLAAttention.__init__``): ``auto`` -> FlashMLA sparse over a BF16
         # cache, ``fp8_e4m3`` -> vLLM's FLASHINFER_MLA_SPARSE over a plain fp8

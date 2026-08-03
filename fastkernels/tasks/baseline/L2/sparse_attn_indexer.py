@@ -139,13 +139,22 @@ class SparseAttnIndexer(nn.Module):
 
     def __init__(self, hidden_size: int, q_lora_rank: int,
                  n_head: int, head_dim: int, rope_dim: int,
-                 topk_tokens: int, quant_config: dict | None = None,
+                 topk_tokens: int, max_model_len: int,
+                 quant_config: dict | None = None,
                  topk_indices_buffer: torch.Tensor | None = None):
         super().__init__()
         self.n_head = n_head
         self.head_dim = head_dim
         self.rope_dim = rope_dim
         self.topk_tokens = topk_tokens
+        # Width of the decode logits buffer. vLLM's ``Indexer.max_model_len``,
+        # passed to ``fp8_fp4_paged_mqa_logits`` so ``logits.shape[1]`` is the
+        # same FIXED value on every step. Sizing it to the batch's max context
+        # instead (which fastkernels used to do) changes ``logits.stride(0)``,
+        # and the stride decides both the cooperative-vs-persistent top-k choice
+        # (``stride(0) % 4 == 0``) and ``persistent_topk``'s radix range -- so the
+        # top-k could take a different kernel from vLLM's on the same batch.
+        self.max_model_len = max_model_len
         self.q_lora_rank = q_lora_rank
         self.softmax_scale = head_dim ** -0.5
 
@@ -487,7 +496,14 @@ class SparseAttnIndexer(nn.Module):
             return out
 
         block_size = int(self.indexer_k_cache.shape[1])
-        max_ctx = int(ctx.decode_max_context_len or ctx.max_context_len or 1)
+        # Fixed buffer width (vLLM's ``max_model_len``), not the batch max.
+        logits_width = self.max_model_len
+        # The BATCH max still goes to ``cooperative_topk`` as its ``max_seq_len``
+        # -- vLLM passes ``attn_metadata.max_seq_len`` there while giving
+        # ``persistent_topk`` ``logits.shape[1]``.
+        batch_max_ctx = int(
+            ctx.decode_max_context_len or ctx.max_context_len or 1
+        )
 
         B = ctx.decode_context_lens.shape[0]
         next_n = M // B if B > 0 else 1
@@ -543,9 +559,9 @@ class SparseAttnIndexer(nn.Module):
             cl_2d,
             ctx.decode_block_tables,
             schedule,
-            max_context_len=max_ctx,
+            max_context_len=logits_width,
         )
         return self.topk_per_row.forward_decode(
             logits, ctx.decode_context_lens, next_n=next_n, topk=self.topk_tokens,
-            max_seq_len=max_ctx,
+            max_seq_len=batch_max_ctx,
         )

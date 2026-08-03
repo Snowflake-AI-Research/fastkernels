@@ -77,6 +77,13 @@ class DeepSeekV3Config:
     # scheduler_config.max_num_batched_tokens; this is not an HF-config field, so
     # the engine threads its real value in via load_model before construction.
     max_num_batched_tokens: int = 16384
+    # Width of the DSA indexer's decode logits buffer, i.e. vLLM's
+    # ``Indexer.max_model_len`` (from ``model_config.max_model_len``). vLLM sizes
+    # the buffer to this fixed value and passes ``logits.shape[1]`` to
+    # ``persistent_topk``; using the per-batch max instead changes the buffer
+    # stride, which flips the cooperative-vs-persistent top-k choice and the
+    # radix binning. Not an HF-config field, so the engine threads it in.
+    max_model_len: int = 16384
     # MLA paged-KV cache dtype, which also selects the attention backend:
     # ``"auto"`` (BF16 cache -> FlashMLA sparse), ``"fp8_ds_mla"`` (DeepSeek's
     # 656-byte block-scaled cache), ``"fp8_e4m3"`` (plain per-tensor fp8 ->

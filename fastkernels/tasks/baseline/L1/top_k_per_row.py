@@ -236,7 +236,14 @@ class TopKPerRow(nn.Module):
                 row_lens = (
                     seq_lens.to(torch.int32).view(B, 1) - next_n + 1 + j.view(1, next_n)
                 ).clamp_min_(0).reshape(-1).contiguous()
-            msl = int(max_seq_len) if max_seq_len is not None else logits.shape[1]
+            # vLLM passes DIFFERENT last arguments to the two radix kernels:
+            # ``cooperative_topk`` gets ``attn_metadata.max_seq_len`` (the batch's
+            # max context) and ``persistent_topk`` gets ``logits.shape[1]`` (the
+            # fixed buffer width). Passing one value to both changes the radix
+            # range on whichever kernel is chosen.
+            coop_msl = (
+                int(max_seq_len) if max_seq_len is not None else logits.shape[1]
+            )
             ws = self._radix_workspace(logits.device)
             cap_major = torch.cuda.get_device_capability(logits.device)[0]
             use_cooperative = (
@@ -246,10 +253,10 @@ class TopKPerRow(nn.Module):
             )
             if use_cooperative:
                 torch.ops._C.cooperative_topk(
-                    logits, row_lens, indices, ws, topk, msl)
+                    logits, row_lens, indices, ws, topk, coop_msl)
             else:
                 torch.ops._C.persistent_topk(
-                    logits, row_lens, indices, ws, topk, msl)
+                    logits, row_lens, indices, ws, topk, logits.shape[1])
             return indices
 
         torch.ops._C.top_k_per_row_decode(

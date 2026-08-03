@@ -524,6 +524,7 @@ class ModelRunner:
             max_layers=self.max_layers,
             max_num_batched_tokens=self.max_num_batched_tokens,
             kv_cache_dtype=self.kv_cache_dtype,
+            max_model_len=self.max_model_len,
         )
         model_type = getattr(self.config, "model_type", "")
         self.is_kimi_linear = model_type == "kimi_linear"
