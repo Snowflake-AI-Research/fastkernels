@@ -3676,3 +3676,106 @@ noise on a 64-request set rather than a numerics regression. Backend selection
 is unchanged at tp=2: the same `FA4 on Blackwell does not support head_size=...`
 fallback to `TRITON_ATTN` for every layer. vLLM turns on `fuse_allreduce_rms` at
 tp>1, which fastkernels already matches (sections 20-21).
+
+---
+
+## 27. nvidia/GLM-5.2-NVFP4 with an fp8_e4m3 KV cache
+
+The NVFP4 checkpoint is not the FP8 one with different weights. It changes which
+modules are quantized, which MoE kernel runs, and — because the KV cache dtype
+drives vLLM's backend choice — which attention and MLA-prefill backends the
+reference uses. All of the following is read out of a real vLLM run on the model,
+not inferred from the selector code:
+
+```
+Using FLASHINFER_MLA_SPARSE attention backend out of potential backends:
+  ['FLASHINFER_MLA_SPARSE'].
+Using HND KV cache layout for FLASHINFER_MLA_SPARSE backend.
+Using standard fp8 KV cache format. To use DeepSeek's fp8_ds_mla KV cache
+  format, please set `--attention-backend FLASHMLA_SPARSE`
+Using TRTLLM_RAGGED MLA prefill backend.
+Using 'FLASHINFER_TRTLLM' NvFp4 MoE backend out of potential backends: [...]
+Using MoEPrepareAndFinalizeNoDPEPMonolithic
+kv_cache_dtype=fp8_e4m3, block_size=64, quantization=modelopt_fp4
+Checkpoint does not provide a q scaling factor ... Using KV cache scaling
+  factor 1.0 for fp8_e4m3.
+```
+
+### 27a. Three things to match
+
+**Quantization scope.** Only `mlp.experts.*` is NVFP4. The checkpoint's own
+`ignore` list covers every `self_attn*`, every `mlp.shared_experts*`, the dense
+layers 0-2, the MTP layer 78, `lm_head` and `embed_tokens`; and vLLM builds MoE
+gates with no `quant_config` at all (`deepseek_v2.py`), so the router is BF16
+too. So `quant_config is not None` can no longer mean "every linear is
+quantized": `infra/quant_scheme.linear_quant_config` hands every `Linear` a
+`None` config under NVFP4, and only `DeepSeekMoE` sees the real one.
+
+**KV layout.** `fp8_e4m3` here is the plain per-tensor layout —
+`[num_blocks, block_size, 576]` `float8_e4m3fn`, one byte per element — **not**
+DeepSeek's 656-byte block-scaled `fp8_ds_mla`, which FLASHINFER_MLA_SPARSE
+rejects outright (`supports_combination`: "SM10 does not support fp8_ds_mla
+kv-cache dtype"). The two are separate `MLAAttention.kv_cache_dtype` values, and
+`FASTKERNELS_KV_CACHE_DTYPE=fp8` still aliases to `fp8_ds_mla`.
+
+**The prefill gate.** Sparse MLA only runs the trtllm-gen MQA kernel for tokens
+it has to. When every prefill sequence is at most `index_topk` (2048) long the
+indexer's top-k selects the whole context, sparse degenerates to dense, and vLLM
+routes prefill through the dense `trtllm_ragged_attention_deepseek` instead
+(`mla_attention.py`'s `use_mha`). Skipping that gate would run 2048-slot gathers
+for a 512-token prompt.
+
+### 27b. vLLM 0.26 forces FP32 MoE routing for glm_moe_dsa
+
+`_get_moe_router_dtype` returns FP32 unconditionally when
+`model_type == "glm_moe_dsa"` — "Older GLM-5/5.2 configs require fp32 routing but
+do not expose moe_router_dtype yet" — and the gate is built with that
+`out_dtype`. fastkernels passed `None`, which is right for DeepSeek but for GLM
+gives FP32 only in decode: the `F.linear` fallback prefill lands on does not
+cast, so every prefill token reached grouped-topk in BF16 where vLLM had FP32.
+Near-tie expert selection flips on exactly that bit pattern. This is drift from
+vLLM 0.24, which had no such special case.
+
+### 27c. deep_gemm must be vLLM 0.26's vendored commit
+
+vLLM 0.26's sparse indexer calls the unified `fp8_fp4_mqa_logits`, which
+`v2.1.1.post3` does not export — every DSA model dies on its first prefill with
+"DeepGEMM backend is unavailable in the current vLLM environment". The pin is now
+`a6b593d` (reports itself as 2.5.0), which is a strict superset and is what the
+DSA ops in this tree were already written against.
+
+### 27d. Decode CUDA graphs: three defects, ~20x at stake
+
+GLM-5.2 — FP8 and NVFP4 alike — died on the **first decode CUDA-graph replay**,
+so it was only ever runnable with `--enforce-eager`. That is not a small loss:
+vLLM's own compiled run does the mixed workload in 11.5 s against **227.6 s
+eager**, i.e. eager gives up roughly 20x on a 78-layer MoE at bs=32. Any
+"eager-vs-eager" ratio for these models measures Python launch overhead, not
+kernels.
+
+1. `get_paged_mqa_logits_metadata` was called from **inside** the captured
+   region. Capture records fine; the first replay dies inside
+   `deep_gemm.fp8_fp4_paged_mqa_logits` — `cudaErrorInvalidAddressSpace` on
+   NVFP4, `cudaErrorIllegalAddress` on FP8, and **nothing at all under
+   compute-sanitizer**, which is what a pool/launch-timing fault looks like. The
+   kernel is not the problem: fed a schedule built beforehand it captures and
+   replays fine standalone. The schedule is `(num_sms+1, 2)` for every batch size
+   and context length, so the engine keeps one persistent buffer and refreshes it
+   per step at each decode site, including immediately before `replay()`. vLLM
+   builds the same tensor in its metadata builder — also outside the graph.
+2. That buffer, allocated during KV-cache setup (which runs under
+   `inference_mode`), was an *inference tensor*, and the compiled model takes it
+   as an input. Allocate it under `inference_mode(False)`.
+3. `capture_cudagraph` traced the compiled model with grad enabled, so
+   AOTAutograd built a training graph behind an `autograd.Function`; the first
+   mixed prefill+decode batch afterwards rejected its own inference-mode inputs
+   ("Inference tensors cannot be saved for backward"). Decorate the capture with
+   `inference_mode`.
+
+Localised by bisection: stub the indexer's decode top-k → replay OK; keep its
+metadata build but stub only the paged-logits kernel → replay OK.
+
+Fixed on the way: the DSA radix top-k and both trtllm-gen MLA workspaces were
+allocated on first use, which — once capture worked — would have put them in one
+graph's private memory pool while every later batch size replayed atomics into
+it. They are now materialised from KV-cache allocation via `ensure_workspaces`.
