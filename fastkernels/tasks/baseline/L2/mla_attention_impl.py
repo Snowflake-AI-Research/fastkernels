@@ -64,6 +64,11 @@ try:
 except ImportError:  # pragma: no cover - optional vLLM runtime dependency
     _mask_empty_context = None
 
+# Sentinel for the per-step batch-metadata memo: ``None`` is a meaningful
+# result there (no block table => nothing to attend to), so absence needs its own
+# marker.
+_UNSET = object()
+
 _MLA_HEAD_DIM_V = 512
 _MLA_WORKSPACE_HEAD_SIZE = 576  # 512 NoPE + 64 RoPE = 576 BF16 dims
 MIN_HEADS_FOR_BF16_PREFILL = 32
@@ -711,9 +716,22 @@ class MLAAttention(nn.Module):
         (right-padded to a common width) and request ids are numbered in that
         same order.
 
+        Memoized on the context: this is batch metadata, identical for every
+        layer, and vLLM likewise builds it once per step in its metadata builder.
+        Recomputing it per layer costs two ``torch.cat``s of the block tables on
+        every one of the model's 78 attention layers.
+
         Returns ``None`` when the batch has no block table at all (nothing to
         attend to), letting the caller return zeros.
         """
+        cached = getattr(ctx, "_fk_sparse_batch_meta", _UNSET)
+        if cached is not _UNSET:
+            return cached
+        meta = self._compute_unified_sparse_batch_meta(q, ctx)
+        ctx._fk_sparse_batch_meta = meta
+        return meta
+
+    def _compute_unified_sparse_batch_meta(self, q, ctx):
         N = q.shape[0]
         if ctx.is_mixed:
             num_dc = ctx.num_decode_tokens
