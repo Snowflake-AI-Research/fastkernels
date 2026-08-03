@@ -3709,6 +3709,8 @@ class ModelRunner:
             return max(1, max_bs)
 
         probe = min(max_bs, 256)
+        probe_ids = self._md_input_ids[:probe]
+        probe_positions = self._md_positions[:probe]
         meta = self._mamba_make_decode_meta(
             probe, self._md_state_indices[:probe],
         )
@@ -3717,18 +3719,34 @@ class ModelRunner:
             mamba_state=self.mamba_state_manager,
             mamba_metadata=meta,
         )
-        torch.cuda.synchronize()
-        torch.cuda.reset_peak_memory_stats()
-        baseline = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        try:
-            hidden = self.model(
-                self._md_input_ids[:probe], self._md_positions[:probe],
-            )
+        # This probe -- not the capture loop below -- is the *first* forward
+        # through the compiled Mamba2 model, so the batch dim has to be marked
+        # dynamic here.  ``compile_model`` traces with ``dynamic=False`` and
+        # drops every Dynamo guard, so whatever shape the first forward sees is
+        # baked into the graph's buffers for good: a probe traced at 256 tokens
+        # left every later batch size (including the first capture bucket at
+        # ``max_num_seqs``) running against 256-row activations.
+        if self._compiled and not self._mark_dynamic_done:
+            torch._dynamo.mark_dynamic(probe_ids, 0)
+            torch._dynamo.mark_dynamic(probe_positions, 0)
+            self._mark_dynamic_done = True
+
+        def _probe_forward():
+            hidden = self.model(probe_ids, probe_positions)
             partial = self.model.lm_head.linear_op(
                 hidden, self.model.lm_head.embedding_op.emb.weight,
             ).float()
             partial.max(dim=-1)
-            del hidden, partial
+
+        try:
+            # Warmup pass first: the compile this triggers (Inductor autotuning
+            # allocates real buffers) is not part of a steady-state decode
+            # forward and would inflate the per-seq estimate.
+            _probe_forward()
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            baseline = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+            _probe_forward()
             torch.cuda.synchronize()
             peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         finally:
