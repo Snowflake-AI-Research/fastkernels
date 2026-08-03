@@ -1,13 +1,24 @@
-# GLM-5.2 (bf16/fp8)
+# GLM-5.2 (bf16 / fp8 / nvfp4)
+#
+# ``enforce_eager`` on every row: the DSA indexer's decode top-k runs
+# ``deep_gemm.fp8_fp4_paged_mqa_logits``, a persistent kernel scheduled across
+# num_sms, and that is not CUDA-graph capturable -- capture records but the first
+# replay faults (see ``ModelRunner._supports_cudagraphs``). The engine forces
+# eager for these models on its own; declaring it here holds the vLLM reference
+# to the same footing, because vLLM CAN still use piecewise graphs on this model
+# (its ``splitting_ops`` make the indexer a graph split point). That asymmetry is
+# real and is reported separately rather than hidden by the flag.
 
 scenarios:
   - model: zai-org/GLM-5.2
     tp: 8
     dtype: bfloat16
+    enforce_eager: true
     workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
   - model: zai-org/GLM-5.2-FP8
     tp: 8
     dtype: fp8
+    enforce_eager: true
     workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
   # NVFP4 weights (routed experts only; attention / shared experts / dense MLPs
   # stay BF16 per the checkpoint's own exclude list) with an fp8 KV cache. The
@@ -18,4 +29,5 @@ scenarios:
     tp: 8
     dtype: nvfp4
     kv_cache_dtype: fp8_e4m3
+    enforce_eager: true
     workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]

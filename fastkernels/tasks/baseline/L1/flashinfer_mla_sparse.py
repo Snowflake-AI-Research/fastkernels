@@ -69,6 +69,22 @@ def flashinfer_mla_sparse_available() -> bool:
         return False
 
 
+def ensure_workspaces(device: torch.device) -> None:
+    """Materialize both shared workspaces on ``device``.
+
+    MUST be called before CUDA graph capture. A workspace allocated lazily on
+    first use is created *inside* the capturing region, so it comes from that
+    one graph's private memory pool -- and every later graph (one per captured
+    batch size) then records kernels that atomically reduce into another graph's
+    pool. Replay fails with ``cudaErrorInvalidAddressSpace`` ("operation not
+    permitted on the memory's address space", i.e. an atomic on memory the
+    kernel may not atomically touch). vLLM sidesteps this by taking its
+    workspaces from a module-level buffer / its workspace manager at model init.
+    """
+    _sparse_ws(device)
+    _ragged_ws(device)
+
+
 def _sparse_ws(device: torch.device) -> torch.Tensor:
     """Shared int8 workspace for the sparse MLA decode kernel.
 
@@ -120,6 +136,10 @@ class FlashInferMLASparseDecode(nn.Module):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.kv_lora_rank = kv_lora_rank
 
+    def ensure_workspaces(self, device: torch.device) -> None:
+        """See :func:`ensure_workspaces` -- pre-capture workspace allocation."""
+        ensure_workspaces(device)
+
     def forward(
         self,
         q: torch.Tensor,              # [N, H, 576] fp8_e4m3 (ql_nope || q_pe)
@@ -168,6 +188,10 @@ class TrtllmRaggedPrefill(nn.Module):
     def __init__(self, scale: float):
         super().__init__()
         self.scale = scale
+
+    def ensure_workspaces(self, device: torch.device) -> None:
+        """See :func:`ensure_workspaces` -- pre-capture workspace allocation."""
+        ensure_workspaces(device)
 
     def forward(
         self,

@@ -106,6 +106,18 @@ class TopKPerRow(nn.Module):
         super().__init__()
         self._radix_ws: dict[torch.device, torch.Tensor] = {}
 
+    def ensure_workspaces(self, device: torch.device) -> None:
+        """Materialize the radix top-k workspace before CUDA graph capture.
+
+        The radix kernels reduce into this buffer atomically. Allocated lazily
+        on first use it lands in the capturing graph's private memory pool, and
+        every subsequently captured batch size then replays an atomic into
+        another graph's pool -- which faults at replay
+        (``cudaErrorIllegalAddress`` / ``cudaErrorInvalidAddressSpace``). The
+        engine calls this after KV cache allocation, before capture.
+        """
+        self._radix_workspace(device)
+
     def _radix_workspace(self, device: torch.device) -> torch.Tensor:
         ws = self._radix_ws.get(device)
         if ws is None:

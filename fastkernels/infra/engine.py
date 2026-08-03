@@ -527,6 +527,7 @@ class ModelRunner:
         )
         model_type = getattr(self.config, "model_type", "")
         self.is_kimi_linear = model_type == "kimi_linear"
+        self._force_eager_reason = ""
         self.is_qwen3_next = model_type == "qwen3_next"
         self.is_mamba2 = model_type == "mamba2"
         self.is_mamba = (
@@ -650,6 +651,11 @@ class ModelRunner:
             self._init_fa3_decode_buffers()
             if rank == 0:
                 print(f"  [4/6] KV cache done in {_time.perf_counter()-_t3:.1f}s", flush=True)
+            if not self.enforce_eager and not self._supports_cudagraphs():
+                self.enforce_eager = True
+                if rank == 0:
+                    print("  [5/6] Forcing eager: "
+                          f"{self._force_eager_reason}", flush=True)
             if not self.enforce_eager:
                 if rank == 0:
                     print(f"  [5/6] Compiling + capturing CUDA graphs...", flush=True)
@@ -4184,6 +4190,30 @@ class ModelRunner:
             )
             layer.k_cache = cache
             layer.v_cache = cache
+            # Resolve the fp8 attention scales to Python floats here: weights are
+            # loaded, capture has not started, and the warmup forward ran against
+            # an empty cache so it never touched the sparse decode path. Reading
+            # them lazily on the first decode instead records a D2H copy into the
+            # decode CUDA graph, and replay then fails with
+            # ``cudaErrorInvalidAddressSpace``.
+            if hasattr(layer, "finalize_kv_scales"):
+                layer.finalize_kv_scales()
+
+        # Materialize every lazily-allocated device workspace NOW, while the KV
+        # cache is up but capture has not started. A workspace first allocated
+        # inside a capture region belongs to that one graph's private memory
+        # pool; the next captured batch size then records kernels reducing
+        # atomically into another graph's pool, and replay faults
+        # (``cudaErrorIllegalAddress`` / ``cudaErrorInvalidAddressSpace``). That
+        # hit the DSA radix top-k and both trtllm-gen MLA workspaces -- the
+        # sparse-MLA models were only runnable with ``enforce_eager`` because of
+        # it. vLLM avoids the whole class by taking its workspaces from a
+        # module-level buffer or its workspace manager at model init.
+        _ws_device = torch.device(device)
+        for module in self.model.modules():
+            ensure = getattr(module, "ensure_workspaces", None)
+            if ensure is not None:
+                ensure(_ws_device)
 
         if num_indexer_layers > 0:
             if self.rank == 0:
@@ -5722,6 +5752,46 @@ class ModelRunner:
         self._mark_dynamic_done = False
 
     @torch.inference_mode()
+    def _supports_cudagraphs(self) -> bool:
+        """Whether a decode step of this model can be recorded into a CUDA graph.
+
+        DSA models (DeepSeek-V3.2, GLM-5.2) cannot: their indexer's decode top-k
+        runs ``deep_gemm.fp8_fp4_paged_mqa_logits``, a persistent kernel
+        scheduled across ``num_sms`` via ``get_paged_mqa_logits_metadata``.
+        Capturing it records fine but the first REPLAY dies -- observed as
+        ``cudaErrorInvalidAddressSpace`` ("operation not supported on
+        global/shared address space") on GLM-5.2-NVFP4 and
+        ``cudaErrorIllegalAddress`` on GLM-5.2-FP8. Bisected to that one call:
+        skipping the indexer's decode top-k, or just the paged-logits kernel
+        while keeping its metadata build, makes replay succeed.
+
+        vLLM has the same constraint and handles it structurally -- its
+        ``compilation_config.splitting_ops`` lists ``vllm::sparse_attn_indexer``,
+        so the indexer is a graph split point and runs eagerly between graph
+        segments, and the rest of the step still gets piecewise graphs.
+        fastkernels captures a decode step as ONE graph, so there is no
+        equivalent split, and a compiled-body/eager-decode hybrid does not work
+        either: the batch-dim ``mark_dynamic`` and the guard-dropping both live
+        in ``capture_cudagraph``, so a compiled model with no captured graphs
+        decodes at the wrong shape. So these models run fully eager, and the
+        benchmark scenario declares ``enforce_eager`` to hold vLLM to the same
+        footing (it can otherwise use its piecewise graphs here; that difference
+        is real and is called out in the results).
+        """
+        if not getattr(self, "is_deepseek_mla", False):
+            return True
+        from ..tasks.baseline.L2.sparse_attn_indexer import SparseAttnIndexer
+
+        if not any(isinstance(m, SparseAttnIndexer)
+                   for m in self.model.modules()):
+            return True
+        self._force_eager_reason = (
+            "the DSA indexer's paged MQA-logits kernel "
+            "(deep_gemm.fp8_fp4_paged_mqa_logits) is not CUDA-graph "
+            "capturable; replay faults. See _supports_cudagraphs."
+        )
+        return False
+
     def capture_cudagraph(self):
         import gc
         from contextlib import nullcontext

@@ -950,26 +950,32 @@ class MLAAttention(nn.Module):
         q_fp8 = self.q_quant(q_latent, self._q_scale)
         o = self.fi_sparse_decode(
             q_fp8, kv_cache, topk_global, valid_counts,
-            self.topk_tokens, *self._fi_bmm_scales(),
+            self.topk_tokens, *self.finalize_kv_scales(),
         )
         return self._v_up_proj(o)
 
-    def _fi_bmm_scales(self) -> tuple[float, float]:
-        """``(bmm1_scale, bmm2_scale)`` for the sparse MLA kernel, computed once.
+    def finalize_kv_scales(self) -> tuple[float, float]:
+        """Resolve the sparse-MLA bmm scales to Python floats, once.
 
-        Mirrors ``FlashInferMLASparseImpl.forward_mqa``: ``bmm1 = sm_scale *
-        q_scale * k_scale`` and ``bmm2 = k_scale`` for a quantized cache. vLLM
-        also memoizes these (``if self.bmm1_scale is None``) and for the same
-        reason: reading ``_q_scale`` / ``_k_scale`` as Python floats is a
-        device-to-host sync, and paying it per layer per decode step would
-        serialize the whole step against the copy engine. The scales are set at
-        load time and never change.
+        ``(bmm1_scale, bmm2_scale)`` mirrors ``FlashInferMLASparseImpl.forward_mqa``:
+        ``bmm1 = sm_scale * q_scale * k_scale`` and ``bmm2 = k_scale`` for a
+        quantized cache. vLLM memoizes these too (``if self.bmm1_scale is None``)
+        because reading ``_q_scale`` / ``_k_scale`` as Python floats is a
+        device-to-host copy, and paying it per layer per decode step would
+        serialize every step against the copy engine.
+
+        This MUST run outside CUDA graph capture. The engine calls it from KV
+        cache allocation -- after weight loading, before capture -- because the
+        pre-capture warmup forward runs with an empty cache and so never reaches
+        the sparse decode path: the lazy read would otherwise first happen
+        *during* capture, where a D2H copy is recorded into the graph and replay
+        fails with ``cudaErrorInvalidAddressSpace`` ("operation not supported on
+        global/shared address space").
         """
         cached = self._fi_bmm_scale_cache
         if cached is None:
-            q_scale = float(self._q_scale)
             k_scale = float(self._k_scale)
-            cached = (self.scale * q_scale * k_scale, k_scale)
+            cached = (self.scale * float(self._q_scale) * k_scale, k_scale)
             self._fi_bmm_scale_cache = cached
         return cached
 
