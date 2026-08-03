@@ -221,6 +221,11 @@ class DeepSeekMoE(nn.Module):
             routed_scaling_factor=1.0,
         )
         self.gate = GateLinear()
+        # See the ``out_dtype`` note in ``forward_impl``.
+        _router_dtype = getattr(config, "moe_router_dtype", None)
+        self.router_dtype = (
+            torch.float32 if _router_dtype == "float32" else None
+        )
         # FP8 path uses a fresh-allocation, vLLM-mirrored op so it is
         # both bit-identical to vLLM's Triton MoE *and* safe to compose
         # with CUDA graph capture (no shared scratch buffers that an
@@ -426,19 +431,21 @@ class DeepSeekMoE(nn.Module):
         # that flips near-tie group/expert selection in the noaux_tc
         # grouped-topk path.
         #
-        # Router ``out_dtype`` mirrors vLLM ``DeepseekV2MoE``: on CUDA the
-        # ``GateLinear`` is constructed with ``out_dtype=None`` and
-        # ``set_out_dtype`` is called ONLY on the ROCm/aiter path
-        # (``deepseek_v2.py:304-309``). So on CUDA ``gate.out_dtype`` stays
-        # ``None`` for BOTH the FP8 and the BF16/unquantized experts. With
-        # ``None``, vLLM's dispatch yields FP32 router logits in decode (the
-        # DSV3 kernel's ``torch.empty(dtype=None)`` output) and BF16 in prefill
-        # (the ``F.linear`` fallback, no cast) — and vLLM does NOT upcast before
-        # the sigmoid, so this precision split feeds grouped-topk verbatim.
-        # Pass ``None`` to reproduce it exactly (GateLinear pins FP32 for the
-        # DSV3 output since fastkernels' global default dtype is bf16).
+        # Router ``out_dtype`` mirrors vLLM ``DeepseekV2MoE``, which builds its
+        # gate with ``out_dtype=_get_moe_router_dtype(config)``:
+        #
+        # * ``glm_moe_dsa`` (GLM-5.2) -> **FP32, unconditionally** ("Older
+        #   GLM-5/5.2 configs require fp32 routing but do not expose
+        #   moe_router_dtype yet"). Leaving it ``None`` would give FP32 in decode
+        #   but BF16 in prefill (the ``F.linear`` fallback does not cast), so
+        #   every prefill token would reach grouped-topk with a different bit
+        #   pattern than vLLM and flip near-tie expert selection.
+        # * every other model -> ``None`` unless the config says
+        #   ``moe_router_dtype: "float32"``. With ``None`` vLLM's dispatch yields
+        #   FP32 in decode and BF16 in prefill, and it does NOT upcast before the
+        #   sigmoid, so that precision split feeds grouped-topk verbatim.
         router_logits = self.gate(
-            hidden_states, self.gate_weight, out_dtype=None,
+            hidden_states, self.gate_weight, out_dtype=self.router_dtype,
         )
         if self.use_nvfp4:
             # Blackwell FLASHINFER_TRTLLM NVFP4 path — vLLM's only viable NVFP4

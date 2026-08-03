@@ -83,6 +83,15 @@ class DeepSeekV3Config:
     # vLLM's FLASHINFER_MLA_SPARSE). ``None`` defers to
     # ``FASTKERNELS_KV_CACHE_DTYPE`` (default ``"auto"``).
     kv_cache_dtype: Optional[str] = None
+    # MoE router output dtype. vLLM's ``_get_moe_router_dtype``
+    # (deepseek_v2.py) returns FP32 unconditionally for ``model_type ==
+    # "glm_moe_dsa"`` -- "Older GLM-5/5.2 configs require fp32 routing but do
+    # not expose moe_router_dtype yet" -- and honours an explicit
+    # ``moe_router_dtype: "float32"`` otherwise. ``None`` leaves the gate's
+    # dispatch to choose, which is FP32 in decode and BF16 in prefill; for GLM
+    # that prefill BF16 would feed grouped-topk a different bit pattern than
+    # vLLM and flip near-tie expert selection.
+    moe_router_dtype: Optional[str] = None
 
     # YARN RoPE params
     rope_parameters: dict = field(default_factory=lambda: {
@@ -206,7 +215,28 @@ class DeepSeekV3Config:
             index_topk_pattern=getattr(hf, 'index_topk_pattern', None),
             index_skip_topk_offset=getattr(hf, 'index_skip_topk_offset', 2),
             rope_parameters=rope_params,
+            moe_router_dtype=_moe_router_dtype(hf),
         )
+
+
+def _moe_router_dtype(hf) -> Optional[str]:
+    """The MoE router's output dtype, mirroring vLLM ``_get_moe_router_dtype``.
+
+    ``glm_moe_dsa`` is forced to FP32 there regardless of what the checkpoint
+    says; every other model honours an explicit ``moe_router_dtype`` and is
+    otherwise left to the gate's own dispatch.
+
+    Note the HF fallback path in ``from_pretrained`` rewrites ``model_type`` to
+    ``"deepseek_v3"`` before building a ``DeepseekV3Config``, so the raw
+    architecture name is checked too -- GLM-5.2 ships
+    ``architectures: ["GlmMoeDsaForCausalLM"]``.
+    """
+    model_type = getattr(hf, "model_type", None)
+    archs = getattr(hf, "architectures", None) or []
+    if model_type == "glm_moe_dsa" or "GlmMoeDsaForCausalLM" in archs:
+        return "float32"
+    router_dtype = getattr(hf, "moe_router_dtype", None)
+    return "float32" if router_dtype == "float32" else None
 
 
 class DeepSeekV3Model(nn.Module):
