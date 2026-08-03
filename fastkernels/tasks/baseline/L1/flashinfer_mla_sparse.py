@@ -215,33 +215,35 @@ class TrtllmRaggedPrefill(nn.Module):
         return ret
 
 
-class ConcatQuantFp8MLAQuery(nn.Module):
-    """Concatenate ``ql_nope`` and ``q_pe``, then per-tensor fp8-quantize.
+class QuantFp8MLAQuery(nn.Module):
+    """Per-tensor fp8-quantize the absorbed 576-D MLA query.
 
-    Mirrors vLLM's ``_DecodeConcatQuantFP8`` (a ``QuantFP8`` subclass that
-    concatenates before quantizing, see mla_attention.py:1258-1289), which
-    ``forward_impl`` applies when the KV cache is quantized and the impl sets
-    ``supports_quant_query_input`` — the trtllm-gen sparse MLA kernel requires q
-    and the cache to share a dtype (mixed bf16+fp8 is unsupported).
+    The counterpart of vLLM's ``_DecodeConcatQuantFP8``
+    (mla_attention.py:1258-1289), applied by ``forward_impl`` when the KV cache
+    is quantized and the impl sets ``supports_quant_query_input`` — the
+    trtllm-gen sparse MLA kernel requires q and the cache to share a dtype
+    (mixed bf16+fp8 is unsupported). vLLM's variant exists to *fuse* the
+    ``cat(ql_nope, q_pe)`` with the quantization; fastkernels' caller already
+    holds the concatenated query (``_absorb_q_to_latent``), so it quantizes that
+    directly — same arithmetic, one copy fewer.
 
     Static per-tensor scale: ``QuantFP8.forward_cuda`` with a provided ``scale``
     dispatches to ``ops.scaled_fp8_quant`` ->
     ``torch.ops._C.static_scaled_fp8_quant``, so call that same CUDA kernel here
-    rather than an equivalent-looking clamp/divide in PyTorch (which rounds
-    differently at the fp8 boundary). ``scale`` is ``layer._q_scale``, which is
-    1.0 unless the checkpoint carries q/k calibration — nvidia/GLM-5.2-NVFP4
-    does not (it has no attention ``*_scale`` tensors).
+    rather than an equivalent-looking clamp/divide in PyTorch. ``scale`` is
+    ``layer._q_scale``, which is 1.0 unless the checkpoint carries q/k
+    calibration — nvidia/GLM-5.2-NVFP4 does not, and vLLM says so at load:
+    "Checkpoint does not provide a q scaling factor ... Using KV cache scaling
+    factor 1.0 for fp8_e4m3".
     """
 
     def forward(
         self,
-        ql_nope: torch.Tensor,   # [N, H, kv_lora_rank]
-        q_pe: torch.Tensor,      # [N, H, qk_rope_head_dim]
+        q: torch.Tensor,         # [N, H, kv_lora_rank + qk_rope_head_dim]
         scale: torch.Tensor,     # [1] fp32
     ) -> torch.Tensor:
         from vllm import _custom_ops as ops
 
-        q = torch.cat((ql_nope, q_pe), dim=-1)
         flat = q.reshape(q.shape[0], -1)
         out, _ = ops.scaled_fp8_quant(flat, scale)
         return out.view(q.shape)

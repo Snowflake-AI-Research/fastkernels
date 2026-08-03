@@ -48,8 +48,8 @@ from ..L1.flash_mla_decode import (
 from ..L1.flash_mla_sparse_prefill import FlashMLASparsePrefill
 from ..L1.flash_attn_varlen import FlashAttnVarlen
 from ..L1.flashinfer_mla_sparse import (
-    ConcatQuantFp8MLAQuery,
     FlashInferMLASparseDecode,
+    QuantFp8MLAQuery,
     TrtllmRaggedPrefill,
     flashinfer_mla_sparse_available,
 )
@@ -232,7 +232,8 @@ class MLAAttention(nn.Module):
                 kv_lora_rank=kv_lora_rank,
             )
             self.ragged_prefill = TrtllmRaggedPrefill(scale=scale)
-            self.q_concat_quant = ConcatQuantFp8MLAQuery()
+            self.q_quant = QuantFp8MLAQuery()
+        self._fi_bmm_scale_cache: tuple[float, float] | None = None
         self.get_metadata = FlashMLAGetMetadata()
         self.get_metadata_dense_fp8 = FlashMLAGetMetadataDenseFP8()
         self.varlen_attn = FlashAttnVarlen()
@@ -374,7 +375,9 @@ class MLAAttention(nn.Module):
                 chunk_seq_lens = (cu_seqlens_k[1:] - cu_seqlens_k[:-1])
             ret = self.ragged_prefill(
                 q, k, v,
-                seq_lens=chunk_seq_lens.to(torch.int32),
+                seq_lens=chunk_seq_lens.to(
+                    device=q.device, dtype=torch.int32, non_blocking=True,
+                ),
                 cu_seq_lens_q=cu_seqlens_q,
                 cu_seq_lens_kv=cu_seqlens_k,
                 max_q_len=max_seqlen_q,
@@ -470,9 +473,11 @@ class MLAAttention(nn.Module):
                 cu_seqlens_k=chunked_ctx.cu_seq_lens[i],
                 max_seqlen_q=max_query_len,
                 max_seqlen_k=chunked_ctx.max_seq_lens[i],
-                chunk_seq_lens=chunked_ctx.seq_lens[i]
-                if isinstance(chunked_ctx.seq_lens, (list, tuple))
-                else chunked_ctx.seq_lens,
+                # ``seq_lens`` is a CPU ``[num_chunks, num_prefills]`` tensor;
+                # row ``i`` is this chunk's per-request KV length, which is what
+                # vLLM hands the ragged kernel as
+                # ``chunked_context.seq_lens[chunk_idx]``.
+                chunk_seq_lens=chunked_ctx.seq_lens[i],
             )
 
             # A request with no context in this chunk attended to zero keys,
@@ -899,22 +904,33 @@ class MLAAttention(nn.Module):
                 req_ids=req_ids[:num_mqa], return_valid_counts=True,
             )
             q_latent = self._absorb_q_to_latent(q[:num_mqa])  # [n, H, 576]
-            q_fp8 = self.q_concat_quant(
-                q_latent[..., :self.kv_lora_rank],
-                q_latent[..., self.kv_lora_rank:],
-                self._q_scale,
-            )
-            bmm1_scale = (
-                self.scale * float(self._q_scale) * float(self._k_scale)
-            )
-            bmm2_scale = float(self._k_scale)
+            q_fp8 = self.q_quant(q_latent, self._q_scale)
             o = self.fi_sparse_decode(
                 q_fp8, kv_cache, topk_global, valid_counts,
-                self.topk_tokens, bmm1_scale, bmm2_scale,
+                self.topk_tokens, *self._fi_bmm_scales(),
             )
             out[:num_mqa] = self._v_up_proj(o)
 
         return out
+
+    def _fi_bmm_scales(self) -> tuple[float, float]:
+        """``(bmm1_scale, bmm2_scale)`` for the sparse MLA kernel, computed once.
+
+        Mirrors ``FlashInferMLASparseImpl.forward_mqa``: ``bmm1 = sm_scale *
+        q_scale * k_scale`` and ``bmm2 = k_scale`` for a quantized cache. vLLM
+        also memoizes these (``if self.bmm1_scale is None``) and for the same
+        reason: reading ``_q_scale`` / ``_k_scale`` as Python floats is a
+        device-to-host sync, and paying it per layer per decode step would
+        serialize the whole step against the copy engine. The scales are set at
+        load time and never change.
+        """
+        cached = self._fi_bmm_scale_cache
+        if cached is None:
+            q_scale = float(self._q_scale)
+            k_scale = float(self._k_scale)
+            cached = (self.scale * q_scale * k_scale, k_scale)
+            self._fi_bmm_scale_cache = cached
+        return cached
 
     def _absorb_q_to_latent(self, q: torch.Tensor) -> torch.Tensor:
         """Absorb q_nope through W_UK_T into the latent space and concat q_pe.

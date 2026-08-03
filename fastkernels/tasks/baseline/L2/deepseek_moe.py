@@ -245,7 +245,15 @@ class DeepSeekMoE(nn.Module):
         if self.use_nvfp4:
             # NVFP4 has exactly one backend on this hardware (checked in
             # __init__), so there is no oracle branch to mirror here.
-            self.trtllm_fp4_moe = TrtllmFp4MoE()
+            # ``fi_moe_largest_bucket`` = max(max_num_tokens * dp_size, 8192);
+            # dp_size is 1 under plain TP, and ``max_num_tokens`` is the
+            # scheduler's max_num_batched_tokens -- the same value the engine
+            # threads onto the config for the DSA top-k buffer.
+            self.trtllm_fp4_moe = TrtllmFp4MoE(
+                tune_max_num_tokens=max(
+                    getattr(config, "max_num_batched_tokens", 8192), 8192,
+                ),
+            )
             self.act_quant_fp4 = NvFp4Quantize()
             self._fp4_weights_ready = False
         self.allreduce = AllReduce()
