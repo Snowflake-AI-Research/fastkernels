@@ -527,7 +527,6 @@ class ModelRunner:
         )
         model_type = getattr(self.config, "model_type", "")
         self.is_kimi_linear = model_type == "kimi_linear"
-        self._force_eager_reason = ""
         self.is_qwen3_next = model_type == "qwen3_next"
         self.is_mamba2 = model_type == "mamba2"
         self.is_mamba = (
@@ -654,8 +653,9 @@ class ModelRunner:
             if not self.enforce_eager and not self._supports_cudagraphs():
                 self.enforce_eager = True
                 if rank == 0:
-                    print("  [5/6] Forcing eager: "
-                          f"{self._force_eager_reason}", flush=True)
+                    print("  [5/6] Forcing eager: decode CUDA graphs are unsafe "
+                          "for this model (see _supports_cudagraphs).",
+                          flush=True)
             if not self.enforce_eager:
                 if rank == 0:
                     print(f"  [5/6] Compiling + capturing CUDA graphs...", flush=True)
@@ -4071,6 +4071,41 @@ class ModelRunner:
             self.shm.buf[self._SHM_FLAG_OFFSET] = 2  # mamba_decode_greedy
             self._signal_workers()
         return self.run_mamba_decode_fast_async(decode_data)
+    def _refresh_indexer_schedule(self, context_lens: torch.Tensor) -> None:
+        """Recompute the DSA indexer's paged-logits schedule for this step.
+
+        Must run OUTSIDE CUDA graph capture/replay: with
+        ``get_paged_mqa_logits_metadata`` inside the captured region the
+        downstream ``fp8_fp4_paged_mqa_logits`` faults on the first replay, while
+        a schedule computed outside captures and replays cleanly (the kernel is
+        capturable -- verified standalone). vLLM builds the same tensor in its
+        metadata builder, i.e. also outside the graph.
+
+        ``context_lens`` is the [n] int32 decode lengths *including* the padded
+        tail the captured graph covers, so the schedule matches the shape the
+        graph was recorded at.
+        """
+        sched = self._indexer_sched
+        if sched is None:
+            return
+        import deep_gemm as _dg
+
+        # ``inference_mode`` explicitly: some decode sites (notably the CUDA
+        # graph capture warmup) reach here with grad enabled, and the schedule is
+        # computed from inference-mode buffers, which autograd refuses to track
+        # ("Inference tensors cannot be saved for backward").
+        with torch.inference_mode():
+            cl_2d = context_lens.view(-1, 1)
+            sched.copy_(
+                _dg.get_paged_mqa_logits_metadata(
+                    cl_2d, self._indexer_block_size, self._indexer_num_sms,
+                ),
+                non_blocking=True,
+            )
+        ctx = get_context()
+        if ctx is not None:
+            ctx.indexer_schedule = sched
+
     def _allocate_mla_kv_cache(self):
         """Allocate MLA KV cache + indexer K cache.
 
@@ -4214,6 +4249,30 @@ class ModelRunner:
             ensure = getattr(module, "ensure_workspaces", None)
             if ensure is not None:
                 ensure(_ws_device)
+
+        # Persistent DeepGEMM paged-MQA-logits schedule for the DSA indexer.
+        # Shape is (num_sms + 1, 2) for every batch size and context length, so a
+        # single buffer serves every captured decode graph. The engine refreshes
+        # its CONTENTS each step, outside the graph -- see Context.indexer_schedule.
+        self._indexer_sched = None
+        if num_indexer_layers > 0:
+            import deep_gemm as _dg
+
+            self._indexer_block_size = _MLA_BLOCK_SIZE
+            self._indexer_num_sms = torch.cuda.get_device_properties(
+                _ws_device).multi_processor_count
+            # ``inference_mode(False)``: KV cache allocation runs under
+            # inference mode, and a buffer created there is an *inference
+            # tensor*. The compiled model reads this one as an input, and the
+            # CUDA-graph capture warmup traces with grad enabled, where autograd
+            # rejects inference tensors ("Inference tensors cannot be saved for
+            # backward"). Allocating it as a normal tensor sidesteps that; the
+            # per-step ``copy_`` from an inference-mode source is still fine.
+            with torch.inference_mode(False):
+                probe = torch.ones(1, 1, dtype=torch.int32, device=_ws_device)
+                self._indexer_sched = _dg.get_paged_mqa_logits_metadata(
+                    probe, self._indexer_block_size, self._indexer_num_sms,
+                ).clone()
 
         if num_indexer_layers > 0:
             if self.rank == 0:
@@ -4476,6 +4535,7 @@ class ModelRunner:
             max_context_len=max_cl,
             req_id_per_token=req_id_per_token,
         )
+        self._refresh_indexer_schedule(get_context().context_lens)
         self._apply_pending_cross_ctx()
         if use_mrope:
             positions_t = torch.from_numpy(mrope_pos).pin_memory().cuda(non_blocking=True)
@@ -4767,6 +4827,8 @@ class ModelRunner:
             torch.from_numpy(bt_np), non_blocking=True
         )
         self._prev_decode_n = n
+        # Outside the graph, and after context_lens for this step is in place.
+        self._refresh_indexer_schedule(gv["context_lens"][:graph_bs])
         self.graphs[graph_bs].replay()
 
     @torch.inference_mode()
@@ -4861,6 +4923,7 @@ class ModelRunner:
             max_context_len=int(cl_np.max()),
             req_id_per_token=req_id_per_token,
         )
+        self._refresh_indexer_schedule(context_lens)
         self._apply_pending_cross_ctx()
         use_bitnet_eager_model = self.is_bitnet and self._compiled
         model = getattr(self, "_eager_model", self.model) if use_bitnet_eager_model else self.model
@@ -5755,44 +5818,42 @@ class ModelRunner:
     def _supports_cudagraphs(self) -> bool:
         """Whether a decode step of this model can be recorded into a CUDA graph.
 
-        DSA models (DeepSeek-V3.2, GLM-5.2) cannot: their indexer's decode top-k
-        runs ``deep_gemm.fp8_fp4_paged_mqa_logits``, a persistent kernel
-        scheduled across ``num_sms`` via ``get_paged_mqa_logits_metadata``.
-        Capturing it records fine but the first REPLAY dies -- observed as
-        ``cudaErrorInvalidAddressSpace`` ("operation not supported on
-        global/shared address space") on GLM-5.2-NVFP4 and
-        ``cudaErrorIllegalAddress`` on GLM-5.2-FP8. Bisected to that one call:
-        skipping the indexer's decode top-k, or just the paged-logits kernel
-        while keeping its metadata build, makes replay succeed.
+        DSA models (DeepSeek-V3.2, GLM-5.2) need the indexer's paged-logits
+        schedule to be built OUTSIDE the graph. With
+        ``get_paged_mqa_logits_metadata`` called from inside the captured region,
+        capture succeeds but the first REPLAY dies in
+        ``deep_gemm.fp8_fp4_paged_mqa_logits`` -- ``cudaErrorInvalidAddressSpace``
+        on GLM-5.2-NVFP4, ``cudaErrorIllegalAddress`` on GLM-5.2-FP8, and nothing
+        at all under compute-sanitizer. The kernel itself IS capturable: fed a
+        schedule built beforehand it captures and replays fine standalone. vLLM
+        builds the same tensor in its metadata builder, i.e. also outside the
+        graph.
 
-        vLLM has the same constraint and handles it structurally -- its
-        ``compilation_config.splitting_ops`` lists ``vllm::sparse_attn_indexer``,
-        so the indexer is a graph split point and runs eagerly between graph
-        segments, and the rest of the step still gets piecewise graphs.
-        fastkernels captures a decode step as ONE graph, so there is no
-        equivalent split, and a compiled-body/eager-decode hybrid does not work
-        either: the batch-dim ``mark_dynamic`` and the guard-dropping both live
-        in ``capture_cudagraph``, so a compiled model with no captured graphs
-        decodes at the wrong shape. So these models run fully eager, and the
-        benchmark scenario declares ``enforce_eager`` to hold vLLM to the same
-        footing (it can otherwise use its piecewise graphs here; that difference
-        is real and is called out in the results).
+        So the engine keeps one persistent ``_indexer_sched`` buffer and refreshes
+        it per step via ``_refresh_indexer_schedule`` at every decode site,
+        including immediately before ``replay()``. This returns False only if that
+        buffer is missing, which would mean capture is unsafe.
         """
         if not getattr(self, "is_deepseek_mla", False):
             return True
         from ..tasks.baseline.L2.sparse_attn_indexer import SparseAttnIndexer
 
-        if not any(isinstance(m, SparseAttnIndexer)
-                   for m in self.model.modules()):
-            return True
-        self._force_eager_reason = (
-            "the DSA indexer's paged MQA-logits kernel "
-            "(deep_gemm.fp8_fp4_paged_mqa_logits) is not CUDA-graph "
-            "capturable; replay faults. See _supports_cudagraphs."
-        )
-        return False
+        return not any(
+            isinstance(m, SparseAttnIndexer) for m in self.model.modules()
+        ) or self._indexer_sched is not None
 
+    @torch.inference_mode()
     def capture_cudagraph(self):
+        """Trace, warm up, and capture the decode CUDA graphs.
+
+        ``inference_mode`` on the whole thing: this is where the compiled model
+        is traced for the first time, and tracing with grad enabled makes
+        AOTAutograd build a training graph wrapped in an ``autograd.Function``.
+        Every real forward afterwards runs under inference mode, so that graph
+        then rejects its own inputs ("Inference tensors cannot be saved for
+        backward") the first time a mixed prefill+decode batch takes the eager
+        compiled path.
+        """
         import gc
         from contextlib import nullcontext
         max_bs = self.max_num_seqs
@@ -5874,6 +5935,7 @@ class ModelRunner:
             max_context_len=self.max_model_len,
             req_id_per_token=decode_req_id[:largest_bs],
         )
+        self._refresh_indexer_schedule(context_lens[:largest_bs])
         # Mark batch dim as dynamic BEFORE the first compile-triggering forward
         # so Dynamo / Inductor produce a single symbolic-shape compiled graph
         # that works for every batch size we will subsequently capture, instead
@@ -5944,6 +6006,7 @@ class ModelRunner:
                     max_context_len=self.max_model_len,
                     req_id_per_token=decode_req_id[:bs],
                 )
+                self._refresh_indexer_schedule(context_lens[:bs])
 
                 ids_slice = input_ids[:bs]
                 if self.is_qwen_vl:

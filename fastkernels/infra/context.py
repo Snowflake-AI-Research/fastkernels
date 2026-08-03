@@ -208,6 +208,16 @@ class Context:
 
     # Per-token request ID mapping (for sparse indexer index conversion)
     req_id_per_token: torch.Tensor | None = None
+    # DeepGEMM paged-MQA-logits schedule for the DSA indexer's decode top-k,
+    # shape (num_sms + 1, 2) int32 -- batch- and context-independent, so one
+    # persistent buffer serves every captured batch size. Built by the engine
+    # OUTSIDE any CUDA graph: ``get_paged_mqa_logits_metadata`` called from
+    # inside the captured region makes the paged-logits kernel fault on replay,
+    # while feeding it a schedule computed outside captures and replays fine
+    # (the kernel itself is capturable -- verified in isolation). vLLM builds
+    # this in its metadata builder for the same reason. ``None`` on paths the
+    # engine does not pre-fill (prefill / mixed), where the layer computes it.
+    indexer_schedule: torch.Tensor | None = None
 
     # DSA indexer prefill chunk plan, computed once per forward and shared by
     # all indexer layers (they see the same Context). Lazily populated by the
