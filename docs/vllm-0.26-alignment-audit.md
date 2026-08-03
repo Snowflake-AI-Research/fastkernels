@@ -3779,3 +3779,43 @@ Fixed on the way: the DSA radix top-k and both trtllm-gen MLA workspaces were
 allocated on first use, which — once capture worked — would have put them in one
 graph's private memory pool while every later batch size replayed atomics into
 it. They are now materialised from KV-cache allocation via `ensure_workspaces`.
+
+### 27e. Measured, tp=8, full standard workloads
+
+8x B200, compiled with decode CUDA graphs on both sides, vLLM 0.26,
+`kv_cache_dtype=fp8_e4m3`:
+
+| workload | requests | fastkernels tok/s | vLLM tok/s | ratio | avg prefix match |
+|---|---|---|---|---|---|
+| mixed | 1000 | 3,426 | 4,188 | 0.82x | 13.1 / 388 |
+| long-context | 64 | 88 | 248 | 0.35x | 25.6 / 256 |
+| single-request (bs=1) | — | 11.53 ms/tok | 8.98 ms/tok | 0.78x | — |
+| fixed-batch-32 | — | 0.61 ms/tok | 0.51 ms/tok | 0.84x | — |
+
+Correctness is not in doubt at the operator level: at 4 layers / tp=1 the greedy
+output is **byte-identical** to vLLM's for the same prompt, and on the full model
+23 of the 1000 mixed requests match vLLM for all 388 tokens. What the 13.1 average
+reflects is the documented tie-flip cascade for this model family -- see the
+`validate/forced_decode.py` docstring, which measures the per-step ceiling at
+~88% and fastkernels' own batch-composition self-consistency at ~83%, i.e. no
+full-sequence greedy match can do much better across differing batch
+compositions.
+
+The `max_model_len` / `logits.stride(0)` fix in 27d moved mixed from 0.73x to
+0.82x on its own.
+
+### 27f. What is left: long-context needs mixed-batch graphs
+
+The long-context gap is not kernels. Its prefills are 8k-60k, so every step is a
+mixed prefill+decode batch, and:
+
+* fastkernels captures **pure-decode** graphs only, so those steps run fully
+  eager -- 78 layers of Python per step.
+* vLLM captures **both**: its log shows `Capturing CUDA graphs (mixed
+  prefill-decode, PIECEWISE)` *and* `Capturing CUDA graphs (decode, FULL)`.
+
+The size of that lever is visible directly: vLLM's own eager-vs-compiled numbers
+on the mixed workload are 227.6 s vs 11.5 s. Closing long-context therefore means
+teaching the engine to capture mixed-batch graphs (piecewise, with the indexer as
+a split point), which is a general engine feature rather than anything specific to
+NVFP4 -- it would lift GLM-5.2 and GLM-5.2-FP8 identically.
