@@ -956,7 +956,8 @@ def _throughput_rows_for_result(
                     "correctness": _cosine_summary(cosines),
                 }
             )
-    elif harness == "bench_recsys":
+    elif harness == "bench_recsys" and not data.get("scenarios"):
+        # Legacy shape, before bench_recsys emitted comparison.py's scenarios.
         for name, entry in (data.get("models") or {}).items():
             throughput = (entry or {}).get("throughput") or {}
             speedup = _speedup_ratio(
@@ -1120,7 +1121,8 @@ def _latency_rows_for_result(
                     "speedup": speedup,
                 }
             )
-    elif harness == "bench_recsys":
+    elif harness == "bench_recsys" and not data.get("latency_scenarios"):
+        # Legacy shape: the p50 of the throughput batch was all there was.
         for name, entry in (data.get("models") or {}).items():
             throughput = (entry or {}).get("throughput") or {}
             speedup = _speedup_ratio(
@@ -1270,14 +1272,9 @@ _COVERAGE_ALIAS_HARNESSES = {
 # always reported, never silent, but do not fail the run: the fix is either to
 # build the probe or to drop the declaration, and both belong to whoever owns
 # the row rather than to the summary writer.
-_UNIMPLEMENTED_WORKLOADS = {
-    ("bench_recsys", "single-request"): (
-        "bench_recsys times one large batch and derives both its throughput and "
-        "its p50 from it; no batch-1 probe exists"
-    ),
-    ("bench_recsys", "fixed-batch-32"): (
-        "bench_recsys times one large batch; no batch-32 probe exists"
-    ),
+_UNIMPLEMENTED_WORKLOADS: dict[tuple[str, str], str] = {
+    # Empty: bench_recsys's single-request / fixed-batch-32 were the last
+    # entries, and now have real batch-1 / batch-32 probes.
 }
 
 

@@ -85,6 +85,14 @@ from fastkernels.tasks.baseline.L4.dlrmv2 import DLRMv2, DLRMv2Config
 from fastkernels.tasks.baseline.L4.lightgcn import LightGCN, LightGCNConfig
 
 
+from fastkernels.validate.comparison import (
+    alignment_from_similarity,
+    latency_entry,
+    throughput_entry,
+)
+from fastkernels.workloads import RECSYS_LATENCY_WORKLOADS
+
+
 def _load_torchrec_dlrm():
     try:
         from torchrec.models.dlrm import DLRM as TorchRecDLRM
@@ -612,6 +620,123 @@ def _run_dlrm_alignment(
     }
 
 
+def _slice_dlrm_batch(throughput_batch, batch_size: int):
+    """First ``batch_size`` rows of a (dense, sparse-list) DLRM batch."""
+    dense_features, sparse_indices = throughput_batch
+    return dense_features[:batch_size], [t[:batch_size] for t in sparse_indices]
+
+
+def _run_dlrm_latency(
+    *,
+    device: torch.device,
+    prepared_inputs: dict[str, Any],
+    workloads,
+    skip_reference: bool = False,
+) -> list[dict[str, Any]]:
+    config: DLRMv2Config = prepared_inputs["config"]
+    ref, ours, _checkpoint = _load_dlrm_models(
+        config=config,
+        checkpoint_path=prepared_inputs["checkpoint_path"],
+        device=device,
+        skip_reference=skip_reference,
+    )
+    available = prepared_inputs["throughput_batch"][0].shape[0]
+    entries: list[dict[str, Any]] = []
+    with torch.inference_mode():
+        for workload in workloads:
+            batch_size = min(workload.batch_size, available)
+            dense_features, sparse_indices = _slice_dlrm_batch(
+                prepared_inputs["throughput_batch"], batch_size
+            )
+            ours_metrics = _benchmark_forward(
+                lambda: ours(dense_features, sparse_indices),
+                device=device,
+                warmup_iters=workload.num_warmup,
+                measure_iters=workload.num_iters,
+                items_per_iter=batch_size,
+                metric_name="samples_per_second",
+            )
+            ref_metrics = None
+            if ref is not None:
+                kjt = _build_torchrec_kjt(sparse_indices)
+                ref_metrics = _benchmark_forward(
+                    lambda: ref(dense_features, kjt),
+                    device=device,
+                    warmup_iters=workload.num_warmup,
+                    measure_iters=workload.num_iters,
+                    items_per_iter=batch_size,
+                    metric_name="samples_per_second",
+                )
+            entries.append(
+                latency_entry(
+                    workload.name,
+                    ours_metrics["latency_ms_p50"] / 1000.0,
+                    (ref_metrics["latency_ms_p50"] / 1000.0) if ref_metrics else None,
+                    batch_size=batch_size,
+                    reference_impl=None if ref is None else "torchrec.models.dlrm.DLRM",
+                )
+            )
+    return entries
+
+
+def _run_lightgcn_latency(
+    *,
+    device: torch.device,
+    prepared_inputs: dict[str, Any],
+    workloads,
+    skip_reference: bool = False,
+) -> list[dict[str, Any]]:
+    config: LightGCNConfig = prepared_inputs["config"]
+    ref, ours, _checkpoint = _load_lightgcn_models(
+        config=config,
+        checkpoint_path=prepared_inputs["checkpoint_path"],
+        device=device,
+        skip_reference=skip_reference,
+    )
+    _eu, _ei, all_users, all_items, adjacency = prepared_inputs["throughput_batch"]
+    available = all_users.numel()
+    entries: list[dict[str, Any]] = []
+    with torch.inference_mode():
+        for workload in workloads:
+            batch_size = min(workload.batch_size, available)
+            # The graph is the model's input; only the scored pairs shrink.
+            user_ids = all_users[:batch_size]
+            item_ids = all_items[:batch_size]
+            edge_label_index = torch.stack(
+                [user_ids, item_ids + config.num_users], dim=0
+            )
+            ours_metrics = _benchmark_forward(
+                lambda: ours(user_ids, item_ids, adjacency),
+                device=device,
+                warmup_iters=workload.num_warmup,
+                measure_iters=workload.num_iters,
+                items_per_iter=batch_size,
+                metric_name="pairs_per_second",
+            )
+            ref_metrics = None
+            if ref is not None:
+                ref_metrics = _benchmark_forward(
+                    lambda: ref(adjacency, edge_label_index=edge_label_index),
+                    device=device,
+                    warmup_iters=workload.num_warmup,
+                    measure_iters=workload.num_iters,
+                    items_per_iter=batch_size,
+                    metric_name="pairs_per_second",
+                )
+            entries.append(
+                latency_entry(
+                    workload.name,
+                    ours_metrics["latency_ms_p50"] / 1000.0,
+                    (ref_metrics["latency_ms_p50"] / 1000.0) if ref_metrics else None,
+                    batch_size=batch_size,
+                    reference_impl=(
+                        None if ref is None else "torch_geometric.nn.models.LightGCN"
+                    ),
+                )
+            )
+    return entries
+
+
 def _run_dlrm_throughput(
     *,
     device: torch.device,
@@ -1117,6 +1242,13 @@ def _run_model(args: argparse.Namespace, model_name: str, device: torch.device) 
                 measure_iters=args.measure_iters,
                 skip_reference=args.skip_reference,
             )
+        if not args.skip_latency:
+            result["latency_scenarios"] = _run_dlrm_latency(
+                device=device,
+                prepared_inputs=prepared_inputs,
+                workloads=_latency_workloads(args),
+                skip_reference=args.skip_reference,
+            )
     elif model_name == "lightgcn":
         prepared_inputs = _prepare_lightgcn_inputs(args, device)
         result["data"] = prepared_inputs["metadata"]
@@ -1133,9 +1265,72 @@ def _run_model(args: argparse.Namespace, model_name: str, device: torch.device) 
                 measure_iters=args.measure_iters,
                 skip_reference=args.skip_reference,
             )
+        if not args.skip_latency:
+            result["latency_scenarios"] = _run_lightgcn_latency(
+                device=device,
+                prepared_inputs=prepared_inputs,
+                workloads=_latency_workloads(args),
+                skip_reference=args.skip_reference,
+            )
     else:
         raise ValueError(f"unsupported model: {model_name}")
     return result
+
+
+_THROUGHPUT_WORKLOAD_NAME = {
+    "dlrmv2": "ctr-batch",
+    "lightgcn": "recommend-batch",
+}
+
+
+def _alignment_block(alignment):
+    """comparison.py alignment entry from the per-tensor cosine metrics."""
+    if not isinstance(alignment, dict):
+        return None
+    cosines = [
+        value["cosine"]
+        for value in alignment.values()
+        if isinstance(value, dict) and isinstance(value.get("cosine"), (int, float))
+    ]
+    if not cosines:
+        return None
+    return alignment_from_similarity("min_cosine", min(cosines), threshold=0.99)
+
+
+def _print_latency_result(model_name: str, entries: list[dict]) -> None:
+    if not entries:
+        return
+    print(f"  latency ({model_name}):")
+    for entry in entries:
+        ours = entry.get("fastkernels_median_s")
+        ref = entry.get("reference_median_s")
+        speedup = entry.get("speedup")
+        line = f"    {entry['scenario']:<16} bs={entry.get('batch_size'):<5} ours={ours*1000:.4f}ms"
+        if ref is not None:
+            line += f"  reference={ref*1000:.4f}ms  speedup={speedup:.2f}x"
+        print(line)
+
+
+def _latency_workloads(args):
+    """Declared Recsys latency workloads, or an override from the CLI."""
+    if not args.latency_batch_sizes:
+        return RECSYS_LATENCY_WORKLOADS
+    by_size = {w.batch_size: w for w in RECSYS_LATENCY_WORKLOADS}
+    chosen = []
+    for token in args.latency_batch_sizes.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        size = int(token)
+        spec = by_size.get(size)
+        if spec is None:
+            raise SystemExit(
+                f"ERROR: batch size {size} is not a declared Recsys latency "
+                f"workload. Declared: "
+                f"{', '.join(f'{w.name}(bs={w.batch_size})' for w in RECSYS_LATENCY_WORKLOADS)}."
+            )
+        chosen.append(spec)
+    return chosen
 
 
 def _default_output_dir(model: str) -> Path:
@@ -1179,6 +1374,11 @@ def _parse_args() -> argparse.Namespace:
              "models entirely (implies --skip-alignment).",
     )
     parser.add_argument("--skip-throughput", action="store_true", help="Skip throughput benchmark")
+    parser.add_argument("--skip-latency", action="store_true",
+                        help="Skip the batch-1 / batch-32 serving latency probes")
+    parser.add_argument("--latency-batch-sizes", default="",
+                        help="Override the declared latency batch sizes "
+                             "(comma-separated); defaults to the workload specs.")
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -1248,6 +1448,37 @@ def main() -> None:
         model_result = _run_model(args, model_name, device)
         results["models"][model_name] = model_result
         _summarize_model_result(model_name, model_result)
+        _print_latency_result(model_name, model_result.get("latency_scenarios") or [])
+
+    # Standard comparison shape, so the sweep summary reads this harness through
+    # the same path as every other one (see validate/comparison.py). The declared
+    # throughput row is named per model; the latency rows carry the declared
+    # single-request / fixed-batch-32 names.
+    scenarios: list[dict] = []
+    latency_scenarios: list[dict] = []
+    reference_name = None
+    for model_name, model_result in results["models"].items():
+        throughput = model_result.get("throughput") or {}
+        metric = "samples_per_second" if model_name == "dlrmv2" else "pairs_per_second"
+        ours = (throughput.get("ours") or {}).get(metric)
+        reference = (throughput.get("reference_metrics") or {}).get(metric)
+        reference_name = reference_name or throughput.get("reference")
+        if ours is not None and reference is not None:
+            scenarios.append(
+                throughput_entry(
+                    _THROUGHPUT_WORKLOAD_NAME.get(model_name, model_name),
+                    ours,
+                    reference,
+                    metric=metric.replace("_per_second", "_per_s"),
+                    alignment=_alignment_block(model_result.get("alignment")),
+                    batch_size=(model_result.get("data") or {}).get("batch_size"),
+                )
+            )
+        latency_scenarios.extend(model_result.get("latency_scenarios") or [])
+    results["scenarios"] = scenarios
+    results["latency_scenarios"] = latency_scenarios
+    if reference_name:
+        results["reference_name"] = reference_name
 
     output_dir = args.output_dir
     if output_dir is None and len(models) == 1:

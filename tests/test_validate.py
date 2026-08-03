@@ -844,39 +844,74 @@ def test_guard_still_fails_an_alias_harness_that_produced_nothing(tmp_path):
     assert "EAGLE-3" in gap["alias_reason"]
 
 
-def test_guard_reports_known_unimplemented_workloads_without_failing(tmp_path):
+def test_guard_reports_known_unimplemented_workloads_without_failing(
+    tmp_path, monkeypatch
+):
+    # The _UNIMPLEMENTED_WORKLOADS table is empty now that bench_recsys has real
+    # batch-1 / batch-32 probes, so this exercises the mechanism with a synthetic
+    # entry: a declared workload no harness implements is reported with its
+    # reason but must not fail the run, because implementing the probe or
+    # dropping the declaration is a judgement call, not the summary's to make.
+    from fastkernels.validate import ray_runner
+
+    monkeypatch.setitem(
+        ray_runner._UNIMPLEMENTED_WORKLOADS,
+        ("bench_vllm", "long-context"),
+        "no long-context dataset wired up for this harness yet",
+    )
     root, scenarios, summary = _guard_run(
         tmp_path,
-        "bench_recsys",
-        ["ctr-batch", "single-request", "fixed-batch-32"],
+        "bench_vllm",
+        ["mixed", "long-context"],
         {
-            "models": {
-                "dlrmv2": {
-                    "throughput": {
-                        "reference": "torchrec",
-                        "ours": {"samples_per_second": 4.0, "latency_ms_p50": 0.35},
-                        "reference_metrics": {
-                            "samples_per_second": 2.0,
-                            "latency_ms_p50": 0.70,
-                        },
-                        "ratio_vs_reference": 2.0,
-                    }
-                }
-            }
+            "model": "m",
+            "scenarios": [{"scenario": "mixed", "speedup": 1.1, "alignment": {}}],
+            "latency_scenarios": [],
         },
     )
     gap = summary["coverage_gaps"][0]
 
-    # Visible, with a reason, but not a build break: implementing the probe or
-    # dropping the declaration is a judgement call, not the summary's to make.
     assert summary["run"]["status"] == "PASS"
     assert gap["missing"] == []
-    assert [entry["workload"] for entry in gap["unimplemented"]] == [
-        "single-request",
-        "fixed-batch-32",
-    ]
+    assert [entry["workload"] for entry in gap["unimplemented"]] == ["long-context"]
     assert all(entry["reason"] for entry in gap["unimplemented"])
     assert _write_summary(root, scenarios, {0: "PASS"}) == 0
+
+
+def test_recsys_latency_workloads_are_specified_not_name_only():
+    # These two were the only single-request / fixed-batch-32 members in any
+    # family with params=None, which is why bench_recsys never implemented them:
+    # nothing said what they meant.
+    from fastkernels.workloads import Recsys, purpose_of, spec_for
+
+    for member, batch_size in ((Recsys.single_request, 1), (Recsys.fixed_batch_32, 32)):
+        spec = spec_for(member)
+        assert purpose_of(member).value == "latency"
+        assert spec.params is not None, f"{member.value} is still name-only"
+        assert spec.params.batch_size == batch_size
+
+
+def test_recsys_emits_a_row_for_every_declared_workload():
+    from fastkernels.validate.comparison import latency_entry, throughput_entry
+
+    for model, throughput_name in (("dlrmv2", "ctr-batch"), ("lightgcn", "recommend-batch")):
+        metric = "samples_per_s" if model == "dlrmv2" else "pairs_per_s"
+        data = {
+            "reference_name": "torchrec",
+            "models": {model: {}},
+            "scenarios": [throughput_entry(throughput_name, 4.0, 2.0, metric=metric)],
+            "latency_scenarios": [
+                latency_entry("single-request", 0.0004, 0.0005, batch_size=1),
+                latency_entry("fixed-batch-32", 0.0006, 0.0007, batch_size=32),
+            ],
+        }
+        throughput, latency = _rows("bench_recsys", data)
+        assert [r["workload"] for r in throughput] == [throughput_name]
+        assert [r["workload"] for r in latency] == [
+            "single-request",
+            "fixed-batch-32",
+        ]
+        assert all(r["speedup"] > 1.0 for r in throughput + latency)
 
 
 def test_guard_accepts_a_row_the_reference_cannot_run(tmp_path):

@@ -670,6 +670,24 @@ class SegmentationVideoWorkload:
 # veval-yt1b-val) were never run -- bench_sam imported the list and ignored it,
 # so the sweep advertised seven throughput workloads and produced none. Only
 # sav-val-video is dropped: the clip pass runs one --veval-subset, the default.
+# --- Recommendation / ranking (e.g. DLRMv2 CTR, LightGCN recommend) --------
+
+@dataclass(frozen=True)
+class RecsysLatencyWorkload:
+    name: str
+    batch_size: int
+    num_warmup: int = 100
+    num_iters: int = 1000
+
+
+# Serving-shaped probes over the same model and checkpoint the throughput row
+# uses, sliced from its batch: batch-1 is one CTR request or one user-item pair.
+RECSYS_LATENCY_WORKLOADS: list[RecsysLatencyWorkload] = [
+    RecsysLatencyWorkload("single-request", 1),
+    RecsysLatencyWorkload("fixed-batch-32", 32),
+]
+
+
 SEGMENTATION_THROUGHPUT_WORKLOADS: list[SegmentationThroughputWorkload] = [
     SegmentationThroughputWorkload(
         "full-pipeline", 1008, 500, "facebook/SACo-Gold", "metaclip", modality="image"
@@ -1050,6 +1068,7 @@ _SPEC_SOURCES: tuple[tuple[type[Workload], list[Any], list[Any]], ...] = (
     (Embedding, EMBEDDING_THROUGHPUT_WORKLOADS, EMBEDDING_LATENCY_WORKLOADS),
     (StructurePrediction, STRUCTURE_PREDICTION_THROUGHPUT_WORKLOADS, STRUCTURE_PREDICTION_LATENCY_WORKLOADS),
     (PointCloudPolicy, DP3_THROUGHPUT_WORKLOADS, DP3_LATENCY_WORKLOADS),
+    (Recsys, [], RECSYS_LATENCY_WORKLOADS),
 )
 
 # Families benchmarked by bespoke scripts that carry no parameter specs yet;
@@ -1072,8 +1091,6 @@ _PARAMLESS_PURPOSES: dict[Workload, Purpose] = {
     Rendering.single_render: Purpose.LATENCY,
     Recsys.ctr_batch: Purpose.THROUGHPUT,
     Recsys.recommend_batch: Purpose.THROUGHPUT,
-    Recsys.single_request: Purpose.LATENCY,
-    Recsys.fixed_batch_32: Purpose.LATENCY,
     VideoRepresentation.predictor: Purpose.THROUGHPUT,
     VideoRepresentation.encoder: Purpose.THROUGHPUT,
     VideoRepresentation.classification: Purpose.THROUGHPUT,
