@@ -43,10 +43,17 @@ scenarios:
   # reference is Microsoft's W2A8 CUDA kernel, which only reads this checkpoint's
   # native quantized format (the 1bitLLM/bitnet_b1_58-3B reproduction is a
   # llama-arch model with unpacked weights and does not load here).
+  #
+  # LLM.fixed_batch_32 is deliberately absent: the official int2 decode kernel
+  # dispatches only for M == 1 (see bitnet_kernels.cu -- every branch requires
+  # M == 1, and the kernel body is a GEMV with no row dimension), so the
+  # reference cannot serve a batch at all. The sweep's latency table reports
+  # speedups only, so a workload with no baseline contributes an empty cell;
+  # running our side alone would measure into a void.
   - model: microsoft/bitnet-b1.58-2B-4T
     tp: 1
     dtype: bfloat16
-    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request]
   - model: openai/gpt-oss-120b
     tp: 2
     dtype: mxfp4

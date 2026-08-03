@@ -124,8 +124,10 @@ MODEL_ID = "microsoft/bitnet-b1.58-2B-4T"
 
 # Default workloads when the caller names none. These are the LLM workloads
 # full.yaml declares for this row; the sweep passes them explicitly via
-# --workloads.
-DEFAULT_WORKLOADS = ("mixed", "long-context", "single-request", "fixed-batch-32")
+# --workloads. LLM.fixed_batch_32 is excluded: the official int2 decode kernel
+# dispatches only for M == 1, so the reference cannot batch and the workload has
+# no baseline to compare against.
+DEFAULT_WORKLOADS = ("mixed", "long-context", "single-request")
 
 # Output length for throughput workloads whose spec leaves decode_cap unset
 # (LLM.long_context). The reference pins gen_length at CUDA-graph build time, so
@@ -225,6 +227,7 @@ def _build_real_token_prompts(
     split: str,
     dataset_name: str | None = None,
     max_input_len: int | None = None,
+    keep_prompts: int | None = None,
 ) -> tuple[list[list[int]], str, tuple[int, int, int], int, float]:
     try:
         from datasets import disable_progress_bars
@@ -286,6 +289,12 @@ def _build_real_token_prompts(
         _normalize_prompt_len(sample.prompt_token_ids, input_len, int(pad_id))
         for sample in samples
     ]
+    # ``keep_prompts`` trims the *timed* request list only. ``input_len`` and the
+    # length stats above stay derived from the workload's full declared trace, so
+    # a capped run still measures the declared fixed shape instead of drifting to
+    # whatever mean the subsample happens to have.
+    if keep_prompts is not None:
+        prompts = prompts[:keep_prompts]
     return prompts, dataset_id, length_stats, input_len, mean_len
 
 
@@ -325,6 +334,9 @@ engine.generate([[0] * 16], SamplingParams(temperature=0.0, max_tokens=16))
 
 results = []
 kb_bsz = int(cfg.get("kb_bsz", 1))
+# Seconds of silence after which a serial loop prints progress; the sweep kills
+# a task whose log has not moved for 900s (--stall-timeout).
+HEARTBEAT_SEC = 30.0
 for sc in cfg["scenarios"]:
     prompts = sc["prompt_token_ids"]
     out_lens = sc["output_lens"]
@@ -334,10 +346,28 @@ for sc in cfg["scenarios"]:
     ]
     engine.block_manager.reset()
     torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    outs = engine.generate(prompts, sps, use_tqdm=False)
-    torch.cuda.synchronize()
-    elapsed = time.perf_counter() - t0
+    # At kb_bsz > 0 the engine is built with max_num_seqs=kb_bsz, so it already
+    # serves at most that many at once; issuing the prompts in kb_bsz-sized
+    # calls is the same work and the same concurrency, but it gives the loop a
+    # place to report progress. One 64-prompt call at kb_bsz=1 is ~2min of
+    # silence, and the declared 1000 would be ~34min -- past the watchdog.
+    # kb_bsz == 0 means "hand everything to the continuous scheduler", which
+    # must stay a single call for the scheduler to batch across requests.
+    chunk = kb_bsz if kb_bsz > 0 else len(prompts)
+    outs = []
+    elapsed = 0.0
+    last_beat = time.perf_counter()
+    for lo in range(0, len(prompts), max(1, chunk)):
+        hi = min(lo + max(1, chunk), len(prompts))
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        outs.extend(engine.generate(prompts[lo:hi], sps[lo:hi], use_tqdm=False))
+        torch.cuda.synchronize()
+        elapsed += time.perf_counter() - t0
+        if time.perf_counter() - last_beat >= HEARTBEAT_SEC:
+            print(f"[kb] {sc['name']:>14}: {hi}/{len(prompts)} prompts, "
+                  f"{elapsed:6.1f}s elapsed", flush=True)
+            last_beat = time.perf_counter()
     n_in = sum(len(p) for p in prompts)
     n_out = sum(len(o.token_ids) for o in outs)
     out_records = [{"token_ids": list(o.token_ids)} for o in outs]
@@ -415,10 +445,15 @@ with open(cfg["output_file"], "w") as f:
 # from the timed window; only ``generate_all`` is timed. Per-prompt outputs
 # are captured into ``outputs`` for alignment scoring.
 #
-# Upstream ``generate.py`` has a batched prefill indexing bug:
-# ``output[kv_seqlen - 1, :]`` ignores the flattened per-request prompt
-# offset. This worker uses a local fixed generation loop so the benchmark
-# stays self-contained and does not require patching the Microsoft repo.
+# Upstream ``generate.py`` has two bugs this worker fixes locally, leaving the
+# provisioned third_party checkout untouched:
+#
+# 1. Batched prefill indexing: ``output[kv_seqlen - 1, :]`` ignores the
+#    flattened per-request prompt offset.
+# 2. The decode CUDA graph is captured with the AttnBias built at
+#    ``kv_seqlen=[prompt_length]``, so the replayed decode attends over a
+#    prompt-length window and never sees the tokens it generated. See
+#    ``recapture_generate_full_window``.
 # ---------------------------------------------------------------------------
 SOTA_WORKER = r'''
 import json, math, os, sys, time
@@ -439,6 +474,9 @@ import model as _bitnet_model
 
 ckpt_dir = cfg["ckpt_dir"]
 gen_bsz = int(cfg["gen_bsz"])
+# Seconds of silence after which a serial loop prints progress. The sweep's
+# watchdog kills a task whose log has not moved for 900s (--stall-timeout).
+HEARTBEAT_SEC = 30.0
 torch.cuda.set_device(0)
 if gen_bsz != 1:
     raise ValueError(
@@ -538,14 +576,78 @@ def generate_all_fixed(g, prompts, use_cuda_graphs, use_sampling):
     return stats, answers
 
 @torch.inference_mode()
+def recapture_generate_full_window(g):
+    """Re-record the decode CUDA graph over the *full* KV window.
+
+    Upstream ``FastGen.compile_generate`` (generate.py:170) builds the decode
+    graph's AttnBias with ``kv_seqlen=[prompt_length]``.  ``AttnBias.from_seqlens``
+    precomputes Python-side ``max_seqlen``/``min_seqlen`` next to the device
+    ``seqlen`` tensor, and those scalars are baked into the captured kernel's
+    launch configuration.  ``replay()`` copies fresh seqlen *values* in, which
+    only re-masks *within* that frozen window -- so the replayed decode attends
+    over a ``prompt_length``-key window forever and never sees the tokens it just
+    generated.  Nothing errors; the model simply computes the wrong thing.
+
+    Capturing at ``max_seq_length`` makes the window cover the whole allocation,
+    and the per-step seqlen copy then masks correctly.  Measured 2026-08-02 at
+    prompt_len=298 / gen_len=1024 over 4 real wildchat prompts: graph vs eager
+    decode went from diverging at 87/92/88/95 tokens to 1024/1024 exact on all
+    four.  Both paths are individually deterministic, so the divergence was a
+    real correctness bug, not nondeterminism.
+
+    Cost: 2.476 -> 2.532 ms/token (2.3%), i.e. what the reference always owed for
+    attending over the window it actually has.  In exchange the timed pass
+    becomes usable for alignment, which removes a second, eager generation pass
+    that cost ~37 ms/token.
+    """
+    gen_bsz = g.gen_args.gen_bsz
+    max_seq = g.max_seq_length
+    bias = _bitnet_generate.AttnBias.from_seqlens(
+        q_seqlen=[1] * gen_bsz,
+        kv_seqlen=[max_seq] * gen_bsz,
+        kv_padding=max_seq,
+    )
+    bias.q_seqinfo.to("cuda")
+    bias.k_seqinfo.to("cuda")
+    tokens = torch.IntTensor([1] * gen_bsz).cuda()
+    g._generate_inputs = (tokens, bias)
+
+    # Warm on a side stream before capture, exactly as compile_generate does.
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        _ = g.decode_model.forward_with_attn_bias(
+            token_values=tokens, attn_bias=bias, cache=g._cache,
+        )
+    torch.cuda.current_stream().wait_stream(s)
+
+    g._generate_cuda_graph = torch.cuda.CUDAGraph()
+    recording_kwargs = {}
+    if "capture_error_mode" in torch.cuda.graph.__init__.__annotations__:
+        recording_kwargs["capture_error_mode"] = "thread_local"
+    with torch.cuda.graph(g._generate_cuda_graph, **recording_kwargs):
+        g._generate_logits = g.decode_model.forward_with_attn_bias(
+            token_values=tokens, attn_bias=bias, cache=g._cache,
+        )
+
+    def replay(t, seq_lens):
+        g._generate_inputs[0].copy_(t)
+        g._generate_inputs[1].k_seqinfo.seqlen.copy_(seq_lens)
+        g._generate_cuda_graph.replay()
+        return g._generate_logits
+
+    g._generate_compile_model = replay
+
+
+@torch.inference_mode()
 def generate_all_direct_fixed(g, prompts, use_sampling):
     """Correctness reference: official models with fresh decode metadata.
 
-    ``FastGen.compile_generate`` captures an AttnBias at prompt length and
-    only mutates ``k_seqinfo.seqlen`` during graph replay.  The resulting
-    graph output diverges from the official model's direct autoregressive
-    decode.  Use this direct path for alignment only; graph replay remains
-    the timed SOTA throughput path.
+    Rebuilds the AttnBias every step (``Transformer.forward``, model.py:283) so
+    no capture-time metadata can go stale.  Kept as a cross-check behind
+    ``--alignment-reference direct``: since ``recapture_generate_full_window``
+    fixes the capture, the timed graph path now produces byte-identical tokens to
+    this loop, so the default no longer pays ~37 ms/token to regenerate them.
     """
     bs = len(prompts)
     prompt_lens = [len(p) for p in prompts]
@@ -648,6 +750,7 @@ for sc in cfg["scenarios"]:
     # unreachable id so the bench runs ``gen_length`` decode iterations
     # for every prompt (ignore_eos=True semantics, matching fastkernels).
     g.tokenizer.eot_id = -1
+    recapture_generate_full_window(g)
     torch.cuda.synchronize()
     print(f"[sota] build took {time.perf_counter() - build_t0:.1f}s",
           flush=True)
@@ -661,6 +764,14 @@ for sc in cfg["scenarios"]:
     n_in = 0
     n_out = 0
     elapsed_total = 0.0
+    last_beat = time.perf_counter()
+    align_count = min(int(cfg.get("alignment_prompts", len(prompts))), len(prompts))
+    align_ref = cfg.get("alignment_reference", "timed")
+    # With the decode graph recaptured over the full window, the timed pass emits
+    # the same tokens the eager path does, so alignment reuses them for free --
+    # the way every other harness works.  ``direct`` re-runs the eager path
+    # instead (~37 ms/token) as a cross-check.
+    out_records = []
     for bi in range(n_batches):
         batch = prompts[bi * gen_bsz:(bi + 1) * gen_bsz]
         # Pad the last batch with copies of the first prompt so the
@@ -673,7 +784,7 @@ for sc in cfg["scenarios"]:
 
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-        generate_all_fixed(
+        _stats, answers = generate_all_fixed(
             g, batch, use_cuda_graphs=True, use_sampling=False,
         )
         torch.cuda.synchronize()
@@ -681,24 +792,45 @@ for sc in cfg["scenarios"]:
         elapsed_total += dt
         n_in += real_count * in_len
         n_out += real_count * out_len
+        if align_ref == "timed":
+            for answer in answers[:real_count]:
+                if len(out_records) >= align_count:
+                    break
+                out_records.append({"token_ids": list(answer)[:out_len]})
+        # gen_bsz is pinned to 1, so a scenario is minutes of otherwise silent
+        # work and the sweep kills a task whose log has not moved for 900s.
+        # Printed outside the timed window so it cannot affect the measurement.
+        if time.perf_counter() - last_beat >= HEARTBEAT_SEC:
+            print(f"[sota] {sc['name']:>14}: {bi + 1}/{n_batches} batches, "
+                  f"{elapsed_total:6.1f}s elapsed", flush=True)
+            last_beat = time.perf_counter()
 
-    align_count = min(int(cfg.get("alignment_prompts", len(prompts))), len(prompts))
-    out_records = []
-    if align_count > 0:
+    if align_ref == "direct" and align_count > 0:
         print(f"[sota] generating {align_count} direct-reference output(s) "
               f"for alignment...", flush=True)
-        for prompt in prompts[:align_count]:
+        last_beat = time.perf_counter()
+        for ai, prompt in enumerate(prompts[:align_count]):
             answers = generate_all_direct_fixed(
                 g, [prompt], use_sampling=False,
             )
             out_records.append({"token_ids": list(answers[0])[:out_len]})
+            # The direct path is uncompiled (~37 ms/token), so this loop also
+            # needs to stay visible to the watchdog.
+            if time.perf_counter() - last_beat >= HEARTBEAT_SEC:
+                print(f"[sota] {sc['name']:>14}: alignment "
+                      f"{ai + 1}/{align_count}", flush=True)
+                last_beat = time.perf_counter()
 
     results.append({
         "name": sc["name"], "elapsed": elapsed_total,
         "total_input_tokens": n_in, "total_output_tokens": n_out,
         "num_prompts": len(prompts), "gen_bsz": gen_bsz,
-        "alignment_reference": "official_direct_decode",
-        "timed_reference": "official_cuda_graph",
+        "alignment_reference": (
+            "official_cuda_graph_full_window" if align_ref == "timed"
+            else "official_direct_decode"
+        ),
+        "timed_reference": "official_cuda_graph_full_window",
+        "decode_graph_capture": "max_seq_length",
         "outputs": out_records,
     })
     print(f"[sota] {sc['name']:>14}: {elapsed_total:7.2f}s  "
@@ -739,6 +871,7 @@ for sc in cfg.get("latency_scenarios") or []:
     )
     g = _bitnet_generate.FastGen.build(ckpt_dir, largs, "cuda:0")
     g.tokenizer.eot_id = -1
+    recapture_generate_full_window(g)
     for _ in range(int(sc.get("num_warmup", 3))):
         generate_all_fixed(g, [prompts[0]], use_cuda_graphs=True,
                            use_sampling=False)
@@ -809,6 +942,9 @@ import generate as _bitnet_generate
 ckpt_dir = cfg["ckpt_dir"]
 topks = tuple(int(k) for k in cfg.get("topks", [1, 5, 20]))
 max_topk = max(topks)
+# Seconds of silence after which the scoring loop prints progress; the sweep
+# kills a task whose log has not moved for 900s (--stall-timeout).
+HEARTBEAT_SEC = 30.0
 torch.cuda.set_device(0)
 
 @torch.inference_mode()
@@ -893,13 +1029,19 @@ for sc in cfg["scenarios"]:
         total = 0
         counts = {str(k): 0 for k in topks}
         t0 = time.perf_counter()
-        for prompt, record in zip(prompts, records):
+        last_beat = t0
+        for si, (prompt, record) in enumerate(zip(prompts, records)):
             seq_counts, n = score_sequence_direct(
                 g, prompt, record["token_ids"][:out_len],
             )
             total += n
             for k in topks:
                 counts[str(k)] += seq_counts[str(k)]
+            # ~40s per 1024-token sequence (opt-in path), so keep it visible.
+            if time.perf_counter() - last_beat >= HEARTBEAT_SEC:
+                print(f"[topk] {sc['name']:>14} {group_name}: "
+                      f"{si + 1}/{len(records)} sequences", flush=True)
+                last_beat = time.perf_counter()
         elapsed = time.perf_counter() - t0
         if total == 0:
             score = empty_score()
@@ -1101,6 +1243,13 @@ def _persist_results(output_dir: str, model: str, num_prompts: int,
                 "dataset": sc.get("dataset"),
                 "input_len": len(sc["prompt_token_ids"][0]),
                 "output_len": sc["output_lens"][0],
+                # Declared vs actually-timed request count: both engines are
+                # pinned to one request at a time by the reference's M == 1
+                # decode kernels, so the timed count is capped (see
+                # --max-timed-prompts). Recorded per scenario so a sweep query
+                # can tell a capped run from a full one.
+                "num_requests_declared": sc.get("num_requests_declared"),
+                "num_requests_timed": sc.get("num_requests_timed"),
             }
             for sc in scenarios
         ],
@@ -1212,6 +1361,17 @@ def main():
                          "workloads. Default: each workload's declared "
                          "num_requests (mixed=1000, long-context=64). Latency "
                          "workloads always use their declared batch_size.")
+    ap.add_argument("--max-timed-prompts", type=int, default=64,
+                    help="Cap on how many requests each throughput workload "
+                         "actually times, applied only when --num-prompts is "
+                         "not given. The reference's int2 decode kernels only "
+                         "dispatch for M == 1, so both engines serve requests "
+                         "one at a time (~2.6s each at mixed's shape) and the "
+                         "declared 1000 would take ~44min per side -- past the "
+                         "sweep's watchdog. Each request is padded to the same "
+                         "fixed shape with early stop disabled, so this trims "
+                         "repetitions rather than coverage; the prompt length "
+                         "is still derived from the full declared trace.")
     ap.add_argument("--workloads", type=str,
                     default=",".join(DEFAULT_WORKLOADS),
                     help="Comma-separated LLM workload names to run, as "
@@ -1249,9 +1409,17 @@ def main():
                          "GPU worker. Must be 1: the official int2 decode "
                          "kernels only implement M == 1.")
     ap.add_argument("--alignment-prompts", type=int, default=32,
-                    help="Number of prompts per scenario to score against "
-                         "the official direct-decode reference. Throughput "
-                         "still uses --num-prompts.")
+                    help="Number of prompts per scenario compared against the "
+                         "reference. These come from the timed run itself, so "
+                         "raising this is free up to --max-timed-prompts.")
+    ap.add_argument("--alignment-reference", choices=("timed", "direct"),
+                    default="timed",
+                    help="Which reference tokens alignment compares against. "
+                         "'timed' (default) reuses the CUDA-graph run's own "
+                         "output, which is byte-identical to eager decode once "
+                         "the graph is captured over the full KV window. "
+                         "'direct' re-generates through the eager path as a "
+                         "cross-check, at ~37 ms/token.")
     ap.add_argument("--kb-bsz", type=int, default=1,
                     help="Number of requests per fastkernels generate() call. "
                          "Default 1 matches the Microsoft BitNet GPU "
@@ -1262,9 +1430,20 @@ def main():
                          "non-eager, matching bench_vllm.py and the "
                          "reference, which times its own CUDA-graph path. "
                          "Correctness and speed are measured in the same run.")
-    ap.add_argument("--skip-topk-alignment", action="store_true",
-                    help="Skip teacher-forced top-k scoring under the "
-                         "official direct-decode reference")
+    ap.add_argument("--topk-alignment", dest="skip_topk_alignment",
+                    action="store_false", default=True,
+                    help="Also score teacher-forced top-k agreement under the "
+                         "official direct-decode reference. Off by default: "
+                         "the scorer decodes one token at a time with three "
+                         "host syncs per token (~40s per 1024-token prompt per "
+                         "group), which at the default --alignment-prompts "
+                         "costs more than both timed throughput loops "
+                         "combined. AVG PREFIX / EXACT already compare the "
+                         "generated token ids directly.")
+    ap.add_argument("--skip-topk-alignment", dest="skip_topk_alignment",
+                    action="store_true", default=True,
+                    help="Deprecated no-op: top-k scoring is already off by "
+                         "default. Use --topk-alignment to turn it on.")
     ap.add_argument("--skip-sota", action="store_true",
                     help="Skip the Microsoft BitNet GPU SOTA reference run")
     ap.add_argument("--skip-kb", action="store_true",
@@ -1331,13 +1510,22 @@ def main():
     def _scenarios_for(descriptors: list[dict], kind: str) -> list[dict]:
         built = []
         for idx, wl in enumerate(descriptors):
-            n = args.num_prompts if args.num_prompts is not None else (
-                wl.get("num_requests") or wl.get("batch_size") or 1
-            )
+            declared = wl.get("num_requests") or wl.get("batch_size") or 1
             if kind == "latency":
                 # A latency probe times one fixed batch repeatedly, so it needs
                 # exactly batch_size prompts regardless of --num-prompts.
-                n = wl["batch_size"]
+                declared = n = wl["batch_size"]
+            elif args.num_prompts is not None:
+                # An explicit count sets the shape too, as it always has.
+                declared = n = args.num_prompts
+            else:
+                # The reference's int2 decode kernels only dispatch for M == 1,
+                # so both engines serve these one at a time (~2.6s per request at
+                # mixed's shape). Every request is padded to the same fixed shape
+                # with early stop disabled, so each is identical work and tok/s
+                # is a rate over repetitions -- cap the timed count, keep the
+                # declared shape.
+                n = min(declared, max(1, args.max_timed_prompts))
             out_len = wl["output_len"]
             cap = None
             if model_ctx is not None:
@@ -1346,10 +1534,11 @@ def main():
                 assert tokenizer is not None
                 prompt_ids, dataset_id, length_stats, input_len, mean_len = (
                     _build_real_token_prompts(
-                        tokenizer, wl["name"], n, None, out_len,
+                        tokenizer, wl["name"], declared, None, out_len,
                         args.seed, args.dataset_split,
                         dataset_name=wl.get("dataset_name"),
                         max_input_len=cap,
+                        keep_prompts=n,
                     )
                 )
                 clamped = (
@@ -1358,12 +1547,17 @@ def main():
                     if cap is not None and int(round(mean_len)) > cap
                     else ""
                 )
+                count_desc = (
+                    f" n={n} of {declared} (timed-request cap)"
+                    if n < declared else f" n={n}"
+                )
                 print(
                     f"[data] {wl['name']:>14}: {dataset_id} "
                     f"raw_prompt_len(min/p50/max/mean)="
                     f"{length_stats[0]}/{length_stats[1]}/{length_stats[2]}/"
                     f"{mean_len:.0f} "
-                    f"normalized={input_len}{clamped} out={out_len} n={n}",
+                    f"normalized={input_len}{clamped} out={out_len}"
+                    f"{count_desc}",
                     flush=True,
                 )
             else:
@@ -1387,6 +1581,8 @@ def main():
                 "raw_prompt_len_mean": mean_len,
                 "input_len": input_len,
                 "model_max_position_embeddings": model_ctx,
+                "num_requests_declared": declared,
+                "num_requests_timed": n,
             }
             if kind == "latency":
                 entry.update({
@@ -1449,6 +1645,7 @@ def main():
                 "gen_bsz": args.gen_bsz,
                 "latency_scenarios": latency_scenarios_cfg,
                 "alignment_prompts": args.alignment_prompts,
+                "alignment_reference": args.alignment_reference,
             }
             sota_data = run_worker(
                 SOTA_WORKER, sota_cfg,
