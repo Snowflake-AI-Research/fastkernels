@@ -872,7 +872,7 @@ class MLAAttention(nn.Module):
             return torch.zeros(
                 N, num_heads * self.v_head_dim, dtype=q.dtype, device=q.device,
             )
-        unified_block_table, req_ids, num_dc, num_pf = meta
+        unified_block_table, req_ids, num_dc, _num_pf = meta
 
         # --- Decide the prefill route (vLLM's ``use_mha`` gate) --------------
         num_mqa = num_dc
@@ -883,6 +883,15 @@ class MLAAttention(nn.Module):
             )
             if prefill_max_seq_len > self.topk_tokens:
                 num_mqa, num_mha = N, 0
+
+        # Decode-only steps (and any batch that went fully sparse) are the hot
+        # path: return the up-projection directly instead of staging it through
+        # a full-size buffer.
+        if num_mha == 0:
+            return self._sparse_mqa(
+                q, topk_indices, kv_cache, unified_block_table, req_ids,
+                block_size, num_mqa,
+            )
 
         out = torch.empty(
             N, num_heads * self.v_head_dim, dtype=q.dtype, device=q.device,
@@ -899,19 +908,33 @@ class MLAAttention(nn.Module):
             out[num_mqa:] = mha_out
 
         if num_mqa > 0:
-            topk_global, valid_counts = self.convert_indices(
-                topk_indices[:num_mqa], unified_block_table, block_size,
-                req_ids=req_ids[:num_mqa], return_valid_counts=True,
+            out[:num_mqa] = self._sparse_mqa(
+                q, topk_indices, kv_cache, unified_block_table, req_ids,
+                block_size, num_mqa,
             )
-            q_latent = self._absorb_q_to_latent(q[:num_mqa])  # [n, H, 576]
-            q_fp8 = self.q_quant(q_latent, self._q_scale)
-            o = self.fi_sparse_decode(
-                q_fp8, kv_cache, topk_global, valid_counts,
-                self.topk_tokens, *self._fi_bmm_scales(),
-            )
-            out[:num_mqa] = self._v_up_proj(o)
 
         return out
+
+    def _sparse_mqa(self, q, topk_indices, kv_cache, block_table, req_ids,
+                    block_size, num_mqa):
+        """The sparse top-k MQA half of ``forward_mqa`` for ``q[:num_mqa]``.
+
+        Translates each token's top-k request-local positions into global cache
+        slots (and the count of valid ones, which the kernel takes as its
+        ``seq_lens``), absorbs q into the 576-D latent, quantizes it to fp8, and
+        runs the trtllm-gen sparse kernel. Returns ``[num_mqa, H*v_head_dim]``.
+        """
+        topk_global, valid_counts = self.convert_indices(
+            topk_indices[:num_mqa], block_table, block_size,
+            req_ids=req_ids[:num_mqa], return_valid_counts=True,
+        )
+        q_latent = self._absorb_q_to_latent(q[:num_mqa])  # [n, H, 576]
+        q_fp8 = self.q_quant(q_latent, self._q_scale)
+        o = self.fi_sparse_decode(
+            q_fp8, kv_cache, topk_global, valid_counts,
+            self.topk_tokens, *self._fi_bmm_scales(),
+        )
+        return self._v_up_proj(o)
 
     def _fi_bmm_scales(self) -> tuple[float, float]:
         """``(bmm1_scale, bmm2_scale)`` for the sparse MLA kernel, computed once.
