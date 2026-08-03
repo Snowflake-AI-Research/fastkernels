@@ -1181,12 +1181,19 @@ def _postprocess_fp8_weights(model: torch.nn.Module) -> None:
         _t_moe = _time.perf_counter()
         total = len(deepseek_moe_modules)
         for j, module in enumerate(deepseek_moe_modules):
-            for wname, sname in (("w13", "w13_weight_scale_inv"),
-                                 ("w2", "w2_weight_scale_inv")):
-                w = getattr(module, wname)
-                s = getattr(module, sname)
-                postprocess_fp8_weights_batched(w.data, s.data)
-                moe_count += w.shape[0]
+            if getattr(module, "_use_trtllm", False):
+                # Blackwell FLASHINFER_TRTLLM experts: transform the RAW fp8
+                # weights into the BlockMajorK layout (NO UE8M0 requant — vLLM's
+                # TRTLLM path uses the un-requantized checkpoint weights).
+                module.prepare_trtllm_weights()
+                moe_count += 2 * module.num_experts
+            else:
+                for wname, sname in (("w13", "w13_weight_scale_inv"),
+                                     ("w2", "w2_weight_scale_inv")):
+                    w = getattr(module, wname)
+                    s = getattr(module, sname)
+                    postprocess_fp8_weights_batched(w.data, s.data)
+                    moe_count += w.shape[0]
             if j % max(1, total // 5) == 0 or j == total - 1:
                 print(f"    DeepSeek MoE postprocess {j+1}/{total} "
                       f"({(j+1)*100//total}%, "
@@ -1264,7 +1271,12 @@ def _detect_model_type(model_name: str) -> str:
         # files that don't exist in the repo (model_type is registered
         # natively).  In both cases reading config.json directly works.
         model_type = _load_config_dict(model_name).get("model_type", "llama")
-    if model_type == "deepseek_v32":
+    if model_type in ("deepseek_v32", "glm_moe_dsa"):
+        # GLM-5.2 (``glm_moe_dsa`` / ``GlmMoeDsaForCausalLM``) is a pure config
+        # variant of DeepSeek-V3.2 -- in vLLM ``GlmMoeDsaForCausalLM`` subclasses
+        # ``DeepseekV2ForCausalLM`` with an empty body -- so it shares the entire
+        # MLA + DSA + MoE stack (weight names, MLA-absorbed weights, TP KV-head
+        # exemption, FP8 block dequant). Route it through the DeepSeek path.
         model_type = "deepseek_v3"
     return model_type
 
@@ -1399,6 +1411,7 @@ def load_model(
     device: torch.device = torch.device("cuda"),
     dtype: torch.dtype = torch.bfloat16,
     max_layers: int | None = None,
+    max_num_batched_tokens: int | None = None,
 ):
     model_path = download_model(model_name)
     model_type = _detect_model_type(model_name)
@@ -1548,8 +1561,15 @@ def load_model(
         )
         config = DeepSeekV3Config.from_pretrained(model_name)
         config.dtype = dtype
+        # DSA topk_indices_buffer is sized from this (vLLM uses
+        # scheduler_config.max_num_batched_tokens); the HF config has no such
+        # field, so thread the engine's value in before the model (and its
+        # buffer) is constructed.
+        if max_num_batched_tokens is not None:
+            config.max_num_batched_tokens = max_num_batched_tokens
         _apply_max_layers(config, max_layers)
-        print(f"  Allocating DeepSeek V3.2 model ({config.n_routed_experts} experts, "
+        print(f"  Allocating DeepSeek-V3.2 / GLM-5.2 (MLA+DSA+MoE) model "
+              f"({config.n_routed_experts} experts, "
               f"top-{config.num_experts_per_tok}, DSA topk={config.index_topk})...")
         model = DeepSeekV3ForCausalLM(config, quant_config=quant_config)
     elif model_type == "bitnet":
@@ -1657,6 +1677,10 @@ def load_model(
         if model_type in ("deepseek_v3", "kimi_linear"):
             _compute_mla_absorbed_weights(model)
         _postprocess_fp8_weights(model)
+        # fp8 MLA absorbed weights are built here (post-processing done) via an
+        # fp8 GEMM on identity, matching vLLM's use_deep_gemm dequant bit-for-bit.
+        if model_type == "deepseek_v3":
+            _finalize_mla_absorbed_weights(model)
     elif model_type in ("kimi_linear", "qwen3_next"):
         _move_preserving_param_dtypes(model, device, dtype)
     elif model_type != "gpt_oss":
@@ -2108,3 +2132,15 @@ def _compute_mla_absorbed_weights(model: torch.nn.Module) -> None:
             module.compute_absorbed_weights()
             count += 1
     print(f"  Computed absorbed MLA weights for {count} attention layers.")
+
+
+def _finalize_mla_absorbed_weights(model: torch.nn.Module) -> None:
+    """Build fp8 MLA absorbed weights (W_UV/W_UK_T) AFTER FP8 post-processing,
+    via an fp8 GEMM on an identity — bit-identical to vLLM's use_deep_gemm
+    dequant. No-op for BF16 checkpoints (already built)."""
+    from ..tasks.baseline.L2.deepseek_mla_attention import DeepSeekMLAAttention
+    for module in model.modules():
+        if isinstance(module, DeepSeekMLAAttention) and hasattr(
+            module, "finalize_absorbed_weights"
+        ):
+            module.finalize_absorbed_weights()

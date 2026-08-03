@@ -32,7 +32,9 @@ dependencies = [
     "diffusers>=0.37",
     "peft>=0.17.0",
     "sam3 @ git+https://github.com/sfc-gh-goliaro/sam3.git",
-    "openfold3 @ git+https://github.com/sfc-gh-goliaro/openfold-3.git",
+    # Pinned to the commit that stops openfold3 installing a top-level `scripts`
+    # package (which shadowed DeepGEMM's build-time `from scripts.generate_pyi`).
+    "openfold3 @ git+https://github.com/sfc-gh-goliaro/openfold-3.git@0ad77348bbdc71b7b028535ede809a71f87b3264",
     "pycocotools",
     "timm",
     "einops",

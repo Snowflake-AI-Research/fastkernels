@@ -1,7 +1,12 @@
 """FP8 MQA logits for DSA indexer via DeepGEMM.
 
-Wraps ``deep_gemm.fp8_mqa_logits`` and ``deep_gemm.fp8_paged_mqa_logits`` for
-sparse attention indexer logits.
+Uses DeepGEMM's UNIFIED FP8/FP4 kernels ``fp8_fp4_mqa_logits`` /
+``fp8_fp4_paged_mqa_logits`` — the EXACT functions vLLM's DSA indexer calls
+(``vllm.utils.deep_gemm``). deep_gemm 2.5.0 also ships the legacy
+``fp8_mqa_logits`` / ``fp8_paged_mqa_logits``, but they are a DIFFERENT kernel
+that produces bit-different index scores, which flips the selected top-2048 set
+at seq>2048. On the FP8 path the query is passed as ``(q_fp8, None)`` (the
+per-token Q scale is folded into ``weights`` upstream), matching vLLM.
 """
 
 from __future__ import annotations
@@ -13,10 +18,10 @@ import deep_gemm
 
 
 class Fp8MQALogits(nn.Module):
-    """FP8 MQA logits for the DSA indexer.
+    """FP8 MQA logits for the DSA indexer (vLLM's unified fp8/fp4 kernels).
 
-    Prefill path: :func:`deep_gemm.fp8_mqa_logits`.
-    Decode path: :func:`deep_gemm.fp8_paged_mqa_logits`.
+    Prefill path: :func:`deep_gemm.fp8_fp4_mqa_logits`.
+    Decode path: :func:`deep_gemm.fp8_fp4_paged_mqa_logits`.
     """
 
     def forward_prefill(
@@ -27,8 +32,8 @@ class Fp8MQALogits(nn.Module):
         cu_seqlen_ks: torch.Tensor,
         cu_seqlen_ke: torch.Tensor,
     ) -> torch.Tensor:
-        return deep_gemm.fp8_mqa_logits(
-            q_fp8,
+        return deep_gemm.fp8_fp4_mqa_logits(
+            (q_fp8, None),   # FP8 Q: scale folded into weights (matches vLLM)
             kv,
             weights,
             cu_seqlen_ks,
@@ -46,8 +51,8 @@ class Fp8MQALogits(nn.Module):
         schedule_metadata: torch.Tensor,
         max_context_len: int,
     ) -> torch.Tensor:
-        return deep_gemm.fp8_paged_mqa_logits(
-            q_fp8,
+        return deep_gemm.fp8_fp4_paged_mqa_logits(
+            (q_fp8, None),   # FP8 Q: scale folded into weights (matches vLLM)
             kv_cache,
             weights,
             context_lens,

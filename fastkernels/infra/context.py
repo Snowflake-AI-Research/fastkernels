@@ -209,6 +209,12 @@ class Context:
     # Per-token request ID mapping (for sparse indexer index conversion)
     req_id_per_token: torch.Tensor | None = None
 
+    # DSA indexer prefill chunk plan, computed once per forward and shared by
+    # all indexer layers (they see the same Context). Lazily populated by the
+    # first SparseAttnIndexer call; reset to None each forward. Mirrors vLLM's
+    # DeepseekV32IndexerMetadataBuilder (chunks built once, not per layer).
+    indexer_prefill_meta: object | None = None
+
     # Cross-attention metadata (encoder-decoder models like Whisper)
     # Slot mapping for writing encoder K/V to paged cache
     cross_slot_mapping: torch.Tensor | None = None

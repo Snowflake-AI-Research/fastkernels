@@ -518,6 +518,7 @@ class ModelRunner:
         self.model, self.config = load_model(
             model_name, torch.device(f"cuda:{rank}"), dtype,
             max_layers=self.max_layers,
+            max_num_batched_tokens=self.max_num_batched_tokens,
         )
         model_type = getattr(self.config, "model_type", "")
         self.is_kimi_linear = model_type == "kimi_linear"
@@ -876,7 +877,11 @@ class ModelRunner:
             512 * 1024 * 1024, dtype=torch.uint8, device=f"cuda:{self.rank}"
         )
         for layer in self._attn_layers:
-            layer.set_trtllm_workspace(trtllm_workspace)
+            # MLA layers (DeepSeek-V3.2 / GLM-5.2) expose k_cache/v_cache but use
+            # the FlashMLA workspace, not the TRT-LLM per-layer workspace, so they
+            # do not implement set_trtllm_workspace — skip them.
+            if hasattr(layer, "set_trtllm_workspace"):
+                layer.set_trtllm_workspace(trtllm_workspace)
         # Hybrid models (Qwen3-Next, Kimi-Linear) keep their KV cache in the
         # engine's state manager rather than on the layer, so those layers
         # carry no ``k_cache`` attribute and are not in ``_attn_layers``.
@@ -4174,6 +4179,27 @@ class ModelRunner:
                     num_blocks, _MLA_BLOCK_SIZE, _INDEXER_CACHE_BYTES,
                     dtype=torch.uint8, device=device,
                 )
+            # Shared, reused DSA-indexer prefill K-gather workspace (ONE buffer
+            # for all indexer layers). Bounds the gather + logits memory so long
+            # prefills chunk over it instead of allocating O(ΣN) per layer/step.
+            # Sized like vLLM's get_max_prefill_buffer_size = max_model_len*40,
+            # capped by the cache size and floored at max_model_len so any single
+            # request always fits (see SparseAttnIndexer._prefill_topk).
+            idx_head_dim = indexer_layers[0].head_dim
+            idx_ws_tokens = min(40 * self.max_model_len,
+                                num_blocks * _MLA_BLOCK_SIZE)
+            idx_ws_tokens = max(idx_ws_tokens, self.max_model_len)
+            idx_k_fp8_ws = torch.empty(
+                idx_ws_tokens, idx_head_dim,
+                dtype=torch.float8_e4m3fn, device=device,
+            )
+            idx_k_scale_ws = torch.empty(
+                idx_ws_tokens, 4, dtype=torch.uint8, device=device,
+            )
+            for layer in indexer_layers:
+                layer._gather_ws_k_fp8 = idx_k_fp8_ws
+                layer._gather_ws_k_scale = idx_k_scale_ws
+                layer._gather_ws_tokens = idx_ws_tokens
 
         if self.rank == 0:
             print(f"  MLA attention backend: FlashMLA (block_size={_MLA_BLOCK_SIZE}, {backend_desc})")
@@ -4763,6 +4789,17 @@ class ModelRunner:
         req_id_per_token = getattr(self, "_decode_req_id_buf", None)
         if req_id_per_token is not None:
             req_id_per_token = req_id_per_token[:n]
+        else:
+            # Eager decode without a captured CUDA graph never allocated the
+            # persistent arange buffer. Pure-decode is one token per request
+            # (token i -> request i); without this the sparse-MLA
+            # ``convert_indices`` sees an all-zeros req map and every decode
+            # token past the first indexes request 0's (shorter) block table,
+            # truncating its sparse-attention KV. Mirrors the fallback at the
+            # non-eager ``prepare_decode`` above.
+            req_id_per_token = torch.arange(
+                n, dtype=torch.int32, device=f"cuda:{self.rank}",
+            )
         set_context(
             False,
             slot_mapping=slot_mapping,
@@ -7685,6 +7722,10 @@ class LlamaEngine:
                         it = enumerate(pool.map(_make_seq, range(num_prompts)))
                         for i, seq in it:
                             all_seqs[i] = seq
+                            # Admission index: MLA/DSA decode keeps ``running``
+                            # sorted by it so the packed batch layout matches
+                            # vLLM's persistent batch step-for-step.
+                            seq._req_idx = i
                             if collect_logits:
                                 seq_logits[id(seq)] = []
                             waiting.append(seq)
@@ -7692,6 +7733,7 @@ class LlamaEngine:
                     for i in range(num_prompts):
                         seq = _make_seq(i)
                         all_seqs[i] = seq
+                        seq._req_idx = i
                         if collect_logits:
                             seq_logits[id(seq)] = []
                         waiting.append(seq)
@@ -8072,7 +8114,18 @@ class LlamaEngine:
 
             return False
 
+        # Diagnostic gate: force every decode step through the fresh-rebuild
+        # path (_prepare_decode_arrays reads live seq state). The async fast
+        # path reuses the prior step's sampled ``token_ids`` to build the next
+        # input incrementally (6664), so token substitution at append_token
+        # would NOT propagate there. Off by default; used only by the
+        # forced-decode agreement harness.
+        _force_sync_decode = os.environ.get(
+            "FASTKERNELS_FORCE_SYNC_DECODE", "0") != "0"
+
         def _can_enter_decode_fast_path() -> bool:
+            if _force_sync_decode:
+                return False
             # Note: the stagger in ``_admit_stride`` blocks admission outright on
             # non-stride steps, so those steps carry decode and nothing else, and
             # it is tempting to route them here (94 of 673 steps on the Qwen3-VL
@@ -8109,6 +8162,19 @@ class LlamaEngine:
         while (waiting or running or prefilling
                or not _produce_done.is_set()):
             _step_index += 1
+            # Keep the decode (running) queue in admission order so the packed
+            # batch layout matches vLLM's persistent-batch order step-for-step
+            # (offline determinism vs vLLM). fk otherwise rotates decoded seqs
+            # to the tail of ``running`` each step; vLLM keeps them in place.
+            # DSA sparse attention's decode split-KV reduction is batch-order-
+            # sensitive, so this ordering is what lets fk reproduce vLLM's
+            # long-context batched tokens. Gated to DSA/MLA to avoid perturbing
+            # other models' batch shapes.
+            if getattr(getattr(self, "model_runner", None),
+                       "is_deepseek_mla", False) and len(running) > 1:
+                running = deque(
+                    sorted(running, key=lambda s: getattr(s, "_req_idx", 0))
+                )
             if _tp_win:
                 if _step_index == _tp_start:
                     _torch_prof = torch.profiler.profile(

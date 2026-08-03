@@ -26,6 +26,10 @@ from ..L1.gate_linear import GateLinear
 from .fused_experts import FusedExperts
 from .llama_mlp import LlamaMLP
 from .vllm_fused_experts import VllmFusedExperts
+from ..L1.fp8_linear import PerTokenGroupQuantFp8
+from ..L1.trtllm_fp8_moe import (
+    TrtllmFp8MoE, prepare_trtllm_moe_weights, trtllm_fp8_moe_available,
+)
 
 _FP8_BLOCK = 128
 
@@ -150,6 +154,18 @@ class DeepSeekMoE(nn.Module):
             self.fused_experts = VllmFusedExperts()
         else:
             self.fused_experts = FusedExperts()
+        # On Blackwell (sm100) vLLM's fp8-MoE oracle selects the
+        # FLASHINFER_TRTLLM kernel, not Triton (it only forces TRITON to the
+        # front on Hopper/sm90). Match it: run the TRTLLM path for fp8 experts
+        # on sm100, keeping the Triton ``VllmFusedExperts`` for Hopper/other
+        # arches. Weights are transformed to the BlockMajorK layout at load
+        # time by ``prepare_trtllm_weights`` (the weight postprocess hook calls
+        # it and SKIPs the UE8M0 requant for these experts).
+        self._use_trtllm = self.use_fp8 and trtllm_fp8_moe_available()
+        self._trtllm_weights_ready = False
+        if self._use_trtllm:
+            self.trtllm_moe = TrtllmFp8MoE()
+            self.act_quant = PerTokenGroupQuantFp8()
         self.allreduce = AllReduce()
         # Mirrors vLLM's ``VLLM_DISABLE_SHARED_EXPERTS_STREAM`` env knob
         # (default: stream enabled). When disabled, the shared expert runs
@@ -196,6 +212,29 @@ class DeepSeekMoE(nn.Module):
         src = loaded_weight.chunk(tp, 1)[rank]
         param.data[expert_id].copy_(src)
 
+    def prepare_trtllm_weights(self) -> None:
+        """Transform the raw loaded fp8 expert weights into the FlashInfer
+        BlockMajorK layout for the TRTLLM kernel and drop the originals.
+
+        Called once from the weight postprocess hook for sm100 fp8 MoE modules
+        (which then SKIP the UE8M0 requant — the TRTLLM path uses the
+        un-requantized checkpoint weights). No-op off the TRTLLM path.
+        """
+        if not getattr(self, "_use_trtllm", False) or self._trtllm_weights_ready:
+            return
+        w13_fi, w2_fi, w13_scale_fi, w2_scale_fi = prepare_trtllm_moe_weights(
+            self.w13.data, self.w2.data,
+            self.w13_weight_scale_inv.data, self.w2_weight_scale_inv.data,
+        )
+        self.register_buffer("w13_fi", w13_fi, persistent=False)
+        self.register_buffer("w2_fi", w2_fi, persistent=False)
+        self.register_buffer("w13_scale_fi", w13_scale_fi, persistent=False)
+        self.register_buffer("w2_scale_fi", w2_scale_fi, persistent=False)
+        # Free the raw [E,2N,K]/[E,K,N] params — the FI buffers replace them.
+        del self.w13, self.w2, self.w13_weight_scale_inv, self.w2_weight_scale_inv
+        self._trtllm_weights_ready = True
+        torch.cuda.empty_cache()
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self._use_custom_op:
             # The all-reduce stays *outside* the opaque op: inside it Inductor
@@ -237,41 +276,47 @@ class DeepSeekMoE(nn.Module):
         # that flips near-tie group/expert selection in the noaux_tc
         # grouped-topk path.
         #
-        # vLLM chooses the router ``out_dtype`` in
-        # ``deepseek_v2.py:DeepseekV2MoE.__init__``:
-        #
-        #     self.gate.set_out_dtype(
-        #         torch.float32
-        #         if self.experts.quant_method.is_monolithic
-        #         and self.experts.routing_method_type ==
-        #             RoutingMethodType.DeepSeekV3
-        #         else torch.bfloat16
-        #     )
-        #
-        # For FP8 blockwise DeepSeek-V3 experts (our ``use_fp8`` path) the
-        # quant method is *not* ``is_monolithic``, so vLLM uses BF16 here
-        # — and the router_logits carry BF16 precision, which matters for
-        # near-tie top-k boundaries. For the BF16 / "unquantized" path vLLM
-        # is monolithic, so it keeps FP32. We mirror that choice exactly.
-        router_out_dtype = (
-            torch.float32 if not self.use_fp8 else torch.bfloat16
-        )
+        # Router ``out_dtype`` mirrors vLLM ``DeepseekV2MoE``: on CUDA the
+        # ``GateLinear`` is constructed with ``out_dtype=None`` and
+        # ``set_out_dtype`` is called ONLY on the ROCm/aiter path
+        # (``deepseek_v2.py:304-309``). So on CUDA ``gate.out_dtype`` stays
+        # ``None`` for BOTH the FP8 and the BF16/unquantized experts. With
+        # ``None``, vLLM's dispatch yields FP32 router logits in decode (the
+        # DSV3 kernel's ``torch.empty(dtype=None)`` output) and BF16 in prefill
+        # (the ``F.linear`` fallback, no cast) — and vLLM does NOT upcast before
+        # the sigmoid, so this precision split feeds grouped-topk verbatim.
+        # Pass ``None`` to reproduce it exactly (GateLinear pins FP32 for the
+        # DSV3 output since fastkernels' global default dtype is bf16).
         router_logits = self.gate(
-            hidden_states, self.gate_weight, out_dtype=router_out_dtype,
+            hidden_states, self.gate_weight, out_dtype=None,
         )
-        topk_weights, topk_ids = self.grouped_topk(
-            router_logits, self.e_score_correction_bias,
-            self.n_group, self.topk_group, self.top_k,
-        )
-        # ``topk_weights`` is FP32 (matches vLLM). For the FP8 expert path
-        # we pass FP32 weights through verbatim so the Triton kernel reads
-        # them at the same precision vLLM does (vLLM's grouped_topk router
-        # returns FP32 — see
-        # ``vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py:165``
-        # — and ``invoke_fused_moe_triton_kernel`` consumes them directly).
-        # Cast to activation dtype only for the BF16 / "unquantized" path,
-        # which still uses fastkernels's local FusedExperts wrapper.
-        if self.use_fp8:
+        if self._use_trtllm:
+            # Blackwell FLASHINFER_TRTLLM path (vLLM's oracle choice on sm100).
+            # Use the MONOLITHIC kernel (``trtllm_fp8_block_scale_moe``) with
+            # routing (sigmoid + noaux_tc grouped top-k + norm) done INSIDE the
+            # kernel from raw ``router_logits`` — exactly vLLM's DeepSeek/GLM CUDA
+            # path (``routing_method_type=DeepSeekV3``). This is BIT-IDENTICAL to
+            # vLLM; the pre-routed variant instead truncates the top-k combine
+            # weights to bf16, a ~1-ULP error that scales with expert-output
+            # magnitude. ``routed_scaling_factor`` is applied post-experts below.
+            M, K = hidden_states.shape
+            a_fp8 = torch.empty(M, K, dtype=torch.float8_e4m3fn,
+                                device=hidden_states.device)
+            a_scale = torch.empty(M, K // _FP8_BLOCK, dtype=torch.float32,
+                                  device=hidden_states.device)
+            self.act_quant(hidden_states, a_fp8, a_scale)
+            out = self.trtllm_moe.forward_monolithic(
+                a_fp8, a_scale.t().contiguous(),
+                self.w13_fi, self.w13_scale_fi, self.w2_fi, self.w2_scale_fi,
+                router_logits, self.e_score_correction_bias,
+                self.num_experts, self.top_k, self.n_group, self.topk_group,
+                self.intermediate_per_tp,
+            )
+        elif self.use_fp8:
+            topk_weights, topk_ids = self.grouped_topk(
+                router_logits, self.e_score_correction_bias,
+                self.n_group, self.topk_group, self.top_k,
+            )
             # FP8 W8A8 block-quant on Hopper + TP: vLLM's oracle
             # (``select_fp8_moe_backend`` -> ``_get_priority_backends``
             # in ``vllm/.../fused_moe/oracle/fp8.py``) explicitly moves
@@ -291,6 +336,10 @@ class DeepSeekMoE(nn.Module):
                 block_shape=[_FP8_BLOCK, _FP8_BLOCK],
             )
         else:
+            topk_weights, topk_ids = self.grouped_topk(
+                router_logits, self.e_score_correction_bias,
+                self.n_group, self.topk_group, self.top_k,
+            )
             topk_weights_act = topk_weights.to(hidden_states.dtype)
             out = self.fused_experts(
                 hidden_states, self.w13, self.w2,
