@@ -49,6 +49,45 @@ def _load_backbone_state_dict(model_path: str) -> dict[str, torch.Tensor]:
     raise FileNotFoundError(f"No backbone weight file found in {model_path}")
 
 
+def _fuse_qkv_keys(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Merge separate query/key/value projections into one fused ``qkv``.
+
+    The reference fuses these: vLLM's ``BertSelfAttention`` builds a single
+    ``QKVParallelLinear`` and splits its output, so a 12-layer BERT issues 12
+    projection GEMMs where three separate ``Linear`` modules issue 36. On a
+    56-token colbertv2 request the forward is entirely host-dispatch-bound
+    (1.08 ms of device work against ~3.4 ms of host time, of which
+    ``aten::addmm`` alone is 1.03 ms over 72 calls), so removing 24 of those
+    dispatches is a direct latency win as well as an interface match.
+
+    Checkpoints always store the three projections separately, so the
+    concatenation happens here rather than in the model.
+    """
+    groups: dict[str, dict[str, torch.Tensor]] = {}
+    passthrough: dict[str, torch.Tensor] = {}
+    for key, value in state.items():
+        parts = key.rsplit(".", 2)
+        if len(parts) == 3 and parts[1] in ("query", "key", "value"):
+            groups.setdefault(f"{parts[0]}.qkv.{parts[2]}", {})[parts[1]] = value
+        else:
+            passthrough[key] = value
+
+    for fused_key, parts_by_name in groups.items():
+        if set(parts_by_name) != {"query", "key", "value"}:
+            # Incomplete triple: leave the originals alone so load_state_dict
+            # reports them rather than silently dropping a projection.
+            base, _, suffix = fused_key.rsplit(".", 2)
+            for name, value in parts_by_name.items():
+                passthrough[f"{base}.{name}.{suffix}"] = value
+            continue
+        passthrough[fused_key] = torch.cat(
+            [parts_by_name["query"], parts_by_name["key"],
+             parts_by_name["value"]],
+            dim=0,
+        )
+    return passthrough
+
+
 def _remap_encoder_embedding_keys(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     remapped: dict[str, torch.Tensor] = {}
     for key, value in state.items():
@@ -73,7 +112,9 @@ def _prefix_model_keys(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor
 
 def load_bge_m3_weights(model: BgeM3EmbeddingModel, model_path: str) -> None:
     backbone_state = _prefix_model_keys(
-        _remap_encoder_embedding_keys(_load_backbone_state_dict(model_path)),
+        _fuse_qkv_keys(
+            _remap_encoder_embedding_keys(_load_backbone_state_dict(model_path)),
+        ),
     )
     missing, unexpected = model.load_state_dict(backbone_state, strict=False)
 
@@ -132,7 +173,9 @@ def load_bge_m3_model(
 
 def load_colbertv2_weights(model: ColBERTModel, model_path: str) -> None:
     state = _prefix_model_keys(
-        _remap_encoder_embedding_keys(_load_backbone_state_dict(model_path)),
+        _fuse_qkv_keys(
+            _remap_encoder_embedding_keys(_load_backbone_state_dict(model_path)),
+        ),
     )
     if "linear.weight" in state:
         state["colbert_linear.weight"] = state.pop("linear.weight")

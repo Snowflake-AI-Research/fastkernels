@@ -24,7 +24,10 @@ class EncoderOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.dense = Linear(config.intermediate_size, config.hidden_size, bias=True)
-        self.LayerNorm = LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        # promote_fp32=False: vLLM's bert.py / roberta.py use a plain
+        # nn.LayerNorm here (see encoder_embeddings for the full rationale).
+        self.LayerNorm = LayerNorm(config.hidden_size, eps=config.layer_norm_eps,
+                                   promote_fp32=False)
 
     def forward(
         self,

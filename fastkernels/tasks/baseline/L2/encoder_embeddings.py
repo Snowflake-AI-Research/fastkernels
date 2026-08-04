@@ -55,9 +55,15 @@ class EncoderEmbeddingsBase(nn.Module):
             config.type_vocab_size,
             config.hidden_size,
         )
+        # promote_fp32=False to match the reference: vLLM's bert.py and
+        # roberta.py both use a plain ``nn.LayerNorm`` here, which keeps its
+        # affine weight in the model dtype and lets ATen accumulate the
+        # statistics in fp32 internally. Promoting would add an x.float() and a
+        # cast back around every norm and apply the weight in fp32.
         self.LayerNorm = LayerNorm(
             config.hidden_size,
             eps=config.layer_norm_eps,
+            promote_fp32=False,
         )
         self.position_embedding_type = getattr(config, "position_embedding_type", "absolute")
         self.register_buffer(
