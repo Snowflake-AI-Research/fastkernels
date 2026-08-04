@@ -443,6 +443,12 @@ class ModelRunner:
         # Batch size whose sampled tokens are already in graph_vars["input_ids"]
         # on device; -1 when there is no valid handoff.
         self._staged_ids_n = -1
+        # DSA indexer paged-MQA-logits schedule. Only the MLA KV-cache path fills
+        # this in, but ``_refresh_indexer_schedule`` is called unconditionally from
+        # every decode site and from capture_cudagraph, and it returns early on
+        # None. Default it here so non-MLA models (Llama, Mixtral, BitNet, ...)
+        # reach that early return instead of an AttributeError.
+        self._indexer_sched = None
 
         torch.cuda.set_device(rank)
         self._dist_initialized = False
