@@ -92,7 +92,12 @@ def _load_pil_images(dataset_name, dataset_split, num_needed, seed):
                 f"'ethz/food101' with '--dataset-split validation'.",
             ) from exc
         raise
-    ds = ds.shuffle(seed=seed, buffer_size=5000)
+    # buffer_size=64, not 5000: a streaming shuffle fills its buffer before
+    # yielding the first example, so the buffer is paid in full JPEG decodes even
+    # though this harness only wants 32 images by default. The seeded SHARD-order
+    # permutation that ``shuffle`` also applies is what supplies class diversity
+    # on a class-ordered split, and that part is free.
+    ds = ds.shuffle(seed=seed, buffer_size=64)
 
     images = []
     for sample in ds:

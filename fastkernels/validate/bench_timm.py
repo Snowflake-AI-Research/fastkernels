@@ -69,7 +69,7 @@ MODEL_REGISTRY = {
         "short_name": "siglip2-so400m",
         "image_mean": [0.5, 0.5, 0.5],
         "image_std": [0.5, 0.5, 0.5],
-        "default_num_images": 10000,
+        "default_num_images": 2000,
     },
     "facebook/dinov3-vit7b16-pretrain-lvd1689m": {
         "timm_name": "vit_7b_patch16_dinov3.lvd1689m",
@@ -89,7 +89,7 @@ MODEL_REGISTRY = {
         "short_name": "swinv2-large",
         "image_mean": [0.485, 0.456, 0.406],
         "image_std": [0.229, 0.224, 0.225],
-        "default_num_images": 5000,
+        "default_num_images": 1000,
         "strict_img_size": False,
     },
     "timm/mobilenetv4_conv_medium.e500_r256_in1k": {
@@ -100,7 +100,7 @@ MODEL_REGISTRY = {
         "short_name": "mobilenetv4-conv-medium",
         "image_mean": [0.485, 0.456, 0.406],
         "image_std": [0.229, 0.224, 0.225],
-        "default_num_images": 5000,
+        "default_num_images": 1000,
     },
 }
 
@@ -123,10 +123,45 @@ def _detect_gpu_name() -> str:
 # timm subprocess worker
 # ---------------------------------------------------------------------------
 _WORKER_COMMON = r'''
-import json, os, sys, time, torch
+import hashlib, json, os, sys, time
+import numpy as np
+import torch
 from tqdm import tqdm
 
 EMBED_SAVE_CAP = 500
+
+# A streaming shuffle must fill its buffer before yielding the first example, so
+# buffer_size is paid in full JPEG decodes even when only a handful of images are
+# wanted. At 5000 that dominated the whole task: bench_timm spent 61 min of the
+# 20260804-035022 run to produce 2.8 min of measured work. 64 keeps the part that
+# actually matters -- ``IterableDataset.shuffle`` also permutes SHARD order from
+# the seed, which is what gives class diversity on a class-ordered split -- while
+# costing 64 decodes instead of 5000.
+_SHUFFLE_BUFFER = 64
+
+# Warm up by DURATION, not iteration count. Once the image cache removed the
+# untimed CPU preprocessing, the throughput loop went from ~12% GPU duty cycle to
+# ~93%, and the measured rate stopped being flat: siglip2's running images/sec
+# fell 1734 -> 1565 across a 63-batch run as the GPU left boost clocks. The two
+# engines run in SEQUENTIAL subprocesses, so without a common thermal starting
+# point that drift leaks straight into the ratio -- it moved siglip2's high-res
+# from 1.0019x to 0.9715x and single-image from 0.9981x to 1.1787x purely from
+# measurement order. A few seconds of continuous work first puts both sides in
+# the same steady state; 3 iterations did not.
+_WARMUP_SECONDS = float(os.environ.get("FASTKERNELS_BENCH_WARMUP_S", "10"))
+
+
+def _image_cache_dir():
+    root = os.environ.get("FASTKERNELS_IMAGE_CACHE") or os.path.expanduser(
+        "~/.fastkernels/cache/bench_images")
+    os.makedirs(root, exist_ok=True)
+    return root
+
+
+def _image_cache_path(dataset_name, dataset_split, seed, num_images, resolution):
+    key = f"{dataset_name}|{dataset_split}|{seed}|{num_images}|{resolution}|{_SHUFFLE_BUFFER}"
+    digest = hashlib.sha1(key.encode()).hexdigest()[:16]
+    return os.path.join(_image_cache_dir(), f"imgs_{digest}.npy")
 
 
 def _load_pil_images(dataset_name, dataset_split, num_needed, seed):
@@ -139,7 +174,7 @@ def _load_pil_images(dataset_name, dataset_split, num_needed, seed):
         file=sys.stderr, flush=True,
     )
     ds = load_dataset(dataset_name, split=dataset_split, streaming=True)
-    ds = ds.shuffle(seed=seed, buffer_size=5000)
+    ds = ds.shuffle(seed=seed, buffer_size=_SHUFFLE_BUFFER)
 
     images = []
     for sample in ds:
@@ -161,21 +196,94 @@ def _load_pil_images(dataset_name, dataset_split, num_needed, seed):
     return images
 
 
-def _preprocess_batch(pil_images, resolution, image_mean, image_std, dtype):
-    """Resize, center-crop, normalize, and stack PIL images into a GPU tensor."""
+def _get_cached_uint8(dataset_name, dataset_split, seed, num_images, resolution):
+    """uint8 [N,3,R,R] of resize+center-cropped images, memmapped from disk.
+
+    Cached because the decode/resize is pure setup that the harness does not
+    time, yet it ran twice per model (once in each side's subprocess) and again
+    on every rerun.
+
+    The split point is exact: Resize/CenterCrop operate on the PIL image in
+    uint8 space, and caching their output was verified bit-identical to
+    recomputing it. Everything after them (ToTensor's ``/255``, Normalize's
+    ``(x-m)/s``) is elementwise float and moves to the GPU per batch.
+
+    That last move is not bit-exact, and deliberately so: doing the normalize on
+    device instead of on the host shifts float32 results by up to 1 ULP
+    (1.2e-07), which occasionally tips the round-to-bfloat16. It is not worth
+    the ~15 ms/batch of single-threaded host work to avoid, because both sides
+    read this same cache through this same path -- so the fastkernels-vs-timm
+    comparison sees byte-identical inputs, which is if anything stronger than
+    before, when each subprocess preprocessed independently.
+    """
     from torchvision import transforms
 
-    transform = transforms.Compose([
+    path = _image_cache_path(dataset_name, dataset_split, seed, num_images, resolution)
+    want = (num_images, 3, resolution, resolution)
+    if os.path.exists(path):
+        try:
+            arr = np.load(path, mmap_mode="r")
+            if arr.shape == want and arr.dtype == np.uint8:
+                print(f"  image cache HIT {os.path.basename(path)} {want}",
+                      file=sys.stderr, flush=True)
+                return arr
+        except Exception:
+            pass
+
+    print(f"  image cache MISS {os.path.basename(path)} {want} -- building",
+          file=sys.stderr, flush=True)
+    geom = transforms.Compose([
         transforms.Resize(
-            resolution,
-            interpolation=transforms.InterpolationMode.BICUBIC,
+            resolution, interpolation=transforms.InterpolationMode.BICUBIC,
         ),
         transforms.CenterCrop(resolution),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=image_mean, std=image_std),
     ])
-    tensors = [transform(img) for img in pil_images]
-    return torch.stack(tensors).to(device="cuda", dtype=dtype)
+    pil_images = _load_pil_images(dataset_name, dataset_split, num_images, seed)
+    if len(pil_images) < num_images:
+        raise RuntimeError(
+            f"requested {num_images} images from {dataset_name}:{dataset_split}, "
+            f"got {len(pil_images)}"
+        )
+
+    out = np.empty(want, dtype=np.uint8)
+    for i, img in enumerate(tqdm(pil_images, desc="  resize+crop", unit="img",
+                                 file=sys.stderr)):
+        out[i] = np.asarray(geom(img), dtype=np.uint8).transpose(2, 0, 1)
+
+    # Atomic publish so a crash mid-build cannot leave a short/torn cache that a
+    # later run would happily mmap. The temp name already ends in .npy so np.save
+    # does not append a second suffix.
+    tmp = os.path.join(_image_cache_dir(), f".tmp_{os.getpid()}_{os.path.basename(path)}")
+    try:
+        np.save(tmp, out, allow_pickle=False)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    return np.load(path, mmap_mode="r")
+
+
+class _BatchSource:
+    """Turns the cached uint8 array into normalized GPU batches."""
+
+    def __init__(self, arr, image_mean, image_std, dtype, device="cuda"):
+        self.arr = arr
+        self.dtype = dtype
+        self.device = device
+        self.mean = torch.tensor(image_mean, dtype=torch.float32,
+                                 device=device).view(1, 3, 1, 1)
+        self.std = torch.tensor(image_std, dtype=torch.float32,
+                                device=device).view(1, 3, 1, 1)
+
+    def __len__(self):
+        return self.arr.shape[0]
+
+    def batch(self, start, end):
+        chunk = np.ascontiguousarray(self.arr[start:end])
+        t = torch.from_numpy(chunk).to(device=self.device, non_blocking=True)
+        t = t.float().div_(255.0)
+        t = t.sub_(self.mean).div_(self.std)
+        return t.to(self.dtype)
 
 
 def run_benchmark(model, cfg, label):
@@ -193,36 +301,49 @@ def run_benchmark(model, cfg, label):
     scenarios = cfg.get("scenarios", [])
     latency_scenarios = cfg.get("latency_scenarios", [])
 
-    max_needed = 0
+    # One cache per distinct resolution, sized to the largest consumer of it.
+    need = {}
     for s in scenarios:
-        max_needed = max(max_needed, s["num_images"])
+        need[s["resolution"]] = max(need.get(s["resolution"], 0), s["num_images"])
     for ls in latency_scenarios:
-        max_needed = max(max_needed, ls["batch_size"])
+        need[ls["resolution"]] = max(need.get(ls["resolution"], 0), ls["batch_size"])
+    sources = {
+        res: _BatchSource(
+            _get_cached_uint8(dataset_name, dataset_split, seed, n, res),
+            image_mean, image_std, dtype,
+        )
+        for res, n in sorted(need.items())
+    }
 
-    raw_images = _load_pil_images(dataset_name, dataset_split, max_needed, seed)
-
-    # Per-resolution warmup
+    # Per-(resolution, batch) warmup
     seen_shapes = set()
     for s in scenarios + latency_scenarios:
         key = (s["resolution"], s.get("batch_size", 1))
-        if key not in seen_shapes:
-            seen_shapes.add(key)
-            res, bs = key
-            print(f"Warmup at {res}x{res} bs={bs}", file=sys.stderr, flush=True)
-            warm = _preprocess_batch(
-                raw_images[:bs], res, image_mean, image_std, dtype,
-            )
-            with torch.no_grad():
-                for _ in range(3):
-                    _ = model(warm)
-                torch.cuda.synchronize()
-            del warm
+        if key in seen_shapes:
+            continue
+        seen_shapes.add(key)
+        res, bs = key
+        print(f"Warmup at {res}x{res} bs={bs} for >={_WARMUP_SECONDS:.0f}s",
+              file=sys.stderr, flush=True)
+        warm = sources[res].batch(0, bs)
+        with torch.no_grad():
+            t_end = time.perf_counter() + _WARMUP_SECONDS
+            iters = 0
+            while True:
+                _ = model(warm)
+                iters += 1
+                if iters >= 3 and time.perf_counter() >= t_end:
+                    break
+            torch.cuda.synchronize()
+        print(f"  warmup iters={iters}", file=sys.stderr, flush=True)
+        del warm
 
     all_results = []
     for scenario in scenarios:
         res = scenario["resolution"]
         batch_size = scenario["batch_size"]
-        num_images = min(scenario["num_images"], len(raw_images))
+        src = sources[res]
+        num_images = min(scenario["num_images"], len(src))
         num_batches = (num_images + batch_size - 1) // batch_size
         embed_max_batch = (EMBED_SAVE_CAP + batch_size - 1) // batch_size
 
@@ -235,9 +356,7 @@ def run_benchmark(model, cfg, label):
             end = min(start + batch_size, num_images)
             actual_bs = end - start
 
-            x = _preprocess_batch(
-                raw_images[start:end], res, image_mean, image_std, dtype,
-            )
+            x = src.batch(start, end)
 
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -279,18 +398,23 @@ def run_benchmark(model, cfg, label):
         num_warmup = ls.get("num_warmup", 3)
         num_iters = ls.get("num_iters", 10)
 
-        x = _preprocess_batch(
-            raw_images[:batch_size], res, image_mean, image_std, dtype,
-        )
+        x = sources[res].batch(0, batch_size)
 
-        for _ in tqdm(
-            range(num_warmup), desc=f"{label} warmup {ls['name']}",
-            file=sys.stderr,
-        ):
-            with torch.no_grad():
+        # At least num_warmup iterations AND at least _WARMUP_SECONDS of
+        # continuous work, so the timed iterations start from the same steady
+        # state on both sides (see _WARMUP_SECONDS).
+        with torch.no_grad():
+            t_end = time.perf_counter() + _WARMUP_SECONDS
+            it = 0
+            while True:
                 torch.cuda.synchronize()
                 _ = model(x)
                 torch.cuda.synchronize()
+                it += 1
+                if it >= num_warmup and time.perf_counter() >= t_end:
+                    break
+        print(f"{label} warmup {ls['name']}: {it} iters",
+              file=sys.stderr, flush=True)
 
         latencies = []
         for _ in tqdm(

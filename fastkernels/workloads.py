@@ -858,14 +858,25 @@ class VisionEncoderLatencyWorkload:
     num_iters: int = 10
 
 
+# 1000 images, not 5000/2500. The measurement is a mean over individually-timed
+# batches and it converges far faster than these counts imply: siglip2's ratio vs
+# timm reproduced to 0.4% between a 47-way-contended run and an idle one, and the
+# running images/sec settles to +/-0.1% within ~10 batches. The images that were
+# bought with the other 4000 were paid for in untimed JPEG decode -- see
+# bench_timm's image cache. Per-model overrides live in bench_timm.MODEL_REGISTRY.
 VISION_ENCODER_THROUGHPUT_WORKLOADS: list[VisionEncoderThroughputWorkload] = [
-    VisionEncoderThroughputWorkload("default-res", resolution=0, num_images=5000, batch_size=32),
-    VisionEncoderThroughputWorkload("high-res", resolution=512, num_images=2500, batch_size=16),
+    VisionEncoderThroughputWorkload("default-res", resolution=0, num_images=1000, batch_size=32),
+    VisionEncoderThroughputWorkload("high-res", resolution=512, num_images=1000, batch_size=16),
 ]
 
+# 300 iters, not 30. These are the only under-sampled workloads in the family:
+# at 30 iterations of a ~5 ms forward the whole measurement is ~150 ms, and
+# siglip2's single-image ratio swung 8.4% between a contended and an idle run --
+# enough to flip it from 0.907x (fail) to 0.983x (pass) with no code change. The
+# throughput scenarios reproduce to 0.4% by comparison. 300 iters costs ~1.5 s.
 VISION_ENCODER_LATENCY_WORKLOADS: list[VisionEncoderLatencyWorkload] = [
-    VisionEncoderLatencyWorkload("single-image", resolution=0, batch_size=1, num_warmup=5, num_iters=30),
-    VisionEncoderLatencyWorkload("batch-8", resolution=0, batch_size=8, num_warmup=5, num_iters=30),
+    VisionEncoderLatencyWorkload("single-image", resolution=0, batch_size=1, num_warmup=10, num_iters=300),
+    VisionEncoderLatencyWorkload("batch-8", resolution=0, batch_size=8, num_warmup=10, num_iters=300),
 ]
 
 
