@@ -41,6 +41,8 @@ class LayerNorm(nn.Module):
         # A separate flag rather than a None check on _w32, so a module with no
         # affine params does not retry the cast every call.
         self._cast_done = False
+        self._src_w: torch.Tensor | None = None
+        self._src_b: torch.Tensor | None = None
         self._w32: torch.Tensor | None = None
         self._b32: torch.Tensor | None = None
 
@@ -63,8 +65,17 @@ class LayerNorm(nn.Module):
         # per decode step across the 21 indexer compute layers -- the same defect
         # as the indexer rope re-casting its cos/sin cache every call. Weight
         # loading completes before the first forward, so a lazy cache is safe.
-        if not self._cast_done:
+        # Re-derive if the parameter object was replaced or moved. ``_w32`` is a
+        # plain attribute, not a buffer, so ``module.to(device)`` would not move
+        # it -- 72 modules across the tree use this op, and a stale cache there
+        # would be a device mismatch (or worse, silently old weights). The guard
+        # is two identity compares, ~100 ns against the ~2 us kernel launch it
+        # saves.
+        if (not self._cast_done
+                or self._src_w is not self.weight
+                or self._src_b is not self.bias):
             w, b = self.weight, self.bias
+            self._src_w, self._src_b = w, b
             self._w32 = (w.float()
                          if w is not None and w.dtype != torch.float32 else w)
             self._b32 = (b.float()

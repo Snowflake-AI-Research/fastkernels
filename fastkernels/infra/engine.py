@@ -4152,6 +4152,10 @@ class ModelRunner:
 
         num_layers = len(mla_layers)
         num_indexer_layers = len(indexer_layers)
+        # Consumed by the decode scheduler (prefill-priority) and by the
+        # prefill activation-arena reserve below, both of which are scoped to
+        # DSA models because that is where they were measured.
+        self._has_indexer_layers = num_indexer_layers > 0
 
         # All MLA layers must agree on the cache layout.
         if num_layers > 0:
@@ -6024,9 +6028,17 @@ class ModelRunner:
             # from 4,210 to 7,942 tok/s. Startup cost is 83 graphs instead of 63
             # (96s vs 75s of capture); configs that cannot exceed 512 concurrent
             # sequences are unaffected.
+            # Scoped to DSA models along with prefill-priority. The
+            # eager-above-the-largest-captured-size problem is general, and the
+            # measurement below is only from GLM-5.2, so widening it tree-wide
+            # would spend ~20 extra graphs of memory and ~21s of startup on every
+            # other architecture untested. ``_has_indexer_layers`` is set in
+            # allocate_kv_cache, which runs before capture.
             max_capture_limit = (
                 1024
-                if (self.is_gpt_oss or self.is_gemma4 or self.max_num_seqs > 512)
+                if (self.is_gpt_oss or self.is_gemma4
+                    or (self.max_num_seqs > 512
+                        and getattr(self, "_has_indexer_layers", False)))
                 else 512
             )
         max_capture = min(max_bs, max_capture_limit)
@@ -8442,8 +8454,16 @@ class LlamaEngine:
         # divergence from vLLM, so keeping prefill steps pure removes an error
         # source as well as the eager-step cost. Set the env var to 0 to restore
         # vLLM-style mixed batching.
-        _prefill_priority = os.environ.get(
-            "FASTKERNELS_PREFILL_PRIORITY", "1") != "0"
+        # Scoped to DSA/indexer models: that is the only family it was measured
+        # on, and it changes batch composition for every request, so enabling it
+        # tree-wide on one model's evidence would put every other architecture's
+        # throughput and alignment at risk untested. Set the env var explicitly
+        # to force it on or off anywhere.
+        _pp_env = os.environ.get("FASTKERNELS_PREFILL_PRIORITY")
+        _prefill_priority = (
+            _pp_env != "0" if _pp_env is not None
+            else bool(getattr(self.model_runner, "_has_indexer_layers", False))
+        )
 
         def _can_enter_decode_fast_path() -> bool:
             if _force_sync_decode:
