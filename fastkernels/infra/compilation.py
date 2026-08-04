@@ -65,6 +65,7 @@ logger = logging.getLogger(__name__)
 
 SPLITTING_OPS: list[str] = [
     "fastkernels::unified_attention",
+    "fastkernels::whisper_cross_attention",
     "fastkernels::mamba2_conv_ssm_forward",
     "fastkernels::unified_mla_attention",
     "fastkernels::sparse_attn_indexer",
@@ -121,6 +122,23 @@ def _unified_attention_fake(
     layer_name: str,
 ) -> torch.Tensor:
     return torch.empty_like(query)
+
+
+def _whisper_cross_attention_impl(
+    query: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    layer = get_no_compile_layers()[layer_name]
+    return layer.forward_impl(query)
+
+
+def _whisper_cross_attention_fake(
+    query: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    # ``query`` arrives as [num_tokens, num_heads, head_dim]; the op returns the
+    # flattened [num_tokens, num_heads * head_dim] that out_proj consumes.
+    return query.new_empty((query.shape[0], query.shape[1] * query.shape[2]))
 
 
 def _mamba2_conv_ssm_forward_impl(
@@ -340,6 +358,13 @@ def ensure_custom_ops_registered() -> None:
     lib.impl("unified_attention", _unified_attention_impl, "CUDA")
     lib.impl("unified_attention", _unified_attention_impl, "CPU")
     abstract_lib.impl("unified_attention", _unified_attention_fake)
+
+    lib.define(
+        "whisper_cross_attention(Tensor query, str layer_name) -> Tensor"
+    )
+    lib.impl("whisper_cross_attention", _whisper_cross_attention_impl, "CUDA")
+    lib.impl("whisper_cross_attention", _whisper_cross_attention_impl, "CPU")
+    abstract_lib.impl("whisper_cross_attention", _whisper_cross_attention_fake)
 
     lib.define(
         "mamba2_conv_ssm_forward(Tensor projected_states, Tensor(a!) output, "

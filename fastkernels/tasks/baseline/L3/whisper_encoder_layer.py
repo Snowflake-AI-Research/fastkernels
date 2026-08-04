@@ -31,9 +31,13 @@ class WhisperEncoderLayer(nn.Module):
         self.self_attn = WhisperEncoderSelfAttention(
             config.d_model, config.encoder_attention_heads,
         )
-        self.self_attn_layer_norm = LayerNorm(config.d_model, eps=1e-5)
+        self.self_attn_layer_norm = LayerNorm(
+            config.d_model, eps=1e-5, promote_fp32=False,
+        )
         self.mlp = WhisperMLP(config.d_model, config.encoder_ffn_dim)
-        self.final_layer_norm = LayerNorm(config.d_model, eps=1e-5)
+        self.final_layer_norm = LayerNorm(
+            config.d_model, eps=1e-5, promote_fp32=False,
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """

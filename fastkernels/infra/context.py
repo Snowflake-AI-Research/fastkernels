@@ -335,6 +335,7 @@ def auto_register_no_compile_layers(model: "nn.Module") -> None:
       - ``Qwen3MoE``, ``MixtralMoE``, ``GptOssMoE``, ``DeepSeekMoE``,
         ``Gemma4MoE``                                               (MoE blocks)
       - ``Attention``, ``MLAAttention``, ``SparseAttnIndexer``       (attention impls)
+      - ``WhisperCrossAttention``                (encoder-decoder cross-attn)
       - ``Mamba2Mixer``                                              (Mamba2 compile boundary)
 
     Also sets ``_layer_name`` on each module so it knows its own key.
@@ -343,6 +344,7 @@ def auto_register_no_compile_layers(model: "nn.Module") -> None:
     _TARGET_NAMES = {
         "Qwen3MoE", "MixtralMoE", "GptOssMoE", "DeepSeekMoE", "Gemma4MoE",
         "Attention", "MLAAttention", "SparseAttnIndexer",
+        "WhisperCrossAttention",
         "Mamba2Mixer",
     }
     layers: dict[str, "nn.Module"] = {}

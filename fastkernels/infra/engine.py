@@ -577,7 +577,6 @@ class ModelRunner:
         self.is_whisper = getattr(self.config, "is_encoder_decoder", False)
         self.is_deepseek_mla = hasattr(self.config, "kv_lora_rank")
         if self.is_whisper:
-            self.enforce_eager = True
             self.max_model_len = min(
                 self.max_model_len,
                 getattr(self.config, "max_target_positions", self.max_model_len),
@@ -663,6 +662,7 @@ class ModelRunner:
             _t3 = _time.perf_counter()
             self.allocate_kv_cache()
             self._init_fa3_decode_buffers()
+            self._init_cross_attn_decode_buffers()
             if rank == 0:
                 print(f"  [4/6] KV cache done in {_time.perf_counter()-_t3:.1f}s", flush=True)
             if not self.enforce_eager and not self._supports_cudagraphs():
@@ -5802,31 +5802,108 @@ class ModelRunner:
         ctx.cross_max_seqlen_k = cross_max_sk
         ctx.cross_block_tables = cross_bt
 
+    def _init_cross_attn_decode_buffers(self):
+        """Persistent cross-attention decode metadata, for CUDA graph capture.
+
+        ``WhisperCrossAttention._forward_decode`` reads ``cross_context_lens``
+        and ``cross_block_tables`` off the global Context, so a captured decode
+        graph bakes whatever tensors were live at capture time. The old
+        per-step ``torch.from_numpy(...).cuda()`` in
+        ``_set_cross_attn_context_decode`` therefore cannot be captured -- the
+        graph would replay against a freed pointer. These buffers are written
+        in place instead, exactly like ``graph_vars``' self-attention metadata.
+
+        Two deliberate choices about the rows past the real batch size, which a
+        graph captured at ``graph_bs > n`` still executes:
+
+        * Block ids start at 0, a valid page, not -1. FlashAttention's launcher
+          walks ``ceil(max_seqlen_k / page_size)`` columns of every row in the
+          table, so -1 would be a real out-of-bounds read.
+        * Context lens start at ``max_encoder_tokens`` and are never zeroed, so
+          those rows attend to block 0 and produce finite garbage that
+          ``_greedy_from_hidden`` slices off. Zeroing instead (what
+          self-attention does with ``context_lens[n:graph_bs]``) would hand
+          FlashAttention ``seqused_k == 0`` and a NaN row. Captured sizes are
+          dense up to 256, so this wastes at most 7 rows of encoder attention.
+        """
+        if not getattr(self, "_cross_attn_layers", None):
+            return
+        max_bs = self.max_num_seqs
+        dev = f"cuda:{self.rank}"
+        blocks = self.cross_blocks_per_seq
+        self._cross_cl_buf = torch.full(
+            (max_bs,), self.max_encoder_tokens, dtype=torch.int32, device=dev,
+        )
+        self._cross_bt_buf = torch.zeros(
+            (max_bs, blocks), dtype=torch.int32, device=dev,
+        )
+        # Pinned staging + numpy views over the same memory: the per-step fill
+        # is a Python loop over sequences, and writing it through numpy keeps
+        # that loop off the GPU and off the allocator.
+        self._cross_cl_host = torch.empty(
+            (max_bs,), dtype=torch.int32, device="cpu",
+        ).pin_memory()
+        self._cross_bt_host = torch.zeros(
+            (max_bs, blocks), dtype=torch.int32, device="cpu",
+        ).pin_memory()
+        self._cross_cl_np = self._cross_cl_host.numpy()
+        self._cross_bt_np = self._cross_bt_host.numpy()
+
+    def _set_cross_attn_context_for_capture(self, bs):
+        """Point the Context's cross-attn decode fields at the graph buffers.
+
+        ``set_context`` builds a fresh Context, so capture has to re-apply
+        these after every call, the same way ``_run_decode_greedy_eager`` calls
+        ``_apply_pending_cross_ctx``.
+        """
+        if not getattr(self, "_cross_attn_layers", None):
+            return
+        ctx = get_context()
+        ctx.cross_slot_mapping = None
+        ctx.cross_context_lens = self._cross_cl_buf[:bs]
+        ctx.cross_block_tables = self._cross_bt_buf[:bs]
+        ctx.cross_max_context_len = self.max_encoder_tokens
+
     def _set_cross_attn_context_decode(self, decode_seqs):
         """Set cross-attention metadata on the global Context for decode.
 
         Each decode token attends to the full encoder output via paged cache.
         Also stores the tensors as instance state so they can be applied to
         any Context created later (e.g., by the greedy eager decode path).
+
+        The metadata goes into the persistent buffers from
+        ``_init_cross_attn_decode_buffers`` so that a captured decode graph
+        replays against stable pointers. Encoder K/V is written once at
+        prefill and never moves, so callers only need to invoke this when the
+        running set changes, not every step.
         """
         n = len(decode_seqs)
-        cross_cl = np.empty(n, dtype=np.int32)
-        cross_max_bt = 0
-        for i, seq in enumerate(decode_seqs):
-            cross_cl[i] = seq.encoder_seq_len
-            blen = len(seq.cross_block_table)
-            if blen > cross_max_bt:
-                cross_max_bt = blen
+        cl_buf = getattr(self, "_cross_cl_buf", None)
+        if cl_buf is None:
+            # No cross-attention layers (or buffers not built): nothing to do.
+            return
+        bt_buf = self._cross_bt_buf
+        cl_np, bt_np = self._cross_cl_np, self._cross_bt_np
 
-        cross_bt = np.full((n, cross_max_bt), -1, dtype=np.int32)
+        max_bt = 0
         for i, seq in enumerate(decode_seqs):
+            cl_np[i] = seq.encoder_seq_len
             b = seq.cross_block_table
-            cross_bt[i, :len(b)] = b
+            lb = len(b)
+            bt_np[i, :lb] = b
+            if lb > max_bt:
+                max_bt = lb
+
+        cl_buf[:n].copy_(self._cross_cl_host[:n], non_blocking=True)
+        if max_bt:
+            bt_buf[:n, :max_bt].copy_(
+                self._cross_bt_host[:n, :max_bt], non_blocking=True,
+            )
 
         self._pending_cross_ctx = {
-            "cross_context_lens": torch.from_numpy(cross_cl).pin_memory().cuda(non_blocking=True),
-            "cross_block_tables": torch.from_numpy(cross_bt).pin_memory().cuda(non_blocking=True),
-            "cross_max_context_len": int(cross_cl.max()) if n > 0 else 0,
+            "cross_context_lens": cl_buf[:n],
+            "cross_block_tables": bt_buf[:n],
+            "cross_max_context_len": self.max_encoder_tokens,
         }
         self._apply_pending_cross_ctx()
 
@@ -5931,7 +6008,21 @@ class ModelRunner:
         # Mamba2 owns a dedicated decode-cudagraph path, so keep the
         # compile stack's generic cudagraph wrapper off for it.
         cudagraph_enabled = not self.is_mamba2
-        if self.is_qwen_vl:
+        if self.is_whisper:
+            # Compile the decoder only, matching vLLM, which puts
+            # ``@support_torch_compile`` on ``WhisperDecoder`` and leaves the
+            # encoder and the outer wrapper eager. The encoder runs once per
+            # request from ``get_multimodal_embeddings`` (not through forward),
+            # so it has nothing to gain and would only lengthen the traced
+            # graph. ``set_compiled_decoder`` keeps the uncompiled module
+            # reachable for the prefill call.
+            self.model.set_compiled_decoder(
+                compile_model(
+                    self.model.decoder,
+                    cudagraph_enabled=cudagraph_enabled,
+                )
+            )
+        elif self.is_qwen_vl:
             # Save the uncompiled inner model for multimodal prefill
             # (which needs deepstack_embeds that the compiled graph
             # doesn't trace).
@@ -6094,6 +6185,7 @@ class ModelRunner:
             req_id_per_token=decode_req_id[:largest_bs],
         )
         self._refresh_indexer_schedule(context_lens[:largest_bs])
+        self._set_cross_attn_context_for_capture(largest_bs)
         # Mark batch dim as dynamic BEFORE the first compile-triggering forward
         # so Dynamo / Inductor produce a single symbolic-shape compiled graph
         # that works for every batch size we will subsequently capture, instead
@@ -6165,6 +6257,7 @@ class ModelRunner:
                     req_id_per_token=decode_req_id[:bs],
                 )
                 self._refresh_indexer_schedule(context_lens[:bs])
+                self._set_cross_attn_context_for_capture(bs)
 
                 ids_slice = input_ids[:bs]
                 if self.is_qwen_vl:

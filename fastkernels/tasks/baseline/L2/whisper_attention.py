@@ -161,6 +161,15 @@ class WhisperCrossAttention(nn.Module):
         self.is_cross_attn = True
         self.k_cache = self.v_cache = torch.tensor([])
 
+        # Compile boundary, mirroring ``Attention``. The paged cross-attn read
+        # is opaque to Inductor, so it is dispatched through
+        # ``fastkernels::whisper_cross_attention`` (a splitting op) once
+        # compilation is enabled. That keeps the surrounding layer norms,
+        # projections and residual adds inside compiled subgraphs -- vLLM puts
+        # its compile boundary in the same place, on ``WhisperDecoder``.
+        self._use_custom_op = False
+        self._layer_name = ""
+
         attn_cfg = get_attn_backend_config()
         self._block_size = attn_cfg.block_size
 
@@ -192,33 +201,56 @@ class WhisperCrossAttention(nn.Module):
                 for NEW requests this step, or None if all requests are
                 in decode phase (K/V already in paged cache).
         """
-        ctx = get_context()
-
         q = self.q_proj(hidden_states)
         N_dec = q.shape[0]
         q = q.view(N_dec, self.num_heads, self.head_dim)
 
-        k_cache, v_cache = self.k_cache, self.v_cache
-
         if encoder_hidden_states is not None:
+            # Prefill only. The compiled decode graph is traced with
+            # ``encoder_hidden_states=None``, so this branch never enters it.
+            ctx = get_context()
             kv = self.kv_proj(encoder_hidden_states)
             k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
             N_enc = encoder_hidden_states.shape[0]
             k = k.view(N_enc, self.num_heads, self.head_dim)
             v = v.view(N_enc, self.num_heads, self.head_dim)
 
-            if k_cache.numel() and v_cache.numel() and ctx.cross_slot_mapping is not None:
-                self.store_kvcache(k, v, k_cache, v_cache, ctx.cross_slot_mapping)
+            if (self.k_cache.numel() and self.v_cache.numel()
+                    and ctx.cross_slot_mapping is not None):
+                self.store_kvcache(
+                    k, v, self.k_cache, self.v_cache, ctx.cross_slot_mapping,
+                )
+
+        if self._use_custom_op:
+            attn_out = torch.ops.fastkernels.whisper_cross_attention(
+                q, self._layer_name,
+            )
+        else:
+            attn_out = self.forward_impl(q)
+        return self.out_proj(attn_out)
+
+    def forward_impl(self, q: torch.Tensor) -> torch.Tensor:
+        """Read the paged encoder K/V for this batch. Returns [N, H*D].
+
+        Split out of ``forward`` so it can back the
+        ``fastkernels::whisper_cross_attention`` custom op: ``out_proj`` stays
+        outside, in the compiled region, where Inductor can fuse it with the
+        residual add and the next layer norm.
+        """
+        ctx = get_context()
+        k_cache, v_cache = self.k_cache, self.v_cache
+        flat = (q.shape[0], self.num_heads * self.head_dim)
 
         if not k_cache.numel():
-            return self.out_proj(torch.zeros_like(hidden_states))
+            return q.new_zeros(flat)
 
         if ctx.is_prefill or ctx.is_mixed:
             if ctx.cross_cu_seqlens_q is None:
-                return self.out_proj(torch.zeros_like(hidden_states))
-            return self._forward_prefill(q, k_cache, v_cache, ctx)
+                return q.new_zeros(flat)
+            out = self._forward_prefill(q, k_cache, v_cache, ctx)
         else:
-            return self._forward_decode(q, k_cache, v_cache, ctx)
+            out = self._forward_decode(q, k_cache, v_cache, ctx)
+        return out.view(flat)
 
     def _forward_prefill(self, q, k_cache, v_cache, ctx):
         """Prefill: Q attends to encoder K/V in paged cache (non-causal)."""
@@ -226,7 +258,7 @@ class WhisperCrossAttention(nn.Module):
         cu_k = ctx.cross_cu_seqlens_k
         bt = ctx.cross_block_tables
 
-        out = self.prefill_op(
+        return self.prefill_op(
             q, k_cache, v_cache,
             cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
             max_seqlen_q=ctx.cross_max_seqlen_q,
@@ -235,11 +267,10 @@ class WhisperCrossAttention(nn.Module):
             causal=False,
             block_table=bt,
         )
-        return self.out_proj(out.view(q.shape[0], -1))
 
     def _forward_decode(self, q, k_cache, v_cache, ctx):
         """Decode: each decoder token attends to full encoder KV in cache."""
-        out = self.decode_op(
+        return self.decode_op(
             q, k_cache, v_cache,
             cache_seqlens=ctx.cross_context_lens,
             block_table=ctx.cross_block_tables,
@@ -247,4 +278,3 @@ class WhisperCrossAttention(nn.Module):
             causal=False,
             max_seq_len=ctx.cross_max_context_len,
         )
-        return self.out_proj(out.view(q.shape[0], -1))
