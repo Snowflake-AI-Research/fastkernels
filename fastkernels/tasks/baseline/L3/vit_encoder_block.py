@@ -42,9 +42,16 @@ class VitEncoderBlock(nn.Module):
         act_approximate: str = "none",
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
+        norm_eps: float = 1e-6,
     ):
         super().__init__()
-        self.norm1 = LayerNorm(dim)
+        # promote_fp32=False and eps=1e-6 to match timm, whose ViT Block uses
+        # ``timm.layers.LayerNorm`` -- an nn.LayerNorm subclass that calls plain
+        # ``F.layer_norm`` in the model dtype, with eps defaulting to 1e-6 (not
+        # torch's 1e-5). Promoting costs an x.float() before and a cast back
+        # after every norm: at 27 blocks x 2 norms, bs=32 and 576 patches, that
+        # is ~340 MB of extra traffic per site, ~18 GB per forward.
+        self.norm1 = LayerNorm(dim, eps=norm_eps, promote_fp32=False)
         self.attn = VitEncoderAttention(
             dim,
             num_heads=num_heads,
@@ -53,7 +60,7 @@ class VitEncoderBlock(nn.Module):
             attn_drop=attn_drop,
             proj_drop=proj_drop,
         )
-        self.norm2 = LayerNorm(dim)
+        self.norm2 = LayerNorm(dim, eps=norm_eps, promote_fp32=False)
         self.mlp = VitEncoderMlp(
             in_features=dim,
             hidden_features=int(dim * mlp_ratio),
