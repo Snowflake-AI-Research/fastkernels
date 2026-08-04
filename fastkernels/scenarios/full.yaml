@@ -39,6 +39,21 @@ scenarios:
     tp: 2
     dtype: bfloat16
     workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+  # GLM-5.2 in NVFP4: routed experts only (attention, shared experts and the
+  # dense MLPs stay BF16 per the checkpoint's own exclude list), with an fp8
+  # KV cache. The KV dtype is what selects vLLM's attention backend here -- a
+  # quantized MLA cache on Blackwell picks FLASHINFER_MLA_SPARSE (plain 576-byte
+  # fp8 slots) over FLASHMLA_SPARSE, plus the TRTLLM_RAGGED MLA prefill backend.
+  #
+  # Like DeepSeek-V3.2-Exp above this is a tp=8 DSA model, so it adds real time
+  # to a full sweep (~35 min: weight load, 83 decode graphs, then the four
+  # workloads). Kept enabled rather than commented out because it is the only
+  # NVFP4 LLM row; comment it if sweep wall-clock matters more.
+  - model: nvidia/GLM-5.2-NVFP4
+    tp: 8
+    dtype: nvfp4
+    kv_cache_dtype: fp8_e4m3
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
   # BitNet b1.58: the official 2B-4T release. bench_microsoft_bitnet's SOTA
   # reference is Microsoft's W2A8 CUDA kernel, which only reads this checkpoint's
   # native quantized format (the 1bitLLM/bitnet_b1_58-3B reproduction is a
