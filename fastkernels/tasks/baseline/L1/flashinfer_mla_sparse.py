@@ -247,9 +247,14 @@ class QuantFp8MLAQuery(nn.Module):
     is quantized and the impl sets ``supports_quant_query_input`` — the
     trtllm-gen sparse MLA kernel requires q and the cache to share a dtype
     (mixed bf16+fp8 is unsupported). vLLM's variant exists to *fuse* the
-    ``cat(ql_nope, q_pe)`` with the quantization; fastkernels' caller already
-    holds the concatenated query (``_absorb_q_to_latent``), so it quantizes that
-    directly — same arithmetic, one copy fewer.
+    ``cat(ql_nope, q_pe)`` with the quantization, which Inductor then lowers to a
+    single kernel.
+
+    This module is the un-fused form, kept for paths that already hold a
+    concatenated query. The hot sparse-decode path does not use it: it calls
+    ``CatQuantFP8`` (``L1/cat_quant_fp8.py``), which fuses the concat in exactly
+    the way vLLM's compiled variant does and is byte-identical to
+    ``cat`` + this op.
 
     Static per-tensor scale: ``QuantFP8.forward_cuda`` with a provided ``scale``
     dispatches to ``ops.scaled_fp8_quant`` ->

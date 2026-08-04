@@ -47,9 +47,9 @@ from ..L1.flash_mla_decode import (
 )
 from ..L1.flash_mla_sparse_prefill import FlashMLASparsePrefill
 from ..L1.flash_attn_varlen import FlashAttnVarlen
+from ..L1.cat_quant_fp8 import CatQuantFP8
 from ..L1.flashinfer_mla_sparse import (
     FlashInferMLASparseDecode,
-    QuantFp8MLAQuery,
     TrtllmRaggedPrefill,
     flashinfer_mla_sparse_available,
 )
@@ -237,7 +237,11 @@ class MLAAttention(nn.Module):
                 kv_lora_rank=kv_lora_rank,
             )
             self.ragged_prefill = TrtllmRaggedPrefill(scale=scale)
-            self.q_quant = QuantFp8MLAQuery()
+            # Fused concat+quant for the decode query: byte-identical to
+            # ``cat`` + ``QuantFp8MLAQuery`` but one kernel instead of two. See
+            # cat_quant_fp8.py for why vLLM gets this fusion from Inductor and
+            # fastkernels has to write it by hand.
+            self.cat_quant = CatQuantFP8()
         self._fi_bmm_scale_cache: tuple[float, float] | None = None
         self.get_metadata = FlashMLAGetMetadata()
         self.get_metadata_dense_fp8 = FlashMLAGetMetadataDenseFP8()
@@ -946,8 +950,10 @@ class MLAAttention(nn.Module):
             topk_indices[:num_mqa], block_table, block_size,
             req_ids=req_ids[:num_mqa], return_valid_counts=True,
         )
-        q_latent = self._absorb_q_to_latent(q[:num_mqa])  # [n, H, 576]
-        q_fp8 = self.q_quant(q_latent, self._q_scale)
+        # One kernel for concat+quantize: the bf16 [n, H, 576] concatenation is
+        # never materialised.
+        q_fp8 = self.cat_quant(*self._absorb_q_parts(q[:num_mqa]),
+                               self._q_scale)
         o = self.fi_sparse_decode(
             q_fp8, kv_cache, topk_global, valid_counts,
             self.topk_tokens, *self.finalize_kv_scales(),
@@ -979,11 +985,14 @@ class MLAAttention(nn.Module):
             self._fi_bmm_scale_cache = cached
         return cached
 
-    def _absorb_q_to_latent(self, q: torch.Tensor) -> torch.Tensor:
-        """Absorb q_nope through W_UK_T into the latent space and concat q_pe.
+    def _absorb_q_parts(
+        self, q: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The two halves of the absorbed latent query, unconcatenated.
 
-        Output shape: ``[..., H, kv_lora_rank + qk_rope_head_dim]`` (576 for
-        DeepSeek-V3.2). Matches vLLM's MLA decode/sparse query absorption.
+        ``(q_absorbed [.., H, L], q_pe [.., H, rope])``. Kept separate so the
+        fp8 decode path can hand both to one fused concat+quant kernel instead
+        of materialising the bf16 concatenation first.
         """
         q_nope = q[..., :self.qk_nope_head_dim]
         q_pe = q[..., self.qk_nope_head_dim:]
@@ -991,7 +1000,15 @@ class MLAAttention(nn.Module):
         q_absorbed = self.bmm(
             q_nope.transpose(0, 1), self.W_UK_T,
         ).transpose(0, 1)
-        return torch.cat([q_absorbed, q_pe], dim=-1)
+        return q_absorbed, q_pe
+
+    def _absorb_q_to_latent(self, q: torch.Tensor) -> torch.Tensor:
+        """Absorb q_nope through W_UK_T into the latent space and concat q_pe.
+
+        Output shape: ``[..., H, kv_lora_rank + qk_rope_head_dim]`` (576 for
+        DeepSeek-V3.2). Matches vLLM's MLA decode/sparse query absorption.
+        """
+        return torch.cat(self._absorb_q_parts(q), dim=-1)
 
     def _forward_sparse_mixed_batch(self, q, kv_cache, ctx, topk_indices,
                                     num_prefill_tokens, num_decode_tokens):

@@ -18,6 +18,7 @@ import torch.nn as nn
 from ....infra.context import get_context
 from ..L1.layer_norm import LayerNorm
 from ..L1.fp8_linear import PerTokenGroupQuantFp8
+from ..L1.indexer_weights import IndexerWeights
 from ..L1.indexer_k_cache import IndexerKCacheStore, IndexerKCacheGather
 from ..L1.fp8_mqa_logits import Fp8MQALogits, Fp8PagedMQALogitsMetadata
 from ..L1.top_k_per_row import TopKPerRow
@@ -177,6 +178,7 @@ class SparseAttnIndexer(nn.Module):
         self.paged_mqa_metadata = Fp8PagedMQALogitsMetadata()
         self.topk_per_row = TopKPerRow()
         self.fp8_quant = PerTokenGroupQuantFp8()
+        self.indexer_weights = IndexerWeights()
 
         # Indexer K cache: [num_blocks, block_size, 132] uint8
         self.indexer_k_cache = torch.tensor([])
@@ -300,10 +302,19 @@ class SparseAttnIndexer(nn.Module):
         # ``wp_out`` is the weights_proj output from the fused GEMM above
         # (bit-identical to vLLM). Fold in the per-token Q scale + softmax
         # scale exactly as vLLM (deepseek_v2.py:738-741).
-        weights = (
-            wp_out.unsqueeze(-1) * q_scale * self.softmax_scale * self.n_head ** -0.5
+        # One kernel for the whole chain, same op order and precision (see
+        # L1/indexer_weights.py). The PyTorch form below is what vLLM writes and
+        # Inductor fuses; issuing it as four ops cost ~89 us/step across the 21
+        # compute layers.
+        #   weights = (wp_out.unsqueeze(-1) * q_scale
+        #              * self.softmax_scale * self.n_head ** -0.5).squeeze(-1)
+        weights = self.indexer_weights(
+            wp_out, q_scale, self.softmax_scale, self.n_head ** -0.5,
         )
-        weights = weights.squeeze(-1)
+
+        _needs_prefill_path = (
+            ctx.is_prefill or (ctx.is_mixed and ctx.num_prefill_tokens > 0)
+        )
 
         # Use pre-allocated buffer if available, otherwise allocate
         if self.topk_indices_buffer is not None and M <= self.topk_indices_buffer.shape[0]:
@@ -312,12 +323,18 @@ class SparseAttnIndexer(nn.Module):
                 buf = buf.to(hidden_states.device)
                 self.topk_indices_buffer = buf
             topk_indices = buf[:M, :self.topk_tokens]
-            topk_indices.fill_(-1)
+            if _needs_prefill_path:
+                # Only the prefill/mixed branches write PARTIALLY (``[:np_]`` /
+                # ``[np_:]``), so they need the -1 initialisation. Pure decode
+                # overwrites every element from ``_decode_topk`` below, where the
+                # top-k kernel also initialises its own output, making this a
+                # wasted kernel on the hot path.
+                topk_indices.fill_(-1)
         else:
             topk_indices = torch.full((M, self.topk_tokens), -1, dtype=torch.int32,
                                       device=hidden_states.device)
 
-        if ctx.is_prefill or (ctx.is_mixed and ctx.num_prefill_tokens > 0):
+        if _needs_prefill_path:
             # Prefill path: gather K from cache, compute logits, top-k
             if ctx.is_mixed:
                 np_ = ctx.num_prefill_tokens
@@ -488,12 +505,19 @@ class SparseAttnIndexer(nn.Module):
     ) -> torch.Tensor:
         """Paged FP8 MQA logits + top-k for decode."""
         M = q_fp8.shape[0]
-        out = torch.full((M, self.topk_tokens), -1, dtype=torch.int32, device=device)
+
+        # Allocate the all -1 fallback only where it is actually returned. The
+        # happy path ends in ``topk_per_row.forward_decode``, which allocates and
+        # initialises its own output, so hoisting this above the guards filled a
+        # [M, topk_tokens] buffer per compute layer per step and threw it away.
+        def _empty_topk():
+            return torch.full((M, self.topk_tokens), -1, dtype=torch.int32,
+                              device=device)
 
         if not self.indexer_k_cache.numel():
-            return out
+            return _empty_topk()
         if ctx.decode_context_lens is None or ctx.decode_block_tables is None:
-            return out
+            return _empty_topk()
 
         block_size = int(self.indexer_k_cache.shape[1])
         # Fixed buffer width (vLLM's ``max_model_len``), not the batch max.

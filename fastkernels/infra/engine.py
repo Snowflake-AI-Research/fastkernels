@@ -180,6 +180,11 @@ _PROFILE = os.environ.get("FASTKERNELS_PROFILE", "0") == "1"
 ATTN_BACKEND_CONFIG = get_attn_backend_config()
 USE_TRTLLM = ATTN_BACKEND_CONFIG.use_trtllm
 BLOCK_SIZE = ATTN_BACKEND_CONFIG.block_size
+
+# Stand-in for a sampled token that is still on the GPU while the host runs
+# ahead one decode step. Only ever read back by the deferred patch, never by
+# the model: the graph gets its tokens device-to-device.
+_RUNAHEAD_PLACEHOLDER = 0
 USE_FLASHINFER = USE_TRTLLM  # back-compat alias
 
 
@@ -435,6 +440,9 @@ class ModelRunner:
         # MLA paged-KV cache dtype. Also selects the MLA attention backend, so it
         # has to reach the model at construction time, not just the allocator.
         self.kv_cache_dtype = kv_cache_dtype
+        # Batch size whose sampled tokens are already in graph_vars["input_ids"]
+        # on device; -1 when there is no valid handoff.
+        self._staged_ids_n = -1
 
         torch.cuda.set_device(rank)
         self._dist_initialized = False
@@ -770,11 +778,11 @@ class ModelRunner:
                 f"max_num_blocks={max_num_blocks} (2-byte fields, limit 65535)"
             )
 
-        # Attention decode: [n(2)][max_bt(2)][ids][pos][sm][cl][bt]
+        # Attention decode: [n(2)][max_bt(2)][staged(1)][pad(3)][ids][pos][sm][cl][bt]
         pos_elems = 3 * max_bs if self.is_qwen_vl else max_bs
         sm_bytes = max_bs * (8 if self.is_deepseek_mla else 4)
         attn_bytes = (
-            4
+            8                       # header, padded so the int64s stay aligned
             + max_bs * 8            # ids   (int64)
             + pos_elems * 8         # pos   (int64, 3x for MRoPE)
             + sm_bytes              # slot_mapping (int64 for MLA, else int32)
@@ -4190,6 +4198,35 @@ class ModelRunner:
                 max(1, self.max_num_seqs),
             )
 
+        # Prefill activation arena.
+        #
+        # ``peak`` above comes from the pre-KV warmup forward, which runs at
+        # ``max_num_batched_tokens`` but BEFORE the KV cache exists -- so it never
+        # exercises any path that needs the cache, notably the DSA indexer's
+        # prefill gather + ``fp8_fp4_mqa_logits``, whose
+        # [chunk_tokens x context] fp32 logits buffer is the largest transient in
+        # a long prefill. KV sizing therefore hands the arena's memory to the KV
+        # cache, and the caching allocator has to release blocks back to the
+        # driver and re-acquire them every layer.
+        #
+        # Measured on GLM-5.2-NVFP4 (24,576-token prefill, tp=8): only 2.97 GiB
+        # of transient above resident, but the allocator wants ~12 GiB of pool
+        # slack to serve it without churning. With 9.2 GiB left over, one prefill
+        # made 183 ``cudaFree`` (704 ms) + 186 ``cudaMalloc`` (334 ms) calls --
+        # both device-synchronising, so peer ranks stalled and the wait surfaced
+        # as multi-millisecond all-reduce durations on every other rank (median
+        # 526 us, max 134 ms). Prefill throughput 13.8k tok/s against vLLM's
+        # 27.4k; giving the arena room restored 27.0k.
+        # 4 GiB restores full prefill throughput (26.9k tok/s, 0.98x of vLLM) at a
+        # cost of 4.6% of the KV cache -- 29,177 blocks instead of 30,584, still
+        # well clear of the 24,851 blocks long-context peaks at. Only models with a
+        # DSA indexer have the un-measurable transient, so only they pay for it.
+        default_arena = 4.0 if num_indexer_layers > 0 else 0.0
+        arena_gib = float(os.environ.get("FASTKERNELS_PREFILL_ARENA_GIB",
+                                         str(default_arena)))
+        if arena_gib:
+            reserve_bytes += int(arena_gib * (1 << 30))
+
         available_bytes = int(
             total * self.gpu_memory_utilization
             - used
@@ -4709,6 +4746,10 @@ class ModelRunner:
     def run_model(self, input_ids, positions, is_prefill, inputs_embeds=None,
                   deepstack_embeds=None, encoder_outputs=None,
                   skip_final_softcap=False):
+        # Any non-replay forward (prefill, mixed, eager decode, capture warmup)
+        # breaks the device token handoff: it takes its ids from the argument, not
+        # from graph_vars, so a staged value would be stale for the next replay.
+        self._staged_ids_n = -1
         # One traced signature for the compiled inner model. DeepStack adds a
         # residual at the first few decoder layers; vLLM keeps that inside its
         # compiled graph, reading from persistent buffers that it zeroes after
@@ -4814,7 +4855,13 @@ class ModelRunner:
         graph_bs = self._graph_bs_for_n[n]
         prev_n = getattr(self, '_prev_decode_n', -1)
 
-        gv["input_ids"][:n].copy_(torch.from_numpy(ids_np), non_blocking=True)
+        # Skip the token H2D copy when the previous step staged them on device
+        # (see _stage_next_input_ids). ``ids_np`` is then stale by design -- the
+        # host may not have read the token yet.
+        if self._staged_ids_n == n:
+            self._staged_ids_n = -1
+        else:
+            gv["input_ids"][:n].copy_(torch.from_numpy(ids_np), non_blocking=True)
         if self.is_qwen_vl:
             gv["positions"][:, :n].copy_(torch.from_numpy(pos_np), non_blocking=True)
         else:
@@ -4844,23 +4891,13 @@ class ModelRunner:
         if self.enforce_eager:
             result = self._run_decode_greedy_eager(n, ids_np, pos_np, sm_np, cl_np, bt_np)
             if result is not None:
-                main_stream = torch.cuda.current_stream()
-                cs = self._copy_stream
-                with torch.cuda.stream(cs):
-                    cs.wait_stream(main_stream)
-                    self._pinned_token_ids[:n].copy_(result, non_blocking=True)
-                    self._copy_event.record(cs)
+                self._issue_token_copy(n, result)
                 return True, n
             return False, n
         if n > self.graph_bs_list[-1]:
             result = self._run_decode_greedy_eager(n, ids_np, pos_np, sm_np, cl_np, bt_np)
             if result is not None:
-                main_stream = torch.cuda.current_stream()
-                cs = self._copy_stream
-                with torch.cuda.stream(cs):
-                    cs.wait_stream(main_stream)
-                    self._pinned_token_ids[:n].copy_(result, non_blocking=True)
-                    self._copy_event.record(cs)
+                self._issue_token_copy(n, result)
                 return True, n
             return False, n
 
@@ -4869,6 +4906,9 @@ class ModelRunner:
         return has_result, n
 
     def _run_decode_greedy_eager(self, n, ids_np, pos_np, sm_np, cl_np, bt_np):
+        # Eager decode reads its tokens from ``ids_np``, so any device handoff is
+        # unusable here and must not leak into the next graph replay.
+        self._invalidate_staged_ids()
         """Eager decode path for greedy sampling with TP (no CUDA graphs)."""
         self._eager_input_ids[:n].copy_(torch.from_numpy(ids_np), non_blocking=True)
         if self.is_qwen_vl:
@@ -5021,11 +5061,68 @@ class ModelRunner:
         self._eager_context_lens = torch.zeros(max_bs, dtype=torch.int32, device=dev)
         self._eager_block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32, device=dev)
 
-        # Async D2H: pinned buffer + copy stream for pipelined decode
-        self._pinned_token_ids = torch.empty(max_bs, dtype=torch.int64,
-                                             device="cpu", pin_memory=True)
+        # Async D2H: pinned buffers + copy stream for pipelined decode.
+        # A ring, not a single slot: with host run-ahead (see the decode fast path
+        # in generate) step N+1's copy is issued while step N's tokens have not
+        # been read off the host yet, so a single buffer/event pair would be
+        # overwritten before it was consumed. Two outstanding copies is the most
+        # the loop ever has; three slots leaves headroom.
+        self._N_COPY_SLOTS = 3
+        self._pinned_token_ids_ring = [
+            torch.empty(max_bs, dtype=torch.int64, device="cpu", pin_memory=True)
+            for _ in range(self._N_COPY_SLOTS)
+        ]
+        self._copy_events = [torch.cuda.Event()
+                             for _ in range(self._N_COPY_SLOTS)]
         self._copy_stream = torch.cuda.Stream(device=dev)
-        self._copy_event = torch.cuda.Event()
+        # Issue/harvest cursors into the ring; the difference is the number of
+        # copies in flight. Harvest order is FIFO, matching issue order, so the
+        # caller does not have to carry a slot id around.
+        self._copy_issued = 0
+        self._copy_harvested = 0
+
+    def _issue_token_copy(self, n: int, gpu_ids: torch.Tensor) -> None:
+        """Start the D2H copy of this step's sampled tokens into a free ring slot.
+
+        On the MAIN stream, deliberately. ``gpu_ids`` is usually a view of a
+        persistent graph output buffer (``lm_max_idxs``), which the next replay
+        overwrites; a copy on a side stream only survived because the host used to
+        block on it before launching that replay. With run-ahead there is no such
+        block, so a side-stream copy would race the next replay. Enqueuing it on
+        the main stream orders it between the two replays for free -- it is a
+        few hundred bytes, and the event recorded after it lets the host poll for
+        completion without waiting on anything that follows.
+        """
+        if self._copy_issued - self._copy_harvested >= self._N_COPY_SLOTS:
+            # Should not happen with the current loop; drain rather than corrupt.
+            self._wait_async_tokens(n)
+        slot = self._copy_issued % self._N_COPY_SLOTS
+        stream = torch.cuda.current_stream()
+        self._pinned_token_ids_ring[slot][:n].copy_(gpu_ids, non_blocking=True)
+        self._copy_events[slot].record(stream)
+        self._copy_issued += 1
+
+    def _stage_next_input_ids(self, n: int, gpu_ids: torch.Tensor) -> None:
+        """Hand this step's sampled tokens to the next graph replay ON DEVICE.
+
+        The decode graph reads its tokens from ``graph_vars["input_ids"]``, which
+        was filled by an H2D copy of a host numpy array -- so the host had to
+        know the sampled token before it could launch the next step, and the
+        measured cost of that round trip is 1.56 ms of GPU idle per step at bs=1
+        (vLLM: 0.74 ms). Writing the token device-to-device here removes the
+        dependency: the copy is issued on the same stream as the replay, so it is
+        ordered after the step that produced it and before the step that consumes
+        it, with no host involvement.
+
+        ``_staged_ids_n`` is the batch size the staged tokens correspond to; a
+        consumer must check it matches, and any non-graph forward invalidates it.
+        """
+        self.graph_vars["input_ids"][:n].copy_(gpu_ids, non_blocking=True)
+        self._staged_ids_n = n
+
+    def _invalidate_staged_ids(self) -> None:
+        """Drop the device token handoff (a non-graph forward ran in between)."""
+        self._staged_ids_n = -1
 
     def _greedy_from_hidden(self, n):
         """Use CUDA-graph-captured LM head + local argmax, then allgather.
@@ -5036,7 +5133,9 @@ class ModelRunner:
         gv = self.graph_vars
 
         if self.world_size == 1:
-            return gv["lm_max_idxs"][:n]
+            ids = gv["lm_max_idxs"][:n]
+            self._stage_next_input_ids(n, ids)
+            return ids
 
         local_max_vals = gv["lm_max_vals"][:n]
         local_max_idxs = gv["lm_max_idxs"][:n] + self.model.lm_head.vocab_start
@@ -5053,6 +5152,11 @@ class ModelRunner:
         best_rank = all_info[:, :n, 0].argmax(dim=0)
         token_ids = all_info[:, :n, 1].long()[best_rank, self._greedy_arange[:n]]
 
+        # Stage on EVERY rank, before the rank-0 gate: the all_gather above makes
+        # ``token_ids`` bit-identical across ranks, so each rank can fill its own
+        # graph input buffer without rank 0 broadcasting the host value.
+        self._stage_next_input_ids(n, token_ids)
+
         if self.rank == 0:
             return token_ids
         return None
@@ -5066,21 +5170,22 @@ class ModelRunner:
         """
         gpu_ids = self._greedy_from_hidden(n)
         if gpu_ids is not None:
-            main_stream = torch.cuda.current_stream()
-            cs = self._copy_stream
-            with torch.cuda.stream(cs):
-                cs.wait_stream(main_stream)
-                self._pinned_token_ids[:n].copy_(gpu_ids, non_blocking=True)
-                self._copy_event.record(cs)
+            self._issue_token_copy(n, gpu_ids)
         return gpu_ids is not None
 
     def _wait_async_tokens(self, n):
-        """Wait for the async D2H copy to complete and return token list."""
-        self._copy_event.synchronize()
-        return self._pinned_token_ids[:n].tolist()
+        """Wait for the oldest outstanding D2H copy and return its token list."""
+        slot = self._copy_harvested % self._N_COPY_SLOTS
+        self._copy_events[slot].synchronize()
+        self._copy_harvested += 1
+        return self._pinned_token_ids_ring[slot][:n].tolist()
 
     def _prepare_decode_arrays(self, seqs):
         """Precompute numpy arrays for decode - uses pre-allocated buffers."""
+        # Full rebuild means the caller has real host tokens (it runs after a
+        # finish, or on the first decode after prefill), so use them and drop any
+        # device handoff.
+        self._invalidate_staged_ids()
         n = len(seqs)
         ids_np = self._np_ids
         pos_np = self._np_pos
@@ -5133,7 +5238,11 @@ class ModelRunner:
         bt_np = self._np_bt
         bs = BLOCK_SIZE
 
-        ids_np[:n] = token_ids
+        # ``token_ids is None`` means the previous step's tokens were handed to
+        # the graph on device (see _stage_next_input_ids) and the host has not read
+        # them yet -- everything else in this update is token-independent.
+        if token_ids is not None:
+            ids_np[:n] = token_ids
         if self.is_qwen_vl:
             pos_np[:, :n] += 1
         else:
@@ -5171,13 +5280,25 @@ class ModelRunner:
     def _write_decode_shm(self, n, ids_np, pos_np, sm_np, cl_np, bt_np):
         """Write decode arrays directly into SHM with binary layout.
 
-        Layout: [n(2)][max_bt(2)][ids(n*8)][pos(n*8 or 3*n*8)][sm(n*4)][cl(n*4)][bt(n*max_bt*4)]
+        Layout: [n(2)][max_bt(2)][staged(1)][pad(3)][ids(n*8)][pos(n*8 or 3*n*8)][sm(n*4)][cl(n*4)][bt(n*max_bt*4)]
+
+        The header is padded to 8 bytes so the int64 fields that follow stay
+        8-byte aligned; an odd header makes every ``np.frombuffer`` on the reader
+        side unaligned.
         pos_np is (n,) for standard models or (3, n) for MRoPE models.
+
+        ``staged`` carries rank 0's decision about the device token handoff. The
+        workers must not decide for themselves: they would skip the ids copy
+        whenever their own last replay had the same batch size, which is not the
+        same question -- a batch that was reordered (preemption, a swap) has the
+        same n but different tokens per slot, and rank 0 rebuilds the host array
+        in that case. Taking the flag from rank 0 keeps every rank reading the
+        tokens from the same place.
         """
         max_bt = bt_np.shape[1]
         buf = self.shm.buf
         arrays = (ids_np, pos_np.ravel(), sm_np, cl_np, bt_np)
-        payload_bytes = 4 + sum(arr.nbytes for arr in arrays)
+        payload_bytes = 8 + sum(arr.nbytes for arr in arrays)
         if payload_bytes > self._SHM_ACK_OFFSET:
             # Assigning past the data region would silently truncate the
             # lvalue slice and raise an opaque memoryview structure error,
@@ -5190,7 +5311,8 @@ class ModelRunner:
             )
         buf[0:2] = n.to_bytes(2, "little")
         buf[2:4] = max_bt.to_bytes(2, "little")
-        off = 4
+        buf[4] = 1 if self._staged_ids_n == n else 0
+        off = 8
         for arr in arrays:
             nb = arr.nbytes
             buf[off:off+nb] = arr.tobytes()
@@ -5209,7 +5331,9 @@ class ModelRunner:
         buf = self.shm.buf
         n = int.from_bytes(buf[0:2], "little")
         max_bt = int.from_bytes(buf[2:4], "little")
-        off = 4
+        # Mirror rank 0's device-handoff decision (see _write_decode_shm).
+        self._staged_ids_n = n if buf[4] else -1
+        off = 8
         ids_np = np.frombuffer(buf, dtype=np.int64, count=n, offset=off).copy(); off += n * 8
         if self.is_qwen_vl:
             pos_np = np.frombuffer(buf, dtype=np.int64, count=3*n, offset=off).copy().reshape(3, n); off += 3 * n * 8
@@ -5887,8 +6011,23 @@ class ModelRunner:
         if env_cap:
             max_capture_limit = int(env_cap)
         else:
+            # Capture up to ``max_num_seqs`` when the scheduler can actually form
+            # batches beyond 512, because anything past the largest captured size
+            # falls through ``run_decode_greedy_fast`` to the EAGER path, and eager
+            # decode is catastrophically slower for a DSA model.
+            #
+            # Measured on GLM-5.2-NVFP4, mixed at 1000 sequences (max_num_seqs
+            # 1024): the decode batch histogram was
+            # 512-640:83  640-768:97  768-896:79  896-1024:44, i.e. 303 of 1022
+            # steps -- and ~59% of all decode tokens, since these are the *large*
+            # batches -- ran eager. Raising the limit to 1024 took the scenario
+            # from 4,210 to 7,942 tok/s. Startup cost is 83 graphs instead of 63
+            # (96s vs 75s of capture); configs that cannot exceed 512 concurrent
+            # sequences are unaffected.
             max_capture_limit = (
-                1024 if (self.is_gpt_oss or self.is_gemma4) else 512
+                1024
+                if (self.is_gpt_oss or self.is_gemma4 or self.max_num_seqs > 512)
+                else 512
             )
         max_capture = min(max_bs, max_capture_limit)
         self.graph_bs_list = [i for i in [1, 2, 4] if i <= max_capture]
@@ -8282,6 +8421,30 @@ class LlamaEngine:
         _force_sync_decode = os.environ.get(
             "FASTKERNELS_FORCE_SYNC_DECODE", "0") != "0"
 
+        # Prefill-priority scheduling: keep prefill steps PURE instead of adding
+        # decode tokens to them.
+        #
+        # Mixing costs prefill throughput badly on a DSA model. Measured on
+        # long-context (64 x 24,576 tokens): the identical prefill work runs at
+        # 26,829 tok/s as pure prefill steps but only ~20,700 tok/s when the
+        # scheduler folds a handful of decode tokens in (96 mixed steps at 792 ms
+        # each against 608 ms for the same token count). vLLM absorbs that cost by
+        # graph-capturing the mixed prefill-decode shapes (PIECEWISE); we run them
+        # eager, so we pay it.
+        #
+        # This diverges from vLLM's batching, which mixes freely. It is on by
+        # default anyway, because measurement says it improves fidelity rather
+        # than trading it away: on the mixed workload the average matching prefix
+        # against vLLM went from 13.03 to 26.83 tokens (and throughput 1.562x ->
+        # 1.634x), while long-context went 0.843x -> 0.948x with alignment 30.02
+        # -> 27.23, inside its 25.6-43.1 run-to-run band. Latency is unchanged.
+        # The reading is that our *unified mixed-batch* path is itself a source of
+        # divergence from vLLM, so keeping prefill steps pure removes an error
+        # source as well as the eager-step cost. Set the env var to 0 to restore
+        # vLLM-style mixed batching.
+        _prefill_priority = os.environ.get(
+            "FASTKERNELS_PREFILL_PRIORITY", "1") != "0"
+
         def _can_enter_decode_fast_path() -> bool:
             if _force_sync_decode:
                 return False
@@ -8455,8 +8618,48 @@ class LlamaEngine:
 
                         _whisper_fast = self.is_whisper
                         use_incr = True
+
+                        # --- host run-ahead, one step deep -------------------
+                        # Without this the host waits for the sampled token
+                        # before it can launch the next step, so the GPU drains
+                        # between steps: measured 1.56 ms of idle per step at
+                        # bs=1 against vLLM's 0.74 ms. ``_pending`` holds a step
+                        # that is still on the GPU; its sequences carry a
+                        # placeholder token that ``_retire_pending`` overwrites
+                        # once the D2H copy lands. The next step can be prepared
+                        # and launched in the meantime because the graph reads
+                        # its tokens straight from the sampler's device tensor
+                        # (see _stage_next_input_ids).
+                        _pending = None      # (seqs, n) with tokens in flight
+
+                        def _retire_pending():
+                            """Patch in the real tokens for the in-flight step."""
+                            nonlocal _pending, any_finished, running
+                            seqs_p, n_p = _pending
+                            _pending = None
+                            tids = mr._wait_async_tokens(n_p)
+                            for seq_p, tid_p in zip(seqs_p, tids):
+                                seq_p.token_ids[-1] = tid_p
+                                seq_p.generated_ids[-1] = tid_p
+                                # The run-ahead guard below only defers steps
+                                # that cannot terminate a sequence, so this is
+                                # dead code -- kept so the two paths are
+                                # observably identical if the guard ever widens.
+                                done_p = len(seq_p.generated_ids) >= seq_p.max_tokens
+                                if not seq_p.ignore_eos:
+                                    done_p = done_p or tid_p == eos
+                                if done_p:
+                                    _finish_seq(seq_p)
+                                    any_finished = True
+                            if any_finished:
+                                running = deque(
+                                    s for s in running
+                                    if s.status != SeqStatus.FINISHED)
+
                         while _can_enter_decode_fast_path():
                             if any_finished:
+                                if _pending is not None:
+                                    _retire_pending()
                                 decode_seqs = list(running)
                                 n_dc = len(decode_seqs)
                                 any_finished = False
@@ -8497,6 +8700,47 @@ class LlamaEngine:
                             has_result, _async_n = mr.run_decode_greedy_fast_async(decode_data)
                             if _PROFILE:
                                 _fp_t2 = time.perf_counter()
+
+                            # This step is on the GPU now, so retiring the
+                            # previous one costs only the copy that has already
+                            # had a full step to complete.
+                            if _pending is not None:
+                                _retire_pending()
+
+                            # Defer this step's host read too, and let the next
+                            # iteration launch on top of it -- but only when the
+                            # step provably cannot finish a sequence. With greedy
+                            # sampling and ignore_eos, termination is purely a
+                            # length question, so the next step's batch is
+                            # already known and the pipeline is exactly
+                            # equivalent to the blocking loop. Anything else
+                            # (an EOS-terminated request, the last token of a
+                            # request, an eager step with no device handoff)
+                            # falls through to the blocking path unchanged.
+                            if (has_result and not any_finished
+                                    and mr._staged_ids_n == _async_n
+                                    and all(s.ignore_eos
+                                            and len(s.generated_ids) + 1
+                                            < s.max_tokens
+                                            for s in decode_seqs)):
+                                if _PROFILE:
+                                    _fp_t3 = time.perf_counter()
+                                for seq in decode_seqs:
+                                    seq.append_token(_RUNAHEAD_PLACEHOLDER)
+                                _pending = (decode_seqs, _async_n)
+                                # The graph takes its tokens from the device, so
+                                # the incremental prep must not write the host
+                                # array -- the value there is a placeholder.
+                                token_ids = None
+                                if _PROFILE:
+                                    _fp_t4 = time.perf_counter()
+                                    _fp['prep'] += _fp_t1 - _fp_t0
+                                    _fp['gpu'] += _fp_t2 - _fp_t1
+                                    _fp['tolist'] += _fp_t3 - _fp_t2
+                                    _fp['post'] += _fp_t4 - _fp_t3
+                                    _fp['n'] += 1
+                                continue
+
                             if has_result:
                                 token_ids = mr._wait_async_tokens(_async_n)
                                 if _PROFILE:
@@ -8521,6 +8765,18 @@ class LlamaEngine:
                                     _fp['tolist'] += _fp_t3 - _fp_t2
                                     _fp['post'] += _fp_t4 - _fp_t3
                                     _fp['n'] += 1
+                            else:
+                                # No tokens came back. ``token_ids`` may be None
+                                # from an earlier deferral and there is no device
+                                # handoff to fall back on, so the next step has to
+                                # rebuild its input array from the sequences.
+                                use_incr = False
+
+                        # Leaving the fast path (out of blocks, or a prefill is
+                        # ready): the in-flight step must be retired before any
+                        # other code reads generated_ids.
+                        if _pending is not None:
+                            _retire_pending()
                     if _step_profile_active:
                         step_profile["decode_time"] += time.perf_counter() - _spt0
                     continue
@@ -8634,7 +8890,7 @@ class LlamaEngine:
                 running = new_running
                 token_budget -= len(decode_seqs)
 
-            if is_bitnet and (waiting or prefilling):
+            if (is_bitnet or _prefill_priority) and (waiting or prefilling):
                 # BitNet uses bf16 fake-quant weights for prefill and int2
                 # weights for decode. Since BitLinear dispatches per forward,
                 # mixed prefill+decode batches would run decode tokens through
@@ -8774,7 +9030,8 @@ class LlamaEngine:
                 step_profile["admit_steps"] = (
                     step_profile.get("admit_steps", 0) + 1)
 
-            if is_bitnet and not prefill_seqs and not decode_seqs and running:
+            if ((is_bitnet or _prefill_priority)
+                    and not prefill_seqs and not decode_seqs and running):
                 _schedule_decode_tokens()
 
             if not decode_seqs and not prefill_seqs:

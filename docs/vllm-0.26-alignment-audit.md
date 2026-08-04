@@ -3884,25 +3884,97 @@ no run-ahead, the cost of submitting a ~2000-node graph is fully exposed instead
 of being hidden behind the previous step's GPU execution -- hence `cudaGraphLaunch`
 itself sitting in the idle window for ~3.3 ms.
 
-**The fix, not yet implemented.** Feed `input_ids` for step N+1 from the sampler's
-*device* tensor (a D2D copy) instead of from host numpy, and defer the host token
-read -- used only for the EOS / max-tokens check and for recording output -- by one
-step. Positions, context lengths and slot mappings are all derivable without the
-token (`_update_decode_arrays_incremental` already bumps them by +1), and with TP
-every rank already holds the same sampled token on device, so nothing extra needs
-broadcasting. That is what lets vLLM run the host ahead. It is a real scheduler
-change -- deferred stop handling changes block accounting and the step count -- so
-it is called out here rather than landed unverified.
+**The fix, implemented.** Feed `input_ids` for step N+1 from the sampler's *device*
+tensor (a D2D copy) instead of from host numpy, and defer the host token read --
+used only for the EOS / max-tokens check and for recording output -- by one step.
+Positions, context lengths and slot mappings are all derivable without the token
+(`_update_decode_arrays_incremental` already bumps them by +1), and with TP every
+rank already holds the same sampled token on device, so nothing needs broadcasting.
+See §27h.
+
+### 27h. Host run-ahead: what it fixed, and what the idle actually was
+
+This is vLLM's *async scheduling*, on by default in 0.26 for this config
+(`config/vllm.py:1107`; `MultiprocExecutor.supports_async_scheduling()` is True),
+so the reference numbers above already had it. The pieces line up almost one to
+one:
+
+| | vLLM 0.26 | fastkernels |
+|---|---|---|
+| token kept on device | `input_batch.prev_sampled_token_ids` (`gpu_model_runner.py:3751`) | `_stage_next_input_ids` |
+| unchanged-batch fast path | `input_ids.gpu[:n].copy_(prev_sampled_token_ids[:n, 0])` (`:1849`) | the same slice copy into `graph_vars["input_ids"]` |
+| who knows the token | every rank -- vocab-parallel argmax all-gathers `(value, index)` pairs (`logits_processor.py:185`) | every rank, same scheme in `_greedy_from_hidden` |
+| length bookkeeping | `Request.num_output_placeholders` | `append_token(_RUNAHEAD_PLACEHOLDER)` + deferred patch |
+| max-tokens guard | `sched/scheduler.py:475` | `len(generated_ids) + 1 < max_tokens` |
+
+Three places fastkernels is deliberately narrower. vLLM's `_prepare_input_ids`
+*scatters* device tokens into carried-over slots (with `prev_positions` mapping
+current->previous index) and H2D-copies the rest, so it keeps pipelining across
+batch changes and reordering; fastkernels runs ahead only when the batch is
+provably unchanged. vLLM also runs ahead through EOS and discards the extra token
+afterwards (`async_tokens_to_discard`); fastkernels disengages when
+`ignore_eos=False`, which costs nothing on the benchmarks (every path sets it) but
+means EOS-terminated serving gets no run-ahead. And vLLM's max-tokens guard is
+per-request where ours is per-batch -- identical at bs=1 and for uniform
+`max_tokens`.
+
+The multi-rank handoff *is* a different mechanism, forced by different
+architecture. vLLM broadcasts the `SchedulerOutput` and every rank recomputes the
+decision from it, so nothing about the handoff is transmitted. fastkernels
+broadcasts finished numpy arrays over shm, so workers have no scheduler state to
+recompute from: rank 0's decision goes in a flag byte in the shm header
+(`_write_decode_shm`). Letting workers decide for themselves is the trap -- their
+own `_staged_ids_n == n` test passes whenever the previous replay had the same
+batch size, which is *not* the same question as "the batch is unchanged", and a
+reordered batch of the same size would silently desync the ranks.
+
+**Result, bs=1 tp=8, and the correction it forces.** The launch exposure is gone:
+`cudaGraphLaunch` covered 232 ms of idle before and 21.5 ms after; gaps larger
+than 1 ms dropped from 104 to 2; wall 10.328 -> 10.160 ms/token.
+
+But that is only ~0.18 ms/token of the 1.56 ms/step idle, so the earlier
+attribution was too generous to the run-ahead theory. Re-running `gap_analysis` on
+both engines' traces (both exactly 127 decode steps, so the buckets are directly
+comparable):
+
+| gap size | fastkernels | vLLM |
+|---|---|---|
+| 0-10 us | 74.2 ms (n=190,822) | 50.2 ms (n=126,935) |
+| 10-50 us | 38.0 ms (n=1,485) | 19.7 ms (n=796) |
+| 50-200 us | 65.7 ms (n=762) | 44.5 ms (n=503) |
+| 200-1000 us | 30.7 ms (n=94) | 26.5 ms (n=89) |
+| >1000 us | 5.6 ms (n=2) | 4.7 ms (n=3) |
+| **total idle** | **214.1 ms (16.0% of span)** | **145.6 ms (11.8%)** |
+
+Every bucket holds ~1.5x as many gaps, and the >200 us buckets -- the ones host
+lateness would land in -- are now nearly identical in count (94/89, 2/3). What
+remains is **inter-kernel bubbles, and they scale with kernel count**: fastkernels
+launches 2,818 kernels per step against vLLM's 2,292 (**1.23x**) for 1.03x the
+busy time, and has 1.50x the gaps. So the residual "idle" is the *same* unfused
+-kernel problem as the ~0.41 ms/token of extra occupancy, counted from the other
+side -- each extra kernel costs both its own runtime and a launch bubble. Further
+idle reduction means fusing the kernels below, not more host pipelining.
+
+**Method note.** Do not attribute idle by aggregating "which CPU op overlaps a
+gap". Once the host correctly waits *while the GPU is busy*, a single 8 ms
+`cudaEventSynchronize` overlaps thousands of unrelated intra-step bubbles and
+scores 45.95 ms of "covered idle" while causing none of it. Use the gap-size
+histogram and gap *counts* instead: host lateness produces few large gaps, extra
+kernels produce many small ones.
 
 Smaller residual deltas, all fusion differences (fastkernels / vLLM):
 
 * `CatArrayBatchedCopy` 28.9 / ~0 -- our `torch.cat` for the absorbed query and
   the indexer concats; vLLM folds them into Triton kernels (and into
   `_DecodeConcatQuantFP8`, which fuses the cat with the fp8 quant).
+  **Fixed for the query; see §27i.**
 * `act_and_mul` 20.2 / 13.3 (`triton_poi_fused_mul_silu_slice`).
 * `scaled_fp8_quant` 23.7 / 18.0 (`triton_poi_fused__to_copy_cat_clamp_mul_reciprocal`).
+  **Fixed; see §27i.**
 * the two absorbed BMMs: our `TNN`+`NNN` 115.7 / vLLM's `TNN` twice 110.6 -- a
-  weight-layout difference in `W_UV`.
+  weight-layout difference in `W_UV`. **Not a real delta -- the 110.6 was a stale
+  reading. A same-run trace gives fastkernels 115.9 against vLLM's 117.1, i.e.
+  fastkernels is marginally ahead. Do not chase this.**
 
 And where fastkernels is **ahead**: RMSNorm reductions (20.9 vs vLLM's ~68.6
 across three Triton kernels), both NVFP4 MoE GEMMs, the decode all-reduce
@@ -3910,3 +3982,280 @@ across three Triton kernels), both NVFP4 MoE GEMMs, the decode all-reduce
 the prefill all-reduce (NCCL RING_LL 16.9 vs torch multimem 30.6). Collective
 *count* is identical at 2 per layer per step, so this is not a sync-count
 difference.
+
+### 27i. Fusing the decode query's concat + fp8 quant
+
+`L1/cat_quant_fp8.py`. The single largest occupancy delta against vLLM turned out
+to be two kernels where vLLM has one:
+
+| | fastkernels | vLLM |
+|---|---|---|
+| before | `CatArrayBatchedCopy` 28.5 + `scaled_fp8_quant` 23.0 = **51.5 ms** | `triton_poi_fused__to_copy_cat_clamp_mul_reciprocal_view_0` **18.2 ms** |
+| after | `_cat_quant_fp8_kernel` **17.2 ms** (9,906 calls @ 1.74 us) | 18.2 ms (9,906 @ 1.83 us) |
+
+vLLM has no Triton source for this to copy. `_DecodeConcatQuantFP8`
+(`mla_attention.py:1262`) is a small subclass that calls `torch.cat` then
+`QuantFP8`, built with `compile_native=True` so **Inductor** emits the fused
+kernel at runtime. fastkernels' MLA path sits inside opaque custom ops that
+Inductor never sees, so the kernel is hand-written here. Note this is a
+*structural* divergence from "match vLLM's implementation": the numerics match,
+the code does not. The faithful alternative is to make the region
+Inductor-visible and let `torch.compile` fuse it.
+
+Arithmetic is taken from the path vLLM actually runs -- `QuantFP8.forward_native`
+(`input_quant_fp8.py:216-220`), which is `x.float() * scale.float().reciprocal()`
+then `.clamp(_FP8_MIN, _FP8_MAX).to(fp8)`. Matching the *native* path matters
+because `compile_native=True` means vLLM never calls its own CUDA op here.
+Verified byte-identical to `cat` + `ops.scaled_fp8_quant` over 48 cases (6 shapes
+x 8 scale/magnitude combinations). The magnitude sweep exists because a first
+pass with plain `randn` never exceeded 448 and so left the clamp untested.
+
+Effect at bs=1 tp=8 (78 layers): summed kernel time 1376.7 -> 1343.9 ms against
+vLLM's 1335.7, i.e. **1.031x -> 1.006x**. GPU occupancy (union of busy intervals)
+8.853 -> 8.626 ms/step against vLLM's 8.529, so the occupancy gap fell from 0.324
+to **0.097 ms/step**. Wall 10.160 -> 9.922 ms/token. Kernels per step 2,818 ->
+2,762 (vLLM 2,310).
+
+**What is left is idle, not occupancy** -- 1.675 ms/step against vLLM's 1.146,
+and it barely moved (1.686 before). Splitting the excess 0.529 ms/step by gap
+size gives three near-equal thirds:
+
+* 0.163 ms/step from ~477 extra gaps under 10 us -- tracks the 452 extra kernel
+  launches per step, so it only shrinks by fusing more kernels
+* 0.155 ms/step from ~5.5 extra gaps of ~28 us
+* 0.159 ms/step from ~1.9 extra gaps of ~83 us
+
+The last two are ~7 bubbles per step, which is neither per-layer (78) nor
+per-indexer-layer (21), so they are step-boundary structure -- candidates are the
+shm signal plus worker-ack spin, the indexer schedule refresh, and the D2H/graph
+launch boundary. That is where the remaining latency is, not in kernel time.
+
+**Still un-fused, deliberately**: the indexer's two concats (~21/step of
+`CatArrayBatchedCopy` remain) and its rope. Those feed a *per-128-block* fp8
+quant rather than a per-tensor one, so the fused kernel here does not apply, and
+the indexer output drives top-k selection where a single flipped index cascades
+catastrophically (§the alignment sections). Worth ~0.13 ms/step; not worth the
+bit-exactness risk until the alignment bar is met.
+
+### 27j. The rest of the latency gap was un-fused elementwise ops
+
+After §27i the decode-window accounting (restricted to decode -- see the method
+note below) put fastkernels 255 us/step behind vLLM on summed kernel time, and one
+kernel *family* accounted for more than the whole gap: generic
+`vectorized_elementwise_kernel` / `unrolled_elementwise_kernel`, 484 us/step over
+**368 launches** against vLLM's 133 us over 112. vLLM has none of the excess
+because its model code runs under Inductor, which fuses these away; fastkernels'
+equivalents sit in eager Python between custom-op calls.
+
+A `TorchDispatchMode` that logs every copy-like dispatch with the live Python
+frame named them exactly (a profiler `with_stack` pass returns no stack for these
+ops -- use dispatch interception instead):
+
+| per step | site | defect |
+|---|---|---|
+| 78 copies | `L2/deepseek_mla_attention.py:309` | the rope kernels mutate q/k **in place** and return the same tensors, so `q[..., nope:] = rope(...)` was a self-copy |
+| ~50 casts | `L1/layer_norm.py:57-59` | `weight.float()` / `bias.float()` re-cast every call -- parameters, so loop-invariant |
+| 21 fills | `L2/sparse_attn_indexer.py:498` | an all -1 `[M, topk]` fallback buffer allocated above the guards and discarded on the happy path |
+| 21 fills | `L2/sparse_attn_indexer.py:322` | `-1` pre-fill needed only by the *partial-write* prefill/mixed branches; pure decode overwrites every element |
+| ~84 muls | `L2/sparse_attn_indexer.py:303` | the `wp_out * q_scale * softmax_scale * n_head**-0.5` chain as four launches |
+
+All five fixes are **bit-neutral** and were verified as such end to end: the
+full-model greedy output hash stays `d7a2acd2734db1f4` across every one. The
+indexer weight chain is now `L1/indexer_weights.py`, which applies the multiplies
+in the *same order and precision* -- pre-multiplying the two scalar constants
+would be one op fewer but is not bit-neutral, and this output drives top-k.
+
+Measured, single-request / fixed-batch-32 against the clean vLLM reference
+(8.949 / 0.511 ms/tok):
+
+| | single-request | fixed-batch-32 |
+|---|---|---|
+| session start | 10.094 (0.887x) | 0.566 (0.903x) |
+| + host run-ahead (§27h) | 9.857 (0.908x) | 0.554 (0.923x) |
+| + fused cat/quant (§27i) | 9.679 (0.925x) | 0.542 (0.943x) |
+| + fused indexer weights | 9.624 (0.930x) | 0.537 (0.951x) |
+| + rope self-copy, LayerNorm cast | 9.504 (0.942x) | 0.536 (0.954x) |
+| + indexer buffer fills | **9.481 (0.944x)** | **0.532 (0.960x)** |
+
+**What is left, and why it is gated.** The largest single remaining item is the MoE
+epilogue `torch.add(shared_out, routed_out, alpha=routed_scaling_factor)` -- 75
+launches/step, 111.5 us/step, and vLLM has **zero** because Inductor folds it into
+a neighbour. There is no bit-neutral route: the options are to pass
+`routed_scaling_factor` into the trtllm MoE kernel, or to accumulate via a
+`beta=1` GEMM epilogue in the shared expert's `down_proj`. Both re-order the
+rounding (a GEMM epilogue adds in fp32 and rounds once; separate ops round the
+GEMM output to bf16 and then add). With mixed alignment already at ~13 against the
+15-token bar, and the project ordering correctness ahead of performance, that
+trade is not ours to make unilaterally.
+
+**Method notes, both of which cost me a wrong conclusion first:**
+
+* Restrict gap/occupancy analysis to the **decode window**. Normalising the whole
+  trace by the decode step count charges prefill-only stalls (the NCCL prefill
+  all-reduce, the large-M MoE GEMM) to every step. Doing that made ~7 phantom
+  "structural bubbles per step" appear and inverted the occupancy/idle split: the
+  whole-trace read said occupancy was closed (0.097 ms/step) and idle dominated
+  (0.529), while decode-only says occupancy 0.287 and idle 0.146. In steady-state
+  decode there are essentially **no** gaps over 20 us in either engine.
+* Profiler events for `copy_`/`to`/`fill_` carry no Python stack. Use a
+  `TorchDispatchMode` with `traceback.extract_stack()` to get file:line.
+
+### 27k. Throughput: two independent defects, neither of them kernel speed
+
+At 0.949x single-request latency, mixed sat at 0.644x and long-context at 0.367x.
+The step profiler (`FASTKERNELS_STEP_PROFILE=1`) split them immediately, and the
+two scenarios turned out to have **unrelated** causes.
+
+**long-context = prefill, starved of an activation arena.** Decode is only 4.87 s
+of 180 s; 96% is prefill (1.58 M tokens at ~9k tok/s). Isolating one 24,576-token
+prefill: 13,839 tok/s against vLLM's 27,412.
+
+The chain, because the first two readings were misleading:
+1. All-reduce looked like the culprit -- 489 ms of 1,249 ms of prefill GPU time,
+   1,559 us/call. But vLLM runs the **same** `ncclDevKernel_AllReduce_Sum_bf16_RING_LL`
+   at 555 us, and a standalone 8-rank benchmark gives 551 us for that 192 MB
+   message. Neither algorithm nor bandwidth was wrong.
+2. The distribution gave it away: median **526 us**, max **134.8 ms**; six calls
+   held 353 ms. A collective's kernel duration includes waiting for the slowest
+   peer, so the all-reduce was a *victim*.
+3. Host profiling named the real cost: **183 `cudaFree` (704 ms) + 186
+   `cudaMalloc` (334 ms)** in one prefill, both device-synchronising.
+4. Cause: KV sizing uses `allocated_bytes.all.peak` from the warmup forward, which
+   runs at `max_num_batched_tokens` but **before the KV cache exists**, so it never
+   exercises the DSA indexer's prefill gather + `fp8_fp4_mqa_logits`. The KV cache
+   therefore consumes the activation arena.
+
+Measured transient is only **2.97 GiB**, but the allocator wants ~12 GiB of pool
+slack to serve it; we were leaving 9.2 GiB. Fix: a **4 GiB prefill arena reserve**
+in MLA KV sizing (`FASTKERNELS_PREFILL_ARENA_GIB`, defaulted on only for indexer
+models). Costs 4.6% of KV -- 29,177 blocks instead of 30,584, still clear of the
+24,863 long-context peaks at -- and restores isolated prefill to 26,946 tok/s
+(**0.98x**). 8 GiB gives nothing more (201 vs 202 tok/s in-scenario), so the arena
+is saturated at 4.
+
+**mixed = large decode batches falling off the CUDA graphs.** Its avg batch of 47
+at 128 sequences is *arithmetically forced* by the output-length distribution
+(`steps x avg_batch == total decode tokens`), so it is not a scheduling defect --
+an early hypothesis of mine that the numbers killed. Pure-decode timing (step
+profiler, prefill excluded) scales well: 0.411 ms/tok at batch 32, 0.107 at 253,
+0.070 at 502.
+
+The histogram at 1000 sequences found it:
+`512-640:83  640-768:97  768-896:79  896-1024:44` -- **303 of 1022 steps, and ~59%
+of all decode tokens, ran at batch >512**. `max_capture_limit` was 512 while
+`max_num_seqs` was 1024, so everything past 512 fell through
+`run_decode_greedy_fast` to the **eager** path. Fix: capture up to `max_num_seqs`
+when it exceeds 512. 83 graphs instead of 63 (96 s vs 75 s of capture); configs
+that cannot exceed 512 concurrent sequences are unaffected.
+
+| mixed | tok/s | vs vLLM 5,129.3 |
+|---|---|---|
+| baseline | 3,303.6 | 0.644x |
+| + 4 GiB arena | 4,210 | 0.821x |
+| + graphs to 1024 | **7,942-8,017** | **~1.55x** |
+
+**Hypotheses the data ruled out**, so they are not worth re-checking: KV
+*evictions* (zero preemptions; `kv_peak` 21% on mixed), more communication
+(identical collective counts and the identical NCCL kernel), larger dtypes, a
+fallback to dense attention (`fmha` time matches vLLM to 0.1%: 319.5 vs 319.9 ms),
+the indexer decode buffer width (`logits_width = max_model_len` matches vLLM's
+`max_model_len=` argument exactly), and the cooperative-vs-persistent top-k gate
+(both engines switch at `num_rows <= 32`).
+
+**What remains on long-context (0.814x).** In-scenario prefill runs 20,700 tok/s
+against 26,946 isolated. Those 96 steps are *mixed* prefill+decode at 792 ms each
+versus 608 ms for the same token count as a pure prefill. Part of that is genuinely
+more indexer work (16k queries spread over up to 64 sequences, each gathering K
+across its full 24.6k context, versus one sequence in the isolated case), and part
+is that vLLM graph-captures these shapes and we do not: its log shows
+`Capturing CUDA graphs (mixed prefill-decode, PIECEWISE)` over 51 shapes, against
+our decode-only FULL capture. That is the remaining engine feature.
+
+**Method note.** Do not amortise a batch sweep over too few decode steps. A first
+sweep at `out=32` with `prompt=512` was measuring mostly *prefill* (262k prefill
+tokens against 16k decode tokens at batch 512) and showed decode scaling badly; the
+step profiler's `fast_decode` timer, which excludes prefill, showed the opposite.
+
+### 27l. Prefill-priority scheduling: faster *and* better aligned
+
+Keeping prefill steps pure -- never folding decode tokens into them -- is the third
+throughput fix, and the one with an unexpected second effect. The mechanism is the
+same one BitNet already used (`is_bitnet` skipped `_schedule_decode_tokens()`);
+`FASTKERNELS_PREFILL_PRIORITY` generalises it and defaults **on**.
+
+Why: identical prefill work runs at **26,829 tok/s as pure prefill steps** against
+~20,700 tok/s when the scheduler folds a handful of decode tokens in. Measured by
+prefilling the exact long-context workload (64 x 24,576 tokens, `max_tokens=1`),
+which also killed the theory that in-scenario prefill was slower because 64
+sequences each gather K across their full context -- pure prefill at 64 sequences
+matches the single-sequence isolated figure (26,829 vs 26,946), so the whole loss
+was the mixing.
+
+| prefill-priority | mixed | mixed alignment | long-context | lc alignment |
+|---|---|---|---|---|
+| off | 8,014.3 (1.562x) | 13.03 | 209.2 (0.843x) | 30.02 |
+| **on** | **8,379.8 (1.634x)** | **26.83** | **235.3 (0.948x)** | 27.23 |
+
+Latency is unchanged (0.954x / 0.957x against 0.955x / 0.955x).
+
+**The alignment result is the important part.** Mixed's average matching prefix
+against vLLM went from 13.03 to **26.83 tokens**, clearing the 15-token bar. This
+diverges from vLLM's batching -- vLLM mixes freely and absorbs the cost with
+PIECEWISE graphs -- yet it makes our *output* match vLLM better, which means the
+unified mixed-batch path is itself a divergence source. That is a concrete lead for
+the remaining alignment work: compare `prepare_mixed_batch` against vLLM's
+mixed-batch construction rather than hunting further in the operators.
+
+**Arena sizing is settled at 4 GiB.** 8 GiB measured *worse* on long-context both
+with mixing (201 vs 202 tok/s) and without (228.1 vs 235.3) -- it buys no extra
+headroom and costs KV blocks (27,770 vs 29,177).
+
+**Remaining on long-context (0.948x).** In-scenario prefill is ~24,470 tok/s against
+26,829 isolated. The scenario's prompts are variable-length where the isolated test
+was uniform, and 255 decode steps still punctuate the 97 prefill steps. Closing the
+last ~5% means either piecewise capture for the residual mixed shapes or better
+variable-length chunk packing.
+
+### 27m. The prefill-priority alignment trade (read before keeping the default)
+
+The final validated run shows prefill-priority is **not** a free win on alignment --
+it moves the two workloads in opposite directions:
+
+| | mixed alignment | long-context alignment |
+|---|---|---|
+| session start (mixing) | 13.17 | 41.77 |
+| + arena only | 13.03 | 30.02 |
+| + prefill-priority | **26.82** | **19.67** |
+
+Mixed roughly doubles and crosses the 15-token bar it had been failing. The
+long-context number looks like a regression, but the run history says it is not
+attributable: across six full runs it reads 25.62, 41.77, 28.88, 30.02, 27.23,
+19.67 -- with only **2 to 7 exact matches out of 64 sequences**, so a couple of
+sequences move the mean by ten tokens. 25.62 predates every change in this session,
+and the configs that keep vLLM-style mixing (28.88, 30.02) overlap the ones that do
+not (27.23, 19.67). **At n=64 this metric cannot resolve the effect.**
+
+Mixed, at n=1000, can: 13.17 and 13.03 with mixing, 26.83 and 26.82 with
+prefill-priority -- reproducible in two runs each. So the defensible statement is
+that prefill-priority clearly helps mixed alignment and has no *measurable* effect
+on long-context alignment either way. If long-context alignment matters, re-measure
+it at a larger sequence count before drawing a conclusion.
+
+`FASTKERNELS_PREFILL_PRIORITY=0` restores vLLM-style mixing, costing long-context
+0.948x -> 0.843x and mixed alignment 26.8 -> 13.0. The fix that would give both --
+vLLM-style mixing *and* mixed-step speed -- is PIECEWISE graph capture for mixed
+prefill-decode shapes, which remains the outstanding engine feature.
+
+### 27n. Failed experiment: one chunk per prompt
+
+With `max_num_batched_tokens=16384` a ~24.6k long-context prompt takes two chunks,
+and the second runs the indexer's chunked-context gather over the first chunk's
+16.4k tokens. Raising the cap to 32768 removes that pass and halves the step count
+(49 prefill steps instead of 97) -- and makes long-context **2x slower**: 113.5
+tok/s (0.457x) against 235.2 (0.948x), even with the arena at 8 GiB.
+
+The transient scales with `chunk_tokens x context`, so doubling the chunk doubles
+the indexer logits buffer (~2.4 GiB at 24,576 x 24,576 x fp32) and puts the
+allocator straight back into the cudaMalloc/cudaFree churn of §27k. The chunked
+gather is cheaper than the memory pressure of avoiding it. Do not raise this cap
+for long-context; 16384 (which is also vLLM's value) is right.

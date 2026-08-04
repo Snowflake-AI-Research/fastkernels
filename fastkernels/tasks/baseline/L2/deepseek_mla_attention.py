@@ -305,9 +305,18 @@ class DeepSeekMLAAttention(nn.Module):
         kv_c_normed = self.kv_a_layernorm(kv_c)
         k_pe = k_pe.unsqueeze(1)  # [N, 1, qk_rope_head_dim]
 
-        # RoPE on q_pe and k_pe
-        q[..., self.qk_nope_head_dim:], k_pe = self.rotary_emb(
-            positions, q[..., self.qk_nope_head_dim:], k_pe)
+        # RoPE on q_pe and k_pe.
+        # The CUDA rope kernels mutate query/key in place and hand the same
+        # tensors back, so assigning the result into the q slice unconditionally
+        # was a self-copy -- 78 `direct_copy_kernel_cuda` launches per decode step
+        # (one per layer) that vLLM does not have. Guard on identity rather than
+        # dropping the write: the native/compiled rope path
+        # (RotaryEmbedding.forward under `torch.compiler.is_compiling`) is
+        # functional and returns fresh tensors, which still have to be stored.
+        q_pe_view = q[..., self.qk_nope_head_dim:]
+        q_pe_out, k_pe = self.rotary_emb(positions, q_pe_view, k_pe)
+        if q_pe_out is not q_pe_view:
+            q_pe_view.copy_(q_pe_out)
 
         # DSA Indexer (V3.2) — rope_emb is wired to self.indexer._rope_emb
         # so the forward takes only tensor args (custom-op safe).
