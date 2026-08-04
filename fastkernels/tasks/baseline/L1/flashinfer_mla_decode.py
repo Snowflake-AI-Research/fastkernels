@@ -67,6 +67,15 @@ class FlashInferMLADecode(nn.Module):
     def available(self) -> bool:
         return flashinfer_mla_decode_supported()
 
+    def ensure_workspaces(self, device: torch.device) -> None:
+        """Materialize the trtllm-gen MLA decode workspace before graph capture.
+
+        See ``TopKPerRow.ensure_workspaces``: a workspace first allocated inside
+        a capture region belongs to that graph's private pool, and later graphs
+        replaying against it fault.
+        """
+        self._get_workspace(device)
+
     def _get_workspace(self, device: torch.device) -> torch.Tensor:
         if self._workspace is None or self._workspace.device != device:
             self._workspace = torch.zeros(

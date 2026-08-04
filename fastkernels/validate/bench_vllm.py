@@ -311,6 +311,79 @@ if os.environ.get("FASTKERNELS_ALIGN_PROFILING_KV_BLOCKS") == "1":
 
             _MGBT.__init__ = _mgbt_init_kernel_aligned
             _MGBT._fastkernels_kernel_aligned_width = True
+# FASTKERNELS_DSA_DETERMINISTIC_TOPK -- override vLLM's nondeterministic DSA
+# top-k (cooperative_topk / persistent_topk / top_k_per_row_{prefill,decode},
+# whose atomic-append output ordering makes greedy decode nondeterministic at
+# seq>index_topk) with flashinfer.top_k(sorted, deterministic, tie_break=SMALL).
+# fastkernels honours the same env flag in its own TopKPerRow, so with this on
+# BOTH engines use a bit-reproducible top-k and long-context greedy-match
+# becomes a valid gate. Off by default (default = vLLM's native kernels).
+if os.environ.get("FASTKERNELS_DSA_DETERMINISTIC_TOPK", "0") != "0":
+    try:
+        import torch as _t
+        import flashinfer as _fi
+        from flashinfer import TopKTieBreak as _TB
+        import vllm._custom_ops  # noqa: F401  registers torch.ops._C
+    except Exception:
+        pass
+    else:
+        def _fk_fi_topk(logits, ks, ke, topk):
+            logits = logits.contiguous()
+            R, N = logits.shape
+            cols = _t.arange(N, device=logits.device)
+            valid = (cols.unsqueeze(0) >= ks.reshape(-1).unsqueeze(1).long()) & (
+                cols.unsqueeze(0) < ke.reshape(-1).unsqueeze(1).long())
+            sen = _t.finfo(logits.dtype).min
+            lm = _t.where(valid, logits, _t.full_like(logits, sen))
+            vals, idx = _fi.top_k(lm, topk, sorted=False, deterministic=True,
+                                  tie_break=int(_TB.SMALL))
+            idx = idx.to(_t.int32)
+            idx = _t.where(vals <= sen, _t.full_like(idx, -1), idx)
+            # Return WINDOW-RELATIVE indices, matching the native
+            # top_k_per_row_prefill kernel: the DSA ``convert_indices`` kernel
+            # maps ``block_id = idx // block_size`` against the PER-REQUEST
+            # block table, so absolute columns of a sequence at a non-zero
+            # packed offset overflow that request's block table and get
+            # dropped (breaking every non-first sequence in a batch). Decode
+            # passes ks=0 (no-op). Then emit index-ASCENDING (value-insensitive
+            # so it survives tiny cross-engine logit ULP diffs).
+            ksr = ks.reshape(-1, 1).to(idx.dtype)
+            idx = _t.where(idx >= 0, idx - ksr, idx)
+            _IM = 2147483647
+            t = _t.where(idx >= 0, idx, _t.full_like(idx, _IM))
+            t, _ = _t.sort(t, dim=-1)
+            return _t.where(t == _IM, _t.full_like(t, -1), t)
+
+        def _fk_coop(logits, lengths, output, workspace, k, msl):
+            ks = _t.zeros(logits.shape[0], dtype=_t.int32, device=logits.device)
+            output.copy_(_fk_fi_topk(logits, ks, lengths.to(_t.int32), k))
+
+        def _fk_prefill(logits, rowStarts, rowEnds, indices, numRows, s0, s1, topK):
+            indices.copy_(_fk_fi_topk(logits, rowStarts.to(_t.int32),
+                                      rowEnds.to(_t.int32), topK))
+
+        def _fk_decode(logits, next_n, seqLens, indices, numRows, s0, s1, topK):
+            sl = seqLens.to(_t.int32)
+            if next_n == 1:
+                rl = sl.reshape(-1)
+            else:
+                B = sl.numel() // next_n
+                j = _t.arange(next_n, device=sl.device, dtype=_t.int32)
+                rl = (sl.reshape(B, 1) - next_n + 1 + j.view(1, next_n)).clamp_min_(0).reshape(-1)
+            ks = _t.zeros(numRows, dtype=_t.int32, device=logits.device)
+            indices.copy_(_fk_fi_topk(logits, ks, rl, topK))
+
+        try:
+            _lib = _t.library.Library("_C", "FRAGMENT")
+            _lib.impl("cooperative_topk", _fk_coop, "CUDA")
+            _lib.impl("persistent_topk", _fk_coop, "CUDA")
+            _lib.impl("top_k_per_row_prefill", _fk_prefill, "CUDA")
+            _lib.impl("top_k_per_row_decode", _fk_decode, "CUDA")
+            import sys as _sys
+            print("[bench sitecustomize] flashinfer deterministic DSA top-k "
+                  "override installed", file=_sys.stderr, flush=True)
+        except Exception:
+            pass
 ''')
 
     current = os.environ.get("PYTHONPATH", "")
@@ -736,6 +809,8 @@ def main():
         }
     if cfg.get("load_format"):
         llm_kwargs["load_format"] = cfg["load_format"]
+    if cfg.get("kv_cache_dtype"):
+        llm_kwargs["kv_cache_dtype"] = cfg["kv_cache_dtype"]
     if cfg.get("max_layers") is not None:
         llm_kwargs["hf_overrides"] = _fastkernels_limit_layers
     # Reference-only backend overrides for models vLLM's default selection
@@ -871,6 +946,8 @@ def main():
         engine_kwargs["max_model_len"] = cfg["max_model_len"]
     if "max_layers" in cfg:
         engine_kwargs["max_layers"] = cfg["max_layers"]
+    if cfg.get("kv_cache_dtype"):
+        engine_kwargs["kv_cache_dtype"] = cfg["kv_cache_dtype"]
     engine = LlamaEngine(**engine_kwargs)
 
     # Warmup -- same 16-token prompt as the vLLM worker, so both sides enter
@@ -1380,6 +1457,8 @@ def main():
         llm_kwargs["distributed_executor_backend"] = "mp"
     if cfg.get("load_format"):
         llm_kwargs["load_format"] = cfg["load_format"]
+    if cfg.get("kv_cache_dtype"):
+        llm_kwargs["kv_cache_dtype"] = cfg["kv_cache_dtype"]
     if cfg.get("limit_mm_per_prompt"):
         llm_kwargs["limit_mm_per_prompt"] = cfg["limit_mm_per_prompt"]
     if cfg.get("max_layers") is not None:
@@ -1931,6 +2010,8 @@ def main():
         llm_kwargs["distributed_executor_backend"] = "mp"
     if cfg.get("load_format"):
         llm_kwargs["load_format"] = cfg["load_format"]
+    if cfg.get("kv_cache_dtype"):
+        llm_kwargs["kv_cache_dtype"] = cfg["kv_cache_dtype"]
     llm = LLM(**llm_kwargs)
 
     from vllm.inputs import ExplicitEncoderDecoderPrompt, TextPrompt
@@ -2371,6 +2452,13 @@ def main():
              "are unaffected. Not supported for Whisper (encoder-decoder).",
     )
     parser.add_argument(
+        "--kv-cache-dtype", default=None,
+        help="Paged-KV cache dtype passed to BOTH engines (e.g. fp8_e4m3). "
+             "Omit to leave each side on its own default ('auto'). This is "
+             "independent of the weight quantization: nvidia/GLM-5.2-NVFP4 has "
+             "NVFP4 weights and an fp8 KV cache.",
+    )
+    parser.add_argument(
         "--trust-remote-code",
         action="store_true",
         help="Pass trust_remote_code=True to the reference vLLM worker when required.",
@@ -2769,6 +2857,7 @@ def main():
         temperature=args.temperature, enforce_eager=args.enforce_eager,
         max_layers=args.max_layers, max_model_len=global_max_seq_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
+        kv_cache_dtype=args.kv_cache_dtype,
         engine_env=engine_env,
         scenarios=scenario_data, latency=latency_data,
     )
@@ -2807,6 +2896,8 @@ def main():
             }
             if args.max_layers is not None:
                 vllm_config["max_layers"] = args.max_layers
+            if args.kv_cache_dtype:
+                vllm_config["kv_cache_dtype"] = args.kv_cache_dtype
             if is_qwen_omni:
                 vllm_config["limit_mm_per_prompt"] = {
                     "image": 1,
@@ -2873,6 +2964,8 @@ def main():
         }
         if args.max_layers is not None:
             kb_config["max_layers"] = args.max_layers
+        if args.kv_cache_dtype:
+            kb_config["kv_cache_dtype"] = args.kv_cache_dtype
         short_name = args.model.split("/")[-1]
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = str(kb_nccl_port)

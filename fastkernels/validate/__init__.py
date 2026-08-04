@@ -284,6 +284,12 @@ def _build_cmd(
             cmd += [flag, str(args.max_requests)]
     if scenario.enforce_eager and harness in _EAGER_OK:
         cmd.append("--enforce-eager")
+    # Paged-KV cache dtype: only bench_vllm plumbs it (to both engines). A
+    # scenario that declares one for a harness without the flag would silently
+    # run at the default, so keep the gate explicit rather than a broad set.
+    kv_cache_dtype = getattr(scenario, "kv_cache_dtype", None)
+    if kv_cache_dtype and harness == "bench_vllm":
+        cmd += ["--kv-cache-dtype", kv_cache_dtype]
     workloads_flag = _WORKLOADS_FLAG.get(harness)
     if workloads_flag:
         declared = _scenario_workloads(scenario)
@@ -351,7 +357,7 @@ def _load_legacy_validate_scenarios(path: Path) -> list[ValidateScenario] | None
     ):
         return None
 
-    allowed_dtypes = {"bfloat16", "float16", "float32", "fp8", "mxfp4"}
+    allowed_dtypes = {"bfloat16", "float16", "float32", "fp8", "mxfp4", "nvfp4"}
     scenarios: list[ValidateScenario] = []
     for index, entry in enumerate(entries):
         if not isinstance(entry, dict):

@@ -9,14 +9,23 @@ MLA equivalent of attention_impl.py's Attention class. Handles:
 - ``kv_cache_dtype="fp8_ds_mla"``: FP8 paged KV cache (656 bytes/token).
   Sparse prefill uses a BF16 workspace gathered/upconverted from FP8;
   sparse decode uses ``flash_mla_with_kvcache(..., is_fp8_kvcache=True)``.
+- ``kv_cache_dtype="fp8_e4m3"``: plain per-tensor FP8 paged cache (576
+  bytes/token) driving vLLM's ``FLASHINFER_MLA_SPARSE`` backend — the
+  trtllm-gen sparse MQA kernel with an fp8-quantized query, plus a dense
+  ``TRTLLM_RAGGED`` MHA prefill whenever every prefill sequence fits inside
+  ``index_topk`` (where sparse attention degenerates to dense anyway). This is
+  what vLLM selects for a quantized MLA cache on Blackwell; note it is a
+  DIFFERENT backend from ``fp8_ds_mla``, which FLASHINFER_MLA_SPARSE rejects
+  outright, and a different cache layout (576 fp8 bytes, no block scales).
 - Dense prefill via flash_attn_varlen_func (FA2/FA3, matching vLLM)
 - Chunked prefill context: gather from cache, up-project, non-causal attn, merge
 - Mixed batch (prefill + decode) with separate FP8/BF16 paths
 
 The default is BF16 so that ``topk_indices``, attention outputs, and
 downstream MoE expert assignments are bit-for-bit comparable to vLLM's
-stock path. Set ``FASTKERNELS_KV_CACHE_DTYPE=fp8_ds_mla`` to switch to the
-FP8 KV cache (extra memory savings, extra quantization noise).
+stock path. Set ``FASTKERNELS_KV_CACHE_DTYPE=fp8_ds_mla`` or ``=fp8_e4m3`` to
+switch to a paged FP8 cache; a model whose scenario declares an fp8 KV cache
+sets it explicitly rather than relying on the env default.
 """
 
 from __future__ import annotations
@@ -38,6 +47,12 @@ from ..L1.flash_mla_decode import (
 )
 from ..L1.flash_mla_sparse_prefill import FlashMLASparsePrefill
 from ..L1.flash_attn_varlen import FlashAttnVarlen
+from ..L1.cat_quant_fp8 import CatQuantFP8
+from ..L1.flashinfer_mla_sparse import (
+    FlashInferMLASparseDecode,
+    TrtllmRaggedPrefill,
+    flashinfer_mla_sparse_available,
+)
 from ..L1.merge_attn_states import MergeAttnStates
 from ..L1.bmm import BatchMatMul
 from ..L1.convert_indices import ConvertIndicesToGlobal
@@ -49,6 +64,11 @@ try:
 except ImportError:  # pragma: no cover - optional vLLM runtime dependency
     _mask_empty_context = None
 
+# Sentinel for the per-step batch-metadata memo: ``None`` is a meaningful
+# result there (no block table => nothing to attend to), so absence needs its own
+# marker.
+_UNSET = object()
+
 _MLA_HEAD_DIM_V = 512
 _MLA_WORKSPACE_HEAD_SIZE = 576  # 512 NoPE + 64 RoPE = 576 BF16 dims
 MIN_HEADS_FOR_BF16_PREFILL = 32
@@ -58,12 +78,19 @@ def _default_kv_cache_dtype() -> str:
     """Resolve the MLA KV cache dtype from ``FASTKERNELS_KV_CACHE_DTYPE``.
 
     Defaults to ``"auto"`` (BF16), matching stock vLLM on DeepSeek-V3.2.
+    ``fp8``/``fp8_ds_mla`` select DeepSeek's 656-byte block-scaled layout;
+    ``fp8_e4m3`` selects the plain per-tensor 576-byte layout that vLLM's
+    FLASHINFER_MLA_SPARSE backend uses. The two are NOT interchangeable, so
+    ``fp8`` is left aliased to ``fp8_ds_mla`` for backwards compatibility and
+    ``fp8_e4m3`` must be spelled out.
     """
     v = os.environ.get("FASTKERNELS_KV_CACHE_DTYPE", "auto").strip().lower()
     if v in ("", "auto", "bf16", "bfloat16"):
         return "auto"
     if v in ("fp8", "fp8_ds_mla"):
         return "fp8_ds_mla"
+    if v in ("fp8_e4m3", "fp8_e4m3fn"):
+        return "fp8_e4m3"
     raise ValueError(f"Unsupported FASTKERNELS_KV_CACHE_DTYPE={v!r}")
 
 
@@ -101,7 +128,8 @@ class MLAAttention(nn.Module):
                  qk_nope_head_dim: int, qk_rope_head_dim: int,
                  v_head_dim: int, kv_lora_rank: int,
                  is_sparse: bool = False,
-                 kv_cache_dtype: str | None = None):
+                 kv_cache_dtype: str | None = None,
+                 topk_tokens: int | None = None):
         super().__init__()
         self.num_heads = num_heads
         self.scale = scale
@@ -111,20 +139,48 @@ class MLAAttention(nn.Module):
         self.v_head_dim = v_head_dim
         self.kv_lora_rank = kv_lora_rank
         self.is_sparse = is_sparse
+        # ``index_topk``. Needed by the FLASHINFER_MLA_SPARSE path both as the
+        # kernel's ``sparse_mla_top_k`` / ``max_seq_len`` and as the threshold
+        # that decides whether prefill can take the dense MHA route.
+        self.topk_tokens = topk_tokens
 
         if kv_cache_dtype is None:
             kv_cache_dtype = _default_kv_cache_dtype()
-        assert kv_cache_dtype in ("auto", "fp8_ds_mla"), (
+        assert kv_cache_dtype in ("auto", "fp8_ds_mla", "fp8_e4m3"), (
             f"MLAAttention: unsupported kv_cache_dtype={kv_cache_dtype!r}"
         )
         self.kv_cache_dtype = kv_cache_dtype
         self.use_fp8_kv_cache = kv_cache_dtype == "fp8_ds_mla"
+        # vLLM's FLASHINFER_MLA_SPARSE backend: plain per-tensor fp8 cache with
+        # the trtllm-gen sparse MQA kernel. Only reachable for a sparse (DSA)
+        # model — vLLM's ``supports_combination`` requires ``index_topk``.
+        self.use_flashinfer_sparse = kv_cache_dtype == "fp8_e4m3"
+        if self.use_flashinfer_sparse:
+            if not is_sparse or topk_tokens is None:
+                raise ValueError(
+                    "kv_cache_dtype='fp8_e4m3' selects vLLM's "
+                    "FLASHINFER_MLA_SPARSE backend, which only supports sparse "
+                    "(DSA) models with an index_topk"
+                )
+            if not flashinfer_mla_sparse_available():
+                raise RuntimeError(
+                    "kv_cache_dtype='fp8_e4m3' needs a Blackwell (sm100) GPU "
+                    "with flashinfer's trtllm_batch_decode_with_kv_cache_mla "
+                    "and trtllm_ragged_attention_deepseek"
+                )
+            if qk_nope_head_dim not in (128, 192):
+                raise ValueError(
+                    "FlashInfer MLA Sparse kernel requires qk_nope_head_dim in "
+                    f"[128, 192], but got {qk_nope_head_dim}"
+                )
 
         self._num_kv_heads = 1
         # ``_head_dim`` is used by external callers (e.g. the engine) to
         # size the cache. For BF16 it's the packed
         # ``kv_lora_rank + qk_rope_head_dim`` (576). For FP8 the cache is
         # uint8 with 656 bytes/token, which we continue to advertise here.
+        # ``fp8_e4m3`` keeps the 576 slot width but stores one byte per element,
+        # matching ``FlashInferMLASparseTRTLLMBackend.get_kv_cache_shape``.
         self._head_dim = (
             kv_lora_rank + qk_rope_head_dim if not self.use_fp8_kv_cache else 656
         )
@@ -172,6 +228,21 @@ class MLAAttention(nn.Module):
             else None
         )
         self.sparse_prefill_op = FlashMLASparsePrefill()
+        # FLASHINFER_MLA_SPARSE ops. Built only for that cache dtype so the other
+        # paths do not pay the flashinfer import or the workspace allocation.
+        if self.use_flashinfer_sparse:
+            self.fi_sparse_decode = FlashInferMLASparseDecode(
+                qk_nope_head_dim=qk_nope_head_dim,
+                qk_rope_head_dim=qk_rope_head_dim,
+                kv_lora_rank=kv_lora_rank,
+            )
+            self.ragged_prefill = TrtllmRaggedPrefill(scale=scale)
+            # Fused concat+quant for the decode query: byte-identical to
+            # ``cat`` + ``QuantFp8MLAQuery`` but one kernel instead of two. See
+            # cat_quant_fp8.py for why vLLM gets this fusion from Inductor and
+            # fastkernels has to write it by hand.
+            self.cat_quant = CatQuantFP8()
+        self._fi_bmm_scale_cache: tuple[float, float] | None = None
         self.get_metadata = FlashMLAGetMetadata()
         self.get_metadata_dense_fp8 = FlashMLAGetMetadataDenseFP8()
         self.varlen_attn = FlashAttnVarlen()
@@ -254,8 +325,33 @@ class MLAAttention(nn.Module):
     def _run_prefill_new_tokens(self, q, k, v, cu_seqlens_q, cu_seqlens_k,
                                 max_seqlen_q, max_seqlen_k,
                                 return_softmax_lse=False):
-        """Run causal attention on new prefill tokens via the L1
-        FlashAttnVarlen op."""
+        """Run causal attention on new prefill tokens.
+
+        Uses the trtllm-gen ragged kernel when the layer is on the
+        FLASHINFER_MLA_SPARSE path -- that is the MLA prefill backend vLLM's
+        ``get_mla_prefill_backend`` selects on sm100 for these head dims
+        ("Using TRTLLM_RAGGED MLA prefill backend"), and FlashAttention's
+        different accumulation order would show up in every prefill token.
+        Every other path keeps the L1 ``FlashAttnVarlen`` op, which is what vLLM
+        selects for them.
+        """
+        if self.use_flashinfer_sparse:
+            seq_lens = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).to(torch.int32)
+            ret = self.ragged_prefill(
+                q, k, v,
+                seq_lens=seq_lens,
+                cu_seq_lens_q=cu_seqlens_q,
+                cu_seq_lens_kv=cu_seqlens_q,
+                max_q_len=max_seqlen_q,
+                max_kv_len=max_seqlen_q,
+                is_causal=True,
+                return_lse=return_softmax_lse,
+            )
+            if isinstance(ret, tuple):
+                return ret[0], ret[1]
+            if return_softmax_lse:
+                return ret, None
+            return ret
         attn_out = self.varlen_attn(
             q, k, v,
             cu_seqlens_q=cu_seqlens_q,
@@ -273,9 +369,32 @@ class MLAAttention(nn.Module):
         return attn_out
 
     def _run_prefill_context_chunk(self, q, k, v, cu_seqlens_q, cu_seqlens_k,
-                                   max_seqlen_q, max_seqlen_k):
-        """Run non-causal attention on a context chunk via the L1
-        FlashAttnVarlen op (always returns LSE for merging)."""
+                                   max_seqlen_q, max_seqlen_k,
+                                   chunk_seq_lens=None):
+        """Run non-causal attention on a context chunk (always returns LSE).
+
+        ``chunk_seq_lens`` is the per-request KV length of this chunk; the
+        trtllm-gen ragged kernel takes it explicitly (vLLM passes
+        ``chunked_context.seq_lens[chunk_idx]``), whereas FlashAttention derives
+        it from ``cu_seqlens_k``. Falls back to the difference of
+        ``cu_seqlens_k`` when the caller does not supply it.
+        """
+        if self.use_flashinfer_sparse:
+            if chunk_seq_lens is None:
+                chunk_seq_lens = (cu_seqlens_k[1:] - cu_seqlens_k[:-1])
+            ret = self.ragged_prefill(
+                q, k, v,
+                seq_lens=chunk_seq_lens.to(
+                    device=q.device, dtype=torch.int32, non_blocking=True,
+                ),
+                cu_seq_lens_q=cu_seqlens_q,
+                cu_seq_lens_kv=cu_seqlens_k,
+                max_q_len=max_seqlen_q,
+                max_kv_len=max_seqlen_k,
+                is_causal=False,
+                return_lse=True,
+            )
+            return ret[0], ret[1]
         attn_out = self.varlen_attn(
             q, k, v,
             cu_seqlens_q=cu_seqlens_q,
@@ -363,6 +482,11 @@ class MLAAttention(nn.Module):
                 cu_seqlens_k=chunked_ctx.cu_seq_lens[i],
                 max_seqlen_q=max_query_len,
                 max_seqlen_k=chunked_ctx.max_seq_lens[i],
+                # ``seq_lens`` is a CPU ``[num_chunks, num_prefills]`` tensor;
+                # row ``i`` is this chunk's per-request KV length, which is what
+                # vLLM hands the ragged kernel as
+                # ``chunked_context.seq_lens[chunk_idx]``.
+                chunk_seq_lens=chunked_ctx.seq_lens[i],
             )
 
             # A request with no context in this chunk attended to zero keys,
@@ -556,6 +680,11 @@ class MLAAttention(nn.Module):
         """
         N = q.shape[0]
 
+        if self.use_flashinfer_sparse:
+            return self._forward_sparse_flashinfer(
+                q, kv_c_normed, k_pe, kv_b_proj, kv_cache, ctx, topk_indices,
+            )
+
         if not self.use_fp8_kv_cache:
             return self._forward_sparse_bf16(q, kv_cache, ctx, topk_indices)
 
@@ -581,31 +710,33 @@ class MLAAttention(nn.Module):
             q, kv_c_normed, k_pe, kv_b_proj, kv_cache, ctx, topk_indices,
             num_prefill_tokens=num_pf, num_decode_tokens=num_dc)
 
-    def _forward_sparse_bf16(self, q, kv_cache, ctx, topk_indices):
-        """BF16 KV cache sparse path, identical to vLLM's ``_forward_bf16_kv``.
+    def _build_unified_sparse_batch_meta(self, q, ctx):
+        """Unified block table + per-token request ids for the sparse paths.
 
-        All tokens (prefill, decode, mixed) go through a single
-        ``flash_mla_sparse_fwd`` call over the BF16 paged cache:
+        The sparse kernels index a single flat cache, so the per-request top-k
+        indices must be translated with one block table covering the whole
+        packed batch. fastkernels packs decode rows first and prefill rows
+        after, so the table is ``cat([decode_block_tables, prefill_block_tables])``
+        (right-padded to a common width) and request ids are numbered in that
+        same order.
 
-        * convert per-request ``topk_indices`` into global slot indices
-          (``convert_indices`` with the batch's unified block table);
-        * absorb ``q`` through ``W_UK_T`` and concat with ``q_pe`` to get
-          a 576-D head ("MQA 576/512 approach");
-        * pad the head count to ``self.prefill_padding`` (64 on Hopper /
-          128 on Blackwell) as required by the BF16 sparse kernel;
-        * call ``flash_mla_sparse_fwd(q, kv_cache.view(-1, 1, 576),
-          topk_indices.view(N, 1, topk), sm_scale)``;
-        * slice output heads back to ``num_heads`` and up-project via
-          ``W_UV``.
+        Memoized on the context: this is batch metadata, identical for every
+        layer, and vLLM likewise builds it once per step in its metadata builder.
+        Recomputing it per layer costs two ``torch.cat``s of the block tables on
+        every one of the model's 78 attention layers.
+
+        Returns ``None`` when the batch has no block table at all (nothing to
+        attend to), letting the caller return zeros.
         """
-        N = q.shape[0]
-        block_size = int(kv_cache.shape[1])
-        num_heads = self.num_heads
-        pad_h = self.prefill_padding
+        cached = getattr(ctx, "_fk_sparse_batch_meta", _UNSET)
+        if cached is not _UNSET:
+            return cached
+        meta = self._compute_unified_sparse_batch_meta(q, ctx)
+        ctx._fk_sparse_batch_meta = meta
+        return meta
 
-        # Build the unified block_table (decode rows first, prefill after)
-        # and per-token req_ids so ``convert_indices`` can translate
-        # per-request topk indices to global slot indices of ``kv_cache``.
+    def _compute_unified_sparse_batch_meta(self, q, ctx):
+        N = q.shape[0]
         if ctx.is_mixed:
             num_dc = ctx.num_decode_tokens
             num_pf = ctx.num_prefill_tokens
@@ -635,16 +766,10 @@ class MLAAttention(nn.Module):
             elif num_decode_seqs > 0:
                 unified_block_table = ctx.decode_block_tables
             else:
-                return torch.zeros(
-                    N, num_heads * self.v_head_dim,
-                    dtype=q.dtype, device=q.device,
-                )
+                return None
         else:
             if ctx.block_tables is None:
-                return torch.zeros(
-                    N, num_heads * self.v_head_dim,
-                    dtype=q.dtype, device=q.device,
-                )
+                return None
             unified_block_table = ctx.block_tables
             num_dc = 0 if ctx.is_prefill else N
             num_pf = N if ctx.is_prefill else 0
@@ -678,6 +803,36 @@ class MLAAttention(nn.Module):
                         qs = int(cu_q[r].item())
                         qe = int(cu_q[r + 1].item())
                         req_ids[qs:qe] = r
+        return unified_block_table, req_ids, num_dc, num_pf
+
+    def _forward_sparse_bf16(self, q, kv_cache, ctx, topk_indices):
+        """BF16 KV cache sparse path, identical to vLLM's ``_forward_bf16_kv``.
+
+        All tokens (prefill, decode, mixed) go through a single
+        ``flash_mla_sparse_fwd`` call over the BF16 paged cache:
+
+        * convert per-request ``topk_indices`` into global slot indices
+          (``convert_indices`` with the batch's unified block table);
+        * absorb ``q`` through ``W_UK_T`` and concat with ``q_pe`` to get
+          a 576-D head ("MQA 576/512 approach");
+        * pad the head count to ``self.prefill_padding`` (64 on Hopper /
+          128 on Blackwell) as required by the BF16 sparse kernel;
+        * call ``flash_mla_sparse_fwd(q, kv_cache.view(-1, 1, 576),
+          topk_indices.view(N, 1, topk), sm_scale)``;
+        * slice output heads back to ``num_heads`` and up-project via
+          ``W_UV``.
+        """
+        N = q.shape[0]
+        block_size = int(kv_cache.shape[1])
+        num_heads = self.num_heads
+        pad_h = self.prefill_padding
+
+        meta = self._build_unified_sparse_batch_meta(q, ctx)
+        if meta is None:
+            return torch.zeros(
+                N, num_heads * self.v_head_dim, dtype=q.dtype, device=q.device,
+            )
+        unified_block_table, req_ids, _num_dc, _num_pf = meta
 
         topk_global = self.convert_indices(
             topk_indices, unified_block_table, block_size, req_ids=req_ids,
@@ -708,11 +863,136 @@ class MLAAttention(nn.Module):
         out = out[:, :num_heads, :]
         return self._v_up_proj(out)
 
-    def _absorb_q_to_latent(self, q: torch.Tensor) -> torch.Tensor:
-        """Absorb q_nope through W_UK_T into the latent space and concat q_pe.
+    def _forward_sparse_flashinfer(self, q, kv_c_normed, k_pe, kv_b_proj,
+                                   kv_cache, ctx, topk_indices):
+        """vLLM's FLASHINFER_MLA_SPARSE path over a plain fp8 MLA cache.
 
-        Output shape: ``[..., H, kv_lora_rank + qk_rope_head_dim]`` (576 for
-        DeepSeek-V3.2). Matches vLLM's MLA decode/sparse query absorption.
+        Mirrors the split in ``MLAAttention.forward_impl``
+        (vllm/model_executor/layers/attention/mla_attention.py:753-903):
+
+        * The packed batch is decode-first, so ``q[:num_mqa]`` are the sparse
+          MQA tokens and ``q[num_mqa:]`` the dense MHA (prefill) ones.
+        * Prefill takes the **dense** MHA route only when every prefill sequence
+          is at most ``index_topk`` long -- at that length the indexer's top-k
+          selects the whole context, so dense and sparse compute the same
+          attention and vLLM uses the cheaper dense kernel. Longer prefills fall
+          back to sparse for ALL tokens (``num_mqa_tokens = q.size(0)``).
+        * The MQA half absorbs q into the 576-D latent, quantizes it to fp8
+          (the trtllm-gen kernel needs q and cache to share a dtype), and calls
+          ``trtllm_batch_decode_with_kv_cache_mla`` with the per-token top-k
+          global slots as a page-size-1 block table.
+
+        ``bmm1_scale``/``bmm2_scale`` fold the q/k dequant scales in exactly as
+        ``FlashInferMLASparseImpl.forward_mqa`` does.
+        """
+        N = q.shape[0]
+        num_heads = self.num_heads
+        block_size = int(kv_cache.shape[1])
+
+        meta = self._build_unified_sparse_batch_meta(q, ctx)
+        if meta is None:
+            return torch.zeros(
+                N, num_heads * self.v_head_dim, dtype=q.dtype, device=q.device,
+            )
+        unified_block_table, req_ids, num_dc, _num_pf = meta
+
+        # --- Decide the prefill route (vLLM's ``use_mha`` gate) --------------
+        num_mqa = num_dc
+        num_mha = N - num_mqa
+        if num_mha > 0:
+            prefill_max_seq_len = (
+                ctx.prefill_max_seqlen_k if ctx.is_mixed else ctx.max_seqlen_k
+            )
+            if prefill_max_seq_len > self.topk_tokens:
+                num_mqa, num_mha = N, 0
+
+        # Decode-only steps (and any batch that went fully sparse) are the hot
+        # path: return the up-projection directly instead of staging it through
+        # a full-size buffer.
+        if num_mha == 0:
+            return self._sparse_mqa(
+                q, topk_indices, kv_cache, unified_block_table, req_ids,
+                block_size, num_mqa,
+            )
+
+        out = torch.empty(
+            N, num_heads * self.v_head_dim, dtype=q.dtype, device=q.device,
+        )
+
+        if num_mha > 0:
+            # Dense prefill over the new tokens (plus chunked context when the
+            # scheduler split the prompt). ``_forward_mha`` reads the prefill
+            # slice of the context, so hand it the prefill tokens only.
+            mha_out = self._forward_mha(
+                q[num_mqa:], kv_c_normed[num_mqa:], k_pe[num_mqa:],
+                kv_b_proj, kv_cache, ctx,
+            )
+            out[num_mqa:] = mha_out
+
+        if num_mqa > 0:
+            out[:num_mqa] = self._sparse_mqa(
+                q, topk_indices, kv_cache, unified_block_table, req_ids,
+                block_size, num_mqa,
+            )
+
+        return out
+
+    def _sparse_mqa(self, q, topk_indices, kv_cache, block_table, req_ids,
+                    block_size, num_mqa):
+        """The sparse top-k MQA half of ``forward_mqa`` for ``q[:num_mqa]``.
+
+        Translates each token's top-k request-local positions into global cache
+        slots (and the count of valid ones, which the kernel takes as its
+        ``seq_lens``), absorbs q into the 576-D latent, quantizes it to fp8, and
+        runs the trtllm-gen sparse kernel. Returns ``[num_mqa, H*v_head_dim]``.
+        """
+        topk_global, valid_counts = self.convert_indices(
+            topk_indices[:num_mqa], block_table, block_size,
+            req_ids=req_ids[:num_mqa], return_valid_counts=True,
+        )
+        # One kernel for concat+quantize: the bf16 [n, H, 576] concatenation is
+        # never materialised.
+        q_fp8 = self.cat_quant(*self._absorb_q_parts(q[:num_mqa]),
+                               self._q_scale)
+        o = self.fi_sparse_decode(
+            q_fp8, kv_cache, topk_global, valid_counts,
+            self.topk_tokens, *self.finalize_kv_scales(),
+        )
+        return self._v_up_proj(o)
+
+    def finalize_kv_scales(self) -> tuple[float, float]:
+        """Resolve the sparse-MLA bmm scales to Python floats, once.
+
+        ``(bmm1_scale, bmm2_scale)`` mirrors ``FlashInferMLASparseImpl.forward_mqa``:
+        ``bmm1 = sm_scale * q_scale * k_scale`` and ``bmm2 = k_scale`` for a
+        quantized cache. vLLM memoizes these too (``if self.bmm1_scale is None``)
+        because reading ``_q_scale`` / ``_k_scale`` as Python floats is a
+        device-to-host copy, and paying it per layer per decode step would
+        serialize every step against the copy engine.
+
+        This MUST run outside CUDA graph capture. The engine calls it from KV
+        cache allocation -- after weight loading, before capture -- because the
+        pre-capture warmup forward runs with an empty cache and so never reaches
+        the sparse decode path: the lazy read would otherwise first happen
+        *during* capture, where a D2H copy is recorded into the graph and replay
+        fails with ``cudaErrorInvalidAddressSpace`` ("operation not supported on
+        global/shared address space").
+        """
+        cached = self._fi_bmm_scale_cache
+        if cached is None:
+            k_scale = float(self._k_scale)
+            cached = (self.scale * float(self._q_scale) * k_scale, k_scale)
+            self._fi_bmm_scale_cache = cached
+        return cached
+
+    def _absorb_q_parts(
+        self, q: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The two halves of the absorbed latent query, unconcatenated.
+
+        ``(q_absorbed [.., H, L], q_pe [.., H, rope])``. Kept separate so the
+        fp8 decode path can hand both to one fused concat+quant kernel instead
+        of materialising the bf16 concatenation first.
         """
         q_nope = q[..., :self.qk_nope_head_dim]
         q_pe = q[..., self.qk_nope_head_dim:]
@@ -720,7 +1000,15 @@ class MLAAttention(nn.Module):
         q_absorbed = self.bmm(
             q_nope.transpose(0, 1), self.W_UK_T,
         ).transpose(0, 1)
-        return torch.cat([q_absorbed, q_pe], dim=-1)
+        return q_absorbed, q_pe
+
+    def _absorb_q_to_latent(self, q: torch.Tensor) -> torch.Tensor:
+        """Absorb q_nope through W_UK_T into the latent space and concat q_pe.
+
+        Output shape: ``[..., H, kv_lora_rank + qk_rope_head_dim]`` (576 for
+        DeepSeek-V3.2). Matches vLLM's MLA decode/sparse query absorption.
+        """
+        return torch.cat(self._absorb_q_parts(q), dim=-1)
 
     def _forward_sparse_mixed_batch(self, q, kv_cache, ctx, topk_indices,
                                     num_prefill_tokens, num_decode_tokens):
@@ -1066,6 +1354,13 @@ class MLAAttention(nn.Module):
                 head_dim_v=_MLA_HEAD_DIM_V,
                 tile_scheduler_metadata=tile_sched_meta,
                 softmax_scale=self.scale,
+                # Sparse attention: the FlashMLA kernel asserts causal==False
+                # whenever ``indices`` is set (the top-k already encodes the
+                # causal span). ``decode_op`` (FlashMLADecode) defaults
+                # causal=True, so pass it explicitly here — matching the
+                # mixed-batch and sparse-decode call sites above and vLLM's
+                # FlashMLASparseImpl (which never passes causal).
+                causal=False,
                 is_fp8_kvcache=True,
                 indices=topk_dc_4d,
             )

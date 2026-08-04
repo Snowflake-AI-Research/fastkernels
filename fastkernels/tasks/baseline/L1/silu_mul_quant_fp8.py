@@ -60,7 +60,11 @@ def _silu_mul_per_token_group_quant_fp8_colmajor(
     y = (silu_out * mul_in).to(tl.float32)
 
     _absmax = tl.maximum(tl.max(tl.abs(y), axis=1), eps)
-    scale_raw = _absmax / fp8_max
+    # Multiply-by-reciprocal (not division) to match vLLM's
+    # ``_silu_mul_per_token_group_quant_fp8_colmajor`` (fp8_utils.py:408):
+    # GPU fast-division for a constexpr divisor introduces a 1-ULP error that
+    # flips FP8 quantization at representable-value boundaries.
+    scale_raw = _absmax * (1.0 / fp8_max)
     y_s = tl.math.exp2(tl.ceil(tl.log2(scale_raw))) if use_ue8m0 else scale_raw
     y_s = tl.reshape(y_s, (BLOCK_M, 1))
     y_q = tl.clamp(y / y_s, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)

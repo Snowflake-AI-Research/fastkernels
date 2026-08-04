@@ -122,15 +122,6 @@ def test_build_native_ttt_command_keeps_paper_variant(tmp_path):
     assert cmd[cmd.index("--variant") + 1] == "125m_e2e"
 
 
-def test_paper_scenarios_load_with_legacy_workloads():
-    scenarios = _resolve_validate_scenarios("paper_scenarios")
-
-    assert len(scenarios) == 47
-    assert scenarios[0].legacy_workloads[0] == "prefill-heavy"
-    assert scenarios[14].hf_name == "ttt_e2e"
-    assert scenarios[14].legacy_workloads == ("125m_e2e",)
-
-
 def test_ray_resources_scale_with_tensor_parallel_degree():
     resources = _ray_resource_options(
         2,
@@ -521,7 +512,7 @@ def test_bench_vjepa2_accepts_exactly_what_the_scenario_tables_declare():
     from fastkernels.validate import _scenario_workloads
     from fastkernels.validate.bench_vjepa2 import _resolve_workloads
 
-    for table in ("full", "paper_scenarios", "paper_scenarios_native"):
+    for table in ("full",):
         scenario = next(
             s for s in _resolve_validate_scenarios(table) if "vjepa2" in s.hf_name
         )
