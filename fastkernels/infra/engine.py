@@ -612,10 +612,9 @@ class ModelRunner:
                     # ``oneshotAllreduceFusionKernel``), and no Inductor
                     # elementwise fusion happened at all (82 ``direct_copy``
                     # kernels per step, 180 us). vLLM compiles this model.
-                    if os.environ.get("FASTKERNELS_KIMI_COMPILE", "1") == "1":
-                        if rank == 0:
-                            print("  [5/6] Compiling Kimi-Linear...", flush=True)
-                        self._compile_model()
+                    if rank == 0:
+                        print("  [5/6] Compiling Kimi-Linear...", flush=True)
+                    self._compile_model()
                     if rank == 0:
                         print("  [5/6] Preparing Kimi decode buffers...", flush=True)
                     self._init_kimi_decode_buffers()
@@ -8274,6 +8273,7 @@ class LlamaEngine:
             multimodal prompts serially, ~9s of a 28s run, so admission spreads
             over ~320 steps and its KV peaks at 97.9% having never preempted.
 
+            Multimodal/encoder-decoder models only; see the scope guard below.
             Returns 1 (admit every step) when the batch already fits.
             """
             if _admit_stride_cache[0]:
@@ -8283,6 +8283,30 @@ class LlamaEngine:
                 _admit_stride_cache[0] = True
                 _admit_stride_cache[1] = max(1, int(_env))
                 return _admit_stride_cache[1]
+            # Both this stagger and the full-length reservation it selects
+            # between are corrections for one multimodal-only cost: a preempted
+            # multimodal request re-runs its *vision encoder* as well as its
+            # prefill, so evictions are dearer for us than for vLLM, which
+            # reserves only the current length in every regime and eats the
+            # preemption. Neither divergence has a text-model justification (no
+            # encoder to redo, and no serial-frontend counterpart in vLLM to
+            # imitate) or a text-model measurement, and on gemma-4-26B-A4B the
+            # reservation regime misfired badly: N*F/usable is only 1.52x
+            # (47,000 blocks of final length against 30,868 usable), which the
+            # spread test below reads as "far over" and answers with a full
+            # reservation -- yet with the reservation off the run peaks at 81.6%
+            # of the pool and preempts zero times. It cost 1496 steps at mean
+            # decode batch 301 against 1044 at 391, i.e. 9,793 -> 10,997 tok/s
+            # on the mixed scenario (1044 steps at mean 391 is the workload's
+            # floor: max output_len is 1024 and sum/max is 392). This is the same
+            # fault 1c9268f removed for gemma-4 once already, reintroduced from
+            # the multimodal side, so gate the whole mechanism on the cost that
+            # motivates it instead of leaving it tree-wide.
+            if not (self.is_qwen_vl or self.is_whisper):
+                _admit_stride_cache[0] = True
+                _admit_stride_cache[1] = 1
+                _admit_stride_cache[2] = False
+                return 1
             # On by default, but the sign of this trade-off depends on how
             # expensive a prefill step is, so it has moved twice under
             # measurement. Striding holds KV under 100% and drives preemptions
@@ -8397,6 +8421,11 @@ class LlamaEngine:
         # vLLM reserves only the current length in all three regimes and eats the
         # preemption; that is cheaper for it than for us because an evicted
         # multimodal request re-runs its vision encoder as well as its prefill.
+        # That cost is also the whole reason to diverge, so _reserve_full() is
+        # false for text models regardless of regime (see _admit_stride) -- and
+        # note that "N*F far over" is a poor proxy for the real peak whenever
+        # output lengths are heterogeneous, because requests retire while others
+        # grow: gemma-4 mixed classifies as 1.52x over and still peaks at 81.6%.
         _committed = [0]
 
         # Track unconditionally, enforce conditionally. Gating the *accounting*
