@@ -1842,6 +1842,19 @@ def load_model(
                             _FkQwen3NextGDN)):
             mod.process_weights_after_loading()
 
+    # Drop the shuffle temporaries and re-baseline the peak counter. This is
+    # load-bearing, not hygiene: ``allocate_kv_cache`` sizes the cache as
+    # ``total*util - used - peak + current``, so it charges the *transient* peak
+    # of anything that ran before it, permanently. The trtllm-gen weight shuffle
+    # walks experts one at a time allocating per-expert temporaries, and leaving
+    # that peak on the books cost Mixtral 39% of its KV cache -- 1,070,160 token
+    # slots against 1,766,400 without it, i.e. ~45 GB of cache lost to 1.4 GB of
+    # weights. That starved the scheduler badly enough to regress long-context
+    # and fixed-batch-32 while looking like a kernel problem.
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
     model.eval()
     return model, config
 

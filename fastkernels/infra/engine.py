@@ -6080,8 +6080,17 @@ class ModelRunner:
         backward") the first time a mixed prefill+decode batch takes the eager
         compiled path.
         """
+        import contextlib
         import gc
         from contextlib import nullcontext
+        # OFF by default: measured no effect. warmup_model tunes only one shape
+        # (a single ~13k-token prefill), so decode widths run on a default
+        # tactic, and tuning them here was a plausible explanation for
+        # trtllm-gen's large-batch weakness. It is not: Mixtral's mixed
+        # throughput was 0.8816x with this on vs 0.8812x off. Kept as an opt-in
+        # because it is cheap (capture 27.9s) and the coverage gap is real.
+        _autotune_decode = os.environ.get(
+            "FASTKERNELS_AUTOTUNE_DECODE_SHAPES", "0") == "1"
         max_bs = self.max_num_seqs
         max_num_blocks = (self.max_model_len + BLOCK_SIZE - 1) // BLOCK_SIZE
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
@@ -6284,15 +6293,25 @@ class ModelRunner:
                 # Warmup forward: for VL, compute inputs_embeds outside and
                 # pass it so the compiled inner model traces the
                 # inputs_embeds branch (never embed_tokens).
-                if ie_slice is not None:
-                    ie_slice.copy_(vl_embed_fn(ids_slice))
-                    outputs[:bs] = self.model(
-                        ids_slice, pos_slice,
-                        inputs_embeds=ie_slice,
-                        **({"deepstack_embeds": _ds(bs)} if _ds_all else {}),
-                    )
-                else:
-                    outputs[:bs] = self.model(ids_slice, pos_slice)
+                #
+                # Run it under FlashInfer's autotuner. ``warmup_model`` only ever
+                # tunes ONE shape -- a single ~13k-token prefill -- so every
+                # decode width was left on whatever default tactic the kernel
+                # picks, which is exactly where a trtllm-gen MoE loses to Triton
+                # at large batch. Tuning here covers every captured decode size.
+                # Safe because this warmup runs *before* ``torch.cuda.graph``
+                # below: tuning must never be inside the captured region.
+                with (_flashinfer_autotune() if _autotune_decode
+                      else contextlib.nullcontext()):
+                    if ie_slice is not None:
+                        ie_slice.copy_(vl_embed_fn(ids_slice))
+                        outputs[:bs] = self.model(
+                            ids_slice, pos_slice,
+                            inputs_embeds=ie_slice,
+                            **({"deepstack_embeds": _ds(bs)} if _ds_all else {}),
+                        )
+                    else:
+                        outputs[:bs] = self.model(ids_slice, pos_slice)
                 lm_logits[:bs] = lm_head.linear_op(
                     outputs[:bs], lm_head.embedding_op.emb.weight)
                 lm_max_vals[:bs], lm_max_idxs[:bs] = lm_logits[:bs].max(dim=-1)

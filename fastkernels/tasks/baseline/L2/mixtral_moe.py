@@ -80,13 +80,22 @@ class MixtralMoE(nn.Module):
         # over once there is enough work per expert to be compute-bound. Keeping
         # both layouts to dispatch on token count was measured too
         # (FASTKERNELS_MOE_TRTLLM_MAX_TOKENS): it recovered mixed to 0.9987x and
-        # single-request to 1.0262x, but the duplicate experts cost ~1.4 GiB per
-        # rank out of the KV cache and that pushed long-context to 0.9316x and
-        # fixed-batch-32 to 0.9044x -- so all three configurations fail exactly
-        # two of the four scenarios. Closing this properly needs trtllm-gen to be
-        # competitive at large token counts (vLLM reaches 15,535 tok/s on mixed
-        # with it, against our 13,690), which an isolated microbenchmark of the
-        # kernel could not reproduce in either entry point.
+        # single-request to 1.0262x, but it is arithmetically infeasible --
+        # keeping both layouts DOUBLES the model. Mixtral's 47B params are almost
+        # entirely experts: 1.41 GiB per layer x 32 layers = ~45 GiB per rank, and
+        # the KV sizing inputs confirm it (live allocation 90.0 GiB with the
+        # duplicate vs 48.0 GiB without, so available KV fell 108.9 -> 66.6 GiB
+        # and token slots 1,784,528 -> 1,091,008). That starved the scheduler and
+        # regressed long-context to 0.9316x and fixed-batch-32 to 0.9044x. Do not
+        # retry dispatch-by-size for a model whose experts dominate its weights.
+        #
+        # The only route that satisfies both axes is making trtllm-gen fast at
+        # large token counts: vLLM reaches 15,535 tok/s on mixed with it while we
+        # reach 13,690, and pristine Triton already matches vLLM (15,511), so the
+        # headroom is in our invocation. The known difference is the entry point --
+        # vLLM drives the PRE-ROUTED ``trtllm_bf16_routed_moe`` (topk computed
+        # outside, packed) where we drive the router-side ``trtllm_bf16_moe``.
+        # FASTKERNELS_MIXTRAL_TRTLLM_ROUTED=1 selects vLLM's.
         self.use_trtllm = (
             trtllm_bf16_moe_supported()
             and os.environ.get("FASTKERNELS_MIXTRAL_TRTLLM_MOE", "0") == "1"
@@ -102,13 +111,9 @@ class MixtralMoE(nn.Module):
             else None
         )
         self._trtllm_weights_ready = False
-        # Crossover between the two MoE kernels, in tokens per step. Measured
-        # (see process_weights_after_loading): trtllm-gen wins at 32 tokens and
-        # loses at 64, so the boundary sits between them. Env-overridable
-        # because the crossover is a property of the expert shapes, and a model
-        # with a different intermediate size will move it.
-        self._trtllm_max_tokens = int(
-            os.environ.get("FASTKERNELS_MOE_TRTLLM_MAX_TOKENS", "32")
+        # Pre-routed vs router-side flashinfer entry point (see __init__ notes).
+        self._trtllm_routed = (
+            os.environ.get("FASTKERNELS_MIXTRAL_TRTLLM_ROUTED", "0") == "1"
         )
 
         # Custom-op dispatch for torch.compile (set by engine after model init)
@@ -128,33 +133,21 @@ class MixtralMoE(nn.Module):
         param.data[expert_id].copy_(loaded_weight.narrow(1, rank * N, N))
 
     def process_weights_after_loading(self) -> None:
-        """Build a second copy of the experts in trtllm-gen's BlockMajorK layout.
+        """Shuffle the experts into trtllm-gen's BlockMajorK layout, in place.
 
-        Both layouts are kept because neither kernel wins everywhere. Measured
-        end-to-end on an idle B200 at tp=2 (idle-host A/B, Triton -> trtllm):
-
-            single-request  (1 tok/step)    0.8588x -> 1.0141x   trtllm wins
-            fixed-batch-32  (32 tok/step)   0.9123x -> 1.0167x   trtllm wins
-            long-context    (64 tok/step)   1.0048x -> 0.9711x   triton wins
-            mixed           (100s/step)     1.0128x -> 0.8812x   triton wins
-
-        So trtllm-gen's low-latency MoE is the better kernel while the block is
-        weight-bandwidth-bound at a handful of tokens, and the Triton grouped
-        GEMM takes over once there is enough work per expert to be
-        compute-bound. Picking either one alone fixes two scenarios and breaks
-        the other two; dispatching on token count passes all four.
-
-        The duplicate costs ~1.4 GiB per rank for Mixtral (0.8% of a B200),
-        taken out of the KV cache. Do not "simplify" this by dropping a layout
-        without re-running all four scenarios.
-
-        Registered as non-persistent buffers so they stay out of state_dict.
+        Mirrors vLLM's ``convert_to_unquantized_kernel_format`` for the
+        FLASHINFER_TRTLLM backend. This REPLACES w13/w2 rather than keeping a
+        second copy, so the Triton path is unreachable afterwards -- guarded by
+        ``use_trtllm``. Keeping both layouts is not an option for this model; see
+        __init__ for the measured reason (it doubles a 47B model).
         """
         if not self.use_trtllm or self._trtllm_weights_ready:
             return
         w13_t, w2_t = prepare_trtllm_bf16_moe_weights(self.w13.data, self.w2.data)
-        self.register_buffer("w13_trtllm", w13_t, persistent=False)
-        self.register_buffer("w2_trtllm", w2_t, persistent=False)
+        # REPLACE, not duplicate: see __init__ for why keeping both is infeasible
+        # here. The Triton path is unreachable afterwards.
+        self.w13 = nn.Parameter(w13_t, requires_grad=False)
+        self.w2 = nn.Parameter(w2_t, requires_grad=False)
         self._trtllm_weights_ready = True
 
     def forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -167,8 +160,7 @@ class MixtralMoE(nn.Module):
         # Branch on token count, not on a captured flag: decode graphs are
         # captured per batch size, so each graph bakes the right kernel, and the
         # eager prefill/mixed path re-evaluates per step.
-        _use_trt = (self._trtllm_weights_ready
-                    and hidden_states.shape[0] <= self._trtllm_max_tokens)
+        _use_trt = self._trtllm_weights_ready
         if os.environ.get("FASTKERNELS_MOE_DEBUG") == "1":
             _seen = MixtralMoE._dbg_seen
             _key = (hidden_states.shape[0], _use_trt)
@@ -179,9 +171,18 @@ class MixtralMoE(nn.Module):
                       f"thr={self._trtllm_max_tokens} -> "
                       f"{'TRTLLM' if _use_trt else 'triton'}", flush=True)
         if _use_trt:
-            out = self.trtllm_moe(
-                hidden_states, self.w13_trtllm, self.w2_trtllm, router_logits,
-            )
+            if self._trtllm_routed:
+                topk_weights, topk_ids = self.topk_softmax(
+                    router_logits, self.top_k, renormalize=True,
+                )
+                out = self.trtllm_moe.forward_routed(
+                    hidden_states, self.w13, self.w2,
+                    topk_weights.to(hidden_states.dtype), topk_ids,
+                )
+            else:
+                out = self.trtllm_moe(
+                    hidden_states, self.w13, self.w2, router_logits,
+                )
         else:
             topk_weights, topk_ids = self.topk_softmax(
                 router_logits, self.top_k, renormalize=True,
