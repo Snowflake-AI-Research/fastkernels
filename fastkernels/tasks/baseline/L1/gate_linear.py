@@ -31,6 +31,43 @@ import torch.nn as nn
 
 from .csrc import _C
 
+# The pybind11 entry points below are raw C++ extension functions, not torch
+# ops, so Dynamo cannot trace them: compiling a model that calls one fails with
+# "Dynamo does not know how to trace the builtin ... router_gemm_bf16_fp32".
+# That is what blocked compiling Kimi-Linear (which in turn cost it the
+# AR+RMSNorm post-grad fusion and all Inductor elementwise fusion).
+#
+# ``torch._dynamo.disable`` is NOT sufficient here: it graph-breaks, and
+# ``compile_model`` uses fullgraph=True, which rejects breaks outright
+# ("Skip calling torch.compiler.disable()'d function"). Registering real custom
+# ops makes them opaque *without* breaking the graph -- the same reason
+# ``fastkernels::unified_attention`` exists for attention.
+
+
+@torch.library.custom_op("fastkernels::router_gemm_bf16_fp32", mutates_args=())
+def _router_gemm_bf16_fp32(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return _C.router_gemm_bf16_fp32(x, weight)
+
+
+@_router_gemm_bf16_fp32.register_fake
+def _(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return x.new_empty((x.shape[0], weight.shape[0]), dtype=torch.float32)
+
+
+@torch.library.custom_op(
+    "fastkernels::dsv3_router_gemm", mutates_args={"output"})
+def _dsv3_router_gemm_op(
+    output: torch.Tensor, hidden_states: torch.Tensor,
+    router_weight: torch.Tensor,
+) -> None:
+    _C.dsv3_router_gemm(output, hidden_states, router_weight)
+
+
+@_dsv3_router_gemm_op.register_fake
+def _(output: torch.Tensor, hidden_states: torch.Tensor,
+      router_weight: torch.Tensor) -> None:
+    return None
+
 
 @functools.cache
 def _is_hopper_or_blackwell() -> bool:
@@ -74,7 +111,7 @@ def _dsv3_router_gemm(
         device=hidden_states.device,
         dtype=output_dtype if output_dtype is not None else torch.float32,
     )
-    _C.dsv3_router_gemm(output, hidden_states, router_weight)
+    _dsv3_router_gemm_op(output, hidden_states, router_weight)
     return output
 
 
@@ -139,7 +176,7 @@ class GateLinear(nn.Module):
             and bf16_input
             and out_dtype == torch.float32
         ):
-            return _C.router_gemm_bf16_fp32(x, weight)
+            return _router_gemm_bf16_fp32(x, weight)
 
         # Tier 3: F.linear fallback. Match vLLM's behaviour: cast input to
         # weight dtype, and cast the output to out_dtype only when a concrete

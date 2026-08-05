@@ -601,6 +601,21 @@ class ModelRunner:
                     print("  [4/6] Allocating Kimi-Linear state cache...", flush=True)
                 self.allocate_mamba_state_cache()
                 if not self.enforce_eager:
+                    # Compile before capturing. Kimi (and Qwen3-Next) were the
+                    # only non-eager models that captured graphs over EAGER
+                    # modules -- ``_compile_model`` is called on the generic
+                    # mamba2 branch and the attention branch, but never here.
+                    # Two costs followed, both visible in a tp=2 bs=1 profile:
+                    # the AR+RMSNorm post-grad fusion never ran (55 separate
+                    # ``cross_device_reduce`` at 484 us plus 54 separate RMSNorm
+                    # at 146 us, where Mixtral/gpt-oss show one fused
+                    # ``oneshotAllreduceFusionKernel``), and no Inductor
+                    # elementwise fusion happened at all (82 ``direct_copy``
+                    # kernels per step, 180 us). vLLM compiles this model.
+                    if os.environ.get("FASTKERNELS_KIMI_COMPILE", "0") == "1":
+                        if rank == 0:
+                            print("  [5/6] Compiling Kimi-Linear...", flush=True)
+                        self._compile_model()
                     if rank == 0:
                         print("  [5/6] Preparing Kimi decode buffers...", flush=True)
                     self._init_kimi_decode_buffers()
