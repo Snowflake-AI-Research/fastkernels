@@ -41,6 +41,18 @@ except Exception:  # pragma: no cover - optional dependency
     _trtllm_bf16_moe = None
     _TRTLLM_BF16_MOE_AVAILABLE = False
 
+try:
+    # Pre-routed sibling: topk is computed by the caller and handed over packed.
+    # This is the entry point vLLM uses (``TrtLlmBf16ExpertsModular.apply`` ->
+    # ``trtllm_bf16_routed_moe``), and it is NOT interchangeable with
+    # ``trtllm_bf16_moe`` performance-wise -- see ``TrtLlmBf16MoE.forward_routed``.
+    from flashinfer.fused_moe import trtllm_bf16_routed_moe as _trtllm_bf16_routed_moe
+
+    _TRTLLM_BF16_ROUTED_AVAILABLE = True
+except Exception:  # pragma: no cover - optional dependency
+    _trtllm_bf16_routed_moe = None
+    _TRTLLM_BF16_ROUTED_AVAILABLE = False
+
 # ``RoutingMethodType`` values (vllm/model_executor/layers/fused_moe/config.py).
 # The kernel implements each scoring/normalization scheme internally, so the
 # caller only names the one its config asks for.
@@ -219,5 +231,53 @@ class TrtLlmBf16MoE(nn.Module):
             routing_method_type=self.routing_method_type,
             activation_type=ACTIVATION_SWIGLU,
             tune_max_num_tokens=self.tune_max_num_tokens,
+        )
+        return out[0] if isinstance(out, (list, tuple)) else out
+
+    def forward_routed(
+        self,
+        hidden_states: torch.Tensor,
+        w13: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Pre-routed variant: caller supplies topk, kernel skips its router.
+
+        This is the entry point vLLM drives for an unquantized bf16 MoE
+        (``TrtLlmBf16ExpertsModular.apply``), and it is a genuinely different
+        kernel path from ``trtllm_bf16_moe`` rather than a convenience wrapper --
+        worth trying when the router-side variant is fast at decode widths but
+        loses at large token counts.
+        """
+        if _trtllm_bf16_routed_moe is None:
+            raise RuntimeError("flashinfer trtllm_bf16_routed_moe unavailable")
+        from flashinfer.fused_moe import WeightLayout
+
+        import vllm.model_executor.layers.fused_moe as _fm  # noqa: F401
+        from vllm.model_executor.layers.fused_moe.utils import (
+            trtllm_moe_pack_topk_ids_weights,
+        )
+
+        packed = trtllm_moe_pack_topk_ids_weights(topk_ids, topk_weights)
+        out = _trtllm_bf16_routed_moe(
+            topk_ids=packed,
+            hidden_states=hidden_states,
+            gemm1_weights=w13,
+            gemm2_weights=w2,
+            num_experts=self.num_experts,
+            top_k=self.top_k,
+            n_group=None,
+            topk_group=None,
+            intermediate_size=self.intermediate_size_per_partition,
+            local_expert_offset=self.local_expert_offset,
+            local_num_experts=self.local_num_experts,
+            routed_scaling_factor=None,
+            routing_method_type=1,  # unused on the pre-routed path
+            use_shuffled_weight=True,
+            weight_layout=WeightLayout.BlockMajorK,
+            do_finalize=True,
+            tune_max_num_tokens=self.tune_max_num_tokens,
+            activation_type=ACTIVATION_SWIGLU,
         )
         return out[0] if isinstance(out, (list, tuple)) else out
