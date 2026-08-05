@@ -8263,6 +8263,14 @@ class LlamaEngine:
             is N*F - N*S/(2*block), so the spread that just fits is
             S >= 2*block*(N*F - usable)/N.
 
+            Caveat on that derivation: N*F, the sum of final lengths, is not the
+            demand capacity has to cover. Requests retire while others grow, so
+            the real peak is lower -- by 0.54x on gemma-4's mixed workload, which
+            is enough to invert the regime choice below (see the scope guard).
+            ``tests/debug/workload_batch_profile.py`` computes both from a
+            workload; the peak it reports matched the engine's own kv_peak
+            counter to 0.3% there.
+
             Spreading by admitting *fewer per step* was measured and is a net
             loss (0.83x -> 0.79x): the vision encoder batches per step, so going
             from 25 images per call to 7 raised per-image encoder cost 27% and

@@ -64,6 +64,8 @@ def run_fastkernels(args, prompts, out_lens):
     engine = LlamaEngine(
         model_name=args.model, seed=args.seed, enforce_eager=args.enforce_eager,
         tensor_parallel_size=args.tp, max_model_len=args.max_model_len,
+        **({"kv_cache_dtype": args.kv_cache_dtype}
+           if args.kv_cache_dtype else {}),
     )
     engine.generate([[0] * 16], SamplingParams(temperature=0.0, max_tokens=16,
                                                ignore_eos=True))
@@ -93,6 +95,8 @@ def run_vllm(args, prompts, out_lens):
         gpu_memory_utilization=0.9, max_model_len=args.max_model_len,
         enable_prefix_caching=False,
         disable_log_stats=not args.log_stats,
+        **({"kv_cache_dtype": args.kv_cache_dtype}
+           if args.kv_cache_dtype else {}),
     )
     if args.tp > 1:
         kwargs["distributed_executor_backend"] = "mp"
@@ -127,6 +131,9 @@ def main():
                          "--scenario mixed alone resolves to.")
     ap.add_argument("--num-seqs", type=int, default=1000)
     ap.add_argument("--tp", type=int, default=1)
+    ap.add_argument("--kv-cache-dtype", default="",
+                    help="e.g. fp8_e4m3, for rows whose sweep entry sets it "
+                         "(it changes the KV pool size, hence admission).")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--enforce-eager", action="store_true")
     ap.add_argument("--log-stats", action="store_true",
