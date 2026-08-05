@@ -8306,10 +8306,14 @@ class LlamaEngine:
             # of the pool and preempts zero times. It cost 1496 steps at mean
             # decode batch 301 against 1044 at 391, i.e. 9,793 -> 10,997 tok/s
             # on the mixed scenario (1044 steps at mean 391 is the workload's
-            # floor: max output_len is 1024 and sum/max is 392). This is the same
-            # fault 1c9268f removed for gemma-4 once already, reintroduced from
-            # the multimodal side, so gate the whole mechanism on the cost that
-            # motivates it instead of leaving it tree-wide.
+            # floor: max output_len is 1024 and sum/max is 392). End to end
+            # against vLLM 0.26 on B200 tp=1, full validate config, that row is
+            # 0.822x -> 0.997x and 1.039x on two idle-host passes, with
+            # long-context, single-request and fixed-batch-32 unchanged at
+            # 1.01x / 1.12-1.13x / 1.14-1.15x and identical output token counts.
+            # This is the same fault 1c9268f removed for gemma-4 once already,
+            # reintroduced from the multimodal side, so gate the whole mechanism
+            # on the cost that motivates it instead of leaving it tree-wide.
             #
             # Gemma-4 is also the only text model on this loop that can reach the
             # gate, because its pool is the smallest by a wide margin -- 31,179
