@@ -28,6 +28,12 @@ class MixtralMoE(nn.Module):
       w2:  [E, hidden_size, intermediate_per_tp]
     """
 
+    # Diagnostic only (FASTKERNELS_MOE_DEBUG=1): records which kernel each
+    # distinct token count resolved to. Class-level so all 32 layers share one
+    # set and each size is reported once. Note the capture loop walks batch
+    # sizes largest-first, so filter small if that is what you care about.
+    _dbg_seen: set = set()
+
     def __init__(self, config):
         super().__init__()
         self.num_experts = config.num_local_experts
@@ -161,8 +167,18 @@ class MixtralMoE(nn.Module):
         # Branch on token count, not on a captured flag: decode graphs are
         # captured per batch size, so each graph bakes the right kernel, and the
         # eager prefill/mixed path re-evaluates per step.
-        if (self._trtllm_weights_ready
-                and hidden_states.shape[0] <= self._trtllm_max_tokens):
+        _use_trt = (self._trtllm_weights_ready
+                    and hidden_states.shape[0] <= self._trtllm_max_tokens)
+        if os.environ.get("FASTKERNELS_MOE_DEBUG") == "1":
+            _seen = MixtralMoE._dbg_seen
+            _key = (hidden_states.shape[0], _use_trt)
+            if _key not in _seen and hidden_states.shape[0] <= 64:
+                _seen.add(_key)
+                print(f"  [moe-dbg] tokens={hidden_states.shape[0]} "
+                      f"ready={self._trtllm_weights_ready} "
+                      f"thr={self._trtllm_max_tokens} -> "
+                      f"{'TRTLLM' if _use_trt else 'triton'}", flush=True)
+        if _use_trt:
             out = self.trtllm_moe(
                 hidden_states, self.w13_trtllm, self.w2_trtllm, router_logits,
             )
