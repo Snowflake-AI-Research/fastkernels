@@ -612,7 +612,7 @@ class ModelRunner:
                     # ``oneshotAllreduceFusionKernel``), and no Inductor
                     # elementwise fusion happened at all (82 ``direct_copy``
                     # kernels per step, 180 us). vLLM compiles this model.
-                    if os.environ.get("FASTKERNELS_KIMI_COMPILE", "0") == "1":
+                    if os.environ.get("FASTKERNELS_KIMI_COMPILE", "1") == "1":
                         if rank == 0:
                             print("  [5/6] Compiling Kimi-Linear...", flush=True)
                         self._compile_model()
@@ -2578,6 +2578,28 @@ class ModelRunner:
                 ctx = get_context()
                 ctx.kda_state = sm_
                 ctx.kda_metadata = md
+
+                # Mark the batch dim dynamic BEFORE the first
+                # compile-triggering forward. ``compile_model`` traces under
+                # ``skip_all_guards_unsafe``, so without this the first bucket's
+                # batch size is baked into the compiled subgraphs and silently
+                # reused at every other size -- which surfaced as
+                # "Expected batch size 1024 for query and block_table, got 1024
+                # and 1008" when capture reached a different bucket. The mamba
+                # and attention capture paths already do this; this one did not,
+                # which is what blocked compiling Kimi-Linear.
+                if self._compiled and not self._mark_dynamic_done:
+                    # Every buffer sliced by ``bs`` has to be marked, not just
+                    # input_ids: leaving any of them at a static size makes the
+                    # shape solver reject the dynamic dim outright
+                    # ("ConstraintViolationError ... L['input_ids'].size()[0]").
+                    # ``cu_q_v`` is [:bs+1], a different size expression, so it
+                    # needs marking too or the solver cannot relate s0+1 to s0.
+                    for _t in (input_ids_v, positions_v, state_idx_v,
+                               seq_lens_v, has_init_v, slot32_v, slot64_v,
+                               bt_v, cu_q_v, logit_idx_v):
+                        torch._dynamo.mark_dynamic(_t, 0)
+                    self._mark_dynamic_done = True
 
                 # Warmup eager so kernels autotune outside the graph
                 hidden = self.model(input_ids_v, positions=positions_v, state_manager=sm_)

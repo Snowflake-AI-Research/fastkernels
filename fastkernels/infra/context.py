@@ -351,6 +351,15 @@ def auto_register_no_compile_layers(model: "nn.Module") -> None:
         # Kimi-Linear untraceable and left it capturing graphs over eager
         # modules (no AR+RMSNorm fusion, 82 direct_copy kernels/step).
         "KimiMoE", "SharedExpertMoE",
+        # KimiDeltaAttention already dispatches through
+        # fastkernels::kda_attention (a SPLITTING_OP) when _use_custom_op is set,
+        # exactly as vLLM lists vllm::kda_attention in its splitting_ops -- but
+        # it was never registered here, so the flag stayed False and the layer
+        # was traced inline. Its per-step KDA metadata lives on the module-global
+        # Context, which Dynamo then bakes as a static shape, giving
+        # "ConstraintViolationError (... kda_metadata.state_indices.size()[0],
+        # L['input_ids'].size()[0])". Behind the op boundary it stays opaque.
+        "KimiDeltaAttention",
         "Attention", "MLAAttention", "SparseAttnIndexer",
         "WhisperCrossAttention",
         "Mamba2Mixer",
