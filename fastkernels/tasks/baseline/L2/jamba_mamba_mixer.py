@@ -303,8 +303,13 @@ class JambaMambaMixer(nn.Module):
             n_p = num_prefill_tokens
             n_d = num_decode_tokens
 
+            # No ``.contiguous()`` on the decode-half views here either: this
+            # branch went from dead code to the hot path when the scheduler
+            # started mixing, and the vendored kernels read their inputs through
+            # explicit strides (see the homogeneous decode path below for the
+            # same reasoning and the measurement).
             x_p = x_states[:, :n_p]                                  # [I, n_p]
-            x_d = x_states[:, n_p:].transpose(0, 1).contiguous()     # [n_d, I]
+            x_d = x_states[:, n_p:].transpose(0, 1)                  # [n_d, I]
             gate_p = gate[:, :n_p]                                   # [I, n_p]
             gate_d = gate[:, n_p:]                                   # [I, n_d]
 
@@ -325,13 +330,15 @@ class JambaMambaMixer(nn.Module):
                 conv_state_indices=state_indices_d,
                 null_block_id=-1,
             )                                                        # [n_d, I]
-            conv_out_d = conv_out_d_t.transpose(0, 1).contiguous()   # [I, n_d]
+            conv_out_d = conv_out_d_t.transpose(0, 1)                # [I, n_d]
+            # ``cat`` materialises the combined buffer, so the halves do not
+            # need to be dense going in.
             conv_out = torch.cat([conv_out_p, conv_out_d], dim=-1)   # [I, n_p+n_d]
 
             # SSM transform on the combined post-conv output.
             dt, B_bts, C_bts = self._ssm_transform(conv_out.transpose(-2, -1))
             dt_p = dt[:, :n_p]                                       # [I, n_p]
-            dt_d = dt[:, n_p:].transpose(0, 1).contiguous()          # [n_d, I]
+            dt_d = dt[:, n_p:].transpose(0, 1)                       # [n_d, I]
             B_p = B_bts[:n_p]                                        # [n_p, S]
             B_d = B_bts[n_p:]                                        # [n_d, S]
             C_p = C_bts[:n_p]                                        # [n_p, S]
@@ -355,18 +362,18 @@ class JambaMambaMixer(nn.Module):
             scan_out_d = torch.empty_like(conv_out_d.transpose(0, 1))  # [n_d, I]
             selective_state_update(
                 ssm_state,
-                conv_out_d.transpose(0, 1).contiguous(),
+                conv_out_d.transpose(0, 1),
                 dt_d,
                 self.A,
                 B_d, C_d, self.D,
                 dt_bias=time_proj_bias,
-                z=gate_d.transpose(0, 1).contiguous(),
+                z=gate_d.transpose(0, 1),
                 dt_softplus=True,
                 state_batch_indices=state_indices_d,
                 null_block_id=-1,
                 out=scan_out_d,
             )
-            scan_out_d = scan_out_d.transpose(0, 1).contiguous()     # [I, n_d]
+            scan_out_d = scan_out_d.transpose(0, 1)                  # [I, n_d]
 
             scan_out = torch.cat([scan_out_p, scan_out_d], dim=-1)   # [I, n_p+n_d]
             return self.out_proj(scan_out.transpose(-2, -1))

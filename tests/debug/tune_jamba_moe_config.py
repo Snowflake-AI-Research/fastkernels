@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 """Tune the Triton MoE config for Jamba's expert shape (E=16, N=14336) on B200.
 
-``_get_default_config`` keys BLOCK_SIZE_M on the token count M alone, ignoring
-how many rows actually land on each expert. For Jamba that is wrong in the
-decode regime: at 256 tokens with top-2 of 16 experts each expert sees ~32 rows,
-but M=256 selects the "large" heuristic with ``BLOCK_SIZE_M=128``, so
-``moe_align_block_size`` pads every expert to 128 rows and three quarters of the
-grouped GEMM's work is padding. Profiled in-engine, ``_fused_moe_kernel`` was
-16.16 ms of a 26.4 ms batch-256 decode step -- 5.6 TB/s against a 90 GiB weight
-sweep, where the same kernel hits 7.2 TB/s at batch 32.
+``_fused_moe_kernel`` is 63-74% of a Jamba decode step -- 16.16 ms of 26.4 ms at
+batch 256 -- and vLLM ships no tuned table for this shape, so
+``_get_default_config``'s heuristic applies. That heuristic keys BLOCK_SIZE_M on
+the token count M alone, ignoring how many rows land on each expert, which looked
+like it should matter a lot: at 256 tokens with top-2 of 16 experts each expert
+sees ~32 rows, but M=256 selects ``BLOCK_SIZE_M=128``, so
+``moe_align_block_size`` pads every expert to 128 and three quarters of the
+grouped GEMM's arithmetic is padding.
+
+That theory was WRONG, and this script is what disproved it. The full grid buys
+only 1.04-1.13x, all of it below M=128 -- the kernel is bandwidth-bound at
+~5.6 TB/s against a 90 GiB weight sweep, so the wasted MACs are hidden and
+BLOCK_SIZE_M barely moves it. Keep that in mind before spending another day on
+the padding: the win here is real but small, and it does not come from where it
+looks like it should.
 
 Rather than change the shared heuristic (every MoE model in the repo reads it),
 this writes a tuned table to ``L1/moe_configs/``, which ``_get_moe_configs``
@@ -16,10 +23,12 @@ searches and which is keyed by ``E`` and ``N`` -- so it applies to Jamba's exper
 shape and nothing else.
 
 Measures the whole ``FusedExperts`` op, not one GEMM, so the moe_align/moe_sum
-cost of a given BLOCK_SIZE_M is included in the choice.
+cost of a given BLOCK_SIZE_M is included in the choice. It still measures it in
+ISOLATION, which is not where the kernel runs -- see ``--max-tuned-m`` and
+``tune_jamba_moe_ingraph.py``.
 
 Usage:
-    python tests/debug/tune_jamba_moe_config.py --quick     # spot-check M=256
+    python tests/debug/tune_jamba_moe_config.py --quick     # spot-check
     python tests/debug/tune_jamba_moe_config.py --write     # full sweep + emit
 """
 
@@ -92,6 +101,16 @@ def main():
                          "full sweep.")
     ap.add_argument("--write", action="store_true",
                     help="Write the winning configs to L1/moe_configs/.")
+    ap.add_argument(
+        "--max-tuned-m", type=int, default=64,
+        help="Keys above this get the heuristic's 'large' config rather than "
+             "this sweep's winner. Default 64 because the standalone winners "
+             "above it do NOT hold in-engine: the M=256 pick measured 1.07x "
+             "faster here and made the real batch-256 decode step 6.7% slower, "
+             "and re-timing inside the captured graph put the heuristic back on "
+             "top by 1.06x. Raise it only after confirming with "
+             "tune_jamba_moe_ingraph.py.",
+    )
     ap.add_argument("--iters", type=int, default=30)
     args = ap.parse_args()
 
@@ -164,6 +183,19 @@ def main():
               f"{best_us:>9.1f} {base_us / best_us:>6.2f}x  {best_cfg}")
 
     if args.write:
+        # See --max-tuned-m: above the cutoff, emit the heuristic's own "large"
+        # config so the table reproduces what is committed instead of this
+        # sweep's in-isolation winners.
+        heuristic_large = {
+            "BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 16, "num_warps": 8, "num_stages": 4,
+        }
+        pinned = sum(1 for m in best if m > args.max_tuned_m)
+        for m in list(best):
+            if m > args.max_tuned_m:
+                best[m] = dict(heuristic_large)
+        print(f"\n  pinned {pinned} keys above M={args.max_tuned_m} to the "
+              f"heuristic's large config")
         out_dir = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
             "..", "..", "fastkernels", "tasks", "baseline", "L1", "moe_configs",

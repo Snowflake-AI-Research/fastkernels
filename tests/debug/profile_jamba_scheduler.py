@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
 """Account for every forward pass a JambaEngine ``mixed`` run makes.
 
-``mixed`` is the row that degrades with scale -- 0.96x of vLLM at 64 sequences
-but 0.83x at 1000 -- which points at the scheduler rather than any kernel. The
-suspicion this probe tests: ``JambaEngine.generate`` is phase-pure, so each loop
-iteration runs a SEPARATE prefill forward and decode forward. Once the first
-``max_num_seqs`` prompts are resident, sequences finish a few per step, so the
-engine admits a few, and every iteration then pays a full second pass over all
-32 layers' weights to prefill one or two prompts. vLLM's chunked prefill puts
-those prompt tokens in the SAME forward as the decode rows.
+Written to test why ``mixed`` degraded with scale -- 0.96x of vLLM at 64
+sequences but 0.83x at 1000 -- which pointed at the scheduler rather than any
+kernel. It confirmed the cause: ``generate`` was phase-pure, so each iteration
+ran a SEPARATE prefill and decode forward, and once ``max_num_seqs`` prompts were
+resident only one or two sequences finished per step, so a whole second pass over
+all 32 layers' weights went to prefilling a median of 43 tokens. 327 prefill
+calls, 305 of them under 512 tokens, 50.5% of the wall clock.
+
+Still the right probe for tuning ``prefill_batch_floor`` /
+``prefill_max_defer_steps``, and for checking the pass mix after any scheduler
+change. Note that ``_run_mixed_step`` is counted into BOTH the prefill and decode
+columns, since one forward carries both halves -- so those two columns sum past
+100% of wall by design once mixing is on. Use ``--floor`` / ``--defer`` to sweep
+in one process; each sweep point is a full generate over the same prompts.
 
 Prints, for the real WildChat mixed workload:
 
-  * prefill vs decode forward counts and total device time in each,
+  * prefill / decode / mixed forward counts and total device time in each,
   * the distribution of prefill widths (a histogram of tokens per prefill call),
-  * how many prefill calls were "small" (< 25% of ``max_num_batched_tokens``),
-    which is the wasted-pass count the hypothesis predicts.
+  * how many prefill calls were "small" (< 25% of ``max_num_batched_tokens``).
 
 Usage:
     python tests/debug/profile_jamba_scheduler.py --num-seqs 1000
+    python tests/debug/profile_jamba_scheduler.py --floor 256 --floor 512
 """
 
 from __future__ import annotations
@@ -76,11 +82,13 @@ def main():
 
     stats = {
         "prefill_calls": 0, "prefill_tokens": 0, "prefill_s": 0.0,
+        "mixed_calls": 0, "mixed_s": 0.0,
         "decode_calls": 0, "decode_rows": 0, "decode_s": 0.0,
         "prefill_widths": [], "decode_widths": [],
     }
     raw_prefill = engine._run_prefill_chunks
     raw_decode = engine._run_decode_step
+    raw_mixed = engine._run_mixed_step
 
     def timed_prefill(chunks):
         torch.cuda.synchronize()
@@ -107,8 +115,28 @@ def main():
         stats["decode_widths"].append(len(running))
         return out
 
+    def timed_mixed(chunks, decode_seqs):
+        """A mixed step is one forward carrying both halves, so its cost is
+        attributed to both counters -- ``prefill_s + decode_s`` will therefore
+        exceed wall once mixing is on. That is the point of mixing: the halves
+        share one pass over the weights, so neither can be costed alone."""
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        out = raw_mixed(chunks, decode_seqs)
+        torch.cuda.synchronize()
+        dt = time.perf_counter() - t0
+        width = sum(c for _, c in chunks)
+        stats["mixed_calls"] += 1
+        stats["prefill_tokens"] += width
+        stats["decode_rows"] += len(decode_seqs)
+        stats["mixed_s"] += dt
+        stats["prefill_widths"].append(width)
+        stats["decode_widths"].append(len(decode_seqs))
+        return out
+
     engine._run_prefill_chunks = timed_prefill
     engine._run_decode_step = timed_decode
+    engine._run_mixed_step = timed_mixed
 
     sp = [SamplingParams(temperature=0.0, max_tokens=ol, ignore_eos=True)
           for ol in out_lens]
@@ -147,6 +175,10 @@ def _report(engine, stats, outs, wall, floor, defer):
           f"{stats['decode_s']:>7.2f}s ({stats['decode_s'] / wall * 100:.1f}%)  "
           f"{stats['decode_rows']:,} rows    "
           f"{stats['decode_s'] / max(stats['decode_calls'], 1) * 1000:.2f} ms/call")
+    print(f"  mixed  : {stats['mixed_calls']:>6} calls  "
+          f"{stats['mixed_s']:>7.2f}s ({stats['mixed_s'] / wall * 100:.1f}%)  "
+          f"carrying both halves  "
+          f"{stats['mixed_s'] / max(stats['mixed_calls'], 1) * 1000:.2f} ms/call")
     print(f"  prefill width: median {np.median(pw):.0f}  mean {pw.mean():.0f}  "
           f"max {pw.max():.0f}  (budget {budget})")
     print(f"  decode  width: median {np.median(dw):.0f}  mean {dw.mean():.0f}  "

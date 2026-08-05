@@ -11,9 +11,15 @@ what that choice costs at the token counts the four bench rows actually hit:
 1 and 32 for the latency rows, ~200-256 for decode at concurrency, and 16384
 for a full chunked-prefill step.
 
-CAUTION: a MoE microbenchmark has already misled this project once -- the
-Mixtral trtllm/Triton crossover could not be reproduced outside the engine
-because the engine replays the call inside a CUDA graph. Treat a win here as a
+Result on B200 (2026-08-05): our Triton path wins at every token count from 1 to
+16384, by 1.16-1.33x. So Jamba keeps the Triton MoE and the reference's kernel
+choice is NOT worth adopting here -- which is the opposite of the Mixtral answer.
+
+CAUTION: a MoE microbenchmark has already misled this project twice. The Mixtral
+trtllm/Triton crossover could not be reproduced outside the engine, and the
+config sweep in ``tune_jamba_moe_config.py`` picked an M=256 config that was 1.07x
+faster standalone and 6.7% slower in the real decode step. The engine replays this
+kernel inside a CUDA graph next to 32 layers of other work. Treat a win here as a
 reason to wire the kernel up and re-measure end-to-end, not as a result.
 
 Usage:
@@ -81,6 +87,16 @@ def main():
     topk_softmax = TopKSoftmax()
     fused = FusedExperts()
 
+    # trtllm-gen/CUTLASS define the gated activation as [w3; w1] where the
+    # checkpoint (and our Triton path) store [w1; w3]. Feeding the checkpoint
+    # order runs the same FLOPs on the wrong halves: max-abs diff 11.03 instead
+    # of 0.125, i.e. a timing comparison that looks fine and a correctness
+    # column that looks broken. Same rotation
+    # ``prepare_trtllm_bf16_moe_weights`` applies for the trtllm path.
+    w13_swapped = torch.cat(
+        [w13[:, INTERMEDIATE:], w13[:, :INTERMEDIATE]], dim=1,
+    ).contiguous()
+
     try:
         from flashinfer.fused_moe import cutlass_fused_moe
 
@@ -117,7 +133,7 @@ def main():
                     input=x,
                     token_selected_experts=ids_i32,
                     token_final_scales=scales,
-                    fc1_expert_weights=w13,
+                    fc1_expert_weights=w13_swapped,
                     fc2_expert_weights=w2,
                     output_dtype=torch.bfloat16,
                     quant_scales=[],

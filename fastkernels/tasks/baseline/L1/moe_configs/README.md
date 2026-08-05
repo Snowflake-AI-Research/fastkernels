@@ -31,5 +31,9 @@ here only where an in-engine A/B confirmed the win.
 
 Regenerate with:
 
-    python tests/debug/tune_jamba_moe_config.py --write     # standalone sweep
+    python tests/debug/tune_jamba_moe_config.py --write     # sweep + emit
     python tests/debug/tune_jamba_moe_ingraph.py --bs 256   # confirm in-graph
+
+`--write` pins every key above `--max-tuned-m` (default 64) to the heuristic's
+config for the reason above, so it reproduces this file rather than the sweep's
+in-isolation winners. Raise the cutoff only after an in-graph A/B says to.

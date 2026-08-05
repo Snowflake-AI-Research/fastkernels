@@ -16,8 +16,14 @@ Three numbers per batch size:
   * ``wall``   -- end-to-end per step, so ``wall - prep - gpu`` is slack.
 
 With ``--profile`` it also prints the top kernels by self CUDA time and the
-share held by ``copy``/``elementwise`` kernels, which is what the Mamba mixer's
-redundant ``.contiguous()`` calls show up as.
+share held by ``copy``/``elementwise`` kernels -- the signature of a layer
+materialising views the vendored kernels would have read strided.
+
+Answered and not worth re-running: whether the decode graph is captured at
+``__init__`` or re-recorded after a representative prefill makes no difference
+(25.75 vs 25.86 ms at batch 256). The 24.2 ms that
+``tune_jamba_moe_ingraph.py`` reports is an artifact of its own re-capture loop,
+not of capture timing; only compare candidates within one of its runs.
 
 Usage:
     python tests/debug/profile_jamba_decode.py --bs 1 --bs 32 --steps 30
@@ -130,29 +136,32 @@ def _time_decode(engine, running, steps):
 def _rebuild_decode_metadata(engine, running):
     """Replica of ``_run_decode_step``'s host-side metadata build.
 
+    This has to track the engine's build or ``prep`` becomes a number about code
+    that no longer runs: it replicated the pre-optimization version for a while
+    and kept reporting 0.58 ms after the engine's own prep had dropped to
+    ~0.05 ms, which reads as "the optimization did nothing".
+
     Kept in the probe rather than factored out of the engine so the engine's hot
-    loop is not restructured just to be measurable.
+    loop is not restructured just to be measurable. What it mirrors is the
+    steady-state ``reuse_invariants`` branch: the block tables and Mamba slots
+    are per-sequence invariants, rebuilt only when the running set changes.
     """
     n = len(running)
     page_size = engine._page_size
-    bps = engine._max_blocks_per_seq
-    ids_np = np.empty(n, dtype=np.int64)
-    pos_np = np.empty(n, dtype=np.int64)
-    slot_np = np.empty(n, dtype=np.int64)
-    ctx_np = np.empty(n, dtype=np.int32)
-    cache_idx_np = np.empty(n, dtype=np.int32)
-    bt_np = np.full((n, bps), -1, dtype=np.int32)
-    for i, s in enumerate(running):
-        ids_np[i] = s.last_token
-        new_pos = len(s) - 1
-        pos_np[i] = new_pos
-        slot_np[i] = int(s.block_table[new_pos // page_size]) * page_size + (
-            new_pos % page_size
-        )
-        ctx_np[i] = new_pos + 1
-        bt_np[i, : len(s.block_table)] = s.block_table
-        cache_idx_np[i] = s.state_slot
-    return bt_np
+    lens_np = np.fromiter((len(s) for s in running), dtype=np.int64, count=n)
+    np.fromiter((s.last_token for s in running), dtype=np.int64, count=n)
+    pos_np = lens_np - 1
+    lens_np.astype(np.int32)
+    bt_np = engine._decode_meta_bt
+    if bt_np is None or bt_np.shape[0] != n:
+        bps = engine._max_blocks_per_seq
+        bt_np = np.full((n, bps), -1, dtype=np.int32)
+        for i, s in enumerate(running):
+            bt_np[i, : len(s.block_table)] = s.block_table
+    return (
+        bt_np[np.arange(n), pos_np // page_size].astype(np.int64) * page_size
+        + pos_np % page_size
+    )
 
 
 def _profile(engine, running, steps):
@@ -171,7 +180,14 @@ def _profile(engine, running, steps):
         torch.cuda.synchronize()
         wall = time.perf_counter() - t0
 
-    events = [e for e in prof.key_averages() if e.self_device_time_total > 0]
+    # Leaf kernels only: a top-level ``aten::`` entry carries the device time of
+    # the kernel it launched, so summing both double-counts and reports GPU busy
+    # over 100%.
+    events = [
+        e for e in prof.key_averages()
+        if e.self_device_time_total > 0
+        and not e.key.startswith(("aten::", "_C::", "torch"))
+    ]
     events.sort(key=lambda e: e.self_device_time_total, reverse=True)
     total_gpu_us = sum(e.self_device_time_total for e in events)
     print(f"\n  wall {wall * 1000 / steps:.3f} ms/step, "
@@ -281,13 +297,6 @@ def main():
              "varying how many sequences carry it. The Mamba-1 varlen scan's "
              "cost is O(num_seqs x total_tokens), so these are not equivalent.",
     )
-    ap.add_argument(
-        "--recapture-after-prefill", action="store_true",
-        help="Re-record the decode graph after the prefill has run, instead of "
-             "using the one captured during __init__. The in-graph MoE tuner "
-             "read 24.2 ms/step this way against 25.9 ms for the init-time "
-             "graph, so this checks whether capture timing is worth 6%%.",
-    )
     args = ap.parse_args()
     batch_sizes = args.bs or [1, 32]
     max_num_seqs = args.max_num_seqs or max(batch_sizes)
@@ -320,15 +329,6 @@ def main():
             [randint(5, 60000) for _ in range(args.prompt_len)] for _ in range(bs)
         ]
         running = _prefill_to_running(engine, prompts)
-
-        if args.recapture_after_prefill:
-            bucket = engine._pick_bucket(bs)
-            engine._decode_graphs.pop(bucket, None)
-            # Freeing the old graph drops the shared pool's use count to zero,
-            # so re-entering that pool trips an allocator assert; take a new one.
-            engine._cuda_graph_mempool_id = torch.cuda.graph_pool_handle()
-            with torch.inference_mode():
-                engine._capture_decode_graph(bucket)
 
         # Warm the bucket this batch size dispatches to.
         _time_decode(engine, running, 5)
