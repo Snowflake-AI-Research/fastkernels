@@ -84,24 +84,58 @@ class KimiDeltaAttention(nn.Module):
 
         projection_size = self.head_dim * self.num_heads
 
+        # q/k/v/b are four ColumnParallelLinear GEMMs over the same
+        # hidden_states, so at decode width they are four launches of a GEMV-shaped
+        # kernel. Profiled at tp=2 bs=1 they are the
+        # ``nvjet_sm100_tst_16x64_64x16_4x1_v_bz_TNN`` at 99.2 calls/step x 7.0 us =
+        # 694 us of a 4.06 ms step (16.8%) -- a 16-row tile is the compiler telling
+        # us there is not enough work per launch. One [3*proj + num_heads] GEMM does
+        # the same math in one launch with a tile that fits.
+        #
+        # Only the loader needs care: ColumnParallelLinear shards its output, and
+        # rank r needs *its own shard of each sub-projection* laid out end to end --
+        # not the r-th contiguous slice of the concatenation. ``_qkvb_weight_loader``
+        # places each one at its local offset. Kept separate under quantization,
+        # where the block scales would have to be concatenated too.
+        self.qkvb_proj = ColumnParallelLinear(
+            self.hidden_size,
+            3 * projection_size + self.num_heads,
+            bias=False,
+            quant_config=None,
+        ) if quant_config is None else None
+        if self.qkvb_proj is not None:
+            _ps_local = projection_size // self.tp_size
+            _nh_local = self.num_heads // self.tp_size
+            self._ps_local = _ps_local
+            self._nh_local = _nh_local
+
+            def _qkvb_weight_loader(param, loaded_weight, shard_id):
+                # shard_id 0/1/2/3 = q/k/v/b (see packed_modules_mapping in
+                # L4/kimi_linear.py). b_proj is num_heads wide, the others
+                # projection_size.
+                rank = _tp_rank()
+                if shard_id == 3:
+                    local, offset = _nh_local, 3 * _ps_local
+                else:
+                    local, offset = _ps_local, shard_id * _ps_local
+                param.data[offset:offset + local].copy_(
+                    loaded_weight.narrow(0, rank * local, local),
+                )
+
+            self.qkvb_proj.weight.weight_loader = _qkvb_weight_loader
+
         self.q_proj = ColumnParallelLinear(
-            self.hidden_size,
-            projection_size,
-            bias=False,
+            self.hidden_size, projection_size, bias=False,
             quant_config=quant_config,
-        )
+        ) if quant_config is not None else None
         self.k_proj = ColumnParallelLinear(
-            self.hidden_size,
-            projection_size,
-            bias=False,
+            self.hidden_size, projection_size, bias=False,
             quant_config=quant_config,
-        )
+        ) if quant_config is not None else None
         self.v_proj = ColumnParallelLinear(
-            self.hidden_size,
-            projection_size,
-            bias=False,
+            self.hidden_size, projection_size, bias=False,
             quant_config=quant_config,
-        )
+        ) if quant_config is not None else None
 
         self.f_a_proj = ReplicatedLinear(
             self.hidden_size,
@@ -125,7 +159,7 @@ class KimiDeltaAttention(nn.Module):
             self.num_heads,
             bias=False,
             quant_config=quant_config,
-        )
+        ) if quant_config is not None else None
 
         self.q_conv1d = _Conv1DWeights(projection_size, self.conv_size)
         self.k_conv1d = _Conv1DWeights(projection_size, self.conv_size)
@@ -372,11 +406,22 @@ class KimiDeltaAttention(nn.Module):
         num_tokens = hidden_states.size(0)
         self._ensure_triton_allocator(hidden_states.device)
 
-        q_proj_states = self.q_proj(hidden_states)
-        k_proj_states = self.k_proj(hidden_states)
-        v_proj_states = self.v_proj(hidden_states)
+        if self.qkvb_proj is not None:
+            _p = self._ps_local
+            qkvb = self.qkvb_proj(hidden_states)
+            q_proj_states = qkvb[..., :_p]
+            k_proj_states = qkvb[..., _p:2 * _p]
+            v_proj_states = qkvb[..., 2 * _p:3 * _p]
+            raw_beta = qkvb[..., 3 * _p:]
+        else:
+            q_proj_states = self.q_proj(hidden_states)
+            k_proj_states = self.k_proj(hidden_states)
+            v_proj_states = self.v_proj(hidden_states)
+            raw_beta = self.b_proj(hidden_states)
 
-        beta = self.b_proj(hidden_states).float().sigmoid().unsqueeze(0)
+        # ``.float()`` already materializes a contiguous copy, so the beta slice
+        # never reaches a kernel strided.
+        beta = raw_beta.float().sigmoid().unsqueeze(0)
         # Raw gate projection, shaped [1, n, H, D] and left ungated: the prefill
         # chunk kernel applies A_log/dt_bias itself, and the decode path gates
         # with ``fused_kda_gate`` just before its call. Mirrors vLLM's

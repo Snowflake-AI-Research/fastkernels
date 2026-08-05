@@ -206,6 +206,19 @@ class KimiLinearForCausalLM(nn.Module):
     packed_modules_mapping = {
         "gate_proj": ("gate_up_proj", 0),
         "up_proj": ("gate_up_proj", 1),
+        # KDA's q/k/v/b, fused into one GEMM. The keys are DOTTED on purpose: this
+        # mapping matches by substring, and a bare "b_proj" is also a substring of
+        # f_b_proj, g_b_proj and kv_b_proj -- it would silently redirect those
+        # weights into the beta shard. ".b_proj." does not match "...f_b_proj..."
+        # because the character before b_proj there is "_", not ".".
+        #
+        # Only present on the unquantized path; when KimiDeltaAttention keeps the
+        # four separate, ``get_parameter`` raises, the packed branch breaks with
+        # matched=False, and the loader falls through to the original names.
+        ".q_proj.": (".qkvb_proj.", 0),
+        ".k_proj.": (".qkvb_proj.", 1),
+        ".v_proj.": (".qkvb_proj.", 2),
+        ".b_proj.": (".qkvb_proj.", 3),
     }
 
     def __init__(self, config: KimiLinearConfig, quant_config: dict | None = None):
