@@ -8310,6 +8310,20 @@ class LlamaEngine:
             # fault 1c9268f removed for gemma-4 once already, reintroduced from
             # the multimodal side, so gate the whole mechanism on the cost that
             # motivates it instead of leaving it tree-wide.
+            #
+            # Gemma-4 is also the only text model on this loop that can reach the
+            # gate, because its pool is the smallest by a wide margin -- 31,179
+            # blocks, where the other four are 70,892 (Llama-3.1-8B), 110,463
+            # (Mixtral-8x7B tp=2), 216,987 (gpt-oss-120b tp=2) and 29,177 at
+            # block_size 64 (GLM-5.2-NVFP4 tp=8). All four were replayed under
+            # FASTKERNELS_MM_ADMIT_SCOPE=all on the mixed workload: none ever
+            # stops on "reserved", none takes a stride, and all already run at
+            # their workload floor (KV peaks 34.6% / 25.6% / 11.9% / 21.3%), so
+            # this guard is a measured no-op for them. Gemma-4's pool is small
+            # only because 25 of its 30 layers are sliding_attention whose
+            # out-of-window blocks we do not free -- see
+            # _allocate_variable_kv_cache.
+            #
             # FASTKERNELS_MM_ADMIT_SCOPE=all restores the tree-wide behaviour,
             # which is how a text model is A/B'd against it.
             if (not (self.is_qwen_vl or self.is_whisper)
