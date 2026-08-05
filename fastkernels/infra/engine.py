@@ -8302,7 +8302,10 @@ class LlamaEngine:
             # fault 1c9268f removed for gemma-4 once already, reintroduced from
             # the multimodal side, so gate the whole mechanism on the cost that
             # motivates it instead of leaving it tree-wide.
-            if not (self.is_qwen_vl or self.is_whisper):
+            # FASTKERNELS_MM_ADMIT_SCOPE=all restores the tree-wide behaviour,
+            # which is how a text model is A/B'd against it.
+            if (not (self.is_qwen_vl or self.is_whisper)
+                    and os.environ.get("FASTKERNELS_MM_ADMIT_SCOPE") != "all"):
                 _admit_stride_cache[0] = True
                 _admit_stride_cache[1] = 1
                 _admit_stride_cache[2] = False

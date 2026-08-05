@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
-"""Single-engine probe of the Gemma4 ``mixed`` scenario, at a chosen context len.
+"""Single-engine probe of one throughput scenario, at a chosen context length.
 
 ``bench_vllm`` sizes ``max_model_len`` from the *largest* scenario in the run, so
-the mixed row is measured at 167,799 tokens in a full validate pass but at 9,982
-when ``--scenario mixed`` runs alone -- and the two disagree (0.82x vs 0.91x).
-This probe takes ``--max-model-len`` explicitly so that variable can be isolated
-without paying for the long-context scenario, and drives one engine at a time so
-a run costs ~2 minutes instead of ~12.
+gemma-4's mixed row is measured at 167,799 tokens in a full validate pass but at
+9,982 when ``--scenario mixed`` runs alone. This probe takes ``--max-model-len``
+explicitly so that variable can be isolated, and drives one engine at a time so a
+run costs ~2 minutes instead of ~12 -- which is what makes it usable for A/B'ing
+scheduler settings (``FASTKERNELS_MM_ADMIT_SCOPE``,
+``FASTKERNELS_MM_ADMIT_STRIDE``, ...) across models.
 
 The warmup sequence is copied from ``bench_vllm``'s workers verbatim (engine
 warmup, then a ``max_tokens=1`` pass at the scenario's real shapes, then
 ``block_manager.reset()`` on the fastkernels side) so the timed region here is
-the same one the benchmark reports.
+the same one the benchmark reports. Pair it with ``FASTKERNELS_STEP_PROFILE=1``
+for the step/occupancy/admission breakdown.
 
 Usage:
-    python tests/debug/gemma4_mixed_probe.py --engine fastkernels --max-model-len 167799
-    python tests/debug/gemma4_mixed_probe.py --engine vllm        --max-model-len 9982
+    python tests/debug/mixed_scenario_probe.py --engine fastkernels --max-model-len 167799
+    python tests/debug/mixed_scenario_probe.py --engine vllm --max-model-len 9982
+    FASTKERNELS_STEP_PROFILE=1 python tests/debug/mixed_scenario_probe.py \
+        --model meta-llama/Llama-3.1-8B-Instruct --max-model-len 9982
 """
 
 import argparse
@@ -25,7 +29,6 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "../.."))
 
-MODEL = "google/gemma-4-26B-A4B-it"
 
 
 def load_workload(args):
@@ -36,7 +39,7 @@ def load_workload(args):
         load_real_prompt_workload,
     )
 
-    tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
+    tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     samples = load_real_prompt_workload(
         args.scenario, tok, num_requests=args.num_seqs,
         decode_cap=DEFAULT_DECODE_CAPS[args.scenario],
@@ -59,7 +62,7 @@ def run_fastkernels(args, prompts, out_lens):
     from fastkernels.infra.engine import LlamaEngine, SamplingParams
 
     engine = LlamaEngine(
-        model_name=MODEL, seed=args.seed, enforce_eager=args.enforce_eager,
+        model_name=args.model, seed=args.seed, enforce_eager=args.enforce_eager,
         tensor_parallel_size=args.tp, max_model_len=args.max_model_len,
     )
     engine.generate([[0] * 16], SamplingParams(temperature=0.0, max_tokens=16,
@@ -85,7 +88,7 @@ def run_vllm(args, prompts, out_lens):
 
     os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
     kwargs = dict(
-        model=MODEL, seed=args.seed, trust_remote_code=True,
+        model=args.model, seed=args.seed, trust_remote_code=True,
         enforce_eager=args.enforce_eager, tensor_parallel_size=args.tp,
         gpu_memory_utilization=0.9, max_model_len=args.max_model_len,
         enable_prefix_caching=False,
@@ -117,6 +120,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--engine", choices=["fastkernels", "vllm"],
                     default="fastkernels")
+    ap.add_argument("--model", default="google/gemma-4-26B-A4B-it")
     ap.add_argument("--scenario", default="mixed")
     ap.add_argument("--max-model-len", type=int, default=167799,
                     help="167799 reproduces a full validate pass; 9982 is what "

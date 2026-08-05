@@ -28,6 +28,10 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--cap", type=int, default=1024,
                     help="max_num_seqs, for the band edges")
+    ap.add_argument("--block-size", type=int, default=16)
+    ap.add_argument("--blocks", type=int, default=0,
+                    help="KV pool size in blocks (the engine prints it as "
+                         "'KV cache: N blocks'), to compare against demand")
     args = ap.parse_args()
 
     import numpy as np
@@ -67,9 +71,29 @@ def main():
     )
     print(f"    bands             {bands}")
     for frac in (0.25, 0.5, 0.75):
-        k = int(np.searchsorted(-np.sort(-batch), -0, side="left"))  # noqa: F841
         n_below = int((batch < frac * batch.max()).sum())
         print(f"    steps below {frac:.0%} of peak batch: {n_below}")
+
+    # Peak KV demand under the same instantaneous-admission model. This is the
+    # quantity the admission gate actually needs: request i holds
+    # ceil((prompt_i + t)/block) blocks while it is live, and requests retire
+    # while others grow, so the peak is far below sum(final length) whenever
+    # output lengths are heterogeneous. Comparing against ``--blocks`` says
+    # whether the pool is genuinely oversubscribed.
+    b = args.block_size
+    held = np.array([
+        int(((inp[out > t] + t + b - 1) // b).sum()) for t in range(steps)
+    ])
+    final = int((((inp + out) + b - 1) // b).sum())
+    print(f"\n  KV DEMAND (block_size={b})")
+    print(f"    sum of final lengths   {final:,} blocks")
+    print(f"    true peak in flight    {held.max():,} blocks "
+          f"(at step {int(held.argmax())})")
+    print(f"    peak / sum-of-final    {held.max() / final:.2f}x")
+    if args.blocks:
+        print(f"    pool                   {args.blocks:,} blocks -> "
+              f"sum-of-final is {final / args.blocks:.2f}x the pool, "
+              f"true peak is {held.max() / args.blocks:.2f}x")
 
 
 if __name__ == "__main__":
