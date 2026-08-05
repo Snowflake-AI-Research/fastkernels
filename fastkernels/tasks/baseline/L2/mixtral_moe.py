@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import os
-
 import torch
 import torch.nn as nn
 
@@ -53,79 +51,43 @@ class MixtralMoE(nn.Module):
         self.fused_experts = FusedExperts()
         self.allreduce = AllReduce()
 
-        # trtllm-gen BF16 MoE: what vLLM 0.26 selects for Mixtral on Blackwell
-        # (its oracle logs "Using FlashInfer TRTLLM Unquantized MoE backend"
-        # ahead of the Triton fused_moe path). Our Triton MoE is where Mixtral's
-        # decode deficit lives: profiled at tp=2 bs=1, ``_fused_moe_kernel`` was
-        # 55.4% of the step (64 calls x 37.8 us = 2.42 ms of 4.37 ms), and the
-        # step was 100% GPU-bound -- total self CUDA time equalled wall time, so
-        # there is no host or idle slack to reclaim. The MoE kernel IS the gap.
+        # trtllm-gen BF16 MoE is the default, matching vLLM 0.26's kernel choice
+        # exactly: its oracle logs "Using FlashInfer TRTLLM Unquantized MoE
+        # backend" and selects ``TrtLlmBf16ExpertsMonolithic``, which is the
+        # router-side ``trtllm_bf16_moe`` we drive. A/B against the Triton grouped
+        # GEMM is still available through ``FASTKERNELS_TRTLLM_BF16_MOE=0``, which
+        # ``trtllm_bf16_moe_supported`` honours.
         #
-        # OFF by default, but note this is a genuine trade rather than a clear
-        # loss -- scored against the 0.95x bar it fails FEWER scenarios than the
-        # Triton default does. Idle-host A/B at tp=2, Triton -> trtllm:
+        # Flipping to trtllm closed Mixtral's latency axis (single-request
+        # 0.86x -> 1.01x, fixed-batch-32 0.91x -> 1.02x) but at first regressed
+        # ``mixed`` throughput to ~0.90x. The cause was NOT the kernel: a clean
+        # sequential profile at 1000 sequences showed the trtllm MoE GEMMs at or
+        # below the Triton ``_fused_moe_kernel`` in device time. It was CPU
+        # dispatch. The fused trtllm call costs 412-676 us of host time per
+        # invocation (autotuner tactic lookup + routing config + cooperative
+        # launch setup), 2.3-3.7x the Triton path's ~182 us. At 32 layers an
+        # EAGER step therefore burns ~21 ms of host dispatch that a CUDA-graph
+        # replay would pay only once. vLLM hides it by capturing mixed/decode
+        # steps in graphs; our engine graphs decode but capped capture at bs=512,
+        # so at high concurrency (mixed reaches ~1000 concurrent seqs) every
+        # decode step with bs>512 ran eager and re-paid the dispatch. Raising the
+        # capture cap to 1024 for MoE models (see ``capture_cudagraph`` in
+        # engine.py) cut the profiled generate 14.4 s -> 12.1 s and lifted
+        # GPU-busy 77.7% -> 92.9% with the kernel sum unchanged -- the fix lives
+        # there, not here.
         #
-        #     single-request  (1 tok/step)    0.8588x -> 1.0141x   trtllm passes
-        #     fixed-batch-32  (32 tok/step)   0.9123x -> 1.0167x   trtllm passes
-        #     long-context    (64 tok/step)   1.0048x -> 0.9711x   both pass
-        #     mixed           (100s/step)     1.0128x -> 0.8812x   only Triton
-        #
-        # So Triton fails 2 (single-request, fixed-batch-32) and trtllm fails 1
-        # (mixed). Do not score this by "which side regressed" -- long-context's
-        # 1.0048 -> 0.9711 is a regression but still clears the bar, and counting
-        # it as a failure is what made this look like a 2-for-2 wash. Flipping the
-        # default would close Mixtral's entire latency axis at the cost of mixed
-        # throughput; it stays off because that trades a passing throughput
-        # scenario for a passing latency one, which is a product call.
-        #
-        # trtllm-gen's low-latency MoE wins while the block is
-        # weight-bandwidth-bound at a few tokens; the Triton grouped GEMM takes
-        # over once there is enough work per expert to be compute-bound. Keeping
-        # both layouts to dispatch on token count was measured too: it recovered
-        # mixed to 0.9987x and single-request to 1.0262x, but it is
-        # arithmetically infeasible -- keeping both layouts DOUBLES the model.
-        # Mixtral's 47B params are almost entirely experts: 1.41 GiB per layer x
-        # 32 layers = ~45 GiB per rank, and the KV sizing inputs confirm it (live
-        # allocation 90.0 GiB with the duplicate vs 48.0 GiB without, so available
-        # KV fell 108.9 -> 66.6 GiB and token slots 1,784,528 -> 1,091,008). That
-        # starved the scheduler and regressed long-context to 0.9316x and
-        # fixed-batch-32 to 0.9044x. Do not retry dispatch-by-size for a model
-        # whose experts dominate its weights -- and note it cannot be made free
-        # by sharing one copy: the bf16 kernel hard-asserts BlockMajorK. Both
-        # entry points accept ``weight_layout=MajorK`` with
-        # ``use_shuffled_weight=False``, but passing the plain Triton layout fails
-        # at every token count with ``Check failed: (weight_layout ==
-        # batchedGemm::gemm::MatrixLayout::BlockMajorK) is false``.
-        #
-        # What is NOT the cause of the mixed deficit, all measured:
-        #   * the kernel degrading at prefill widths -- per-token cost is flat
-        #     from 1024 to 16384 tokens (0.663 -> 0.607 us/tok, slightly
-        #     improving), and chunking the call is strictly worse at every size.
-        #   * a different entry point -- vLLM's oracle logs
-        #     ``TrtLlmBf16ExpertsMonolithic``, which is the router-side
-        #     ``trtllm_bf16_moe`` we already drive. It has no token-count guard
-        #     and no Triton fallback, so vLLM runs this same kernel at every
-        #     width and still reaches 15,535 tok/s where we reach 13,711.
-        #   * a different autotune bucket set -- both engines run
-        #     ``max_num_batched_tokens=16384`` at dp=1, so vLLM's
-        #     ``fi_moe_largest_bucket`` == the 16384 we pass.
-        #   * KV sizing -- single-layout trtllm gets 1,780,736 token slots vs
-        #     Triton's 1,784,528, so this is not eviction.
-        #
-        # That leaves something *around* the call rather than in it. One clue:
-        # trtllm-gen logs ``cooperative launch SM allocation: 140 SMs used for
-        # MoE, 8 SMs reserved for overlapping kernels`` -- a launch holding 140
-        # of 148 SMs cannot be co-scheduled, which would explain why it wins at
-        # bs=1 (nothing to overlap) and loses on mixed (other work per step). It
-        # cannot be the whole story, since vLLM runs the same cooperative kernel
-        # and its mixed is fast; the question is what *we* overlap with the MoE
-        # that vLLM does not. Compare a mixed-step kernel table under both flags
-        # reading wall-vs-sum-of-kernels, not kernel times -- every finding above
-        # came from a decode-only bs=1 profile, and mixed is what regresses.
-        self.use_trtllm = (
-            trtllm_bf16_moe_supported()
-            and os.environ.get("FASTKERNELS_MIXTRAL_TRTLLM_MOE", "0") == "1"
-        )
+        # Do NOT try to recover the small-token regime by keeping both weight
+        # layouts and dispatching on token count. It was measured (mixed 0.9987x,
+        # single-request 1.0262x) but is arithmetically infeasible: Mixtral's 47B
+        # params are almost entirely experts (~45 GiB per rank at tp=2), so a
+        # second layout roughly DOUBLES the model -- live allocation 90.0 GiB vs
+        # 48.0 GiB, available KV 108.9 -> 66.6 GiB, token slots 1,784,528 ->
+        # 1,091,008 -- which starved the scheduler and regressed long-context to
+        # 0.9316x and fixed-batch-32 to 0.9044x. It cannot be made free by sharing
+        # one copy either: the bf16 kernel hard-asserts BlockMajorK (passing the
+        # plain Triton ``weight_layout=MajorK`` fails with ``Check failed:
+        # (weight_layout == ...::BlockMajorK) is false``).
+        self.use_trtllm = trtllm_bf16_moe_supported()
         self.trtllm_moe = (
             TrtLlmBf16MoE(
                 num_experts=self.num_experts,

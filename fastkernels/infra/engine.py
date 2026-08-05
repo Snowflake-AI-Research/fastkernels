@@ -6161,17 +6161,27 @@ class ModelRunner:
             # from 4,210 to 7,942 tok/s. Startup cost is 83 graphs instead of 63
             # (96s vs 75s of capture); configs that cannot exceed 512 concurrent
             # sequences are unaffected.
-            # Scoped to DSA models along with prefill-priority. The
-            # eager-above-the-largest-captured-size problem is general, and the
-            # measurement below is only from GLM-5.2, so widening it tree-wide
-            # would spend ~20 extra graphs of memory and ~21s of startup on every
-            # other architecture untested. ``_has_indexer_layers`` is set in
-            # allocate_kv_cache, which runs before capture.
+            # Scoped to DSA models along with prefill-priority, and to MoE models
+            # generally. The eager-above-the-largest-captured-size problem is
+            # general, but it bites MoE hardest: the trtllm-gen fused MoE call
+            # costs 412-676 us of CPU dispatch (autotuner lookup + routing config
+            # + cooperative launch), 2.3-3.7x the Triton path's ~182 us, so at 32
+            # layers an eager decode step burns ~21 ms of host time that a graph
+            # replay pays once. Measured on Mixtral-8x7B tp=2, mixed at 1000
+            # sequences: raising the cap 512 -> 1024 cut the profiled generate
+            # 14.4 s -> 12.1 s and lifted GPU-busy 77.7% -> 92.9% (idle 3.2 s ->
+            # 0.9 s) with the kernel sum unchanged -- pure idle removal from the
+            # bs>512 decode steps that had run eager. gpt-oss (also this-path MoE)
+            # already got 1024; ``self.is_moe`` folds Mixtral in. Dense models
+            # below 512 concurrent sequences are unaffected (~0.3 GiB and ~21 s of
+            # extra capture only when max_num_seqs actually exceeds 512).
+            # ``_has_indexer_layers`` is set in allocate_kv_cache, before capture.
             max_capture_limit = (
                 1024
                 if (self.is_gpt_oss or self.is_gemma4
                     or (self.max_num_seqs > 512
-                        and getattr(self, "_has_indexer_layers", False)))
+                        and (self.is_moe
+                             or getattr(self, "_has_indexer_layers", False))))
                 else 512
             )
         max_capture = min(max_bs, max_capture_limit)
