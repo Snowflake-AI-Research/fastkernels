@@ -53,7 +53,7 @@ def load_workload(args):
           f"min={lens[0]:,} p50={lens[len(lens) // 2]:,} max={lens[-1]:,}")
     print(f"  out_lens: min={min(out_lens)} max={max(out_lens)} "
           f"total={sum(out_lens):,}")
-    return prompts, out_lens, sum(lens)
+    return prompts, out_lens
 
 
 def run_fastkernels(args, prompts, out_lens):
@@ -62,7 +62,7 @@ def run_fastkernels(args, prompts, out_lens):
     from fastkernels.infra.engine import LlamaEngine, SamplingParams
 
     engine = LlamaEngine(
-        model_name=args.model, seed=args.seed, enforce_eager=args.enforce_eager,
+        model_name=args.model, seed=args.seed, enforce_eager=False,
         tensor_parallel_size=args.tp, max_model_len=args.max_model_len,
         **({"kv_cache_dtype": args.kv_cache_dtype}
            if args.kv_cache_dtype else {}),
@@ -91,10 +91,9 @@ def run_vllm(args, prompts, out_lens):
     os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
     kwargs = dict(
         model=args.model, seed=args.seed, trust_remote_code=True,
-        enforce_eager=args.enforce_eager, tensor_parallel_size=args.tp,
+        enforce_eager=False, tensor_parallel_size=args.tp,
         gpu_memory_utilization=0.9, max_model_len=args.max_model_len,
-        enable_prefix_caching=False,
-        disable_log_stats=not args.log_stats,
+        enable_prefix_caching=False, disable_log_stats=True,
         **({"kv_cache_dtype": args.kv_cache_dtype}
            if args.kv_cache_dtype else {}),
     )
@@ -135,14 +134,10 @@ def main():
                     help="e.g. fp8_e4m3, for rows whose sweep entry sets it "
                          "(it changes the KV pool size, hence admission).")
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--enforce-eager", action="store_true")
-    ap.add_argument("--log-stats", action="store_true",
-                    help="vLLM only: keep its periodic Running/Waiting/KV-usage "
-                         "log, which is the only view of its batch occupancy.")
     ap.add_argument("--label", default="")
     args = ap.parse_args()
 
-    prompts, out_lens, _ = load_workload(args)
+    prompts, out_lens = load_workload(args)
     runner = run_vllm if args.engine == "vllm" else run_fastkernels
     dt, out_toks = runner(args, prompts, out_lens)
     print(f"\n  RESULT {args.label or args.engine} "

@@ -60,7 +60,7 @@ def main():
 
     steps = int(out.max())
     batch = np.array([(out > t).sum() for t in range(steps)])
-    print(f"\n  IDEAL (all admitted at step 0, no preemption)")
+    print("\n  IDEAL (all admitted at step 0, no preemption)")
     print(f"    decode steps      {steps}")
     print(f"    mean decode batch {batch.mean():.0f}")
     bands = " ".join(
