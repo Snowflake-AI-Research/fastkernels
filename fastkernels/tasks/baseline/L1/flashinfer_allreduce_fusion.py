@@ -144,10 +144,13 @@ def get_fi_ar_workspace(hidden_dim: int, dtype: torch.dtype):
     except Exception as exc:                                    # noqa: BLE001
         # Expected on topologies without NVSwitch multicast. vLLM falls back to
         # the ``trtllm`` backend there; try the same before giving up.
-        logger.warning(
-            "FlashInfer mnnvl allreduce workspace unavailable (%s); "
-            "trying trtllm backend", exc,
-        )
+        if not torch.compiler.is_compiling():
+            # Dynamo rejects logging.Logger methods under fullgraph=True, and
+            # this lazy setup is reachable from a traced forward.
+            logger.warning(
+                "FlashInfer mnnvl allreduce workspace unavailable (%s); "
+                "trying trtllm backend", exc,
+            )
         try:
             workspace = _flashinfer_comm.create_allreduce_fusion_workspace(
                 backend="trtllm",
@@ -160,10 +163,11 @@ def get_fi_ar_workspace(hidden_dim: int, dtype: torch.dtype):
                 group=None,
             )
         except Exception as exc2:                               # noqa: BLE001
-            logger.warning(
-                "FlashInfer allreduce fusion disabled: no usable workspace (%s)",
-                exc2,
-            )
+            if not torch.compiler.is_compiling():
+                logger.warning(
+                    "FlashInfer allreduce fusion disabled: no usable workspace "
+                    "(%s)", exc2,
+                )
             _WORKSPACES[key] = None
             return None, 0
 
@@ -173,12 +177,13 @@ def get_fi_ar_workspace(hidden_dim: int, dtype: torch.dtype):
             max_token_num, hidden_dim, dtype=dtype, device="cuda",
         )
 
-    logger.info(
-        "Initialized FlashInfer allreduce fusion workspace: backend=%s "
-        "world_size=%d hidden_dim=%d max_token_num=%d dtype=%s",
-        getattr(workspace, "backend", "?"), world_size, hidden_dim,
-        max_token_num, dtype,
-    )
+    if not torch.compiler.is_compiling():
+        logger.info(
+            "Initialized FlashInfer allreduce fusion workspace: backend=%s "
+            "world_size=%d hidden_dim=%d max_token_num=%d dtype=%s",
+            getattr(workspace, "backend", "?"), world_size, hidden_dim,
+            max_token_num, dtype,
+        )
     _WORKSPACES[key] = workspace
     return workspace, max_token_num
 

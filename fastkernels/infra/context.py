@@ -343,6 +343,14 @@ def auto_register_no_compile_layers(model: "nn.Module") -> None:
     """
     _TARGET_NAMES = {
         "Qwen3MoE", "MixtralMoE", "GptOssMoE", "DeepSeekMoE", "Gemma4MoE",
+        # KimiMoE and SharedExpertMoE implement the same _use_custom_op /
+        # forward_impl contract but were never listed, so they were traced
+        # INLINE. That is not just a missed fusion boundary: their trtllm-gen
+        # MoE call reaches flashinfer Python that logs, and Dynamo rejects
+        # logging.Logger methods under fullgraph -- which is what made
+        # Kimi-Linear untraceable and left it capturing graphs over eager
+        # modules (no AR+RMSNorm fusion, 82 direct_copy kernels/step).
+        "KimiMoE", "SharedExpertMoE",
         "Attention", "MLAAttention", "SparseAttnIndexer",
         "WhisperCrossAttention",
         "Mamba2Mixer",
