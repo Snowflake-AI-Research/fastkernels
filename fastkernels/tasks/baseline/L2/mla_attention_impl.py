@@ -56,10 +56,7 @@ from ..L1.flashinfer_mla_sparse import (
 from ..L1.merge_attn_states import MergeAttnStates
 from ..L1.bmm import BatchMatMul
 from ..L1.convert_indices import ConvertIndicesToGlobal
-
-from vllm.v1.attention.ops.triton_merge_attn_states import (
-    mask_empty_context as _mask_empty_context,
-)
+from ..L1.mask_empty_context import mask_empty_context as _mask_empty_context
 
 # Sentinel for the per-step batch-metadata memo: ``None`` is a meaningful
 # result there (no block table => nothing to attend to), so absence needs its own
