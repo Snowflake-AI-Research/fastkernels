@@ -30,10 +30,10 @@ from pathlib import Path
 import numpy as np
 
 _THIS_DIR = Path(__file__).resolve().parent
-_PACKAGE_DIR = _THIS_DIR.parent.parent
+_PACKAGE_DIR = _THIS_DIR.parent
 _PROJECT_ROOT = _PACKAGE_DIR.parent
 
-sys.path.insert(0, str(_PACKAGE_DIR))
+sys.path.insert(0, str(_PROJECT_ROOT))
 
 from fastkernels.validate.worker import run_worker
 from fastkernels.workloads import (
@@ -526,7 +526,7 @@ def main():
     print("=" * 70)
 
     common = {
-        "project_root": str(_PACKAGE_DIR),
+        "project_root": str(_PROJECT_ROOT),
         "model": args.model,
         "image_size": image_size,
         "max_detections": args.max_detections,

@@ -13,7 +13,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from vllm.model_executor.layers.fla.ops.layernorm_guard import (
+from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
     rmsnorm_fn as _vllm_rmsnorm_fn,
 )
 

@@ -50,6 +50,17 @@ class LLM(Workload):
     fixed_batch_32 = "fixed-batch-32"
 
 
+class DiffusionLM(Workload):
+    """Masked-diffusion LMs (LLaDA).
+
+    ``bench_dllm`` runs one protocol: real task prompts batched together and
+    decoded with a fixed step/block schedule, scored on generated tokens/sec.
+    There is no latency probe -- a single-request number would just be the same
+    fixed step count with a batch of one.
+    """
+    humaneval = "humaneval"
+
+
 class VLM(Workload):
     """Vision-language models."""
     text_only = "text-only"
@@ -113,12 +124,7 @@ class WorldModel(Workload):
 
 class Segmentation(Workload):
     """Promptable concept segmentation (e.g. SAM3)."""
-    gold_metaclip_nps = "gold-metaclip-nps"
-    gold_wiki_common = "gold-wiki-common"
-    gold_crowded = "gold-crowded"
-    veval_sav_val = "veval-sav-val"
-    veval_yt1b_val = "veval-yt1b-val"
-    sav_val_video = "sav-val-video"
+    full_pipeline = "full-pipeline"
     smartglasses_val_video = "smartglasses-val-video"
     single_image_1008 = "single-image-1008"
     batch_4_image_1008 = "batch-4-image-1008"
@@ -161,11 +167,20 @@ class StructurePrediction(Workload):
 
 
 class Robotics(Workload):
-    """Vision-language-action policies (e.g. Pi0)."""
-    libero_1cam = "libero-1cam"
-    libero_3cam = "libero-3cam"
-    single_3cam = "single-3cam"
-    single_1cam = "single-1cam"
+    """Vision-language-action policies (e.g. Pi0).
+
+    Member names encode the dataset the workload runs on, because bench_openpi
+    benchmarks one dataset per `--datasets` entry and each needs its own
+    checkpoint: ALOHA is 3- or 1-camera, DROID and LIBERO are 2-camera.
+    """
+    aloha_3cam = "aloha-3cam"
+    aloha_1cam = "aloha-1cam"
+    droid_2cam = "droid-2cam"
+    libero_2cam = "libero-2cam"
+    aloha_single_3cam = "aloha-single-3cam"
+    aloha_single_1cam = "aloha-single-1cam"
+    droid_single = "droid-single"
+    libero_single = "libero-single"
 
 
 class PointCloudPolicy(Workload):
@@ -647,12 +662,36 @@ class SegmentationVideoWorkload:
     text_prompt: str = "objects"
 
 
+# bench_sam makes exactly two throughput measurements, and these declare them.
+# It pools SACo-Gold images with SACo-VEval frames and times one pass over the
+# pooled set ("full-pipeline"), then tracks SACo-VEval clips and reports
+# frames/sec. The five per-dataset image rows this table used to declare
+# (gold-metaclip-nps, gold-wiki-common, gold-crowded, veval-sav-val,
+# veval-yt1b-val) were never run -- bench_sam imported the list and ignored it,
+# so the sweep advertised seven throughput workloads and produced none. Only
+# sav-val-video is dropped: the clip pass runs one --veval-subset, the default.
+# --- Recommendation / ranking (e.g. DLRMv2 CTR, LightGCN recommend) --------
+
+@dataclass(frozen=True)
+class RecsysLatencyWorkload:
+    name: str
+    batch_size: int
+    num_warmup: int = 100
+    num_iters: int = 1000
+
+
+# Serving-shaped probes over the same model and checkpoint the throughput row
+# uses, sliced from its batch: batch-1 is one CTR request or one user-item pair.
+RECSYS_LATENCY_WORKLOADS: list[RecsysLatencyWorkload] = [
+    RecsysLatencyWorkload("single-request", 1),
+    RecsysLatencyWorkload("fixed-batch-32", 32),
+]
+
+
 SEGMENTATION_THROUGHPUT_WORKLOADS: list[SegmentationThroughputWorkload] = [
-    SegmentationThroughputWorkload("gold-metaclip-nps", 1008, 500, "facebook/SACo-Gold", "metaclip_nps"),
-    SegmentationThroughputWorkload("gold-wiki-common", 1008, 500, "facebook/SACo-Gold", "wiki_common"),
-    SegmentationThroughputWorkload("gold-crowded", 1008, 500, "facebook/SACo-Gold", "crowded"),
-    SegmentationThroughputWorkload("veval-sav-val", 1008, 100, "facebook/SACo-VEval", "sav_val", modality="video"),
-    SegmentationThroughputWorkload("veval-yt1b-val", 1008, 100, "facebook/SACo-VEval", "yt1b_val", modality="video"),
+    SegmentationThroughputWorkload(
+        "full-pipeline", 1008, 500, "facebook/SACo-Gold", "metaclip", modality="image"
+    ),
 ]
 
 SEGMENTATION_LATENCY_WORKLOADS: list[SegmentationLatencyWorkload] = [
@@ -661,9 +700,12 @@ SEGMENTATION_LATENCY_WORKLOADS: list[SegmentationLatencyWorkload] = [
     SegmentationLatencyWorkload("single-video-frame-1008", 1008, 1, "facebook/SACo-VEval", "smartglasses_val", modality="video"),
 ]
 
+# Clip counts match bench_sam's _save_video_clips_for_workers(max_clips=10,
+# max_frames=16).
 SEGMENTATION_VIDEO_WORKLOADS: list[SegmentationVideoWorkload] = [
-    SegmentationVideoWorkload("sav-val-video", 1008, 10, 16, "facebook/SACo-VEval", "sav_val"),
-    SegmentationVideoWorkload("smartglasses-val-video", 1008, 10, 16, "facebook/SACo-VEval", "smartglasses_val"),
+    SegmentationVideoWorkload(
+        "smartglasses-val-video", 1008, 10, 16, "facebook/SACo-VEval", "smartglasses_val"
+    ),
 ]
 
 
@@ -816,14 +858,25 @@ class VisionEncoderLatencyWorkload:
     num_iters: int = 10
 
 
+# 1000 images, not 5000/2500. The measurement is a mean over individually-timed
+# batches and it converges far faster than these counts imply: siglip2's ratio vs
+# timm reproduced to 0.4% between a 47-way-contended run and an idle one, and the
+# running images/sec settles to +/-0.1% within ~10 batches. The images that were
+# bought with the other 4000 were paid for in untimed JPEG decode -- see
+# bench_timm's image cache. Per-model overrides live in bench_timm.MODEL_REGISTRY.
 VISION_ENCODER_THROUGHPUT_WORKLOADS: list[VisionEncoderThroughputWorkload] = [
-    VisionEncoderThroughputWorkload("default-res", resolution=0, num_images=5000, batch_size=32),
-    VisionEncoderThroughputWorkload("high-res", resolution=512, num_images=2500, batch_size=16),
+    VisionEncoderThroughputWorkload("default-res", resolution=0, num_images=1000, batch_size=32),
+    VisionEncoderThroughputWorkload("high-res", resolution=512, num_images=1000, batch_size=16),
 ]
 
+# 300 iters, not 30. These are the only under-sampled workloads in the family:
+# at 30 iterations of a ~5 ms forward the whole measurement is ~150 ms, and
+# siglip2's single-image ratio swung 8.4% between a contended and an idle run --
+# enough to flip it from 0.907x (fail) to 0.983x (pass) with no code change. The
+# throughput scenarios reproduce to 0.4% by comparison. 300 iters costs ~1.5 s.
 VISION_ENCODER_LATENCY_WORKLOADS: list[VisionEncoderLatencyWorkload] = [
-    VisionEncoderLatencyWorkload("single-image", resolution=0, batch_size=1, num_warmup=5, num_iters=30),
-    VisionEncoderLatencyWorkload("batch-8", resolution=0, batch_size=8, num_warmup=5, num_iters=30),
+    VisionEncoderLatencyWorkload("single-image", resolution=0, batch_size=1, num_warmup=10, num_iters=300),
+    VisionEncoderLatencyWorkload("batch-8", resolution=0, batch_size=8, num_warmup=10, num_iters=300),
 ]
 
 
@@ -1026,16 +1079,22 @@ _SPEC_SOURCES: tuple[tuple[type[Workload], list[Any], list[Any]], ...] = (
     (Embedding, EMBEDDING_THROUGHPUT_WORKLOADS, EMBEDDING_LATENCY_WORKLOADS),
     (StructurePrediction, STRUCTURE_PREDICTION_THROUGHPUT_WORKLOADS, STRUCTURE_PREDICTION_LATENCY_WORKLOADS),
     (PointCloudPolicy, DP3_THROUGHPUT_WORKLOADS, DP3_LATENCY_WORKLOADS),
+    (Recsys, [], RECSYS_LATENCY_WORKLOADS),
 )
 
 # Families benchmarked by bespoke scripts that carry no parameter specs yet;
 # purpose is assigned by intent (batched runs -> throughput, single/latency
 # probes -> latency).
 _PARAMLESS_PURPOSES: dict[Workload, Purpose] = {
-    Robotics.libero_1cam: Purpose.THROUGHPUT,
-    Robotics.libero_3cam: Purpose.THROUGHPUT,
-    Robotics.single_3cam: Purpose.LATENCY,
-    Robotics.single_1cam: Purpose.LATENCY,
+    DiffusionLM.humaneval: Purpose.THROUGHPUT,
+    Robotics.aloha_3cam: Purpose.THROUGHPUT,
+    Robotics.aloha_1cam: Purpose.THROUGHPUT,
+    Robotics.droid_2cam: Purpose.THROUGHPUT,
+    Robotics.libero_2cam: Purpose.THROUGHPUT,
+    Robotics.aloha_single_3cam: Purpose.LATENCY,
+    Robotics.aloha_single_1cam: Purpose.LATENCY,
+    Robotics.droid_single: Purpose.LATENCY,
+    Robotics.libero_single: Purpose.LATENCY,
     PointCloudSeg.scanobjectnn: Purpose.THROUGHPUT,
     PointCloudSeg.single_cloud: Purpose.LATENCY,
     PointCloudSeg.batch_8: Purpose.THROUGHPUT,
@@ -1043,8 +1102,6 @@ _PARAMLESS_PURPOSES: dict[Workload, Purpose] = {
     Rendering.single_render: Purpose.LATENCY,
     Recsys.ctr_batch: Purpose.THROUGHPUT,
     Recsys.recommend_batch: Purpose.THROUGHPUT,
-    Recsys.single_request: Purpose.LATENCY,
-    Recsys.fixed_batch_32: Purpose.LATENCY,
     VideoRepresentation.predictor: Purpose.THROUGHPUT,
     VideoRepresentation.encoder: Purpose.THROUGHPUT,
     VideoRepresentation.classification: Purpose.THROUGHPUT,
@@ -1055,7 +1112,7 @@ _ALL_FAMILIES: tuple[type[Workload], ...] = (
     LLM, VLM, OmniModal, ASR, TTS, Diffusion, VideoDiffusion, WorldModel,
     Segmentation, Detection, VisionEncoder, Embedding, StructurePrediction,
     Robotics, PointCloudPolicy, PointCloudSeg, Rendering, Recsys,
-    VideoRepresentation,
+    VideoRepresentation, DiffusionLM,
 )
 
 
@@ -1209,6 +1266,18 @@ _ARCHITECTURES = (
 FASTKERNELS_ARCHITECTURES: dict[str, Architecture] = {a.module: a for a in _ARCHITECTURES}
 
 
+# Several HuggingFace ``model_type`` strings map to a single fastkernels L4
+# module because they are the same architecture. GLM-5.2 (``glm_moe_dsa`` /
+# ``GlmMoeDsaForCausalLM``) is a pure config variant of DeepSeek-V3.2 -- in vLLM
+# it subclasses ``DeepseekV2ForCausalLM`` with an empty body -- so it is served
+# by the ``deepseek`` module (which the registry keys on ``deepseek_v32``). This
+# mirrors the ``glm_moe_dsa -> deepseek_v3`` remap in ``weight_loader``.
+_MODEL_TYPE_ALIASES: dict[str, str] = {
+    "glm_moe_dsa": "deepseek_v32",
+    "deepseek_v3": "deepseek_v32",
+}
+
+
 def _normalize(text: str) -> str:
     """Lowercase, alphanumeric-only form for tolerant name matching."""
     return "".join(ch for ch in text.lower() if ch.isalnum())
@@ -1234,6 +1303,29 @@ def _module_from_name(hf_name: str) -> str | None:
     return best_module
 
 
+def _model_type_from_config_json(hf_name: str) -> str | None:
+    """Read ``model_type`` straight from a model's ``config.json``.
+
+    Fallback for architectures whose ``model_type`` is not registered with the
+    installed ``transformers`` (so ``AutoConfig`` raises), e.g. GLM-5.2. Accepts
+    a local directory or a HuggingFace repo id; returns ``None`` on any failure.
+    """
+    import json
+    import os
+
+    try:
+        if os.path.isdir(hf_name):
+            path = os.path.join(hf_name, "config.json")
+        else:
+            from huggingface_hub import hf_hub_download
+
+            path = hf_hub_download(hf_name, "config.json")
+        with open(path) as f:
+            return json.load(f).get("model_type")
+    except Exception:
+        return None
+
+
 @functools.lru_cache(maxsize=None)
 def module_for(hf_name: str) -> str | None:
     """Infer the fastkernels L4 module stem for a HuggingFace model.
@@ -1256,8 +1348,12 @@ def module_for(hf_name: str) -> str | None:
         config = AutoConfig.from_pretrained(hf_name, trust_remote_code=True)
         model_type = getattr(config, "model_type", None)
     except Exception:
-        model_type = None
+        # Custom/unregistered ``model_type`` (e.g. GLM-5.2's ``glm_moe_dsa``,
+        # DeepSeek-V3.2's ``deepseek_v32``) makes AutoConfig raise. Read the raw
+        # config.json to recover ``model_type`` before falling back to the name.
+        model_type = _model_type_from_config_json(hf_name)
     if model_type is not None:
+        model_type = _MODEL_TYPE_ALIASES.get(model_type, model_type)
         for arch in _ARCHITECTURES:
             if arch.model_type == model_type:
                 return arch.module
@@ -1276,6 +1372,14 @@ class BenchmarkScenario:
 
     ``workloads`` mixes throughput and latency workloads; use the
     ``throughput_workloads`` / ``latency_workloads`` splits to iterate one kind.
+
+    ``hf_name`` is always a bare identifier -- an HF repo id, or a short module
+    token for the rows that have no Hub checkpoint (``dlrmv2``, ``dp3``, ...).
+    Anything else a harness needs goes in its own optional field rather than
+    being packed into the name: ``draft_model`` (speculative decoding target +
+    draft), ``variant`` (which net a multi-variant harness builds), ``scene``
+    (which scene a renderer loads), ``reference_checkpoint`` (a reference
+    implementation whose weights live somewhere other than ``hf_name``).
     """
     hf_name: str
     tp: int
@@ -1283,6 +1387,16 @@ class BenchmarkScenario:
     workloads: list[Workload]
     enforce_eager: bool = False
     max_num_seqs: int | None = None
+    # Paged-KV cache dtype, passed verbatim to BOTH engines (fastkernels'
+    # ``LlamaEngine(kv_cache_dtype=...)`` and vLLM's ``LLM(kv_cache_dtype=...)``).
+    # ``None`` leaves each side on its own default ("auto" = the model's compute
+    # dtype). Distinct from ``dtype``, which names the WEIGHT quantization: a
+    # checkpoint can be NVFP4 with an fp8 KV cache, as nvidia/GLM-5.2-NVFP4 is.
+    kv_cache_dtype: str | None = None
+    draft_model: str | None = None
+    variant: str | None = None
+    scene: str | None = None
+    reference_checkpoint: str | None = None
 
     @property
     def specs(self) -> list[WorkloadSpec]:
@@ -1306,7 +1420,7 @@ class BenchmarkScenario:
 # "all" shorthand -- every workload is spelled out.
 
 _WORKLOAD_FAMILIES: dict[str, type[Workload]] = {c.__name__: c for c in _ALL_FAMILIES}
-_ALLOWED_DTYPES = {"bfloat16", "float16", "float32", "fp8", "mxfp4"}
+_ALLOWED_DTYPES = {"bfloat16", "float16", "float32", "fp8", "mxfp4", "nvfp4"}
 
 
 def _resolve_workload_token(token: str) -> Workload:
@@ -1329,8 +1443,23 @@ def _resolve_workload_token(token: str) -> Workload:
         )
 
 
+_SCENARIO_KEYS = frozenset(
+    {
+        "model", "tp", "dtype", "workloads",
+        "enforce_eager", "max_num_seqs", "kv_cache_dtype",
+        "draft_model", "variant", "scene", "reference_checkpoint",
+    }
+)
+
+
 def _scenario_from_mapping(entry: Mapping[str, Any], *, source: str) -> BenchmarkScenario:
     """Build a ``BenchmarkScenario`` from one YAML mapping, validating as we go."""
+    unknown = sorted(set(entry) - _SCENARIO_KEYS)
+    if unknown:
+        raise ValueError(
+            f"{source}: {entry.get('model', entry)}: unknown key(s) {unknown}; "
+            f"valid: {sorted(_SCENARIO_KEYS)}"
+        )
     try:
         model, tp, dtype = entry["model"], int(entry["tp"]), entry["dtype"]
         tokens = entry["workloads"]
@@ -1338,6 +1467,13 @@ def _scenario_from_mapping(entry: Mapping[str, Any], *, source: str) -> Benchmar
         raise ValueError(f"{source}: bad scenario entry {entry!r}: {e}")
     if dtype not in _ALLOWED_DTYPES:
         raise ValueError(f"{source}: {model}: dtype {dtype!r} not in {sorted(_ALLOWED_DTYPES)}")
+    for key in ("model", "draft_model", "variant", "scene"):
+        value = entry.get(key)
+        if value is not None and (not isinstance(value, str) or not value or " " in value):
+            raise ValueError(
+                f"{source}: {model}: {key} must be a non-empty identifier without "
+                f"spaces, got {value!r}"
+            )
     workloads: list[Workload] = []
     seen: set[Workload] = set()
     for tok in tokens:
@@ -1354,6 +1490,11 @@ def _scenario_from_mapping(entry: Mapping[str, Any], *, source: str) -> Benchmar
         model, tp, dtype, workloads,
         enforce_eager=bool(entry.get("enforce_eager", False)),
         max_num_seqs=entry.get("max_num_seqs"),
+        kv_cache_dtype=entry.get("kv_cache_dtype"),
+        draft_model=entry.get("draft_model"),
+        variant=entry.get("variant"),
+        scene=entry.get("scene"),
+        reference_checkpoint=entry.get("reference_checkpoint"),
     )
 
 

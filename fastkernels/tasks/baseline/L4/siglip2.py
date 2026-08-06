@@ -93,8 +93,9 @@ class SigLIP2Model(nn.Module):
             for _ in range(depth)
         ])
 
-        # Final norm
-        self.norm = LayerNorm(embed_dim)
+        # Final norm. eps=1e-6 / promote_fp32=False to match timm's
+        # ``timm.layers.LayerNorm`` (see VitEncoderBlock).
+        self.norm = LayerNorm(embed_dim, eps=1e-6, promote_fp32=False)
 
         # MAP attention pooling (uses model's mlp_ratio, not fixed 4.0)
         self.attn_pool = AttentionPoolLatent(

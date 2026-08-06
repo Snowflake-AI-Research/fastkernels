@@ -27,13 +27,23 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-from ....infra.context import get_context
+from ....infra.context import get_attn_backend_config, get_context
 from ....infra.tp import _tp_size
 from ..L1.flash_attn_decode import FlashAttnDecode
 from ..L1.flash_attn_prefill import FlashAttnPrefill
 from ..L1.gemma_rms_norm import GemmaRMSNorm
-from ..L1.store_kvcache import StoreKVCache
+from ..L1.store_kvcache import StoreKVCache, StoreKVCacheHND
 from .parallel_linear import QKVParallelLinear, RowParallelLinear
+
+try:
+    from vllm.model_executor.layers.fused_qk_norm_rope import (
+        fused_qk_rmsnorm_rope_gate as _vllm_fused_qk_rmsnorm_rope_gate,
+    )
+
+    _FUSED_QK_ROPE_GATE_AVAILABLE = True
+except ImportError:  # pragma: no cover - older vLLM without the fused kernel
+    _vllm_fused_qk_rmsnorm_rope_gate = None
+    _FUSED_QK_ROPE_GATE_AVAILABLE = False
 
 
 @triton.jit
@@ -77,6 +87,7 @@ class Qwen3NextAttention(nn.Module):
         head_dim: int,
         layer_idx: int,
         rms_norm_eps: float = 1e-6,
+        reduce_output: bool = True,
     ):
         super().__init__()
         tp = _tp_size()
@@ -93,21 +104,80 @@ class Qwen3NextAttention(nn.Module):
             num_key_value_heads,
         )
 
+        # ``reduce_output=False`` defers the all-reduce to the decoder layer's
+        # next norm, which fuses the two.
         self.o_proj = RowParallelLinear(
             num_attention_heads * head_dim, hidden_size,
+            reduce_results=reduce_output,
         )
 
         # Per-head QK norms (GemmaRMSNorm)
         self.q_norm = GemmaRMSNorm(head_dim, eps=rms_norm_eps)
         self.k_norm = GemmaRMSNorm(head_dim, eps=rms_norm_eps)
 
-        self.store_kvcache = StoreKVCache()
-        self.flash_attn_prefill = FlashAttnPrefill(
-            self.num_heads, self.num_kv_heads, self.head_dim,
-        )
-        self.flash_attn_decode = FlashAttnDecode(
-            self.num_heads, self.num_kv_heads, self.head_dim,
-        )
+        # Qwen3-Next's full-attention layers use head_dim=256.  vLLM 0.26 runs
+        # them on FlashInfer with an HND cache ("Using FLASHINFER attention
+        # backend" / "Using HND KV cache layout for FLASHINFER" on B200), so
+        # follow the same per-device backend selection the generic
+        # ``Attention`` layer uses.  FlashAttention is not a substitute here:
+        # FA4's SM100 head_dim=256 forward rejects seqused_k/seqused_q, which
+        # the paged decode path requires.
+        attn_cfg = get_attn_backend_config()
+        self.kv_layout = attn_cfg.kv_layout
+        self._use_trtllm = attn_cfg.use_trtllm
+        # vLLM collapses the gated split + QK-RMSNorm + partial NeoX RoPE +
+        # gate copy into one Triton launch
+        # (``Qwen3NextAttention.use_fused_qk_norm_rope_gate``). Unfused that is
+        # nine kernels per attention layer -- two gate/q slices, two norms, two
+        # rotary slices, the rotary op and two cats -- which at batch 1 is pure
+        # launch overhead.
+        self._fused_qk_rope_gate = _FUSED_QK_ROPE_GATE_AVAILABLE
+        self._norm_gain_cache: tuple[torch.Tensor, torch.Tensor] | None = None
+        if self._use_trtllm:
+            from ..L1.flashinfer_decode import TRTLLMDecode
+            from ..L1.flashinfer_prefill import TRTLLMPrefill
+
+            self.store_kvcache = StoreKVCacheHND(page_size=attn_cfg.block_size)
+            self.flash_attn_prefill = TRTLLMPrefill(
+                self.num_heads, self.num_kv_heads, self.head_dim,
+            )
+            self.flash_attn_decode = TRTLLMDecode(
+                self.num_heads, self.num_kv_heads, self.head_dim,
+            )
+        else:
+            self.store_kvcache = StoreKVCache()
+            self.flash_attn_prefill = FlashAttnPrefill(
+                self.num_heads, self.num_kv_heads, self.head_dim,
+            )
+            self.flash_attn_decode = FlashAttnDecode(
+                self.num_heads, self.num_kv_heads, self.head_dim,
+            )
+
+    def set_trtllm_workspace(self, workspace: torch.Tensor) -> None:
+        """Adopt the engine's single shared trtllm-gen workspace.
+
+        Without this each layer keeps the 512 MiB buffer it allocated in
+        ``__init__``; Qwen3-Next has one MHA layer per 4 decoder layers, so
+        that would waste several GiB.
+        """
+        if self._use_trtllm:
+            self.flash_attn_decode._workspace = workspace
+            self.flash_attn_prefill._workspace = workspace
+
+    def _norm_gains(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """``1 + weight`` for the QK norms, in fp32, materialized once.
+
+        vLLM recomputes ``q_norm.weight.float() + 1.0`` per call and lets
+        Inductor hoist it; in eager that would be two extra launches on every
+        one of the 12 attention layers. The values are constants after weight
+        loading, so caching them is exact.
+        """
+        if self._norm_gain_cache is None:
+            self._norm_gain_cache = (
+                self.q_norm.weight.float() + 1.0,
+                self.k_norm.weight.float() + 1.0,
+            )
+        return self._norm_gain_cache
 
     def forward(self, hidden_states, rotary_emb=None, positions=None,
                 state_manager=None):
@@ -125,27 +195,61 @@ class Qwen3NextAttention(nn.Module):
         kv_size = self.num_kv_heads * self.head_dim
         q_gate, k, v = qkv.split([q_gate_size, kv_size, kv_size], dim=-1)
 
-        # Split Q and gate
-        q_gate = q_gate.view(N, self.num_heads, 2 * self.head_dim)
-        q = q_gate[:, :, :self.head_dim].contiguous()
-        gate = q_gate[:, :, self.head_dim:].contiguous()
+        use_fused = (
+            self._fused_qk_rope_gate
+            and rotary_emb is not None
+            and positions is not None
+            and getattr(rotary_emb, "is_neox_style", False)
+        )
+        if use_fused:
+            q_gain, k_gain = self._norm_gains()
+            q, k, gate = _vllm_fused_qk_rmsnorm_rope_gate(
+                q_gate,
+                k,
+                q_gain,
+                k_gain,
+                rotary_emb.cos_sin_cache,
+                positions.reshape(-1),
+                self.q_norm.variance_epsilon,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+                rotary_emb.head_dim,
+            )
+            q = q.view(N, self.num_heads, self.head_dim)
+            k = k.view(N, self.num_kv_heads, self.head_dim)
+            gate = gate.view(N, self.num_heads, self.head_dim)
+        else:
+            # Split Q and gate
+            q_gate = q_gate.view(N, self.num_heads, 2 * self.head_dim)
+            q = q_gate[:, :, :self.head_dim].contiguous()
+            gate = q_gate[:, :, self.head_dim:].contiguous()
 
-        k = k.view(N, self.num_kv_heads, self.head_dim)
+            k = k.view(N, self.num_kv_heads, self.head_dim)
+
+            # Per-head QK-norm (applied before RoPE)
+            q = self.q_norm(q.reshape(-1, self.head_dim)).view(
+                N, self.num_heads, self.head_dim)
+            k = self.k_norm(k.reshape(-1, self.head_dim)).view(
+                N, self.num_kv_heads, self.head_dim)
+
+            # Partial RoPE (only rotates first rotary_dim dimensions)
+            if rotary_emb is not None and positions is not None:
+                pos_flat = (
+                    positions.reshape(-1) if positions.dim() > 1 else positions
+                )
+                rotary_dim = rotary_emb.head_dim
+                q_rot, q_pass = (
+                    q[..., :rotary_dim].contiguous(), q[..., rotary_dim:],
+                )
+                k_rot, k_pass = (
+                    k[..., :rotary_dim].contiguous(), k[..., rotary_dim:],
+                )
+                q_rot, k_rot = rotary_emb(pos_flat, q_rot, k_rot)
+                q = torch.cat([q_rot, q_pass], dim=-1)
+                k = torch.cat([k_rot, k_pass], dim=-1)
+
         v = v.view(N, self.num_kv_heads, self.head_dim)
-
-        # Per-head QK-norm (applied before RoPE)
-        q = self.q_norm(q.reshape(-1, self.head_dim)).view(N, self.num_heads, self.head_dim)
-        k = self.k_norm(k.reshape(-1, self.head_dim)).view(N, self.num_kv_heads, self.head_dim)
-
-        # Partial RoPE (only rotates first rotary_dim dimensions)
-        if rotary_emb is not None and positions is not None:
-            pos_flat = positions.reshape(-1) if positions.dim() > 1 else positions
-            rotary_dim = rotary_emb.head_dim
-            q_rot, q_pass = q[..., :rotary_dim].contiguous(), q[..., rotary_dim:]
-            k_rot, k_pass = k[..., :rotary_dim].contiguous(), k[..., rotary_dim:]
-            q_rot, k_rot = rotary_emb(pos_flat, q_rot, k_rot)
-            q = torch.cat([q_rot, q_pass], dim=-1)
-            k = torch.cat([k_rot, k_pass], dim=-1)
 
         layer_idx = self.layer_idx
         k_cache = state_manager.k_cache[layer_idx]

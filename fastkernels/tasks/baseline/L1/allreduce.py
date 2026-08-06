@@ -37,6 +37,13 @@ def get_custom_ar():
 class AllReduce(nn.Module):
     def forward(self, tensor):
         if torch.compiler.is_compiling():
+            # Route through the custom op rather than falling straight to NCCL:
+            # the op is opaque to inductor, so the custom IPC all-reduce still
+            # runs inside a compiled graph. At decode message sizes (one token
+            # wide) NCCL is far slower, which showed up as decode getting *worse*
+            # from tp=1 to tp=2 while vLLM's improved.
+            if _CUSTOM_AR is not None:
+                return torch.ops.fastkernels.custom_all_reduce(tensor)
             dist.all_reduce(tensor)
             return tensor
         ar = _CUSTOM_AR

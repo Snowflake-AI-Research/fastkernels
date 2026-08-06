@@ -57,6 +57,15 @@ _QUANT_EPS = 1e-10
 # FlashInfer FP8 blockscale GEMM (M < 32 swapAB) - resolved lazily
 # ---------------------------------------------------------------------------
 
+def _is_batch_invariant() -> bool:
+    """vLLM's dynamic FP8 blockscale dispatch forces the DeepGEMM path (skips the
+    FlashInfer swapAB kernel) for ALL M under batch-invariant determinism mode
+    (``VLLM_BATCH_INVARIANT=1``) — see the early-out in
+    ``scaled_mm/flashinfer.py`` and ``grouped_topk._is_batch_invariant``. Mirror
+    it so fastkernels matches vLLM in that mode."""
+    return os.environ.get("VLLM_BATCH_INVARIANT", "0") == "1"
+
+
 _FLASHINFER_RESOLVED = False
 _FLASHINFER_FN: object | None = None
 
@@ -210,7 +219,11 @@ def _fp8_group_quant_kernel(
     # ``vllm/.../fp8_utils.py:860``).  Differs from the previous 1e-12
     # only on all-zero rows but the bias compounds across layers.
     absmax = tl.maximum(absmax, 1e-10)
-    scale_raw = absmax / fp8_max
+    # Multiply-by-reciprocal (not division) to match vLLM's
+    # ``_per_token_group_quant_fp8`` (fp8_utils.py:144): fast-division for a
+    # constexpr divisor introduces a 1-ULP error that flips FP8 quantization
+    # at representable-value boundaries.
+    scale_raw = absmax * (1.0 / fp8_max)
     scale = tl.math.exp2(tl.math.ceil(tl.math.log2(scale_raw))) if USE_UE8M0 else scale_raw
 
     x_scaled = x / scale
@@ -231,7 +244,13 @@ def _check_vllm_cuda_quant() -> bool:
     global _HAS_VLLM_CUDA_QUANT
     if _HAS_VLLM_CUDA_QUANT is None:
         try:
-            import vllm._C  # noqa: F401
+            # vLLM registers the fp8 quant ops from ``vllm._custom_ops`` (>=0.20);
+            # ``vllm._C`` no longer exists in 0.24, so importing it here failed and
+            # forced the fastkernels fallback quant, diverging from vLLM's numerics.
+            try:
+                import vllm._custom_ops  # noqa: F401 — vLLM >= 0.20
+            except ImportError:
+                import vllm._C  # noqa: F401 — legacy vLLM <= 0.18
             _HAS_VLLM_CUDA_QUANT = hasattr(torch.ops, "_C") and hasattr(
                 torch.ops._C, "per_token_group_fp8_quant"
             )
@@ -322,6 +341,62 @@ def _alloc_colmajor_scale(M: int, num_groups: int,
     ).permute(-1, -2)
 
 
+# ---------------------------------------------------------------------------
+# torch.compile-safe M-based dispatch. vLLM registers the FlashInfer(M<32) vs
+# DeepGEMM(M>=32) selection as a custom op that branches on the RUNTIME M
+# (``dynamic_flashinfer_deepgemm_blockscale_gemm`` -> ``torch.cond`` over both
+# branches), so CUDA-graph / torch.compile capture keeps the FlashInfer path.
+# fastkernels' eager ``Fp8Linear.forward`` selects the branch in Python gated on
+# ``not torch.compiler.is_compiling()``, which freezes to DeepGEMM at trace time
+# and silently drops FlashInfer's low-batch (M<32) accuracy path under compile.
+# This op performs the same selection INSIDE an opaque custom op (Inductor never
+# inlines it), so the M<32 branch survives capture. ``flashinfer_ok`` folds the
+# M-independent eligibility (dtype/N%64/K%128/availability) into a compile-time
+# constant; only the M<32 test happens at runtime here.
+_fp8_lib.define(
+    "blockscale_gemm_dispatch(Tensor input_2d, Tensor weight_fp8, "
+    "Tensor weight_scale, bool flashinfer_ok) -> Tensor"
+)
+
+# FlashInfer swapAB M threshold — hard-coded to 32 in vLLM (fp8_utils.py:308),
+# same as ``Fp8Linear._FLASHINFER_M_THRESHOLD``.
+_FLASHINFER_M_THRESHOLD = 32
+
+
+def _blockscale_gemm_dispatch_impl(input_2d, weight_fp8, weight_scale,
+                                   flashinfer_ok):
+    N, K = weight_fp8.shape
+    M = input_2d.shape[0]
+    output = torch.empty(M, N, dtype=torch.bfloat16, device=input_2d.device)
+    if flashinfer_ok and M < _FLASHINFER_M_THRESHOLD:
+        # FlashInfer swapAB kernel: internal activation quant (BF16 -> FP8),
+        # FP8 GEMM, BF16 out. Same path as eager ``use_flashinfer``.
+        _flashinfer_blockscale_gemm_impl(input_2d, weight_fp8, weight_scale,
+                                         output)
+        return output
+    # External per-token-group quant (column-major UE8M0 scales) + DeepGEMM
+    # fp8_gemm_nt — identical math to the eager M>=32 path (fresh allocations,
+    # matching the pre-existing compiled branch).
+    num_groups = (K + _GROUP_SIZE - 1) // _GROUP_SIZE
+    q_input = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=input_2d.device)
+    input_scale = _alloc_colmajor_scale(M, num_groups, input_2d.device)
+    _per_token_group_quant_fp8_op_impl(input_2d, q_input, input_scale, True)
+    _fp8_gemm_nt_impl(q_input, input_scale, weight_fp8, weight_scale, output)
+    return output
+
+
+_fp8_lib.impl("blockscale_gemm_dispatch", _blockscale_gemm_dispatch_impl,
+              "CUDA")
+
+
+@torch.library.impl(_fp8_lib, "blockscale_gemm_dispatch", "Meta")
+def _blockscale_gemm_dispatch_meta(input_2d, weight_fp8, weight_scale,
+                                   flashinfer_ok):
+    N = weight_fp8.shape[0]
+    M = input_2d.shape[0]
+    return input_2d.new_empty((M, N), dtype=torch.bfloat16)
+
+
 class _Fp8PrefillBufs:
     """Shared prefill buffers for FP8 activation quantization.
 
@@ -400,19 +475,37 @@ class Fp8Linear(nn.Module):
         M = input_2d.shape[0]
         num_groups = (K + self.BLOCK_SIZE - 1) // self.BLOCK_SIZE
 
-        # Mirror vLLM: pick FlashInfer swapAB iff supported AND batch is
-        # small AND dims align with what FlashInfer's check requires
-        # (``vllm/utils/flashinfer.py:should_use_flashinfer_for_blockscale_fp8_gemm``:
-        # weight ``N % 64 == 0`` and ``K % 128 == 0``).
-        use_flashinfer = (
-            not torch.compiler.is_compiling()
-            and input_bf16.dtype == torch.bfloat16
+        # M-independent FlashInfer eligibility (mirrors vLLM
+        # ``should_use_flashinfer_for_blockscale_fp8_gemm``: N % 64 == 0,
+        # K % 128 == 0, plus the SM90+FlashInfer availability gate). Batch-
+        # invariant mode forces DeepGEMM for all M (vLLM's dynamic-dispatch
+        # early-out), so exclude it here.
+        flashinfer_ok = (
+            input_bf16.dtype == torch.bfloat16
             and weight_fp8.dtype == torch.float8_e4m3fn
             and N % 64 == 0
             and K % 128 == 0
-            and M < self._FLASHINFER_M_THRESHOLD
+            and not _is_batch_invariant()
             and _maybe_get_flashinfer_fp8_gemm() is not None
         )
+
+        # Under torch.compile / CUDA-graph capture, the M<32 (FlashInfer) vs
+        # M>=32 (DeepGEMM) choice must be made at RUNTIME, not frozen at trace
+        # time. A Python ``if M < 32`` (or ``torch.compiler.is_compiling()``)
+        # gate would bake the branch into the graph and drop FlashInfer's
+        # low-batch path. Route through the opaque ``blockscale_gemm_dispatch``
+        # custom op (like vLLM's ``dynamic_flashinfer_deepgemm_blockscale_gemm``)
+        # which branches on the runtime M internally. The eager path below keeps
+        # its buffer-reuse fast path.
+        if torch.compiler.is_compiling():
+            output = torch.ops.fastkernels_fp8.blockscale_gemm_dispatch(
+                input_2d, weight_fp8, weight_scale_inv, flashinfer_ok,
+            )
+            if bias is not None:
+                output = output + bias
+            return output.view(*input_bf16.shape[:-1], N)
+
+        use_flashinfer = flashinfer_ok and M < self._FLASHINFER_M_THRESHOLD
 
         if use_flashinfer:
             output = torch.empty(
@@ -425,19 +518,16 @@ class Fp8Linear(nn.Module):
                 output = output + bias
             return output.view(*input_bf16.shape[:-1], N)
 
-        if not torch.compiler.is_compiling():
-            if self._a_buf is not None and M <= self._a_buf.shape[0]:
-                q_input = self._a_buf[:M]
-                input_scale = _alloc_colmajor_scale(M, num_groups, input_2d.device)
-                output = self._o_buf[:M]
-            elif self._pf is not None and M <= self._pf.a.shape[0]:
-                q_input = self._pf.a[:M]
-                input_scale = _alloc_colmajor_scale(M, num_groups, input_2d.device)
-                output = self._pf.o[:M]
-            else:
-                q_input = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=input_2d.device)
-                input_scale = _alloc_colmajor_scale(M, num_groups, input_2d.device)
-                output = torch.empty(M, N, dtype=torch.bfloat16, device=input_2d.device)
+        # Eager only (the compile path returned above), so buffer reuse is always
+        # safe here — no ``torch.compiler.is_compiling()`` guard needed.
+        if self._a_buf is not None and M <= self._a_buf.shape[0]:
+            q_input = self._a_buf[:M]
+            input_scale = _alloc_colmajor_scale(M, num_groups, input_2d.device)
+            output = self._o_buf[:M]
+        elif self._pf is not None and M <= self._pf.a.shape[0]:
+            q_input = self._pf.a[:M]
+            input_scale = _alloc_colmajor_scale(M, num_groups, input_2d.device)
+            output = self._pf.o[:M]
         else:
             q_input = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=input_2d.device)
             input_scale = _alloc_colmajor_scale(M, num_groups, input_2d.device)
@@ -550,14 +640,25 @@ def postprocess_fp8_weights_batched(weight_fp8: torch.Tensor,
         w_q.copy_(w_requant)
         s_old.copy_(s_requant)
 
-    recipe = (1, block_size, block_size)
-    scale_transformed = deep_gemm.transform_sf_into_required_layout(
-        sf=scale_inv[:, :scale_rows, :scale_cols],
-        mn=N,
-        k=K,
-        recipe=recipe,
-        num_groups=E,
-        is_sfa=False,
-        disable_ue8m0_cast=not use_ue8m0,
-    )
-    scale_inv[:, :scale_rows, :scale_cols].copy_(scale_transformed)
+    # The requant loop above already wrote UNPACKED per-block UE8M0 fp32 scales
+    # into ``scale_inv[:, :scale_rows, :scale_cols]`` — the exact [E, N/128, K/128]
+    # fp32 layout the Triton MoE grouped GEMM (MoeGroupedGemm, used by
+    # VllmFusedExperts) reads via strides. ``transform_sf_into_required_layout``
+    # is a DeepGEMM-only SF layout (see vLLM quant_utils.py:428); on Blackwell
+    # (``use_ue8m0``) it PACKS 4 UE8M0 exponents per int32, shrinking the last dim
+    # (e.g. 48 -> 12) into a layout the Triton kernel does not consume — so applying
+    # it here corrupts the scale (and its old in-place ``copy_`` even crashed on the
+    # shape change). Only run the transform on the non-UE8M0 (Hopper) path, where it
+    # preserves shape, to keep that path bit-identical.
+    if not use_ue8m0:
+        recipe = (1, block_size, block_size)
+        scale_transformed = deep_gemm.transform_sf_into_required_layout(
+            sf=scale_inv[:, :scale_rows, :scale_cols],
+            mn=N,
+            k=K,
+            recipe=recipe,
+            num_groups=E,
+            is_sfa=False,
+            disable_ue8m0_cast=True,
+        )
+        scale_inv[:, :scale_rows, :scale_cols].copy_(scale_transformed)

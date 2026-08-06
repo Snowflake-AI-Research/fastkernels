@@ -55,6 +55,12 @@ from pathlib import Path
 
 import numpy as np
 
+from fastkernels.validate.comparison import (  # noqa: E402
+    alignment_from_similarity,
+    latency_entry,
+    throughput_entry,
+)
+
 
 # ---------------------------------------------------------------------------
 # Config presets — match JAX configs/experiment/...
@@ -423,6 +429,60 @@ def main():
             print(line, flush=True)
 
     if args.results_out:
+        # Standard comparison shape shared with the other harnesses. TTT-E2E has
+        # no public checkpoint (random-init weights), but it *does* have a JAX
+        # reference, so both a throughput/latency speedup and an alignment
+        # metric are available -- they were simply never emitted, which is why
+        # this row recorded no speedup or alignment in 20260729-070206.
+        #
+        # Throughput here is sequences/second derived from the median timed run
+        # (the first fastkernels run includes warm-up, so the median is the
+        # steady-state figure the summary table already prints). Alignment is
+        # the per-token NLL agreement against JAX, reported as max/mean abs
+        # difference plus a normalised score.
+        for blk in summary["results"]:
+            mode = blk["mode"]
+            paired = [
+                e for e in blk["per_seq"]
+                if "jax" in e and "fastkernels" in e
+                and e["jax"]["run_times_s"] and e["fastkernels"]["run_times_s"]
+            ]
+            if not paired:
+                continue
+            kb_med = float(np.median([
+                np.median(e["fastkernels"]["run_times_s"]) for e in paired
+            ]))
+            jax_med = float(np.median([
+                np.median(e["jax"]["run_times_s"]) for e in paired
+            ]))
+            max_abs = max(
+                (e["diff"]["max_abs"] for e in paired if "diff" in e),
+                default=float("nan"),
+            )
+            diffs = [e["diff"]["mean_abs"] for e in paired if "diff" in e]
+            mean_abs = float(np.mean(diffs)) if diffs else float("nan")
+            summary.setdefault("scenarios", []).append(throughput_entry(
+                f"ttt-e2e-{mode}",
+                (1.0 / kb_med) if kb_med > 0 else None,
+                (1.0 / jax_med) if jax_med > 0 else None,
+                metric="sequences_per_s",
+                alignment=alignment_from_similarity(
+                    "token_nll_mean_abs_diff", mean_abs,
+                    # An NLL *difference*: smaller is better, so score is
+                    # 1 - value and the threshold is an upper bound.
+                    higher_is_better=False, threshold=0.05,
+                    max_abs_diff=max_abs, num_sequences=len(paired),
+                ),
+                seq_len=args.seq_len,
+                num_sequences=len(paired),
+            ))
+            summary.setdefault("latency_scenarios", []).append(latency_entry(
+                f"ttt-e2e-{mode}-forward", kb_med, jax_med,
+                seq_len=args.seq_len,
+            ))
+        summary.setdefault("scenarios", [])
+        summary.setdefault("latency_scenarios", [])
+        summary["reference_name"] = "jax"
         Path(args.results_out).write_text(json.dumps(summary, indent=2))
         print(f"[bench] wrote {args.results_out}", flush=True)
 

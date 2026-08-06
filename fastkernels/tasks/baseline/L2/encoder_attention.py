@@ -23,11 +23,22 @@ class EncoderSelfAttention(nn.Module):
         self.attention_head_size = config.hidden_size // config.num_attention_heads
         self.all_head_size = self.num_attention_heads * self.attention_head_size
 
-        self.query = Linear(config.hidden_size, self.all_head_size, bias=True)
-        self.key = Linear(config.hidden_size, self.all_head_size, bias=True)
-        self.value = Linear(config.hidden_size, self.all_head_size, bias=True)
+        # Fused QKV, matching vLLM's BertSelfAttention, which builds a single
+        # QKVParallelLinear and splits its output. Three separate projections
+        # issue 3x the GEMM dispatches for identical math, and this forward is
+        # host-dispatch-bound at small token counts. The checkpoint's separate
+        # query/key/value tensors are concatenated at load time by
+        # ``embedder_loader._fuse_qkv_keys``.
+        self.qkv = Linear(config.hidden_size, 3 * self.all_head_size, bias=True)
         self.attn = DenseAttention(backend="sdpa")
         self.varlen_attn = FlashAttnVarlen()
+
+    def _project_qkv(self, hidden_states: torch.Tensor):
+        qkv = self.qkv(hidden_states)
+        return qkv.split(
+            [self.all_head_size, self.all_head_size, self.all_head_size],
+            dim=-1,
+        )
 
     def forward(
         self,
@@ -41,23 +52,14 @@ class EncoderSelfAttention(nn.Module):
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
-        query = self.query(hidden_states).view(
-            batch_size,
-            seq_len,
-            self.num_attention_heads,
-            self.attention_head_size,
-        )
-        key = self.key(hidden_states).view(
-            batch_size,
-            seq_len,
-            self.num_attention_heads,
-            self.attention_head_size,
-        )
-        value = self.value(hidden_states).view(
-            batch_size,
-            seq_len,
-            self.num_attention_heads,
-            self.attention_head_size,
+        query, key, value = (
+            t.view(
+                batch_size,
+                seq_len,
+                self.num_attention_heads,
+                self.attention_head_size,
+            )
+            for t in self._project_qkv(hidden_states)
         )
         context = self.attn(query, key, value, causal=False, attn_mask=attention_mask)
         return context.contiguous().view(batch_size, seq_len, self.all_head_size)
@@ -68,20 +70,13 @@ class EncoderSelfAttention(nn.Module):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
     ) -> torch.Tensor:
-        query = self.query(hidden_states).view(
-            hidden_states.size(0),
-            self.num_attention_heads,
-            self.attention_head_size,
-        )
-        key = self.key(hidden_states).view(
-            hidden_states.size(0),
-            self.num_attention_heads,
-            self.attention_head_size,
-        )
-        value = self.value(hidden_states).view(
-            hidden_states.size(0),
-            self.num_attention_heads,
-            self.attention_head_size,
+        query, key, value = (
+            t.view(
+                hidden_states.size(0),
+                self.num_attention_heads,
+                self.attention_head_size,
+            )
+            for t in self._project_qkv(hidden_states)
         )
         context = self.varlen_attn(
             query,
@@ -103,7 +98,10 @@ class EncoderSelfOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.dense = Linear(config.hidden_size, config.hidden_size, bias=True)
-        self.LayerNorm = LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        # promote_fp32=False: vLLM's bert.py / roberta.py use a plain
+        # nn.LayerNorm here (see encoder_embeddings for the full rationale).
+        self.LayerNorm = LayerNorm(config.hidden_size, eps=config.layer_norm_eps,
+                                   promote_fp32=False)
 
     def forward(
         self,

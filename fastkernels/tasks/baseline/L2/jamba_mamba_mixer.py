@@ -8,10 +8,11 @@ Key differences from the plain Mamba v1 mixer
 
   * Three additional RMSNorms applied to (dt, B, C) after the x_proj
     split.  ``b_layernorm`` and ``c_layernorm`` use ``hidden_size = 16``
-    (= ``mamba_d_state``), which falls outside the multiple-of-32
-    range the L1 ``RMSNorm`` CUDA kernel handles correctly, so we use
-    the autograd-friendly :class:`L1.rms_norm_native.RMSNormNative`
-    everywhere here for safety.
+    (= ``mamba_d_state``), so we use :class:`L1.rms_norm_native.RMSNormNative`
+    rather than the L1 ``RMSNorm`` whose default CUDA path is vLLM's kernel
+    (1 bf16 ULP off the reference math at every size).  These three norms opt
+    into ``RMSNormNative(allow_cuda_kernel=True)`` so each is one launch
+    instead of eight; see the call site for the measurement.
   * Operates on flat varlen token layout (``[intermediate, total_tokens]``
     + ``query_start_loc`` + ``cache_indices``) so we can reuse vLLM's
     SOTA fused Mamba kernels (``causal_conv1d_fn``,
@@ -135,12 +136,24 @@ class JambaMambaMixer(nn.Module):
 
         self.out_proj = Linear(intermediate_size, hidden_size, bias=use_bias)
 
-        # Per-layer norms on (dt, B, C). All dims are <= 32 here, which
-        # falls outside the L1 RMSNorm CUDA kernel's safe range, so use
-        # the native pure-PyTorch path everywhere.
-        self.dt_layernorm = RMSNormNative(time_step_rank, eps=rms_norm_eps)
-        self.b_layernorm = RMSNormNative(ssm_state_size, eps=rms_norm_eps)
-        self.c_layernorm = RMSNormNative(ssm_state_size, eps=rms_norm_eps)
+        # Per-layer norms on (dt, B, C). All dims are <= 288 here. The L1
+        # RMSNorm's default CUDA path is vLLM's kernel, which rounds 1 bf16 ULP
+        # away from the reference math at every size measured, so stay on
+        # RMSNormNative -- but opt into its single-launch CUDA path
+        # (``allow_cuda_kernel``): three norms per layer x 28 Mamba layers is
+        # 84 norms per decode step, and the PyTorch sequence spends 8 launches
+        # each. That was 0.84 ms of a 6.58 ms batch-1 decode step in ~500
+        # kernels doing almost no work. vLLM pays none of it because its whole
+        # decode step is compiled and Inductor fuses each norm into one kernel.
+        self.dt_layernorm = RMSNormNative(
+            time_step_rank, eps=rms_norm_eps, allow_cuda_kernel=True,
+        )
+        self.b_layernorm = RMSNormNative(
+            ssm_state_size, eps=rms_norm_eps, allow_cuda_kernel=True,
+        )
+        self.c_layernorm = RMSNormNative(
+            ssm_state_size, eps=rms_norm_eps, allow_cuda_kernel=True,
+        )
 
     @staticmethod
     def _A_loader(param: nn.Parameter, loaded_weight: torch.Tensor) -> None:
@@ -150,6 +163,38 @@ class JambaMambaMixer(nn.Module):
         consume ``A = -exp(A_log)`` (negative).  Matches vLLM's loader.
         """
         param.data.copy_(-torch.exp(loaded_weight.float()))
+
+    def process_weights_after_loading(self) -> None:
+        """Materialize the FP32 copies the SSM kernels require.
+
+        ``selective_scan_fn`` / ``selective_state_update`` take ``dt_bias`` and
+        ``D`` in fp32 while the checkpoint stores them in the model dtype, so
+        the reference spells the conversion inline
+        (``self.dt_proj.bias.float()``, ``self.D.float()``) on every call. That
+        is free for vLLM -- its forward is compiled, so Inductor hoists it --
+        but in eager it is a real cast kernel per Mamba layer per step: 28
+        launches of a [8192] copy, 0.12 ms of a 6.6 ms batch-1 decode step.
+        Convert once here instead. Plain attributes rather than buffers, since
+        ``Module.to(dtype=...)`` would cast a registered fp32 buffer back down
+        (same reason ``prime_trtllm_sinks`` keeps its fp32 sink off the module's
+        buffer list).
+
+        Call this AFTER the model has been moved to its device and dtype.
+        """
+        bias = self.dt_proj.bias
+        self._dt_bias_fp32 = None if bias is None else bias.detach().float()
+        self._D_fp32 = self.D.detach().float()
+
+    def _time_proj_bias(self) -> torch.Tensor | None:
+        """FP32 ``dt_proj.bias``, from the post-load cache when it exists."""
+        cached = getattr(self, "_dt_bias_fp32", None)
+        if cached is not None:
+            return cached
+        return self.dt_proj.bias.float() if self.dt_proj.bias is not None else None
+
+    def _D_float(self) -> torch.Tensor:
+        cached = getattr(self, "_D_fp32", None)
+        return cached if cached is not None else self.D.float()
 
     def _ssm_transform(self, x: torch.Tensor) -> tuple[
         torch.Tensor, torch.Tensor, torch.Tensor,
@@ -248,9 +293,7 @@ class JambaMambaMixer(nn.Module):
             self.conv1d_weight.size(0), self.conv1d_weight.size(2),
         )
         conv_b = self.conv1d_bias
-        time_proj_bias = (
-            self.dt_proj.bias.float() if self.dt_proj.bias is not None else None
-        )
+        time_proj_bias = self._time_proj_bias()
 
         # ------------------------------------------------------------------
         # MIXED PATH: split into prefill rows [0:n_p] and decode rows
@@ -260,8 +303,13 @@ class JambaMambaMixer(nn.Module):
             n_p = num_prefill_tokens
             n_d = num_decode_tokens
 
+            # No ``.contiguous()`` on the decode-half views here either: this
+            # branch went from dead code to the hot path when the scheduler
+            # started mixing, and the vendored kernels read their inputs through
+            # explicit strides (see the homogeneous decode path below for the
+            # same reasoning and the measurement).
             x_p = x_states[:, :n_p]                                  # [I, n_p]
-            x_d = x_states[:, n_p:].transpose(0, 1).contiguous()     # [n_d, I]
+            x_d = x_states[:, n_p:].transpose(0, 1)                  # [n_d, I]
             gate_p = gate[:, :n_p]                                   # [I, n_p]
             gate_d = gate[:, n_p:]                                   # [I, n_d]
 
@@ -280,14 +328,17 @@ class JambaMambaMixer(nn.Module):
             conv_out_d_t = causal_conv1d_update(
                 x_d, conv_state, conv_w, conv_b, "silu",
                 conv_state_indices=state_indices_d,
+                null_block_id=-1,
             )                                                        # [n_d, I]
-            conv_out_d = conv_out_d_t.transpose(0, 1).contiguous()   # [I, n_d]
+            conv_out_d = conv_out_d_t.transpose(0, 1)                # [I, n_d]
+            # ``cat`` materialises the combined buffer, so the halves do not
+            # need to be dense going in.
             conv_out = torch.cat([conv_out_p, conv_out_d], dim=-1)   # [I, n_p+n_d]
 
             # SSM transform on the combined post-conv output.
             dt, B_bts, C_bts = self._ssm_transform(conv_out.transpose(-2, -1))
             dt_p = dt[:, :n_p]                                       # [I, n_p]
-            dt_d = dt[:, n_p:].transpose(0, 1).contiguous()          # [n_d, I]
+            dt_d = dt[:, n_p:].transpose(0, 1)                       # [n_d, I]
             B_p = B_bts[:n_p]                                        # [n_p, S]
             B_d = B_bts[n_p:]                                        # [n_d, S]
             C_p = C_bts[:n_p]                                        # [n_p, S]
@@ -299,7 +350,7 @@ class JambaMambaMixer(nn.Module):
                 self.A,
                 B_p.transpose(-2, -1),
                 C_p.transpose(-2, -1),
-                self.D.float(),
+                self._D_float(),
                 gate_p, time_proj_bias,
                 delta_softplus=True,
                 cache_indices=state_indices_p,
@@ -311,17 +362,18 @@ class JambaMambaMixer(nn.Module):
             scan_out_d = torch.empty_like(conv_out_d.transpose(0, 1))  # [n_d, I]
             selective_state_update(
                 ssm_state,
-                conv_out_d.transpose(0, 1).contiguous(),
+                conv_out_d.transpose(0, 1),
                 dt_d,
                 self.A,
                 B_d, C_d, self.D,
-                gate_d.transpose(0, 1).contiguous(),
-                time_proj_bias,
+                dt_bias=time_proj_bias,
+                z=gate_d.transpose(0, 1),
                 dt_softplus=True,
                 state_batch_indices=state_indices_d,
+                null_block_id=-1,
                 out=scan_out_d,
             )
-            scan_out_d = scan_out_d.transpose(0, 1).contiguous()     # [I, n_d]
+            scan_out_d = scan_out_d.transpose(0, 1)                  # [I, n_d]
 
             scan_out = torch.cat([scan_out_p, scan_out_d], dim=-1)   # [I, n_p+n_d]
             return self.out_proj(scan_out.transpose(-2, -1))
@@ -330,12 +382,21 @@ class JambaMambaMixer(nn.Module):
         # HOMOGENEOUS PATH: pure decode OR pure prefill.
         # ------------------------------------------------------------------
         if is_decode:
-            x_t = x_states.transpose(0, 1).contiguous()
-            conv_out_t = causal_conv1d_update(
-                x_t, conv_state, conv_w, conv_b, "silu",
+            # No ``.contiguous()`` on any of these views, matching vLLM's
+            # ``MambaMixer.forward_impl``: ``causal_conv1d_update`` and
+            # ``selective_state_update`` both read their inputs through explicit
+            # strides, so materialising a dense copy first is pure overhead. It
+            # was FOUR copies of ``[num_decode, intermediate]`` per Mamba layer
+            # (x, conv_out twice, and the gate; the ``dt`` and ``scan_out``
+            # spellings were already no-ops because a transposed GEMM output is
+            # contiguous in the transposed orientation). Profiled at 28 layers:
+            # 113 ``direct_copy`` launches per decode step worth 0.27 ms of 6.58
+            # ms at batch 1 and 1.08 ms of 28.6 ms at batch 256.
+            conv_out = causal_conv1d_update(
+                x_states.transpose(0, 1), conv_state, conv_w, conv_b, "silu",
                 conv_state_indices=cache_indices,
-            )
-            conv_out = conv_out_t.transpose(0, 1).contiguous()
+                null_block_id=-1,
+            ).transpose(0, 1)
         else:
             conv_out = causal_conv1d_fn(
                 x_states, conv_w, conv_b,
@@ -349,26 +410,27 @@ class JambaMambaMixer(nn.Module):
         dt, B_bts, C_bts = self._ssm_transform(conv_out.transpose(-2, -1))
 
         if is_decode:
-            scan_out = torch.empty_like(conv_out.transpose(0, 1))
+            scan_out_t = torch.empty_like(conv_out.transpose(0, 1))
             selective_state_update(
                 ssm_state,
-                conv_out.transpose(0, 1).contiguous(),
-                dt.transpose(0, 1).contiguous(),
+                conv_out.transpose(0, 1),
+                dt.transpose(0, 1),
                 self.A, B_bts, C_bts, self.D,
-                gate.transpose(0, 1).contiguous(),
-                time_proj_bias,
+                dt_bias=time_proj_bias,
+                z=gate.transpose(0, 1),
                 dt_softplus=True,
                 state_batch_indices=cache_indices,
-                out=scan_out,
+                null_block_id=-1,
+                out=scan_out_t,
             )
-            scan_out = scan_out.transpose(0, 1).contiguous()
+            scan_out = scan_out_t.transpose(0, 1)
         else:
             scan_out = selective_scan_fn(
                 conv_out, ssm_state, dt,
                 self.A,
                 B_bts.transpose(-2, -1),
                 C_bts.transpose(-2, -1),
-                self.D.float(),
+                self._D_float(),
                 gate, time_proj_bias,
                 delta_softplus=True,
                 cache_indices=cache_indices,

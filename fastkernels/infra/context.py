@@ -32,9 +32,28 @@ class AttnBackendConfig:
     """Selects attention backend and associated KV cache parameters.
 
     Blackwell (sm_100+) uses TRTLLM-gen kernels via FlashInfer (HND layout,
-    block_size=16).  Hopper and below use flash_attn (NHD layout,
-    block_size=256).  Auto-detection picks the optimal backend for the
-    current GPU.
+    block_size=16), which is what vLLM 0.26 selects there too -- it logs
+    ``Using FLASHINFER attention backend`` / ``Using HND KV cache layout``
+    for dense and MoE transformers on B200.  Hopper and below use
+    flash_attn (NHD layout).
+
+    This is the *default* per model; individual ``Attention`` layers refine
+    it, mirroring vLLM's per-KV-cache-group backend choice.  A layer whose
+    head size exceeds what the paged trtllm-gen/FlashAttention kernels
+    advertise falls back to the Triton unified kernel on an NHD cache (as
+    vLLM does for Gemma4's 512-wide layers), and Whisper's cross-attention
+    pins NHD because it reads the cache through FlashAttention.  Each such
+    layer exposes ``kv_layout`` so the engine allocates its cache to match.
+
+    TODO(tech-debt): the flash_attn ``block_size=256`` default is a leftover
+    from routing paged attention through the PyPI ``flash_attn`` package,
+    which rejects page sizes that are not a multiple of 256.  fastkernels now
+    calls vLLM's bundled FlashAttention build (see
+    ``tasks/baseline/L1/fa_utils.py``), which advertises ``MultipleOf(16)``
+    like vLLM's own ``FlashAttentionBackend``.  Lowering this to 16 would
+    match vLLM and cut KV fragmentation, but it changes block-manager and
+    watermark behaviour on non-Blackwell GPUs, which cannot be validated on
+    this host.
     """
     backend: str = "flash_attn"
     block_size: int = 256
@@ -89,6 +108,11 @@ class ChunkedContextMetadata:
     workspace: torch.Tensor
     token_to_seq: torch.Tensor
     chunk_total_token: list[int]
+    # Per chunk: True when at least one request in the batch has no context
+    # in that chunk.  Those queries attended to zero keys, so the backend
+    # leaves their output rows undefined and they must be neutralized before
+    # the merge (vLLM's ``mask_empty_context``).
+    has_empty_context: list[bool] = field(default_factory=list)
 
 
 @dataclass
@@ -111,6 +135,22 @@ class KimiLinearMetadata:
     num_decode_tokens: int = 0
 
     has_initial_state: torch.Tensor | None = None
+
+    # Host-side summary of ``has_initial_state``. The GDN prefill path needs to
+    # know which slots must be zeroed before the chunk kernel reads them;
+    # deriving that on the device costs a stream sync per layer, and the chunk
+    # planner already knows the answer when it builds the step. Defaults say
+    # "some but not all", which routes the layer through the device mask -- the
+    # correct answer for any producer that does not fill these in.
+    all_have_initial_state: bool = False
+    any_have_initial_state: bool = True
+
+    # ``query_start_loc`` as int32 and ``state_indices`` as int64, materialized
+    # once per step instead of once per layer -- the conv, chunk and recurrent
+    # kernels all want int32 cu_seqlens, and the prefill state gather wants int64
+    # indices. ``None`` means "not precomputed"; callers convert themselves.
+    query_start_loc_int32: torch.Tensor | None = None
+    state_indices_long: torch.Tensor | None = None
 
     slot_mapping: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
@@ -168,6 +208,22 @@ class Context:
 
     # Per-token request ID mapping (for sparse indexer index conversion)
     req_id_per_token: torch.Tensor | None = None
+    # DeepGEMM paged-MQA-logits schedule for the DSA indexer's decode top-k,
+    # shape (num_sms + 1, 2) int32 -- batch- and context-independent, so one
+    # persistent buffer serves every captured batch size. Built by the engine
+    # OUTSIDE any CUDA graph: ``get_paged_mqa_logits_metadata`` called from
+    # inside the captured region makes the paged-logits kernel fault on replay,
+    # while feeding it a schedule computed outside captures and replays fine
+    # (the kernel itself is capturable -- verified in isolation). vLLM builds
+    # this in its metadata builder for the same reason. ``None`` on paths the
+    # engine does not pre-fill (prefill / mixed), where the layer computes it.
+    indexer_schedule: torch.Tensor | None = None
+
+    # DSA indexer prefill chunk plan, computed once per forward and shared by
+    # all indexer layers (they see the same Context). Lazily populated by the
+    # first SparseAttnIndexer call; reset to None each forward. Mirrors vLLM's
+    # DeepseekV32IndexerMetadataBuilder (chunks built once, not per layer).
+    indexer_prefill_meta: object | None = None
 
     # Cross-attention metadata (encoder-decoder models like Whisper)
     # Slot mapping for writing encoder K/V to paged cache
@@ -279,6 +335,7 @@ def auto_register_no_compile_layers(model: "nn.Module") -> None:
       - ``Qwen3MoE``, ``MixtralMoE``, ``GptOssMoE``, ``DeepSeekMoE``,
         ``Gemma4MoE``                                               (MoE blocks)
       - ``Attention``, ``MLAAttention``, ``SparseAttnIndexer``       (attention impls)
+      - ``WhisperCrossAttention``                (encoder-decoder cross-attn)
       - ``Mamba2Mixer``                                              (Mamba2 compile boundary)
 
     Also sets ``_layer_name`` on each module so it knows its own key.
@@ -286,7 +343,25 @@ def auto_register_no_compile_layers(model: "nn.Module") -> None:
     """
     _TARGET_NAMES = {
         "Qwen3MoE", "MixtralMoE", "GptOssMoE", "DeepSeekMoE", "Gemma4MoE",
+        # KimiMoE and SharedExpertMoE implement the same _use_custom_op /
+        # forward_impl contract but were never listed, so they were traced
+        # INLINE. That is not just a missed fusion boundary: their trtllm-gen
+        # MoE call reaches flashinfer Python that logs, and Dynamo rejects
+        # logging.Logger methods under fullgraph -- which is what made
+        # Kimi-Linear untraceable and left it capturing graphs over eager
+        # modules (no AR+RMSNorm fusion, 82 direct_copy kernels/step).
+        "KimiMoE", "SharedExpertMoE",
+        # KimiDeltaAttention already dispatches through
+        # fastkernels::kda_attention (a SPLITTING_OP) when _use_custom_op is set,
+        # exactly as vLLM lists vllm::kda_attention in its splitting_ops -- but
+        # it was never registered here, so the flag stayed False and the layer
+        # was traced inline. Its per-step KDA metadata lives on the module-global
+        # Context, which Dynamo then bakes as a static shape, giving
+        # "ConstraintViolationError (... kda_metadata.state_indices.size()[0],
+        # L['input_ids'].size()[0])". Behind the op boundary it stays opaque.
+        "KimiDeltaAttention",
         "Attention", "MLAAttention", "SparseAttnIndexer",
+        "WhisperCrossAttention",
         "Mamba2Mixer",
     }
     layers: dict[str, "nn.Module"] = {}

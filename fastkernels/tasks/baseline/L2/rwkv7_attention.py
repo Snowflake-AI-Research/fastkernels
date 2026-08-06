@@ -149,6 +149,14 @@ class RWKV7Attention(nn.Module):
         **kwargs,
     ) -> tuple[torch.Tensor, None, object | None, torch.Tensor]:
         B, T, _ = hidden_states.shape
+        max_seqlen = None
+        if cu_seqlens is not None:
+            if B != 1:
+                raise ValueError(
+                    "cu_seqlens prefill expects packed hidden_states with batch size 1"
+                )
+            lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+            max_seqlen = int(lengths.max().item()) if lengths.numel() else 0
 
         # Token shift: shifted[t] = previous token's hidden state.
         # For cached decode the previous token lives in past_key_values.conv_states[id(self)]
@@ -233,7 +241,8 @@ class RWKV7Attention(nn.Module):
         #   T  < 64 + fast kernels -> fused_mul_recurrent_rwkv7 (decode)
         #   no fast kernels         -> naive PyTorch (CPU / debug / reference)
         if self.use_fast_kernels and r.is_cuda:
-            if T >= _CHUNK_THRESHOLD:
+            dispatch_len = max_seqlen if max_seqlen is not None else T
+            if dispatch_len >= _CHUNK_THRESHOLD:
                 # The chunk kernel takes the DPLR decomposition (a=-kk, b=kk*gate_a).
                 o, final_state = self.chunk(
                     r=r_mh, w=w_mh, k=k_mh, v=v_mh,

@@ -15,7 +15,7 @@ from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
 _THIS_DIR = Path(__file__).resolve().parent
-_PACKAGE_DIR = _THIS_DIR.parent.parent
+_PACKAGE_DIR = _THIS_DIR.parent
 _PROJECT_ROOT = _PACKAGE_DIR.parent
 
 sys.path.insert(0, str(_PROJECT_ROOT))
@@ -27,7 +27,7 @@ from fastkernels.workloads import (
     EmbeddingThroughputWorkload,
 )
 
-from bench_vllm import (
+from fastkernels.validate.bench_vllm import (
     _detect_gpu_name,
     _install_bench_sitecustomize,
     _make_run_id,
@@ -49,7 +49,7 @@ def _vllm_default_scheduler_limits(gpu: str) -> tuple[int, int]:
 
 
 def _jsonl_path(workload: EmbeddingThroughputWorkload) -> Path:
-    return _PACKAGE_DIR / "data" / "embedding_workloads" / workload.jsonl_name
+    return _PROJECT_ROOT / "data" / "embedding_workloads" / workload.jsonl_name
 
 
 def _iter_dataset_texts(workload: EmbeddingThroughputWorkload, seed: int):
@@ -472,6 +472,7 @@ def main():
     os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
     from vllm import LLM
+    from vllm.config import PoolerConfig
 
     torch.manual_seed(cfg["seed"])
     hf_overrides = None
@@ -482,6 +483,10 @@ def main():
     llm = LLM(
         model=cfg["model_name"],
         runner="pooling",
+        # The pooling task is fixed at engine construction: bge-m3/colbertv2 both
+        # resolve to a sentence-transformers default ("embed&token_classify"), and
+        # vLLM rejects a per-request pooling_task that differs from the engine's.
+        pooler_config=PoolerConfig(task="token_embed"),
         tensor_parallel_size=cfg["tp"],
         dtype=cfg["dtype"],
         seed=cfg["seed"],
@@ -491,6 +496,10 @@ def main():
         max_model_len=cfg["max_length"],
         max_num_batched_tokens=cfg["max_num_batched_tokens"],
         max_num_seqs=cfg["max_num_seqs"],
+        # Pin multi-GPU execution to multiprocessing so vLLM cannot fall back
+        # to its ray executor and nest a second Ray cluster inside the validate
+        # runner's. None leaves vLLM's own default, which is "uni" at tp=1.
+        distributed_executor_backend="mp" if cfg["tp"] > 1 else None,
     )
 
     warm_prompts = [
@@ -876,7 +885,7 @@ def main() -> None:
     if args.output_dir is None:
         run_id = _make_run_id(args.run_id)
         args.output_dir = str(
-            _PACKAGE_DIR / "tests" / "results" / gpu / "embedding" / run_id
+            _PROJECT_ROOT / "tests" / "results" / gpu / "embedding" / run_id
         )
     elif args.run_id is not None:
         print("  NOTE: --run-id is ignored because --output-dir was provided.")

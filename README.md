@@ -52,6 +52,50 @@ fastkernels eval full
 ```
 
 
+## Benchmark Results
+
+End-to-end against the SOTA reference library on the standard workloads
+(`fastkernels validate <scenario>`), 8x NVIDIA B200, compiled with CUDA graphs on
+both sides. "Prefix match" is the average number of leading greedy tokens per
+request that agree with the reference.
+
+### zai-org/GLM-5.2 family vs vLLM 0.26 (tp=8)
+
+`nvidia/GLM-5.2-NVFP4`, NVFP4 routed experts + `kv_cache_dtype=fp8_e4m3`
+(the row in `fastkernels/scenarios/full.yaml`):
+
+| workload | requests | fastkernels | vLLM | ratio | prefix match |
+|---|---|---|---|---|---|
+| mixed | 1000 | 8,266 tok/s | 5,129 tok/s | 1.61x | 26.8 / 388 |
+| long-context | 64 | 235 tok/s | 248 tok/s | 0.95x | 19.7 / 256 |
+| single-request (bs=1) | — | 9.41 ms/tok | 8.95 ms/tok | 0.95x | — |
+| fixed-batch-32 | — | 0.535 ms/tok | 0.511 ms/tok | 0.96x | — |
+
+The vLLM column is re-measured on an idle host; an earlier cached mixed figure
+of 4,188 tok/s was 18% low. Long-context prefix match is measured over 64
+requests with 2-7 exact matches, so it swings 20-42 between runs -- do not read
+movement there as signal. Neither engine's output is degenerate: 0 of 1000
+mixed generations loop (vLLM 1), 4 of 64 long-context (vLLM 8).
+
+At 4 layers / tp=1 the greedy output is byte-identical to vLLM's, and on the full
+model 23 of the 1000 mixed requests match for all 388 tokens; the averages above
+reflect this model family's tie-flip cascade rather than an operator defect (see
+`fastkernels/validate/forced_decode.py`, which measures the per-step agreement
+ceiling at ~88%).
+
+Two remaining gaps are localised and measured rather than mysterious:
+
+* **long-context (0.32x)**: those steps are always mixed prefill+decode batches,
+  which vLLM captures as piecewise CUDA graphs while fastkernels captures
+  pure-decode graphs only, so they run eager here.
+* **latency (0.89x / 0.91x)**: not kernel time -- GPU occupancy now matches vLLM
+  to within 3.4% -- but GPU *idle*, 15.1% of wall against vLLM's 8.1%. The decode
+  loop blocks on the sampled token before launching the next step, so the host
+  never runs ahead and the ~2000-node graph submission is fully exposed.
+
+See [section 27 of the alignment audit](docs/vllm-0.26-alignment-audit.md) for the
+full analysis, including the profiling method.
+
 ## Citation
 
 If you use FastKernels, please cite [our accompanying paper](https://arxiv.org/abs/2605.23215):

@@ -37,6 +37,22 @@ def _detect_flashinfer_rope() -> bool:
 
 _USE_FLASHINFER_ROPE = _detect_flashinfer_rope()
 
+
+# GLM-5.2's plain "default" rope: vLLM applies it via torch.ops._C.rotary_embedding
+# (base RotaryEmbedding.forward_cuda, flashinfer disabled by default). fastkernels'
+# own rope kernel differs from _C by ~1 bf16 ULP (verified: max|Δ|=3.1e-2 on
+# identical input+cache), which is the ROPE half of the MLA-core divergence. Call
+# _C directly so q_pe/k_pe are bit-identical to vLLM. Registered by importing
+# vllm._custom_ops.
+def _detect_vllm_c_rope() -> bool:
+    try:
+        import vllm._custom_ops  # noqa: F401 — registers torch.ops._C
+        return hasattr(torch.ops._C, "rotary_embedding")
+    except Exception:
+        return False
+
+_HAS_VLLM_C_ROPE = _detect_vllm_c_rope()
+
 from .rotary_emb import RotaryEmbedding
 
 
@@ -170,10 +186,19 @@ class YarnRotaryEmbedding(nn.Module):
         mscale: float = 1,
         mscale_all_dim: float = 0,
         is_neox_style: bool = False,
+        is_plain: bool = False,
+        cache_dtype: torch.dtype | None = None,
     ):
         super().__init__()
         self.head_dim = head_dim
         self.is_neox_style = is_neox_style
+        # ``is_plain`` marks a degenerate (scaling_factor==1.0) instance that is
+        # really standard RoPE — e.g. GLM-5.2's ``rope_type: "default"``. vLLM
+        # maps a "default" rope to the base ``RotaryEmbedding``, which does NOT
+        # use the FlashInfer kernel and casts the cos/sin cache to the model
+        # dtype (bf16). DeepSeek-V3.2 YARN (scaling_factor>1) keeps FlashInfer +
+        # fp32 cache. Threading this flag lets both match vLLM exactly.
+        self.is_plain = is_plain
         rotary_dim = head_dim
         base = rope_theta
 
@@ -200,6 +225,14 @@ class YarnRotaryEmbedding(nn.Module):
         cos = freqs.cos() * softmax_mscale
         sin = freqs.sin() * softmax_mscale
         cache = torch.cat((cos, sin), dim=-1).float()
+        # Plain "default" rope (GLM-5.2): vLLM's base ``RotaryEmbedding`` stores
+        # the cos/sin cache in the model compute dtype (bf16) once at init, so
+        # its forward never re-casts. Match that — computing in fp32 then
+        # casting to bf16 here is bit-identical to casting per-forward, and
+        # skips a full-cache dtype conversion on every rope call. YARN
+        # (is_plain=False) keeps the fp32 cache for the FlashInfer path.
+        if self.is_plain and cache_dtype is not None:
+            cache = cache.to(cache_dtype)
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
     def forward(self, positions, query, key):
@@ -208,7 +241,8 @@ class YarnRotaryEmbedding(nn.Module):
         # ``vllm/model_executor/layers/rotary_embedding/deepseek_scaling_rope.py:181-198``).
         # FlashInfer keeps ``cos_sin_cache`` in float32; only the fastkernels
         # CUDA kernel needs the cache cast to query.dtype.
-        if _USE_FLASHINFER_ROPE and query.dtype in (torch.float16, torch.bfloat16) \
+        if _USE_FLASHINFER_ROPE and not self.is_plain \
+                and query.dtype in (torch.float16, torch.bfloat16) \
                 and self.head_dim in (64, 128, 256, 512):
             torch.ops.vllm.flashinfer_rotary_embedding(
                 positions, query, key, self.head_dim, self.cos_sin_cache,
@@ -218,7 +252,15 @@ class YarnRotaryEmbedding(nn.Module):
         cache = self.cos_sin_cache
         if cache.dtype != query.dtype:
             cache = cache.to(query.dtype)
-        torch.ops.fastkernels_rope.rotary_embedding(
-            positions, query, key, self.head_dim, cache, self.is_neox_style,
-        )
+        if self.is_plain and _HAS_VLLM_C_ROPE:
+            # GLM-5.2 plain "default" rope: call vLLM's EXACT rotary kernel so
+            # q_pe/k_pe are bit-identical to vLLM (fastkernels' own kernel is
+            # ~1 ULP off, the rope half of the MLA-core divergence).
+            torch.ops._C.rotary_embedding(
+                positions, query, key, self.head_dim, cache, self.is_neox_style,
+            )
+        else:
+            torch.ops.fastkernels_rope.rotary_embedding(
+                positions, query, key, self.head_dim, cache, self.is_neox_style,
+            )
         return query, key

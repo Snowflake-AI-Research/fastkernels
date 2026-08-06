@@ -1,28 +1,16 @@
 """Flash attention prefill kernel (variable-length sequences).
 
-On Hopper (SM90) when vLLM's bundled FA3 is available, uses FA3 to match
-vLLM's numerical behavior. Falls back to FA2 otherwise.
+Routes through vLLM's bundled FlashAttention build at the version vLLM
+itself would select for this device (FA3 on Hopper, FA4 on Blackwell,
+FA2 otherwise) -- see :mod:`fa_utils`.
 """
 
 import torch
 import torch.nn as nn
 
-_FA3_AVAILABLE = False
-_fa3_varlen_func = None
-try:
-    from vllm.vllm_flash_attn import (
-        flash_attn_varlen_func as _vllm_fa_varlen,
-        is_fa_version_supported,
-    )
-    if is_fa_version_supported(3) and torch.cuda.is_available():
-        cc = torch.cuda.get_device_capability()
-        if cc[0] >= 9:
-            _FA3_AVAILABLE = True
-            _fa3_varlen_func = _vllm_fa_varlen
-except ImportError:
-    pass
+from .fa_utils import FA_VERSION, VLLM_FA_AVAILABLE, flash_attn_varlen_func
 
-if not _FA3_AVAILABLE:
+if not VLLM_FA_AVAILABLE:  # pragma: no cover - CPU-only fallback
     from flash_attn import flash_attn_varlen_func as _fa2_varlen_func
 
 
@@ -35,22 +23,24 @@ class FlashAttnPrefill(nn.Module):
         self.sm_scale = head_dim ** -0.5
 
     def forward(self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs):
-        if _FA3_AVAILABLE:
-            # vLLM's wrapper parameter order differs from standard flash_attn — use kwargs.
-            # FA3 requires seqused_k (not cu_seqlens_k) when block_table is provided.
-            fa3_kw = dict(
+        if VLLM_FA_AVAILABLE:
+            # vLLM's wrapper takes keyword args in a different order than the
+            # standard flash_attn signature.  With a ``block_table`` the
+            # kernel needs per-sequence ``seqused_k`` rather than cumulative
+            # ``cu_seqlens_k``.
+            fa_kw = dict(
                 max_seqlen_q=max_seqlen_q,
                 cu_seqlens_q=cu_seqlens_q,
                 max_seqlen_k=max_seqlen_k,
-                fa_version=3,
+                fa_version=FA_VERSION,
             )
             if kwargs.get("block_table") is not None:
                 seqused_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
-                fa3_kw["seqused_k"] = seqused_k
+                fa_kw["seqused_k"] = seqused_k
             else:
-                fa3_kw["cu_seqlens_k"] = cu_seqlens_k
-            fa3_kw.update(kwargs)
-            return _fa3_varlen_func(q, k, v, **fa3_kw)
+                fa_kw["cu_seqlens_k"] = cu_seqlens_k
+            fa_kw.update(kwargs)
+            return flash_attn_varlen_func(q, k, v, **fa_kw)
         return _fa2_varlen_func(
             q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs,
         )

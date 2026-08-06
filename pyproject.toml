@@ -9,59 +9,173 @@ description = "A CUDA kernel benchmarking library for LLM inference"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "torch>=2.0",
+    "torch==2.11.0",
+    "torchvision==0.26.0",
+    "torchaudio==2.11.0",
     "numpy",
     "pyyaml",
-    "transformers",
+    "transformers>=5.5.3",
     "huggingface_hub",
     "safetensors",
     "tqdm",
+    "blobfile",
     "halo",
-    "flash-attn",
-    "vllm==0.24.0",
-    "deep-gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@v2.1.1.post3",
+    "vllm==0.26.0",
+    "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@v0.26.0rc1",
+    "openai>=2.48.0",
+    "quack-kernels>=0.6.1",
+    "ray[default]",
+    # Pin the exact DeepGEMM commit vLLM 0.26 vendors (its __version__ is 2.5.0),
+    # so fastkernels and vLLM use the identical fp8 GEMM / MQA-logits kernels.
+    # Kept in sync with vllm's cmake/external_projects/deepgemm.cmake
+    # (_DEEPGEMM_UPSTREAM_TAG) and tools/install_deepgemm.sh (DEEPGEMM_GIT_REF).
+    #
+    # v2.1.1.post3 (the previous pin) is NOT enough for the DSA models: vLLM
+    # 0.26's sparse indexer calls the unified ``fp8_fp4_mqa_logits``, which
+    # v2.1.1 does not export, so GLM-5.2 / DeepSeek-V3.2 fail at the first
+    # prefill with "DeepGEMM backend is unavailable". This commit is a strict
+    # superset -- it still exports fp8_mqa_logits / fp8_paged_mqa_logits.
+    "deep-gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@a6b593d2826719dcf4892609af7b84ee23aaf32a",
     "decord",
     "mlflow>=2.10",
     "datasets",
     "diffusers>=0.37",
     "peft>=0.17.0",
     "sam3 @ git+https://github.com/sfc-gh-goliaro/sam3.git",
-    "openfold3 @ git+https://github.com/sfc-gh-goliaro/openfold-3.git",
+    # Pinned to the commit that stops openfold3 installing a top-level `scripts`
+    # package (which shadowed DeepGEMM's build-time `from scripts.generate_pyi`).
+    "openfold3 @ git+https://github.com/sfc-gh-goliaro/openfold-3.git@0ad77348bbdc71b7b028535ede809a71f87b3264",
     "pycocotools",
     "timm",
     "einops",
-    "torchvision",
     "av",
     "rotary-embedding-torch",
     "fastsafetensors",
     "ultralytics",
     "flash-linear-attention>=0.4.2",
-    # TTT-E2E benchmark (tests/bench_ttt_e2e.py): the official reference at
-    # github.com/test-time-training/e2e is JAX/Equinox/Optax. We import its
-    # MetaModel from a subprocess worker for cross-framework correctness +
-    # throughput comparison.
+    # --- FlashAttention 2 ---------------------------------------------------
+    # Pinned to prebuilt wheels rather than the PyPI package, whose extension is
+    # compiled against whatever torch the build/wheel-publish env saw. When that
+    # torch differs from the pin above, `import flash_attn` dies at dlopen:
+    #   ImportError: flash_attn_2_cuda...so: undefined symbol:
+    #     _ZN3c104cuda29c10_cuda_check_implementationEiPKcS2_ib
+    # (c10_cuda_check_implementation's line_number arg went int -> uint32_t, so
+    # the mangled name moved from ...S2_ib to ...S2_jb.) vLLM is collateral
+    # damage: rotary_embedding/common.py imports flash_attn.ops.triton.rotary
+    # under `suppress(ModuleNotFoundError)`, which does not catch an ABI
+    # ImportError, so a mismatched wheel is fatal at engine startup.
+    #
+    # These wheels are built per (flash-attn, CUDA, torch, cpython) tuple, so the
+    # ABI is pinned exactly: https://github.com/mjun0812/flash-attention-prebuild-wheels
+    #
+    # CUDA flavor is hardcoded to cu130 because PEP 508 markers cannot see it —
+    # and they don't need to: torch==2.11.0 on PyPI is a CUDA 13 build (it
+    # depends on nvidia-*-cu13), so cu130 is implied by the torch pin. If you
+    # deliberately install torch 2.11.0 from a cu128/cu126 index, swap the wheel
+    # afterwards with the matching URL from the release above:
+    #   pip install --force-reinstall --no-deps \
+    #     ".../v0.9.4/flash_attn-2.8.3+cu128torch2.11-cp312-cp312-linux_x86_64.whl"
+    # Free-threaded interpreters (3.13t/3.14t) are not selectable by marker;
+    # provision those by hand from the same release.
+    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.4/flash_attn-2.8.3+cu130torch2.11-cp310-cp310-linux_x86_64.whl ; python_version == '3.10' and platform_machine == 'x86_64'",
+    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.4/flash_attn-2.8.3+cu130torch2.11-cp311-cp311-linux_x86_64.whl ; python_version == '3.11' and platform_machine == 'x86_64'",
+    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.4/flash_attn-2.8.3+cu130torch2.11-cp312-cp312-linux_x86_64.whl ; python_version == '3.12' and platform_machine == 'x86_64'",
+    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.4/flash_attn-2.8.3+cu130torch2.11-cp313-cp313-linux_x86_64.whl ; python_version == '3.13' and platform_machine == 'x86_64'",
+    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.4/flash_attn-2.8.3+cu130torch2.11-cp314-cp314-linux_x86_64.whl ; python_version == '3.14' and platform_machine == 'x86_64'",
+    # aarch64 (GB200-class hosts) ships in a later release of the same builder.
+    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.22/flash_attn-2.8.3+cu130torch2.11-cp310-cp310-linux_aarch64.whl ; python_version == '3.10' and platform_machine == 'aarch64'",
+    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.22/flash_attn-2.8.3+cu130torch2.11-cp311-cp311-linux_aarch64.whl ; python_version == '3.11' and platform_machine == 'aarch64'",
+    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.22/flash_attn-2.8.3+cu130torch2.11-cp312-cp312-linux_aarch64.whl ; python_version == '3.12' and platform_machine == 'aarch64'",
+    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.22/flash_attn-2.8.3+cu130torch2.11-cp313-cp313-linux_aarch64.whl ; python_version == '3.13' and platform_machine == 'aarch64'",
+    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.22/flash_attn-2.8.3+cu130torch2.11-cp314-cp314-linux_aarch64.whl ; python_version == '3.14' and platform_machine == 'aarch64'",
+]
+
+# ---------------------------------------------------------------------------
+# Optional dependencies.
+#
+# The mandatory ``dependencies`` above are the *runtime* set: everything the
+# fastkernels engine, candidate kernels, and the e2e eval harness import to
+# run. The extras below are only needed to run the *reference* implementations
+# (and a few heavy task-specific kernels) during the ``validate`` phase. They
+# are installed automatically for the selected scenarios by ``fastkernels
+# validate`` (see fastkernels/validate/provision.py), or manually via
+# ``pip install .[validate]``.
+#
+# These pip extras cover only the pip-resolvable pieces. Several references
+# additionally need things pip cannot express, which the provisioner handles:
+#   * git checkouts (ttt-e2e, 3D-Diffusion-Policy, PointTransformerV3) placed
+#     under THIRD_PARTY_DIR (~/.fastkernels/third_party);
+#   * source builds — fbgemm_gpu for TorchRec/DLRMv2 (``ref-recsys`` only
+#     covers torch-geometric/LightGCN; no prebuilt fbgemm wheel matches recent
+#     torch) and ``pyngp`` for instant-ngp.
+# So ``pip install .[validate]`` alone is not sufficient for those harnesses;
+# ``fastkernels validate`` provisions them end to end.
+# ---------------------------------------------------------------------------
+[project.optional-dependencies]
+# ttt-e2e reference (bench_ttt_e2e): the official reference at
+# github.com/test-time-training/e2e is JAX/Equinox/Optax. We import its
+# MetaModel from a subprocess worker for cross-framework correctness +
+# throughput comparison.
+ref-ttt = [
     "jax[cuda12]",
     "equinox>=0.11.12",
     "optax>=0.2.4",
     "jaxtyping>=0.2.36",
     "hydra-core>=1.3",
-    # DP3 bench (tests/bench_dp3.py): omegaconf is required by the
-    # reference 3D-Diffusion-Policy repo for its OmegaConf-based configs;
-    # pyarrow reads the xarm-pointcloud parquet shards; dill loads the
-    # reference's dill-pickled checkpoints. ``datasets`` already pulls in
-    # pyarrow and dill transitively, but we pin them here for clarity.
+]
+# DP3 reference (bench_dp3): omegaconf drives the reference
+# 3D-Diffusion-Policy's configs; pyarrow reads the xarm-pointcloud parquet
+# shards; dill loads the reference's dill-pickled checkpoints.
+ref-dp3 = [
     "omegaconf",
     "pyarrow",
     "dill",
+    "zarr",  # read by the reference replay-buffer / normalizer
+    # NOTE: diffusion_policy_3d also hard-imports pytorch3d.ops; no wheel matches
+    # recent torch/CUDA, so the provisioner builds pytorch3d from source.
+]
+# RecSys references (bench_recsys): torch-geometric backs the LightGCN
+# reference. DLRMv2 also needs torchrec + a source-built fbgemm_gpu (provisioner).
+ref-recsys = [
+    "torch-geometric",
+]
+# dLLM reference (bench_dllm): lm_eval supplies the official task prompts
+# (HumanEval, etc.); >=0.4.12 tracks transformers 5.x (AutoModelForImageTextToText).
+# The Fast-dLLM reference repo itself is a git checkout the provisioner clones.
+ref-dllm = [
+    "lm_eval>=0.4.12",
+]
+# Omni references (bench_vllm_omni): FLUX / HunyuanVideo / CosyVoice3.
+# s3tokenizer backs CosyVoice3 speech-token extraction (upstream moved this out of
+# cosyvoice3.utils into an on-GPU S3Tokenizer); it is not a vllm-omni dependency.
+ref-omni = [
+    "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@v0.26.0rc1",
+    "s3tokenizer",
+]
+# Reference model libraries pulled from git (bench_sam / bench_openfold3).
+ref-vision = [
+    "sam3 @ git+https://github.com/sfc-gh-goliaro/sam3.git",
+    "openfold3 @ git+https://github.com/sfc-gh-goliaro/openfold-3.git",
+]
+# Task-specific kernels used by the candidate ("ours") path of these
+# benchmarks; kept optional so a core install stays lean and buildable on any
+# box (gsplat compiles a CUDA extension; spconv ships per-CUDA wheels).
+task-3dgs = [
+    "gsplat",
+]
+task-pointcloud = [
+    "spconv-cu126",
+    "addict",  # imported by the official PointTransformerV3 reference model.py
+]
+# Convenience meta-extra installing every pip-resolvable reference/task dep.
+validate = [
+    "fastkernels[ref-ttt,ref-dp3,ref-recsys,ref-dllm,ref-omni,ref-vision,task-3dgs,task-pointcloud]",
 ]
 
 [project.scripts]
 fastkernels = "fastkernels.__main__:main"
 
 [tool.uv]
-find-links = [
-    "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/expanded_assets/v0.9.0",
-]
 no-build-isolation-package = ["flash-attn", "deep-gemm"]
 
 [tool.setuptools.packages.find]

@@ -34,6 +34,25 @@ RESULTS_DIR = Path(
                    str(Path.home() / ".fastkernels" / "results"))
 )
 
+# --- Compiler / JIT caches (override with FASTKERNELS_CACHE_DIR) ---
+# Triton, Inductor, vLLM and CUDA JIT artifacts are redirected under here so a
+# run's cache state is explicit and can be cleared wholesale. ``validate`` gives
+# each run its own subdirectory (reused under ``--resume``), so compile warmth
+# accumulated by one run never silently changes the next run's timings.
+CACHE_DIR = Path(
+    os.environ.get("FASTKERNELS_CACHE_DIR",
+                   str(Path.home() / ".fastkernels" / "cache"))
+)
+
+# --- External reference checkouts / builds (kept out of the repo) ---
+# Reference-library repos and source builds provisioned for the ``validate``
+# phase (ttt-e2e, 3D-Diffusion-Policy, instant-ngp, ...) live here rather than
+# in the repo's ``third_party/``. Override with FASTKERNELS_THIRD_PARTY_DIR.
+THIRD_PARTY_DIR = Path(
+    os.environ.get("FASTKERNELS_THIRD_PARTY_DIR",
+                   str(Path.home() / ".fastkernels" / "third_party"))
+)
+
 # --- MLflow tracking ---
 MLFLOW_TRACKING_DIR = KB_ROOT / "mlruns"
 

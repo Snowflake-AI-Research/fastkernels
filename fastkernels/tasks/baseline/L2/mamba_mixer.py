@@ -29,6 +29,8 @@ Weight names from HF Mamba checkpoint
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 
@@ -48,6 +50,71 @@ from .parallel_linear import (
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
+
+# Mamba v1 keeps its activations channel-major, ``[dim, num_tokens]``, because
+# that is the layout the conv1d / selective-scan kernels want.  ``x_proj`` and
+# ``out_proj`` consume those tensors as ``t.transpose(-2, -1)``, which hands
+# cuBLAS a column-major operand whose *contiguous* axis is the token axis.  The
+# length of that axis sets the kernel's vector width, so an unaligned token
+# count drops cuBLAS off its nvjet path onto an ``align1`` CUTLASS fallback.
+# Measured on a B200 at ~16K tokens, bf16:
+#
+#     token count   out_proj   x_proj
+#     16136 (8|n)    0.28 ms   0.05 ms
+#     16130 (2|n)    1.41 ms   0.16 ms
+#     16131 (odd)    3.43 ms   0.29 ms
+#
+# 3.4 ms x 64 layers is ~200 ms per step, and the token count is whatever the
+# scheduler happened to pack (prompt tails + one token per running decode), so
+# it is odd about half the time.  For ``out_proj`` -- by far the more expensive
+# of the two -- rounding the operand's token axis *up* and slicing the GEMM's
+# output back down costs at most 7 extra token-rows.  ``x_proj``'s operand is
+# the conv output, whose width is the prefill token count; the scheduler keeps
+# that aligned where it can (``ModelRunner._mamba_prefill_align``).
+# vLLM's Mamba2 path never hits this because it keeps activations token-major.
+_LDA_ALIGN = 8  # 8 bf16 elements == 16 bytes
+
+# Kill switch for the split in_proj in ``MambaMixer._project_input``.
+_SPLIT_IN_PROJ = os.environ.get("FASTKERNELS_MAMBA_SPLIT_IN_PROJ", "1") == "1"
+
+
+def _needs_token_pad(t: torch.Tensor) -> bool:
+    """Whether ``t.transpose(-2, -1)`` would hit the unaligned GEMM path.
+
+    ``stride(-2) == 1`` means the transpose is already row-major, so its
+    contiguous axis is ``dim`` (always a multiple of 8) rather than the token
+    count -- that is the decode half, and it is fine as-is.
+    """
+    if t.stride(-2) == 1:
+        return False
+    return t.size(-1) % _LDA_ALIGN != 0
+
+
+def _padded_token_cat(parts: list[torch.Tensor]) -> tuple[torch.Tensor, int]:
+    """Join ``[dim, num_tokens]`` halves into one aligned GEMM operand.
+
+    Returns ``(buffer, num_real_tokens)``.  ``buffer`` may be wider than
+    ``num_real_tokens``; callers slice the GEMM's output to that length.  A
+    mixed batch pays a concatenation either way, so the padding is free there;
+    a single unaligned half costs one copy, which is still ~20x cheaper than
+    the GEMM fallback it avoids.
+    """
+    total = sum(p.size(-1) for p in parts)
+    if len(parts) == 1 and not _needs_token_pad(parts[0]):
+        return parts[0], total
+    padded = (total + _LDA_ALIGN - 1) // _LDA_ALIGN * _LDA_ALIGN
+    buf = torch.empty(
+        (*parts[0].shape[:-1], padded),
+        dtype=parts[0].dtype, device=parts[0].device,
+    )
+    offset = 0
+    for p in parts:
+        width = p.size(-1)
+        buf[..., offset:offset + width].copy_(p)
+        offset += width
+    if offset < padded:
+        buf[..., offset:].zero_()  # keep the discarded tail rows finite
+    return buf, total
 
 
 class MambaMixer(nn.Module):
@@ -150,7 +217,50 @@ class MambaMixer(nn.Module):
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
-    def _ssm_transform(self, x: torch.Tensor):
+    def _project_input(self, hidden_states: torch.Tensor, *, split: bool):
+        """in_proj, returning ``(hidden_states_BC, gate)`` as ``[dim, N]``.
+
+        The two halves feed kernels that disagree about layout: the varlen
+        conv1d wants ``hidden_states_BC`` channel-contiguous, while
+        ``selective_scan_fn`` requires ``z`` (the gate) with
+        ``stride(-1) == 1`` and clones it otherwise.  One merged projection can
+        only satisfy one of them -- vLLM keeps the merged GEMM and pays a
+        transposing clone of the gate inside the scan wrapper, 0.37 ms per layer
+        at 16K tokens (an uncoalesced copy running at ~0.7 TB/s), so ~24 ms per
+        step across 64 layers.  Running the two halves of the same weight as two
+        GEMMs costs ~0.02 ms and lands each half in the layout its kernel wants.
+
+        Only worth doing when the step has prefill tokens: the decode kernels
+        take ``z`` as-is, so decode-only steps (the CUDA-graph path) keep the
+        merged projection.  It also needs an aligned token count -- the split
+        gate GEMM stores a ``[dim, num_tokens]`` result, and an unaligned row
+        length costs it more (0.98 ms) than the clone it saves (0.37 ms).
+        Finally it falls back to the merged projection when the weight is not a
+        plain matrix (fp8) or carries a bias, since the split would otherwise
+        have to reimplement the quantized ``linear_op``.
+        """
+        in_proj = self.in_proj
+        if (
+            not split
+            or not _SPLIT_IN_PROJ
+            or hidden_states.dim() != 2
+            or hidden_states.size(0) % _LDA_ALIGN != 0
+            or getattr(in_proj, "use_fp8", False)
+            or in_proj.bias is not None
+        ):
+            projected_states = in_proj(hidden_states).transpose(-2, -1)
+            return projected_states.chunk(2, dim=-2)
+
+        import torch.nn.functional as F
+        weight = in_proj.weight
+        half = weight.size(0) // 2
+        hidden_states_BC = F.linear(
+            hidden_states, weight[:half],
+        ).transpose(-2, -1)
+        gate = torch.mm(weight[half:], hidden_states.transpose(-2, -1))
+        return hidden_states_BC, gate
+
+    def _ssm_transform(self, x: torch.Tensor, *, dt_contiguous: bool = False):
         """Compute (dt, B, C) from x via x_proj + dt_proj.
 
         x: [N, intermediate_per_rank]
@@ -158,6 +268,9 @@ class MambaMixer(nn.Module):
           dt: [intermediate_per_rank, N]
           B:  [N, ssm_state_size]
           C:  [N, ssm_state_size]
+
+        ``dt_contiguous`` returns ``dt`` already contiguous in that shape.  See
+        the call site in the prefill branch for why.
         """
         ssm_params = self.x_proj(x)  # [N, dt_rank + 2*N_state]
         dt, B, C = torch.split(
@@ -169,7 +282,10 @@ class MambaMixer(nn.Module):
         # ColumnParallelLinear adds bias inside; we want it raw, so we
         # call F.linear without the bias and pass the bias separately.
         import torch.nn.functional as F
-        dt = F.linear(dt, self.dt_proj.weight, None).transpose(-2, -1)
+        if dt_contiguous:
+            dt = torch.mm(self.dt_proj.weight, dt.transpose(-2, -1))
+        else:
+            dt = F.linear(dt, self.dt_proj.weight, None).transpose(-2, -1)
         return dt, B, C
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -185,8 +301,10 @@ class MambaMixer(nn.Module):
         mamba_state = getattr(ctx, "mamba_state", None)
         mamba_meta = getattr(ctx, "mamba_metadata", None)
 
-        projected_states = self.in_proj(hidden_states).transpose(-2, -1)
-        hidden_states_BC, gate = projected_states.chunk(2, dim=-2)
+        hidden_states_BC, gate = self._project_input(
+            hidden_states,
+            split=mamba_meta is not None and mamba_meta.num_prefill_tokens > 0,
+        )
 
         if mamba_state is None or mamba_meta is None:
             # Profile / warmup path (no cache available).
@@ -240,6 +358,7 @@ class MambaMixer(nn.Module):
                 self.conv1d.bias,
                 self.activation,
                 conv_state_indices=mamba_meta.state_indices_d,
+                null_block_id=-1,
             ).transpose(0, 1)
 
             dt_d, B_d, C_d = self._ssm_transform(conv_out_d.transpose(-2, -1))
@@ -252,10 +371,11 @@ class MambaMixer(nn.Module):
                 B_d,
                 C_d,
                 self.D,
-                gate_d.transpose(0, 1),
-                time_proj_bias,
+                dt_bias=time_proj_bias,
+                z=gate_d.transpose(0, 1),
                 dt_softplus=True,
                 state_batch_indices=mamba_meta.state_indices_d,
+                null_block_id=-1,
                 out=out_d,
             )
             ssm_outputs.append(out_d.transpose(0, 1))
@@ -273,7 +393,18 @@ class MambaMixer(nn.Module):
                 metadata=mamba_meta,
             )
 
-            dt_p, B_p, C_p = self._ssm_transform(conv_out_p.transpose(-2, -1))
+            # ``selective_scan_fn`` requires ``delta`` with ``stride(-1) == 1``
+            # and clones it otherwise.  The natural ``F.linear(...).transpose``
+            # produces exactly the layout that fails that test, so the wrapper
+            # materialises a [dim, num_tokens] transposing copy -- an
+            # uncoalesced read that runs at ~0.7 TB/s, 0.37 ms per layer at 16K
+            # tokens, i.e. ~24 ms per step across 64 layers.  Computing
+            # ``W @ dt^T`` costs the same as the linear + view and lands the
+            # values in the layout the kernel wants, so it receives exactly the
+            # tensor it would have built for itself.
+            dt_p, B_p, C_p = self._ssm_transform(
+                conv_out_p.transpose(-2, -1), dt_contiguous=True,
+            )
             scan_out_p = selective_scan_fn(
                 conv_out_p,
                 ssm_state,
@@ -291,8 +422,7 @@ class MambaMixer(nn.Module):
             )
             ssm_outputs.append(scan_out_p)
 
-        scan_outputs = ssm_outputs[0] if len(ssm_outputs) == 1 else torch.cat(
-            ssm_outputs,
-            dim=-1,
-        )
-        return self.out_proj(scan_outputs.transpose(-2, -1))
+        scan_outputs, num_scan_tokens = _padded_token_cat(ssm_outputs)
+        return self.out_proj(
+            scan_outputs.transpose(-2, -1),
+        )[:num_scan_tokens]

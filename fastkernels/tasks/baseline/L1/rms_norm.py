@@ -35,7 +35,17 @@ import torch.nn.functional as F
 from .csrc import _C
 
 try:
-    import vllm._C  # noqa: F401 — registers torch.ops._C.rms_norm etc.
+    # vLLM's C extension registers torch.ops._C.rms_norm / fused_add_rms_norm.
+    # The module that triggers registration differs across versions: vLLM <=0.18
+    # exposed ``vllm._C`` directly, while 0.24 removed that name and registers the
+    # ops from ``vllm._custom_ops``. Import whichever is present so we use vLLM's
+    # bitwise-identical norm kernels instead of silently falling back to
+    # fastkernels' own — the fallback diverges slightly per layer and, summed
+    # over every RMSNorm in a deep model, measurably erodes vLLM output parity.
+    try:
+        import vllm._custom_ops  # noqa: F401 — vLLM >= 0.20 registration path
+    except ImportError:
+        import vllm._C  # noqa: F401 — legacy vLLM (<= 0.18) registration path
     # Importing the extension is not sufficient: some vLLM builds don't register
     # rms_norm / fused_add_rms_norm into the ``_C`` op namespace. Verify the ops
     # actually exist, otherwise fall back to fastkernels' own CUDA kernels.
@@ -138,6 +148,17 @@ class RMSNorm(nn.Module):
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if weight is not None:
+            # The CUDA rms_norm / fused_add_rms_norm kernels assume the row
+            # dimension is contiguous (row stride == hidden size). A strided
+            # input — e.g. the K slice of a fused QKV output when num_kv_heads
+            # collapses to a single head under tensor parallelism, so the
+            # per-head reshape yields a non-contiguous view — makes the kernel
+            # read the wrong memory for every row past the first, silently
+            # corrupting the output. Force contiguity here (a no-op when the
+            # tensor is already contiguous) so every caller is safe.
+            x = x.contiguous()
+            if residual is not None:
+                residual = residual.contiguous()
             if _VLLM_NORM_AVAILABLE:
                 if residual is None:
                     out = torch.empty_like(x)

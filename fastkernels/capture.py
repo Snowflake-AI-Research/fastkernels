@@ -712,8 +712,10 @@ def _verify_forward_capture() -> dict:
 # forward pass, subject to three limits -- at most ``max_num_seqs`` concurrent
 # sequences, at most ``max_num_batched_tokens`` tokens per step, and the paged
 # KV-cache block pool (a waiting sequence is only admitted while its blocks --
-# plus a watermark, and its ``ceil((prompt+max_tokens)/block_size)`` peak
-# reservation across all active sequences -- fit in the pool). Given each
+# plus a watermark, and vLLM's ``full_sequence_must_fit`` check that its whole
+# ``ceil(prompt/block_size)`` fits in the *free* pool -- are available; tokens it
+# has yet to generate are not reserved, and growth past that point is handled by
+# recompute-preempting the newest in-flight sequence). Given each
 # request's prompt length, generated length and decode budget plus those limits
 # and the block-pool geometry we can replay the policy analytically and predict,
 # for every step, how many prefill tokens / prefill sequences / decode sequences
@@ -745,7 +747,7 @@ class _MockSeq:
     def __init__(self, prompt_len: int, gen_len: int, max_tokens: int):
         self.prompt_len = prompt_len
         self.gen_len = gen_len          # tokens actually generated (ground truth)
-        self.max_tokens = max_tokens    # decode budget (drives peak reservation)
+        self.max_tokens = max_tokens    # decode budget (reported, not reserved)
         self.num_computed = 0           # prompt tokens prefilled so far
         self.nblocks = 0                # KV blocks currently held
         self.generated = 0              # decode tokens produced so far
@@ -761,13 +763,15 @@ def _simulate_continuous_batching(prompt_lens, gen_lens, max_num_seqs,
     Returns one dict per GPU step with the token/sequence composition the
     engine's forward pass would see that step. This mirrors the scheduler in
     ``LlamaEngine.generate``: (1) decode every running sequence (allocating a
-    fresh block when it crosses a block boundary, recompute-preempting when the
-    pool is empty); (2) continue in-flight prefills FIFO within the token +
-    block budgets; (3) admit waiting sequences while they fit the token budget,
-    the block pool (+ watermark) and the total peak-block reservation.
+    fresh block when it crosses a block boundary, recompute-preempting the
+    *newest* in-flight sequence when the pool is empty); (2) continue in-flight
+    prefills FIFO within the token + block budgets; (3) admit waiting sequences
+    while they fit the token budget and the block pool (+ watermark), including
+    vLLM's ``full_sequence_must_fit`` check that the whole prompt fits.
 
-    ``max_tokens`` is the per-request decode budget used for the peak-block
-    reservation (defaults to ``gen_lens`` when unknown). When ``num_blocks`` is
+    ``max_tokens`` is retained for ``_MockSeq`` construction but is no longer a
+    peak-block reservation, matching the engine: a request reserves its
+    *current* length, not its final one. When ``num_blocks`` is
     ``None`` the KV-cache accounting is skipped entirely and the replay reduces
     to the token/seq-budget-only model (exact for short-prompt workloads).
     """
@@ -803,14 +807,52 @@ def _simulate_continuous_batching(prompt_lens, gen_lens, max_num_seqs,
         #        max_num_seqs, allocating a block when it crosses a boundary. ---
         decode_seqs: list[_MockSeq] = []
         new_running: deque[_MockSeq] = deque()
+
+        def _preempt_newest(exclude: _MockSeq) -> bool:
+            """Recompute-preempt the newest in-flight seq, as the engine does.
+
+            Mirrors ``_preempt_newest`` in ``LlamaEngine.generate``, which
+            mirrors vLLM's ``preempted_req = self.running.pop()``: the *last*
+            running request is evicted so the oldest keep advancing.
+            ``running`` is oldest-to-newest and this loop pops from its left, so
+            the newest survivors sit at its right end.
+            """
+            nonlocal free
+            for pool in (running, new_running):
+                while pool:
+                    victim = pool.pop()
+                    if victim is exclude:
+                        pool.append(victim)
+                        break
+                    free += victim.nblocks
+                    victim.nblocks = 0
+                    victim.num_computed = 0
+                    victim.generated = 0
+                    waiting.appendleft(victim)
+                    return True
+            for i in range(len(decode_seqs) - 1, -1, -1):
+                victim = decode_seqs[i]
+                if victim is exclude:
+                    continue
+                del decode_seqs[i]
+                free += victim.nblocks
+                victim.nblocks = 0
+                victim.num_computed = 0
+                victim.generated = 0
+                waiting.appendleft(victim)
+                return True
+            return False
+
         while running:
             seq = running.popleft()
             if len(decode_seqs) >= max_num_seqs:
                 new_running.append(seq)
                 continue
             if bounded and (seq.prompt_len + seq.generated) % block_size == 1:
+                while free == 0 and _preempt_newest(seq):
+                    pass
                 if free == 0:
-                    # Recompute-preempt: free blocks, re-prefill from scratch.
+                    # Nothing left to evict: preempt this one instead.
                     free += seq.nblocks
                     seq.nblocks = 0
                     seq.num_computed = 0
@@ -846,11 +888,7 @@ def _simulate_continuous_batching(prompt_lens, gen_lens, max_num_seqs,
             still.append(prefilling.popleft())
         prefilling = still
 
-        # --- 3) admit new waiting sequences (token + block + peak budgets). ---
-        total_peak = 0
-        if bounded:
-            for seq in (*decode_seqs, *running, *prefilling):
-                total_peak += _cdiv(seq.prompt_len + seq.max_tokens, block_size)
+        # --- 3) admit new waiting sequences (token + block budgets). ---
         while waiting and token_budget > 0:
             seq = waiting[0]
             chunk = min(seq.prompt_len, token_budget)
@@ -858,8 +896,13 @@ def _simulate_continuous_batching(prompt_lens, gen_lens, max_num_seqs,
                 need = _cdiv(chunk, block_size)  # num_computed == 0 (fresh)
                 if free < need + watermark_blocks:
                     break
-                seq_peak = _cdiv(seq.prompt_len + seq.max_tokens, block_size)
-                if total_peak + seq_peak > num_blocks:
+                # vLLM's ``full_sequence_must_fit`` gate: the request's current
+                # length (its prompt, for a fresh admission) must fit in the
+                # free blocks, so chunked prefill cannot admit a long prompt on
+                # the strength of its first chunk. Tokens not yet generated are
+                # not reserved -- see the matching comment in the engine.
+                full_need = _cdiv(seq.prompt_len, block_size)
+                if free < full_need + watermark_blocks:
                     break
             if len(prefill_seqs) + len(decode_seqs) >= max_num_seqs:
                 break
@@ -867,7 +910,6 @@ def _simulate_continuous_batching(prompt_lens, gen_lens, max_num_seqs,
             if bounded:
                 seq.nblocks += need
                 free -= need
-                total_peak += seq_peak
             prefill_seqs.append(seq)
             prefill_chunks.append(chunk)
             token_budget -= chunk

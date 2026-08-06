@@ -41,16 +41,20 @@ Layout (matches vLLM / `LlamaAttention`'s convention):
     ``block_tables`` / ``context_lens`` / ``cu_seqlens_q`` /
     ``cu_seqlens_k`` / ``mamba_state`` / ``mamba_metadata``.
 
-Scope of continuous batching: **phase-pure** (each step is either a
-batched prefill or a batched decode, never mixed).  This matches
-:class:`FLAEngine`'s scheduler.  vLLM's chunked prefill goes one step
-further (mixed prefill + decode in a single forward pass via
-per-token metadata splits inside the Attention / Mamba kernels);
-that is a meaningful structural piece for prefill-heavy workloads
-where waiting prompts can be admitted *during* an in-flight decode
-step, but it requires per-token kernel dispatch logic in the L2
-modules and is out of scope for this iteration.  Documented as a
-follow-up.
+Scope of continuous batching: **mixed prefill + decode**, matching vLLM's
+chunked-prefill scheduler.  When an iteration has both prompt chunks and
+running sequences, ``_run_mixed_step`` puts them in ONE forward -- prefill
+rows first, then decode rows -- via the ``set_jamba_context(is_mixed=True)``
+metadata split that ``L2.attention_impl.Attention._forward_mixed`` and
+``L2.jamba_mamba_mixer.JambaMambaMixer``'s mixed branch consume.  This is not
+cosmetic: a forward pass over this model re-reads all 16 MoE layers' experts
+(~90 GiB) regardless of how many tokens it carries, so a phase-pure loop paid
+that sweep twice on every such iteration.  Iterations with only decode work
+still replay the captured decode graph; only mixed steps run eager, and those
+were eager anyway when they were prefill-only.
+
+Prompt chunks are additionally held back until they are worth a pass -- see
+``prefill_batch_floor`` in ``__init__``.
 
 Tensor parallel: NOT supported -- single-GPU.  Open Jamba models
 (tiny-dev = 318M, v0.1 = 52B) fit on a B200.
@@ -361,6 +365,79 @@ class JambaEngine:
         # the conv/SSM state, and short-prompt batches are admitted
         # multiple-at-a-time within the budget.
         self.max_num_batched_tokens = max_num_batched_tokens
+        # Minimum prompt tokens a prefill step should carry, and the most
+        # decode steps the scheduler will hold one back to reach that width.
+        #
+        # A forward pass over this model re-reads all 16 MoE layers' experts
+        # (5.6 GiB per layer, ~90 GiB per pass) no matter how few tokens it
+        # carries, and it runs eager, so ~32 layers of Python dispatch sit on
+        # top. Measured on B200 at 206 tokens/sequence, per prefill call:
+        #
+        #     tokens  seqs   ms/call   us/token
+        #        206     1     44.5      216
+        #        824     4     83.1      101
+        #       3296    16    383.6      116
+        #      13184    64   1455.5      110
+        #
+        # i.e. ~22 ms of the call is fixed and only ~110 us/token is real work.
+        # With phase-pure scheduling that fixed cost landed on nearly every
+        # iteration: once ``max_num_seqs`` prompts are resident ~1 sequence
+        # finishes per decode step, so ``_admit`` released one or two slots and
+        # the next iteration ran a whole pass for a median of 43 tokens. A
+        # 1000-sequence ``mixed`` run made 327 prefill calls of which 305 were
+        # under 512 tokens, and prefill took 50.5% of the wall clock while
+        # carrying only 42k of the 206k prompt tokens in those small calls.
+        #
+        # ``_run_mixed_step`` removes most of that: the prompt chunks now ride
+        # inside a forward the decode rows were going to pay for anyway, so the
+        # expert sweep is shared and an extra pass is nearly free. That inverts
+        # the floor. What the prefill half actually wants is NARROW passes,
+        # because Mamba-1's varlen scan costs O(num_seqs x total_tokens), not
+        # O(total_tokens) -- every sequence's blocks iterate the whole flat
+        # buffer. Measured at a FIXED 8192 tokens per pass:
+        #
+        #     seqs        4      8     16     32     64    128
+        #     ms/call   280    345    483    767   1324   2446
+        #
+        # So splitting the same prompt tokens across more, narrower passes cuts
+        # scan work roughly in proportion -- which only became affordable once
+        # the passes stopped costing a weight sweep each. Wall on the
+        # 1000-sequence mixed workload with mixing enabled (vLLM: 42.30 s):
+        #
+        #     floor        0    256    512   1024   2048   4096
+        #     wall      44.9   42.8   43.4   46.1   46.5   46.8  s
+        #
+        # 4096 -- the right answer BEFORE mixing existed -- is 8% worse than
+        # 512. Do not re-tune one of these knobs without the other.
+        #
+        # 512 rather than the fastest 256, because the floor also decides how
+        # much of a decode row's arithmetic is shared with prompt tokens: a
+        # mixed step runs the MoE and MLP GEMMs at M = prefill + decode rows, so
+        # a smaller floor makes that width vary step to step and moves where
+        # bf16 rounding diverges from the reference. Against vLLM on the same
+        # 1000 requests, 256 scored 0.993x but only 169 exact matches and a 71.3
+        # token mean prefix, where 512 scores 0.975x with 190 exact matches and
+        # 73.7 -- at or above the pre-mixing baseline's 187 / 74.1. The extra
+        # 1.5% is not worth 10% of the exact matches.
+        self.prefill_batch_floor = int(
+            os.environ.get("FASTKERNELS_JAMBA_PREFILL_FLOOR", "512")
+        )
+        self.prefill_max_defer_steps = int(
+            os.environ.get("FASTKERNELS_JAMBA_PREFILL_MAX_DEFER", "32")
+        )
+        # The deferral stays bounded so it cannot stall: this caps the wait, and
+        # ``_should_prefill_now`` runs a pass unconditionally when there is no
+        # decode work to overlap with or when the waiting queue is empty (nothing
+        # more will arrive to widen it). At the 512-token floor a pass gathers
+        # two or three of the mixed workload's ~206-token prompts, so the cap is
+        # slack in practice; it exists for prompt mixes short enough that the
+        # floor alone would hold a sequence back indefinitely.
+        # Fold the running sequences' decode rows into the prefill forward
+        # instead of running a second pass for them. See ``_run_mixed_step``.
+        self.use_mixed_batches = (
+            os.environ.get("FASTKERNELS_JAMBA_MIXED_BATCH", "1") not in
+            ("0", "false", "False")
+        )
         self.device = torch.device(device)
         self.dtype = dtype
         self._set_seeds(seed)
@@ -403,6 +480,10 @@ class JambaEngine:
             mamba = getattr(layer, "mamba", None)
             if mamba is not None:
                 mamba.A.data = mamba.A.data.float()
+                # Must run after the .to() above: it materializes the fp32
+                # dt_bias / D copies the SSM kernels take, which the mixer
+                # would otherwise re-cast on every layer of every step.
+                mamba.process_weights_after_loading()
         torch.cuda.synchronize()
 
         cfg = self.config
@@ -566,6 +647,11 @@ class JambaEngine:
         self._compiled_decode_step = None
         self._decode_graphs: dict[int, _JambaDecodeGraph] = {}
         self._decode_static_buffers: dict[int, dict] = {}
+        # Last decode step's (bucket, running sequence ids) and the per-sequence
+        # invariants uploaded for it. See ``_run_decode_step``.
+        self._decode_meta_key: tuple | None = None
+        self._decode_meta_bt: np.ndarray | None = None
+        self._decode_meta_cache_idx: np.ndarray | None = None
         if self._use_cuda_graphs:
             print(
                 f"  [JambaEngine] Capturing decode graphs at "
@@ -617,6 +703,23 @@ class JambaEngine:
     def _capture_decode_graph(self, B: int) -> _JambaDecodeGraph:
         if B in self._decode_graphs:
             return self._decode_graphs[B]
+        # Allocate the static buffers BEFORE entering inference_mode: a tensor
+        # created inside it is an inference tensor, and the host loop's
+        # ``copy_`` into these buffers would then be rejected for any caller
+        # that is not itself under inference_mode.
+        self._alloc_decode_buffers(B)
+        # Capture under inference_mode, because ``generate`` replays under it.
+        # A graph is a recording, so whatever the model does at capture time is
+        # what every replay does forever: capturing with autograd enabled bakes
+        # in whichever branch a layer takes when ``torch.is_grad_enabled()`` is
+        # True. That silently pinned the Mamba mixer's dt/B/C norms to
+        # RMSNormNative's 8-launch PyTorch sequence instead of its single-kernel
+        # inference path -- the graphs replayed the slow branch even though
+        # every caller runs inference-only.
+        with torch.inference_mode():
+            return self._capture_decode_graph_inner(B)
+
+    def _capture_decode_graph_inner(self, B: int) -> _JambaDecodeGraph:
         bufs = self._alloc_decode_buffers(B)
         max_context_len = self._max_blocks_per_seq * self._page_size
 
@@ -857,6 +960,29 @@ class JambaEngine:
                 tokens_used += chunk
             return chunks
 
+        def _pending_prefill_tokens(seqs: list[Sequence]) -> int:
+            return sum(
+                len(s.prompt_ids) - s.num_computed_tokens for s in seqs
+            )
+
+        def _should_prefill_now(deferred_steps: int) -> bool:
+            """Whether this iteration's prefill pass is worth its fixed cost.
+
+            See ``prefill_batch_floor`` in ``__init__`` for the measurement
+            behind this. The three unconditional cases are what keep a deferral
+            from becoming a stall: with no running sequences there is nothing to
+            overlap with, an empty ``waiting`` queue means no further prompt can
+            widen the batch, and ``prefill_max_defer_steps`` bounds the wait
+            even when prompts are short enough that the floor is far off.
+            """
+            if not running:
+                return True
+            if not waiting:
+                return True
+            if deferred_steps >= self.prefill_max_defer_steps:
+                return True
+            return _pending_prefill_tokens(prefilling) >= self.prefill_batch_floor
+
         def _finalize_decode_token(seq, tok):
             """Apply a sampled decode token to ``seq``; return True if
             the seq is done (eos / max_tokens)."""
@@ -867,14 +993,34 @@ class JambaEngine:
                 or (not seq.ignore_eos and eos is not None and tok == eos)
             )
 
+        deferred_prefill_steps = 0
         while waiting or prefilling or running:
             # ---- admit fresh seqs from waiting into prefilling ----
             prefilling.extend(_admit())
 
             # ---- chunked prefill step ----
-            if prefilling:
+            #
+            # When there are running sequences to decode, fold their rows into
+            # the SAME forward as the prompt chunks -- vLLM's scheduler never
+            # runs a prefill-only step while requests are decoding. The decode
+            # rows then ride along inside one sweep of the MoE experts instead of
+            # paying a second one, at the cost of the step not being a graph
+            # replay (the prefill pass was already eager, so no dispatch is
+            # added). ``_run_mixed_step`` returns the decode tokens as well, so
+            # this iteration skips the separate decode step below.
+            mixed_decode_tokens: list[int] | None = None
+            mixed_decode_seqs: list[Sequence] = []
+            if prefilling and _should_prefill_now(deferred_prefill_steps):
+                deferred_prefill_steps = 0
                 chunks = _next_prefill_chunks(prefilling)
-                chunk_logits, completed_mask = self._run_prefill_chunks(chunks)
+                if self.use_mixed_batches and running and chunks:
+                    mixed_decode_seqs = list(running)
+                    (chunk_logits, completed_mask,
+                     mixed_decode_tokens) = self._run_mixed_step(
+                        chunks, mixed_decode_seqs,
+                    )
+                else:
+                    chunk_logits, completed_mask = self._run_prefill_chunks(chunks)
                 # Process each (seq, chunk_size) result.  Completed
                 # seqs (whose prefill finished this step) get their
                 # last-chunk logit sampled; others advance and stay
@@ -886,6 +1032,23 @@ class JambaEngine:
                     if is_done:
                         completed_seqs.append(seq)
                         completed_logits.append(chunk_logits[i])
+
+                # Apply the decode half of a mixed step before admitting this
+                # step's freshly-prefilled sequences, so ``running`` still lines
+                # up with the rows the forward actually carried.
+                if mixed_decode_tokens is not None:
+                    still_running = []
+                    finished_now = []
+                    for seq, tok in zip(mixed_decode_seqs, mixed_decode_tokens):
+                        if _finalize_decode_token(seq, tok):
+                            finished_now.append(seq)
+                        else:
+                            still_running.append(seq)
+                    for seq in finished_now:
+                        self._finish_seq(seq, outputs, eos, seq_idx_for_id)
+                        if pbar is not None:
+                            pbar.update(1)
+                    running = still_running
 
                 # Sample first decode token for completed prefills.
                 if completed_seqs:
@@ -912,9 +1075,11 @@ class JambaEngine:
                     s for s in prefilling
                     if s.num_computed_tokens < len(s.prompt_ids)
                 ]
+            elif prefilling:
+                deferred_prefill_steps += 1
 
             # ---- decode step over running ----
-            if running:
+            if running and mixed_decode_tokens is None:
                 tokens = self._run_decode_step(running)
                 still_running: list[Sequence] = []
                 finished_now = []
@@ -1096,6 +1261,156 @@ class JambaEngine:
         return chunk_last_logits, completed_mask
 
     # ------------------------------------------------------------------
+    # _run_mixed_step: one forward over prefill chunks AND decode rows.
+    # ------------------------------------------------------------------
+    def _run_mixed_step(
+        self,
+        chunks: list[tuple[Sequence, int]],
+        decode_seqs: list[Sequence],
+    ) -> tuple[torch.Tensor, list[bool], list[int]]:
+        """Chunked prefill and decode in a single forward pass.
+
+        This is what vLLM's scheduler does on every step: fill one token budget
+        with the running requests' decode tokens plus as much waiting prompt as
+        fits, then run ONE forward. Our phase-pure loop instead ran two passes on
+        any iteration that had both, and each pass re-reads all 16 MoE layers'
+        experts (~90 GiB) whether it carries 43 prompt tokens or 16k -- so the
+        second pass roughly doubled that iteration's weight traffic. Merging pays
+        the sweep once.
+
+        Nothing here is new machinery. The metadata is the concatenation of what
+        ``_run_prefill_chunks`` and ``_run_decode_step`` already build, and the
+        consumers -- ``set_jamba_context(is_mixed=True)``,
+        ``Attention._forward_mixed``, and ``JambaMambaMixer``'s mixed branch --
+        already implement vLLM's convention of prefill rows first then decode
+        rows. They were simply never called by the scheduler.
+
+        Returns ``(prefill_last_logits, prefill_completed_mask, decode_tokens)``.
+        """
+        device = self.device
+        page_size = self._page_size
+        bps = self._max_blocks_per_seq
+        n_p_seqs = len(chunks)
+        n_d = len(decode_seqs)
+
+        # ---- prefill portion (mirrors _run_prefill_chunks) ----
+        plens = np.array([cs for _, cs in chunks], dtype=np.int32)
+        starts = np.array(
+            [s.num_computed_tokens for s, _ in chunks], dtype=np.int32,
+        )
+        kvlens = starts + plens
+        completed_mask = [
+            (s.num_computed_tokens + cs) >= len(s.prompt_ids)
+            for s, cs in chunks
+        ]
+
+        flat_ids: list[int] = []
+        for s, cs in chunks:
+            start = s.num_computed_tokens
+            flat_ids.extend(s.prompt_ids[start:start + cs])
+        cu_q_np = np.zeros(n_p_seqs + 1, dtype=np.int32)
+        np.cumsum(plens, out=cu_q_np[1:])
+        cu_k_np = np.zeros(n_p_seqs + 1, dtype=np.int32)
+        np.cumsum(kvlens, out=cu_k_np[1:])
+        pos_p = np.concatenate([
+            np.arange(st, st + cs, dtype=np.int64)
+            for st, (_, cs) in zip(starts, chunks)
+        ])
+
+        pbt_np = np.full((n_p_seqs, bps), -1, dtype=np.int32)
+        for i, (s, _) in enumerate(chunks):
+            pbt_np[i, :len(s.block_table)] = s.block_table
+        seq_idx = np.repeat(np.arange(n_p_seqs, dtype=np.int64), plens)
+        slot_p = (
+            pbt_np[seq_idx, pos_p // page_size].astype(np.int64) * page_size
+            + pos_p % page_size
+        )
+
+        # ---- decode portion (mirrors _run_decode_step) ----
+        lens_d = np.fromiter(
+            (len(s) for s in decode_seqs), dtype=np.int64, count=n_d,
+        )
+        ids_d = np.fromiter(
+            (s.last_token for s in decode_seqs), dtype=np.int64, count=n_d,
+        )
+        pos_d = lens_d - 1
+        ctx_d = lens_d.astype(np.int32)
+        dbt_np = np.full((n_d, bps), -1, dtype=np.int32)
+        for i, s in enumerate(decode_seqs):
+            dbt_np[i, :len(s.block_table)] = s.block_table
+        slot_d = (
+            dbt_np[np.arange(n_d), pos_d // page_size].astype(np.int64) * page_size
+            + pos_d % page_size
+        )
+
+        # ---- one flat batch: prefill rows, then decode rows ----
+        n_p = int(plens.sum())
+        input_ids = torch.from_numpy(
+            np.concatenate([np.asarray(flat_ids, dtype=np.int64), ids_d]),
+        ).to(device)
+        positions = torch.from_numpy(np.concatenate([pos_p, pos_d])).to(device)
+        slot_mapping = torch.from_numpy(
+            np.concatenate([slot_p, slot_d]),
+        ).to(device)
+        cu_q = torch.from_numpy(cu_q_np).to(device)
+        cu_k = torch.from_numpy(cu_k_np).to(device)
+
+        state_p = torch.tensor(
+            [s.state_slot for s, _ in chunks], dtype=torch.int32, device=device,
+        )
+        state_d = torch.tensor(
+            [s.state_slot for s in decode_seqs], dtype=torch.int32, device=device,
+        )
+        has_initial_state = torch.tensor(
+            [s.num_computed_tokens > 0 for s, _ in chunks],
+            dtype=torch.bool, device=device,
+        )
+        mamba_meta = JambaMambaMetadata(
+            conv_states=self.mamba_pool.conv_states,
+            ssm_states=self.mamba_pool.ssm_states,
+            cache_indices=state_p,
+            is_decode=False,
+            query_start_loc=cu_q,
+            has_initial_state=has_initial_state,
+            state_indices_p=state_p,
+            state_indices_d=state_d,
+        )
+        set_jamba_context(
+            is_prefill=True,
+            is_mixed=True,
+            slot_mapping=slot_mapping,
+            num_prefill_tokens=n_p,
+            num_decode_tokens=n_d,
+            num_prefill_seqs=n_p_seqs,
+            prefill_cu_seqlens_q=cu_q,
+            prefill_cu_seqlens_k=cu_k,
+            prefill_max_seqlen_q=int(plens.max()),
+            prefill_max_seqlen_k=int(kvlens.max()),
+            prefill_block_tables=torch.from_numpy(pbt_np).to(device),
+            decode_context_lens=torch.from_numpy(ctx_d).to(device),
+            decode_block_tables=torch.from_numpy(dbt_np).to(device),
+            decode_max_context_len=bps * page_size,
+            mamba_metadata=mamba_meta,
+        )
+        try:
+            hidden = self.model(input_ids, positions)
+            # One logits call covers both halves: the last token of each prefill
+            # chunk, then every decode row.
+            logit_idx = np.concatenate([
+                cu_q_np[1:].astype(np.int64) - 1,
+                n_p + np.arange(n_d, dtype=np.int64),
+            ])
+            picked = hidden.index_select(
+                0, torch.from_numpy(logit_idx).to(device),
+            )
+            logits = self.model.compute_logits(picked)
+        finally:
+            reset_context()
+
+        decode_tokens = logits[n_p_seqs:].argmax(dim=-1).tolist()
+        return logits[:n_p_seqs], completed_mask, decode_tokens
+
+    # ------------------------------------------------------------------
     # _run_decode_step: one decode step over ``running``.  Picks the
     # smallest CUDA-graph bucket >= len(running), pads block_tables /
     # context_lens / slot_mapping / cache_indices into the static
@@ -1115,30 +1430,53 @@ class JambaEngine:
 
         device = self.device
         page_size = self._page_size
+        bps = self._max_blocks_per_seq
 
         # Per-seq decode arrays for the active rows.  Last-token id
         # (input for this step), absolute position, paged slot for the
         # new K/V, post-write context_len, padded block_table row, and
         # Mamba state slot.
-        ids_np = np.empty(n, dtype=np.int64)
-        pos_np = np.empty(n, dtype=np.int64)
-        slot_np = np.empty(n, dtype=np.int64)
-        ctx_np = np.empty(n, dtype=np.int32)
-        cache_idx_np = np.empty(n, dtype=np.int32)
-        bps = self._max_blocks_per_seq
-        bt_np = np.full((n, bps), -1, dtype=np.int32)
-        for i, s in enumerate(running):
-            ids_np[i] = s.last_token
-            new_pos = len(s) - 1  # absolute position of the new token
-            pos_np[i] = new_pos
-            block_idx = new_pos // page_size
-            slot_in_block = new_pos % page_size
-            slot_np[i] = (
-                int(s.block_table[block_idx]) * page_size + slot_in_block
+        #
+        # ``block_tables`` and ``cache_indices`` are properties of the SEQUENCE,
+        # not of the step: ``_admit`` allocates a sequence's entire lifetime of
+        # blocks up front so its block table never grows during decode, and its
+        # Mamba slot is fixed until it finishes. Rebuilding both from Python
+        # lists and re-uploading them every step cost 0.58 ms of a 27.1 ms
+        # batch-256 step, none of which overlapped the GPU (the engine
+        # synchronizes on the sampled token before building the next step). So
+        # rebuild them only when the running set actually changes -- which for a
+        # fixed-batch latency run is never, and for ``mixed`` is roughly once
+        # per finished sequence. Keyed on ``seq_id``, which is a monotonic
+        # counter, rather than ``id()``, which a later object can reuse.
+        running_key = (B, tuple(s.seq_id for s in running))
+        reuse_invariants = running_key == self._decode_meta_key
+        lens_np = np.fromiter(
+            (len(s) for s in running), dtype=np.int64, count=n,
+        )
+        ids_np = np.fromiter(
+            (s.last_token for s in running), dtype=np.int64, count=n,
+        )
+        pos_np = lens_np - 1          # absolute position of the new token
+        ctx_np = lens_np.astype(np.int32)  # post-write context length
+
+        if reuse_invariants:
+            bt_np = self._decode_meta_bt
+            cache_idx_np = self._decode_meta_cache_idx
+        else:
+            cache_idx_np = np.fromiter(
+                (s.state_slot for s in running), dtype=np.int32, count=n,
             )
-            ctx_np[i] = new_pos + 1  # post-write context length
-            bt_np[i, :len(s.block_table)] = s.block_table
-            cache_idx_np[i] = s.state_slot
+            bt_np = np.full((n, bps), -1, dtype=np.int32)
+            for i, s in enumerate(running):
+                bt_np[i, :len(s.block_table)] = s.block_table
+            self._decode_meta_key = running_key
+            self._decode_meta_bt = bt_np
+            self._decode_meta_cache_idx = cache_idx_np
+
+        slot_np = (
+            bt_np[np.arange(n), pos_np // page_size].astype(np.int64) * page_size
+            + pos_np % page_size
+        )
 
         if graph is not None:
             # Pad to bucket B with the project-standard sentinels so
@@ -1171,22 +1509,23 @@ class JambaEngine:
             full_slot[:n] = slot_np
             full_ctx = np.zeros(B, dtype=np.int32)
             full_ctx[:n] = ctx_np
-            full_bt = np.full((B, bps), -1, dtype=np.int32)
-            full_bt[:n] = bt_np
-            # Mamba pad rows: cache_indices=-1 -- the vendored
-            # causal_conv1d_update / selective_state_update kernels
-            # skip rows whose state index is -1 (per
-            # ``_MAMBA_PAD_SLOT_ID = -1`` precedent in
-            # ``infra.engine``).
-            full_cache_idx = np.full(B, -1, dtype=np.int32)
-            full_cache_idx[:n] = cache_idx_np
 
             bufs_input_ids.copy_(torch.from_numpy(full_ids))
             bufs_positions.copy_(torch.from_numpy(full_pos))
             bufs_slot_mapping.copy_(torch.from_numpy(full_slot))
             bufs_context_lens.copy_(torch.from_numpy(full_ctx))
-            bufs_block_tables.copy_(torch.from_numpy(full_bt))
-            bufs_cache_indices.copy_(torch.from_numpy(full_cache_idx))
+            if not reuse_invariants:
+                full_bt = np.full((B, bps), -1, dtype=np.int32)
+                full_bt[:n] = bt_np
+                # Mamba pad rows: cache_indices=-1 -- the vendored
+                # causal_conv1d_update / selective_state_update kernels
+                # skip rows whose state index is -1 (per
+                # ``_MAMBA_PAD_SLOT_ID = -1`` precedent in
+                # ``infra.engine``).
+                full_cache_idx = np.full(B, -1, dtype=np.int32)
+                full_cache_idx[:n] = cache_idx_np
+                bufs_block_tables.copy_(torch.from_numpy(full_bt))
+                bufs_cache_indices.copy_(torch.from_numpy(full_cache_idx))
 
             # Replay graph + async D2H of the sampled tokens.  Mirrors
             # the Mamba engine's ``run_mamba_decode_fast_async`` (see

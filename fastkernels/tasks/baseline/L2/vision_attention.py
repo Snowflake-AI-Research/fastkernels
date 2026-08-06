@@ -49,25 +49,40 @@ class VisionAttention(nn.Module):
         qkv = self.qkv(x)
 
         q_size = self.num_heads * self.head_dim
-        q, k, v = qkv.split([q_size, q_size, q_size], dim=-1)
-        q = q.view(seq_len, batch_size, self.num_heads, self.head_dim)
-        k = k.view(seq_len, batch_size, self.num_heads, self.head_dim)
-        v = v.view(seq_len, batch_size, self.num_heads, self.head_dim)
-
-        # Transpose to (batch, seq, heads, dim)
-        q = q.transpose(0, 1).contiguous()
-        k = k.transpose(0, 1).contiguous()
-        v = v.transpose(0, 1).contiguous()
+        # ``qkv`` is [q | k | v] on the last dim, so q and k are already
+        # adjacent: take them as one slice, make that slice contiguous once, and
+        # let rotary see it as a single (2*batch, seq, heads, dim) tensor. v then
+        # needs no copy at all -- reshape gives a contiguous view because
+        # batch_size is 1 here.
+        #
+        # The previous version did .contiguous() separately on q, k and v and
+        # then torch.cat([q, k]) -- four copies of ~147MB each at a full
+        # encoder batch. A kernel profile against vLLM's encoder showed the two
+        # engines running identical attention/GEMM/norm kernels, with our only
+        # excess being 11.7ms/call in unrolled_elementwise<direct_copy> that
+        # vLLM does not emit at all: 55% of a 21ms/call deficit, and the reason
+        # our encoder peaked at 1.07x vLLM's memory.
+        qk = qkv[..., : 2 * q_size].view(
+            seq_len, batch_size, 2, self.num_heads, self.head_dim,
+        )
+        # -> (2, batch, seq, heads, dim), one copy
+        qk = qk.permute(2, 1, 0, 3, 4).contiguous()
 
         if rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
-            qk = torch.cat([q, k], dim=0)
-            qk = apply_rotary(qk, rotary_pos_emb_cos, rotary_pos_emb_sin)
-            q, k = qk.chunk(2, dim=0)
+            flat = qk.view(2 * batch_size, seq_len, self.num_heads,
+                           self.head_dim)
+            apply_rotary(flat, rotary_pos_emb_cos, rotary_pos_emb_sin,
+                         inplace=True)
 
-        # Flatten batch dim for varlen
-        q = q.reshape(-1, self.num_heads, self.head_dim)
-        k = k.reshape(-1, self.num_heads, self.head_dim)
-        v = v.reshape(-1, self.num_heads, self.head_dim)
+        q = qk[0].reshape(-1, self.num_heads, self.head_dim)
+        k = qk[1].reshape(-1, self.num_heads, self.head_dim)
+        # Keep v in the same (batch, seq) order as q/k. batch_size is 1 on every
+        # current caller, but ordering v seq-major would silently disagree with
+        # q/k if that ever changed.
+        v = (qkv[..., 2 * q_size:]
+             .view(seq_len, batch_size, self.num_heads, self.head_dim)
+             .transpose(0, 1)
+             .reshape(-1, self.num_heads, self.head_dim))
 
         if max_seqlen is None:
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()

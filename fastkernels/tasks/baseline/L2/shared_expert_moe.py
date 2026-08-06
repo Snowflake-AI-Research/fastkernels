@@ -9,7 +9,13 @@ from ....infra.tp import _tp_rank, _tp_size
 from ..L1.allreduce import AllReduce
 from ..L1.gate_linear import GateLinear
 from ..L1.grouped_topk import GroupedTopK
+from ..L1.moe_shared_gate_add import moe_shared_gate_add
 from ..L1.silu_and_mul import SiluAndMul
+from ..L1.trtllm_bf16_moe import (
+    TrtLlmBf16MoE,
+    prepare_trtllm_bf16_moe_weights,
+    trtllm_bf16_moe_supported,
+)
 from .fused_experts import FusedExperts
 from .parallel_linear import (
     MergedColumnParallelLinear,
@@ -18,13 +24,46 @@ from .parallel_linear import (
 )
 
 
+def trtllm_routing_method_type(
+    routing: str,
+    renormalize: bool,
+    has_e_score_bias: bool,
+    num_expert_group: int | None,
+) -> int | None:
+    """Map a routing config to a trtllm-gen ``RoutingMethodType``, else None.
+
+    Mirrors vLLM's ``get_routing_method_type``
+    (``vllm/model_executor/layers/fused_moe/config.py``). ``None`` stands for
+    vLLM's ``Unspecified``, which ``TrtLlmBf16ExpertsMonolithic`` does not
+    accept -- callers fall back to the Triton path in that case.
+    """
+    if has_e_score_bias:
+        if routing != "sigmoid" or not renormalize:
+            return None
+        if (num_expert_group or 0) > 0:
+            return 2  # DeepSeekV3
+        return None
+    if routing == "sigmoid":
+        return 6 if renormalize else 8  # SigmoidRenorm / Sigmoid
+    if routing == "softmax":
+        return 4 if renormalize else 0  # RenormalizeNaive / Default
+    return None
+
+
+
 class _TPSwiGLUMLP(nn.Module):
-    def __init__(self, hidden_size: int, intermediate_size: int):
+    def __init__(self, hidden_size: int, intermediate_size: int,
+                 reduce_results: bool = True):
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size, [intermediate_size, intermediate_size],
         )
-        self.down_proj = RowParallelLinear(intermediate_size, hidden_size)
+        # ``reduce_results=False`` lets the caller add this partial to the
+        # routed-expert partial and all-reduce the sum once, instead of
+        # all-reducing both separately. vLLM does the same.
+        self.down_proj = RowParallelLinear(
+            intermediate_size, hidden_size, reduce_results=reduce_results,
+        )
         self.act_fn = SiluAndMul()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -54,6 +93,7 @@ class SharedExpertMoE(nn.Module):
         shared_expert_intermediate_size: int = 0,
         shared_expert_attr_name: str = "shared_expert",
         shared_expert_gate: bool = False,
+        reduce_results: bool = True,
     ):
         super().__init__()
         self.num_experts = num_experts
@@ -98,6 +138,37 @@ class SharedExpertMoE(nn.Module):
 
         self.fused_experts = FusedExperts()
         self.allreduce = AllReduce()
+        # ``reduce_results=False`` hands the un-reduced partial sum back to the
+        # caller, which folds the collective into its next norm.
+        self.reduce_results = reduce_results
+
+        # trtllm-gen BF16 MoE: what vLLM 0.26 runs for this MoE on Blackwell
+        # (``FLASHINFER_TRTLLM`` unquantized backend ->
+        # ``TrtLlmBf16ExpertsMonolithic``). It fuses routing, both GEMMs and the
+        # weighted reduction into one kernel, replacing gate + top-k +
+        # ``_fused_moe_kernel``.
+        self._trtllm_routing = trtllm_routing_method_type(
+            routing, renormalize, correction_bias, num_expert_group,
+        )
+        self.use_trtllm = (
+            trtllm_bf16_moe_supported() and self._trtllm_routing is not None
+        )
+        self.trtllm_moe = (
+            TrtLlmBf16MoE(
+                num_experts=num_experts,
+                top_k=top_k,
+                intermediate_size_per_partition=self.intermediate_per_tp,
+                routing_method_type=self._trtllm_routing,
+                num_expert_group=num_expert_group if use_grouped_topk else None,
+                topk_group=topk_group if use_grouped_topk else None,
+                routed_scaling_factor=(
+                    routed_scaling_factor if routed_scaling_factor != 1.0 else None
+                ),
+            )
+            if self.use_trtllm
+            else None
+        )
+        self._trtllm_weights_ready = False
 
         self.has_shared_expert = shared_expert_intermediate_size > 0
         self.shared_expert_attr_name = shared_expert_attr_name
@@ -105,7 +176,15 @@ class SharedExpertMoE(nn.Module):
             setattr(
                 self,
                 shared_expert_attr_name,
-                _TPSwiGLUMLP(hidden_size, shared_expert_intermediate_size),
+                _TPSwiGLUMLP(
+                    hidden_size, shared_expert_intermediate_size,
+                    # Defer the shared expert's reduce so it can be folded into
+                    # the routed output's -- one all-reduce per layer instead of
+                    # two. Decode profile: cross_device_reduce_1stage was 18.8%
+                    # of decode time at ~3 all-reduces per layer per step where
+                    # 2 suffice.
+                    reduce_results=(_tp_size() == 1),
+                ),
             )
         if shared_expert_gate:
             self.shared_expert_gate = ReplicatedLinear(hidden_size, 1, bias=False)
@@ -133,6 +212,21 @@ class SharedExpertMoE(nn.Module):
         rank = _tp_rank()
         n = self.intermediate_per_tp
         param.data[expert_id].copy_(loaded_weight.narrow(1, rank * n, n))
+
+    def process_weights_after_loading(self) -> None:
+        """Shuffle expert weights into trtllm-gen's 4D BlockMajorK layout.
+
+        Mirrors vLLM's ``convert_to_unquantized_kernel_format`` for the
+        ``FLASHINFER_TRTLLM`` backend, which runs once after loading. The
+        original ``[E, 2*I, H]`` / ``[E, H, I]`` tensors are replaced, so the
+        Triton path is unavailable afterwards -- guarded by ``use_trtllm``.
+        """
+        if not self.use_trtllm or self._trtllm_weights_ready:
+            return
+        w13, w2 = prepare_trtllm_bf16_moe_weights(self.w13.data, self.w2.data)
+        self.w13 = nn.Parameter(w13, requires_grad=False)
+        self.w2 = nn.Parameter(w2, requires_grad=False)
+        self._trtllm_weights_ready = True
 
     def _route(self, router_logits: torch.Tensor):
         if self.grouped_topk is not None:
@@ -163,20 +257,40 @@ class SharedExpertMoE(nn.Module):
             )
         return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
 
-    def _shared_expert_output(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+    # Token count below which the shared-expert gate projection is folded into
+    # the epilogue kernel instead of run as its own gemv. The gemv is a
+    # ``[hidden] -> [1]`` dot whose 5.33 us is all launch latency, so folding
+    # wins while that dominates; past this the projection is a real GEMM and the
+    # kernel's per-tile recomputation of the dot would start to cost more than
+    # the launch it saves.
+    _FUSE_GATE_MAX_TOKENS = 256
+
+    def _shared_expert_output(
+        self, hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Return ``(shared_output, raw_gate)``, both ``None`` without a shared expert.
+
+        The gate's sigmoid and the scaling are deliberately *not* applied here:
+        the caller folds them into the routed-output add with one kernel (see
+        :func:`moe_shared_gate_add`). ``raw_gate`` is ``None`` when there is
+        nothing for the caller to apply -- either the shared expert has no gate,
+        or the gate projection itself is being folded into that same kernel.
+        """
         if not self.has_shared_expert:
-            return None
+            return None, None
         shared_mlp = getattr(self, self.shared_expert_attr_name)
         out = shared_mlp(hidden_states)
-        if self.shared_expert_gate is not None:
-            out = out * torch.sigmoid(self.shared_expert_gate(hidden_states))
-        return out
+        if self.shared_expert_gate is None:
+            return out, None
+        if hidden_states.shape[0] <= self._FUSE_GATE_MAX_TOKENS:
+            return out, None
+        return out, self.shared_expert_gate(hidden_states)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, self.hidden_size)
 
-        shared_output = self._shared_expert_output(hidden_states)
+        shared_output, shared_gate = self._shared_expert_output(hidden_states)
         if self.gate_linear is not None:
             router_logits = self.gate_linear(
                 hidden_states,
@@ -185,18 +299,55 @@ class SharedExpertMoE(nn.Module):
             )
         else:
             router_logits = self.gate(hidden_states)
-        topk_weights, topk_ids = self._route(router_logits)
-        if not self.keep_router_weights_fp32:
-            topk_weights = topk_weights.to(hidden_states.dtype)
 
-        routed_output = self.fused_experts(
-            hidden_states, self.w13, self.w2,
-            topk_weights, topk_ids, self.num_experts,
-        )
-        if self.routed_scaling_factor != 1.0:
-            routed_output = routed_output * self.routed_scaling_factor
-        if self.tp_size > 1:
-            routed_output = self.allreduce(routed_output)
+        if self.use_trtllm:
+            # Routing, both GEMMs and the weighted reduction happen inside the
+            # kernel, including ``routed_scaling_factor``.
+            routed_output = self.trtllm_moe(
+                hidden_states,
+                self.w13,
+                self.w2,
+                router_logits,
+                routing_bias=(
+                    self.gate.e_score_correction_bias
+                    if self.correction_bias
+                    else None
+                ),
+            )
+        else:
+            topk_weights, topk_ids = self._route(router_logits)
+            if not self.keep_router_weights_fp32:
+                topk_weights = topk_weights.to(hidden_states.dtype)
 
-        output = routed_output if shared_output is None else routed_output + shared_output
+            routed_output = self.fused_experts(
+                hidden_states, self.w13, self.w2,
+                topk_weights, topk_ids, self.num_experts,
+            )
+            if self.routed_scaling_factor != 1.0:
+                routed_output = routed_output * self.routed_scaling_factor
+
+        # Add the shared expert's *unreduced* partial first, then all-reduce the
+        # sum once. Both terms are per-rank partial sums over the same output
+        # space, so summing before the reduce is exact, and it halves the
+        # all-reduce count for layers that have a shared expert. When the shared
+        # expert is gated, its sigmoid, the scaling and the add are a single
+        # kernel -- three separate elementwise launches per layer is what
+        # Inductor fuses away for vLLM, and at batch 1 that is pure overhead.
+        if shared_output is None:
+            output = routed_output
+        elif self.shared_expert_gate is None:
+            output = routed_output + shared_output
+        elif shared_gate is None:
+            # Small batch: the epilogue kernel projects the gate itself.
+            output = moe_shared_gate_add(
+                routed_output, shared_output,
+                hidden_states=hidden_states,
+                gate_weight=self.shared_expert_gate.weight,
+            )
+        else:
+            output = moe_shared_gate_add(
+                routed_output, shared_output, shared_gate,
+            )
+        if self.tp_size > 1 and self.reduce_results:
+            output = self.allreduce(output)
         return output.view(orig_shape)

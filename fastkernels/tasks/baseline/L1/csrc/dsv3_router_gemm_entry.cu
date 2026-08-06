@@ -30,6 +30,12 @@
 static constexpr int DEFAULT_NUM_EXPERTS = 256;
 static constexpr int KIMI_K2_NUM_EXPERTS = 384;
 static constexpr int DEFAULT_HIDDEN_DIM = 7168;
+// GLM-5.2 (glm_moe_dsa) has hidden_size=6144, n_routed_experts=256. vLLM's
+// dsv3_router_gemm supports this shape (GLM_5_HIDDEN_DIM); mirror it so GLM's
+// decode router GEMM uses the same TensorRT-LLM min-latency kernel (matching
+// reduction order) instead of falling back to cuBLAS/F.linear. 6144 % 1024 == 0
+// so the (VPT=8 * kBlockSize=128 = 1024)-strided load covers it exactly.
+static constexpr int GLM_5_HIDDEN_DIM = 6144;
 
 template <typename T, int kNumTokens, int kNumExperts, int kHiddenDim>
 void invokeRouterGemmFloatOutput(float* output, T const* mat_a, T const* mat_b,
@@ -109,13 +115,20 @@ void dsv3_router_gemm(at::Tensor& output,       // [num_tokens, num_experts]
 
   TORCH_CHECK(mat_a.size(1) == mat_b.size(1),
               "mat_a and mat_b must have the same hidden_dim");
-  TORCH_CHECK(hidden_dim == DEFAULT_HIDDEN_DIM,
+  TORCH_CHECK(hidden_dim == DEFAULT_HIDDEN_DIM || hidden_dim == GLM_5_HIDDEN_DIM,
               "Expected hidden_dim=", DEFAULT_HIDDEN_DIM,
+              " or hidden_dim=", GLM_5_HIDDEN_DIM,
               ", but got hidden_dim=", hidden_dim);
   TORCH_CHECK(
       num_experts == DEFAULT_NUM_EXPERTS || num_experts == KIMI_K2_NUM_EXPERTS,
       "Expected num_experts=", DEFAULT_NUM_EXPERTS,
       " or num_experts=", KIMI_K2_NUM_EXPERTS,
+      ", but got num_experts=", num_experts);
+  // KIMI_K2_NUM_EXPERTS (384) is only instantiated for the default hidden_dim.
+  TORCH_CHECK(
+      hidden_dim == DEFAULT_HIDDEN_DIM || num_experts == DEFAULT_NUM_EXPERTS,
+      "hidden_dim=", GLM_5_HIDDEN_DIM,
+      " only supports num_experts=", DEFAULT_NUM_EXPERTS,
       ", but got num_experts=", num_experts);
   TORCH_CHECK(num_tokens >= 1 && num_tokens <= 16,
               "currently num_tokens must be less than or equal to 16 for "
@@ -130,35 +143,36 @@ void dsv3_router_gemm(at::Tensor& output,       // [num_tokens, num_experts]
 
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
+  float* const out_f = reinterpret_cast<float*>(output.mutable_data_ptr());
+  __nv_bfloat16* const out_bf = reinterpret_cast<__nv_bfloat16*>(output.mutable_data_ptr());
+  __nv_bfloat16 const* const a_ptr = reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr());
+  __nv_bfloat16 const* const b_ptr = reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr());
+
   if (output.dtype() == at::kFloat) {
-    if (num_experts == DEFAULT_NUM_EXPERTS) {
-      LoopUnroller<1, 16, DEFAULT_NUM_EXPERTS, DEFAULT_HIDDEN_DIM>::
-          unroll_float_output(
-              num_tokens, reinterpret_cast<float*>(output.mutable_data_ptr()),
-              reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-              reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), stream);
-    } else if (num_experts == KIMI_K2_NUM_EXPERTS) {
-      LoopUnroller<1, 16, KIMI_K2_NUM_EXPERTS, DEFAULT_HIDDEN_DIM>::
-          unroll_float_output(
-              num_tokens, reinterpret_cast<float*>(output.mutable_data_ptr()),
-              reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-              reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), stream);
+    if (hidden_dim == DEFAULT_HIDDEN_DIM) {
+      if (num_experts == DEFAULT_NUM_EXPERTS) {
+        LoopUnroller<1, 16, DEFAULT_NUM_EXPERTS, DEFAULT_HIDDEN_DIM>::
+            unroll_float_output(num_tokens, out_f, a_ptr, b_ptr, stream);
+      } else {  // KIMI_K2_NUM_EXPERTS
+        LoopUnroller<1, 16, KIMI_K2_NUM_EXPERTS, DEFAULT_HIDDEN_DIM>::
+            unroll_float_output(num_tokens, out_f, a_ptr, b_ptr, stream);
+      }
+    } else {  // GLM_5_HIDDEN_DIM (num_experts guaranteed == DEFAULT_NUM_EXPERTS)
+      LoopUnroller<1, 16, DEFAULT_NUM_EXPERTS, GLM_5_HIDDEN_DIM>::
+          unroll_float_output(num_tokens, out_f, a_ptr, b_ptr, stream);
     }
   } else if (output.dtype() == at::kBFloat16) {
-    if (num_experts == DEFAULT_NUM_EXPERTS) {
-      LoopUnroller<1, 16, DEFAULT_NUM_EXPERTS, DEFAULT_HIDDEN_DIM>::
-          unroll_bf16_output(
-              num_tokens,
-              reinterpret_cast<__nv_bfloat16*>(output.mutable_data_ptr()),
-              reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-              reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), stream);
-    } else if (num_experts == KIMI_K2_NUM_EXPERTS) {
-      LoopUnroller<1, 16, KIMI_K2_NUM_EXPERTS, DEFAULT_HIDDEN_DIM>::
-          unroll_bf16_output(
-              num_tokens,
-              reinterpret_cast<__nv_bfloat16*>(output.mutable_data_ptr()),
-              reinterpret_cast<__nv_bfloat16 const*>(mat_a.data_ptr()),
-              reinterpret_cast<__nv_bfloat16 const*>(mat_b.data_ptr()), stream);
+    if (hidden_dim == DEFAULT_HIDDEN_DIM) {
+      if (num_experts == DEFAULT_NUM_EXPERTS) {
+        LoopUnroller<1, 16, DEFAULT_NUM_EXPERTS, DEFAULT_HIDDEN_DIM>::
+            unroll_bf16_output(num_tokens, out_bf, a_ptr, b_ptr, stream);
+      } else {  // KIMI_K2_NUM_EXPERTS
+        LoopUnroller<1, 16, KIMI_K2_NUM_EXPERTS, DEFAULT_HIDDEN_DIM>::
+            unroll_bf16_output(num_tokens, out_bf, a_ptr, b_ptr, stream);
+      }
+    } else {  // GLM_5_HIDDEN_DIM (num_experts guaranteed == DEFAULT_NUM_EXPERTS)
+      LoopUnroller<1, 16, DEFAULT_NUM_EXPERTS, GLM_5_HIDDEN_DIM>::
+          unroll_bf16_output(num_tokens, out_bf, a_ptr, b_ptr, stream);
     }
   }
 }

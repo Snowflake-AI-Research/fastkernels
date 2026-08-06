@@ -10,7 +10,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from vllm.model_executor.layers.fla.ops.op import exp
+from vllm.third_party.flash_linear_attention.ops.op import exp
 from vllm.triton_utils import tl, triton
 
 

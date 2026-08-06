@@ -116,10 +116,22 @@ scenarios:
 ```
 </details>
 
-Run the capture command:
+Run the capture command. `my-model.yaml` is a scenarios YAML holding just the
+model you are adding -- `capture` and `eval` take no model filter, so pointing
+them at a full table runs every row in it. Copy the shape of an existing row out
+of `fastkernels/scenarios/full.yaml`:
+
+```yaml
+scenarios:
+  - model: nvidia/GLM-5.2-NVFP4
+    tp: 8
+    dtype: nvfp4
+    kv_cache_dtype: fp8_e4m3
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+```
 
 ```bash
-fastkernels capture fastkernels/scenarios/glm5.2.yaml --max-layers 4 --max-requests 64
+fastkernels capture my-model.yaml --max-layers 4 --max-requests 64
 ```
 
 One JSON report is written per scenario·workload. This JSON records every executed operator's init/forward parameters and inputs. Drop `--max-layers`/`--max-requests` if you want a full-fidelity capture rather than a truncated run.
@@ -159,7 +171,7 @@ Not faster / not correct → edit the candidate and re-run. Iterate to `SPEEDUP 
 ### 5. Evaluate end-to-end (correctness + perf + cuda-graphs)
 
 ```bash
-fastkernels eval fastkernels/scenarios/glm5.2.yaml --max-layers 4 --max-requests 64
+fastkernels eval my-model.yaml --max-layers 4 --max-requests 64
 ```
 
 **Output** — baseline-vs-candidate summary per scenario (CUDA graphs on; add

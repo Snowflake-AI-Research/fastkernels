@@ -32,6 +32,7 @@ except ImportError:
 from concurrent.futures import ThreadPoolExecutor
 
 from .tp import _tp_size
+from .quant_scheme import is_nvfp4 as _is_nvfp4
 # Only the (lightweight) Llama config/model is imported eagerly. Every other
 # architecture is imported lazily inside ``load_model`` / the EAGLE-3 loader so
 # that loading a plain Llama checkpoint does not require optional, arch-specific
@@ -67,10 +68,26 @@ _EXPERT_RE = re.compile(
     r"(.+\.block_sparse_moe)\.experts\.(\d+)\.(w[123])\.weight"
 )
 
-# DeepSeek-V3 per-expert weight and scale pattern
+# DeepSeek-V3 per-expert weight and scale pattern.
+#
+# ``weight_scale_inv`` is the block-FP8 spelling; ``weight_scale`` /
+# ``weight_scale_2`` / ``input_scale`` are the ModelOpt NVFP4 ones (per-16 block
+# scale, per-expert global weight scale, per-expert static activation scale).
+# The two schemes never coexist in one checkpoint, and the suffixes are disjoint,
+# so one regex plus the ``_EXPERT_ATTR_TO_PARAM`` table covers both.
 _DEEPSEEK_EXPERT_RE = re.compile(
-    r"(.+\.mlp)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.(weight_scale_inv|weight)$"
+    r"(.+\.mlp)\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\."
+    r"(weight_scale_inv|weight_scale_2|weight_scale|input_scale|weight)$"
 )
+
+# Checkpoint suffix -> (w13 param suffix, w2 param suffix) on ``DeepSeekMoE``.
+_EXPERT_ATTR_TO_PARAM = {
+    "weight": ("w13", "w2"),
+    "weight_scale_inv": ("w13_weight_scale_inv", "w2_weight_scale_inv"),
+    "weight_scale": ("w13_weight_scale", "w2_weight_scale"),
+    "weight_scale_2": ("w13_weight_scale_2", "w2_weight_scale_2"),
+    "input_scale": ("w13_input_scale", "w2_input_scale"),
+}
 
 _DEEPSEEK_SHARED_EXPERT_RE = re.compile(
     r"(.+\.mlp)\.shared_experts\.(gate_proj|up_proj|down_proj)\.(weight|weight_scale_inv)"
@@ -742,10 +759,8 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
             if m_conv:
                 prefix, wb = m_conv.groups()
                 mapped_name = f"{prefix}.conv.{wb}"
-            m_ln = _WHISPER_LAYER_NORM_RE.match(mapped_name)
-            if m_ln:
-                prefix, wb = m_ln.groups()
-                mapped_name = f"{prefix}.norm.{wb}"
+            # LayerNorm exposes weight/bias directly, so checkpoint names
+            # already match. Mapping them under ".norm" silently skips them.
             m_emb = _WHISPER_EMBED_RE.match(mapped_name)
             if m_emb:
                 prefix = m_emb.group(1)
@@ -899,22 +914,17 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
         if m_ds:
             moe_prefix, expert_id_str, proj_name, attr = m_ds.groups()
             expert_id = int(expert_id_str)
+            w13_suffix, w2_suffix = _EXPERT_ATTR_TO_PARAM[attr]
             if proj_name in ("gate_proj", "up_proj"):
                 is_w1 = (proj_name == "gate_proj")
-                if attr == "weight":
-                    param_name = f"{moe_prefix}.w13"
-                else:
-                    param_name = f"{moe_prefix}.w13_weight_scale_inv"
+                param_name = f"{moe_prefix}.{w13_suffix}"
                 try:
                     param = model.get_parameter(param_name)
                 except AttributeError:
                     continue
                 param.weight_loader(param, _get_tensor(), expert_id, is_w1=is_w1)
             else:
-                if attr == "weight":
-                    param_name = f"{moe_prefix}.w2"
-                else:
-                    param_name = f"{moe_prefix}.w2_weight_scale_inv"
+                param_name = f"{moe_prefix}.{w2_suffix}"
                 try:
                     param = model.get_parameter(param_name)
                 except AttributeError:
@@ -1128,6 +1138,39 @@ def _postprocess_moe_fp8_weights(module) -> int:
     return count
 
 
+def _postprocess_nvfp4_weights(model: torch.nn.Module) -> None:
+    """Transform loaded NVFP4 expert weights into TRTLLM-gen kernel layout.
+
+    The NVFP4 analogue of :func:`_postprocess_fp8_weights`: there are no
+    quantized linears to touch (the checkpoint excludes every one), so this only
+    walks the MoE modules and hands each one to
+    ``DeepSeekMoE.prepare_fp4_weights``, which mirrors
+    ``ModelOptNvFp4FusedMoE.process_weights_after_loading``.
+    """
+    import time as _time
+
+    from ..tasks.baseline.L2.deepseek_moe import DeepSeekMoE
+
+    modules = [
+        m for m in model.modules()
+        if isinstance(m, DeepSeekMoE) and getattr(m, "use_nvfp4", False)
+    ]
+    if not modules:
+        return
+    _t0 = _time.perf_counter()
+    print("  Post-processing NVFP4 MoE weights for TRTLLM-gen...", flush=True)
+    total = len(modules)
+    for j, module in enumerate(modules):
+        module.prepare_fp4_weights()
+        if j % max(1, total // 5) == 0 or j == total - 1:
+            print(f"    NVFP4 MoE postprocess {j+1}/{total} "
+                  f"({(j+1)*100//total}%, "
+                  f"{_time.perf_counter()-_t0:.1f}s)", flush=True)
+    torch.cuda.empty_cache()
+    print(f"  Post-processed {total} NVFP4 MoE layers "
+          f"({_time.perf_counter()-_t0:.1f}s total).", flush=True)
+
+
 def _postprocess_fp8_weights(model: torch.nn.Module) -> None:
     """Re-quantize FP8 weights to UE8M0 format and transform scale layout for DeepGEMM.
 
@@ -1183,12 +1226,19 @@ def _postprocess_fp8_weights(model: torch.nn.Module) -> None:
         _t_moe = _time.perf_counter()
         total = len(deepseek_moe_modules)
         for j, module in enumerate(deepseek_moe_modules):
-            for wname, sname in (("w13", "w13_weight_scale_inv"),
-                                 ("w2", "w2_weight_scale_inv")):
-                w = getattr(module, wname)
-                s = getattr(module, sname)
-                postprocess_fp8_weights_batched(w.data, s.data)
-                moe_count += w.shape[0]
+            if getattr(module, "_use_trtllm", False):
+                # Blackwell FLASHINFER_TRTLLM experts: transform the RAW fp8
+                # weights into the BlockMajorK layout (NO UE8M0 requant — vLLM's
+                # TRTLLM path uses the un-requantized checkpoint weights).
+                module.prepare_trtllm_weights()
+                moe_count += 2 * module.num_experts
+            else:
+                for wname, sname in (("w13", "w13_weight_scale_inv"),
+                                     ("w2", "w2_weight_scale_inv")):
+                    w = getattr(module, wname)
+                    s = getattr(module, sname)
+                    postprocess_fp8_weights_batched(w.data, s.data)
+                    moe_count += w.shape[0]
             if j % max(1, total // 5) == 0 or j == total - 1:
                 print(f"    DeepSeek MoE postprocess {j+1}/{total} "
                       f"({(j+1)*100//total}%, "
@@ -1266,13 +1316,34 @@ def _detect_model_type(model_name: str) -> str:
         # files that don't exist in the repo (model_type is registered
         # natively).  In both cases reading config.json directly works.
         model_type = _load_config_dict(model_name).get("model_type", "llama")
-    if model_type == "deepseek_v32":
+    if model_type in ("deepseek_v32", "glm_moe_dsa"):
+        # GLM-5.2 (``glm_moe_dsa`` / ``GlmMoeDsaForCausalLM``) is a pure config
+        # variant of DeepSeek-V3.2 -- in vLLM ``GlmMoeDsaForCausalLM`` subclasses
+        # ``DeepseekV2ForCausalLM`` with an empty body -- so it shares the entire
+        # MLA + DSA + MoE stack (weight names, MLA-absorbed weights, TP KV-head
+        # exemption, FP8 block dequant). Route it through the DeepSeek path.
         model_type = "deepseek_v3"
     return model_type
 
 
 def _detect_quant_config(model_name: str) -> dict | None:
-    """Detect FP8 quantization config from HuggingFace config."""
+    """Detect the checkpoint's quantization config from its HuggingFace config.
+
+    Recognizes two schemes (see ``infra/quant_scheme.py``):
+
+    * ``quant_method == "fp8"`` -- DeepSeek / Qwen block-FP8 W8A8.
+    * ``quant_method == "modelopt"`` with ``quant_algo == "NVFP4"`` -- ModelOpt
+      NVFP4 W4A4 (nvidia/GLM-5.2-NVFP4). vLLM reads the same
+      ``config.json:quantization_config`` block for this: its
+      "compressed-tensors style" branch in ``ModelOptQuantConfigBase.from_config``
+      takes ``quant_algo``, ``group_size``, and the ``ignore`` exclude list from
+      exactly these keys. The separate ``hf_quant_config.json`` is the legacy
+      spelling of the same content and is not consulted when
+      ``quantization_config`` is present.
+
+    Anything else returns ``None`` (treated as unquantized) rather than being
+    silently mapped onto one of the two supported schemes.
+    """
     try:
         hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
     except (ValueError, OSError):
@@ -1281,15 +1352,57 @@ def _detect_quant_config(model_name: str) -> dict | None:
     qc = getattr(hf_config, "quantization_config", None)
     if qc is None:
         return None
-    if isinstance(qc, dict):
-        quant_method = qc.get("quant_method", "")
-    else:
-        quant_method = getattr(qc, "quant_method", "")
-    if quant_method != "fp8":
-        return None
-    if isinstance(qc, dict):
+    if not isinstance(qc, dict):
+        qc = qc.to_dict() if hasattr(qc, "to_dict") else {
+            "quant_method": getattr(qc, "quant_method", "")
+        }
+    quant_method = str(qc.get("quant_method", "")).lower()
+    if quant_method == "fp8":
         return qc
-    return qc.to_dict() if hasattr(qc, "to_dict") else {"quant_method": "fp8"}
+    if quant_method.startswith("modelopt"):
+        algo = str(qc.get("quant_algo", "")).upper()
+        if algo == "NVFP4":
+            return qc
+        raise NotImplementedError(
+            f"{model_name}: ModelOpt quant_algo={algo!r} is not supported; "
+            "only NVFP4 is implemented."
+        )
+    return None
+
+
+def _move_preserving_param_dtypes(
+    model: torch.nn.Module,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> None:
+    """Move to ``device`` and cast to ``dtype`` *except* declared-FP32 tensors.
+
+    ``model.to(device, dtype)`` casts every parameter and buffer, which silently
+    demotes the ones a model declared FP32 on purpose. vLLM never does a blanket
+    cast: each parameter keeps the dtype its layer declared. That matters for
+    the hybrid linear-attention models, whose recurrence parameters are FP32 in
+    vLLM and whose kernels upcast from whatever they are handed:
+
+    * Kimi-Linear KDA: ``A_log``, ``dt_bias`` (``dtype=torch.float32``) and the
+      three ``{q,k,v}_conv1d`` weights (``params_dtype=torch.float32``).
+    * Qwen3-Next GDN: ``A_log`` (``dtype=torch.float32``); its ``dt_bias`` and
+      ``conv1d`` weight are model dtype in vLLM too.
+
+    Casting those to BF16 rounds the decay gate and the causal-conv weights
+    before the kernel ever sees them, which is amplified by the recurrence.
+    """
+    for param in model.parameters():
+        if param.dtype == torch.float32:
+            if param.data.device != device:
+                param.data = param.data.to(device=device)
+        elif param.data.device != device or param.dtype != dtype:
+            param.data = param.data.to(device=device, dtype=dtype)
+    for buf in model.buffers():
+        if buf.dtype == torch.float32:
+            if buf.device != device:
+                buf.data = buf.data.to(device=device)
+        elif buf.device != device or buf.dtype != dtype:
+            buf.data = buf.data.to(device=device, dtype=dtype)
 
 
 def _restore_mamba_ssm_params(
@@ -1366,14 +1479,22 @@ def load_model(
     device: torch.device = torch.device("cuda"),
     dtype: torch.dtype = torch.bfloat16,
     max_layers: int | None = None,
+    max_num_batched_tokens: int | None = None,
+    kv_cache_dtype: str | None = None,
+    max_model_len: int | None = None,
 ):
     model_path = download_model(model_name)
     model_type = _detect_model_type(model_name)
     quant_config = _detect_quant_config(model_name)
 
     if quant_config:
-        print(f"  Detected FP8 quantization: {quant_config.get('quant_method')}, "
-              f"block_size={quant_config.get('weight_block_size')}")
+        if _is_nvfp4(quant_config):
+            print(f"  Detected NVFP4 quantization: "
+                  f"{quant_config.get('quant_method')}/"
+                  f"{quant_config.get('quant_algo')} (routed experts only)")
+        else:
+            print(f"  Detected FP8 quantization: {quant_config.get('quant_method')}, "
+                  f"block_size={quant_config.get('weight_block_size')}")
 
     if model_type in ("flux", "hunyuan_video"):
         raise ValueError(
@@ -1515,8 +1636,23 @@ def load_model(
         )
         config = DeepSeekV3Config.from_pretrained(model_name)
         config.dtype = dtype
+        # DSA topk_indices_buffer is sized from this (vLLM uses
+        # scheduler_config.max_num_batched_tokens); the HF config has no such
+        # field, so thread the engine's value in before the model (and its
+        # buffer) is constructed.
+        if max_num_batched_tokens is not None:
+            config.max_num_batched_tokens = max_num_batched_tokens
+        if max_model_len is not None:
+            config.max_model_len = max_model_len
+        # KV cache dtype selects the MLA attention backend (see
+        # ``MLAAttention.__init__``): ``auto`` -> FlashMLA sparse over a BF16
+        # cache, ``fp8_e4m3`` -> vLLM's FLASHINFER_MLA_SPARSE over a plain fp8
+        # cache. ``None`` leaves it to ``FASTKERNELS_KV_CACHE_DTYPE``.
+        if kv_cache_dtype is not None:
+            config.kv_cache_dtype = kv_cache_dtype
         _apply_max_layers(config, max_layers)
-        print(f"  Allocating DeepSeek V3.2 model ({config.n_routed_experts} experts, "
+        print(f"  Allocating DeepSeek-V3.2 / GLM-5.2 (MLA+DSA+MoE) model "
+              f"({config.n_routed_experts} experts, "
               f"top-{config.num_experts_per_tok}, DSA topk={config.index_topk})...")
         model = DeepSeekV3ForCausalLM(config, quant_config=quant_config)
     elif model_type == "bitnet":
@@ -1541,7 +1677,10 @@ def load_model(
             f"({config.num_experts} experts, "
             f"{len(config.kda_layers)} KDA + {len(config.full_attn_layers)} MLA layers)..."
         )
-        model = KimiLinearForCausalLM(config, quant_config=quant_config)
+        from vllm.config import VllmConfig, set_current_vllm_config
+
+        with set_current_vllm_config(VllmConfig()):
+            model = KimiLinearForCausalLM(config, quant_config=quant_config)
     else:
         config = LlamaConfig.from_pretrained(model_name)
         config.dtype = dtype
@@ -1600,7 +1739,30 @@ def load_model(
     else:
         load_weights(model, model_path, model_type)
 
-    if quant_config:
+    if quant_config and _is_nvfp4(quant_config):
+        # ModelOpt NVFP4: only the routed experts are quantized, and their
+        # parameters span three dtypes that a blanket ``.to(dtype)`` would
+        # destroy -- uint8 (packed fp4 values), fp8_e4m3 (per-16 block scales),
+        # and fp32 (per-expert global / input scales). Every other module is
+        # BF16 (the checkpoint's ``ignore`` list covers them all), so those cast
+        # normally.
+        for name, param in model.named_parameters():
+            if param.dtype in (torch.uint8, torch.int8, torch.float8_e4m3fn,
+                               torch.float32):
+                if param.data.device != device:
+                    param.data = param.data.to(device=device)
+            elif param.data.device != device or param.dtype != dtype:
+                param.data = param.data.to(device=device, dtype=dtype)
+        for name, buf in model.named_buffers():
+            if buf.device != device:
+                buf.data = buf.data.to(device=device)
+        if model_type in ("deepseek_v3", "kimi_linear"):
+            # kv_b_proj is BF16 under NVFP4, so this builds W_UV / W_UK_T
+            # directly (the trivial-cast branch) -- there is no fp8 kv_b_proj to
+            # defer to ``_finalize_mla_absorbed_weights``.
+            _compute_mla_absorbed_weights(model)
+        _postprocess_nvfp4_weights(model)
+    elif quant_config:
         for name, param in model.named_parameters():
             if param.dtype == torch.float8_e4m3fn:
                 if not param.is_cuda:
@@ -1621,6 +1783,12 @@ def load_model(
         if model_type in ("deepseek_v3", "kimi_linear"):
             _compute_mla_absorbed_weights(model)
         _postprocess_fp8_weights(model)
+        # fp8 MLA absorbed weights are built here (post-processing done) via an
+        # fp8 GEMM on identity, matching vLLM's use_deep_gemm dequant bit-for-bit.
+        if model_type == "deepseek_v3":
+            _finalize_mla_absorbed_weights(model)
+    elif model_type in ("kimi_linear", "qwen3_next"):
+        _move_preserving_param_dtypes(model, device, dtype)
     elif model_type != "gpt_oss":
         model = model.to(device=device, dtype=dtype)
 
@@ -1647,8 +1815,85 @@ def load_model(
 
     _maybe_tie_word_embeddings(model, model_name, config)
 
+    # Post-load fixups every attention layer needs regardless of model type
+    # (currently: the FP32 attention-sink copy trtllm-gen requires).  Mirrors
+    # vLLM calling ``process_weights_after_loading`` on each attention impl.
+    from ..tasks.baseline.L2.attention_impl import Attention as _FkAttention
+    for mod in model.modules():
+        if isinstance(mod, _FkAttention):
+            mod.process_weights_after_loading()
+
+    # Same for the BF16 MoE layers whose experts run on trtllm-gen: the kernel
+    # needs its weights pre-shuffled into the 4D BlockMajorK layout, which vLLM
+    # does once in ``convert_to_unquantized_kernel_format``. No-op when the
+    # trtllm path is not selected.
+    from ..tasks.baseline.L2.kimi_moe import KimiMoE as _FkKimiMoE
+    from ..tasks.baseline.L2.mixtral_moe import MixtralMoE as _FkMixtralMoE
+    from ..tasks.baseline.L2.qwen3_next_gdn_attention import (
+        Qwen3NextGDNAttention as _FkQwen3NextGDN,
+    )
+    from ..tasks.baseline.L2.shared_expert_moe import (
+        SharedExpertMoE as _FkSharedExpertMoE,
+    )
+    # Qwen3-Next's GDN layers use the same hook to alias their two input
+    # projections into one buffer so they run as a single GEMM.
+    for mod in model.modules():
+        if isinstance(mod, (_FkKimiMoE, _FkMixtralMoE, _FkSharedExpertMoE,
+                            _FkQwen3NextGDN)):
+            mod.process_weights_after_loading()
+
+    # Drop the shuffle temporaries and re-baseline the peak counter. This is
+    # load-bearing, not hygiene: ``allocate_kv_cache`` sizes the cache as
+    # ``total*util - used - peak + current``, so it charges the *transient* peak
+    # of anything that ran before it, permanently. The trtllm-gen weight shuffle
+    # walks experts one at a time allocating per-expert temporaries, and leaving
+    # that peak on the books cost Mixtral 39% of its KV cache -- 1,070,160 token
+    # slots against 1,766,400 without it, i.e. ~45 GB of cache lost to 1.4 GB of
+    # weights. That starved the scheduler badly enough to regress long-context
+    # and fixed-batch-32 while looking like a kernel problem.
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
     model.eval()
     return model, config
+
+
+def _checkpoint_has_lm_head(model_name: str) -> bool:
+    """True if the checkpoint contains a real (untied) ``lm_head`` weight.
+
+    Tied-embedding checkpoints omit ``lm_head.weight`` entirely; a present
+    ``*lm_head.weight`` key means the LM head is a distinct, loaded projection
+    that must not be overwritten by the embedding matrix.
+    """
+    import glob as _glob
+    import json as _json
+    try:
+        path = download_model(model_name)
+    except Exception:
+        return False
+
+    def _is_lm_head(k: str) -> bool:
+        return k.endswith("lm_head.weight")
+
+    # Sharded checkpoints: consult the safetensors / bin weight map.
+    for idx in _glob.glob(os.path.join(path, "*.index.json")):
+        try:
+            wm = _json.load(open(idx)).get("weight_map", {})
+        except Exception:
+            continue
+        if any(_is_lm_head(k) for k in wm):
+            return True
+    # Single-file safetensors: inspect the tensor keys directly.
+    from safetensors import safe_open
+    for st in _glob.glob(os.path.join(path, "*.safetensors")):
+        try:
+            with safe_open(st, framework="pt") as f:
+                if any(_is_lm_head(k) for k in f.keys()):
+                    return True
+        except Exception:
+            continue
+    return False
 
 
 def _maybe_tie_word_embeddings(model, model_name: str, config) -> None:
@@ -1660,6 +1905,16 @@ def _maybe_tie_word_embeddings(model, model_name: str, config) -> None:
     flag from the HF config (fastkernels configs don't all carry it) and share
     the embedding matrix into the LM head after loading.
     """
+    # The checkpoint is authoritative: if it ships a real (untied) lm_head
+    # weight, never overwrite it with the embedding matrix — regardless of what
+    # the ``tie_word_embeddings`` flag says. Composite VL configs frequently
+    # carry a null/misleading flag (e.g. Qwen3-VL's text_config sets it to
+    # ``None`` while the top-level config says ``False`` and the checkpoint has
+    # a distinct ``lm_head.weight``); tying there silently swaps in the wrong
+    # projection and garbles every generated token.
+    if _checkpoint_has_lm_head(model_name):
+        return
+
     tie = getattr(config, "tie_word_embeddings", None)
     if tie is None:
         try:
@@ -1998,3 +2253,15 @@ def _compute_mla_absorbed_weights(model: torch.nn.Module) -> None:
             module.compute_absorbed_weights()
             count += 1
     print(f"  Computed absorbed MLA weights for {count} attention layers.")
+
+
+def _finalize_mla_absorbed_weights(model: torch.nn.Module) -> None:
+    """Build fp8 MLA absorbed weights (W_UV/W_UK_T) AFTER FP8 post-processing,
+    via an fp8 GEMM on an identity — bit-identical to vLLM's use_deep_gemm
+    dequant. No-op for BF16 checkpoints (already built)."""
+    from ..tasks.baseline.L2.deepseek_mla_attention import DeepSeekMLAAttention
+    for module in model.modules():
+        if isinstance(module, DeepSeekMLAAttention) and hasattr(
+            module, "finalize_absorbed_weights"
+        ):
+            module.finalize_absorbed_weights()

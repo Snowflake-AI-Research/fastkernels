@@ -10,8 +10,15 @@ import sys
 from pathlib import Path
 
 _THIS_DIR = Path(__file__).resolve().parent
-_PACKAGE_DIR = _THIS_DIR.parent.parent
-sys.path.insert(0, str(_PACKAGE_DIR))
+_PACKAGE_DIR = _THIS_DIR.parent
+_PROJECT_ROOT = _PACKAGE_DIR.parent
+
+sys.path.insert(0, str(_PROJECT_ROOT))
+from fastkernels.validate.comparison import (  # noqa: E402
+    alignment_from_similarity,
+    latency_entry,
+    throughput_entry,
+)
 
 from fastkernels.validate.worker import run_worker
 from fastkernels.infra.image_cls_loader import infer_image_mean_std, infer_image_size
@@ -42,6 +49,17 @@ with open(sys.argv[1]) as f:
 sys.path.insert(0, cfg["project_root"])
 
 pkg_root = Path(cfg["project_root"])
+# ``project_root`` is the *repo* root; the importable package lives one level
+# down at ``<repo>/fastkernels``. Without this the worker died with
+#     FileNotFoundError: '<repo>/__init__.py'
+# and the harness then wrote results.json with ``ours: None`` and exited 0, so
+# convnextv2 and efficientnetv2 were recorded PASS with an empty `comparisons`
+# block in 20260729-070206. bench_detection already carries this guard.
+if (
+    not (pkg_root / "__init__.py").exists()
+    and (pkg_root / "fastkernels" / "__init__.py").exists()
+):
+    pkg_root = pkg_root / "fastkernels"
 spec = importlib.util.spec_from_file_location(
     "fastkernels", pkg_root / "__init__.py",
     submodule_search_locations=[str(pkg_root)],
@@ -71,10 +89,15 @@ def _load_pil_images(dataset_name, dataset_split, num_needed, seed):
             raise RuntimeError(
                 f"{dataset_name}:{dataset_split} requires gated Hub access. "
                 f"Either request access/login for that dataset, or use an ungated dataset such as "
-                f"'food101' with '--dataset-split validation'.",
+                f"'ethz/food101' with '--dataset-split validation'.",
             ) from exc
         raise
-    ds = ds.shuffle(seed=seed, buffer_size=5000)
+    # buffer_size=64, not 5000: a streaming shuffle fills its buffer before
+    # yielding the first example, so the buffer is paid in full JPEG decodes even
+    # though this harness only wants 32 images by default. The seeded SHARD-order
+    # permutation that ``shuffle`` also applies is what supplies class diversity
+    # on a class-ordered split, and that part is free.
+    ds = ds.shuffle(seed=seed, buffer_size=64)
 
     images = []
     for sample in ds:
@@ -278,7 +301,10 @@ def main():
     ap = argparse.ArgumentParser(description="Benchmark repo-native CNN models vs official baselines")
     ap.add_argument("--model", type=str, required=True)
     ap.add_argument("--image-size", type=int, default=0)
-    ap.add_argument("--dataset", type=str, default="food101")
+    # Namespaced id: current huggingface_hub rejects bare dataset names
+    # ("Repository id must be 'namespace/name', got 'food101'"), which broke
+    # load_dataset for both workers.
+    ap.add_argument("--dataset", type=str, default="ethz/food101")
     ap.add_argument("--dataset-split", type=str, default="validation")
     ap.add_argument("--num-images", type=int, default=32)
     ap.add_argument("--batch-size", type=int, default=8)
@@ -299,7 +325,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     common = {
-        "project_root": str(_PACKAGE_DIR),
+        "project_root": str(_PROJECT_ROOT),
         "model": args.model,
         "image_size": image_size,
         "dataset_name": args.dataset,
@@ -319,13 +345,51 @@ def main():
     }
 
     ours = run_worker(IMAGE_CLS_WORKER, {**common, "backend": "ours"}, "fastkernels image classification")
+    if ours is None:
+        raise SystemExit(
+            "ERROR: the fastkernels image-classification worker failed, so "
+            "there is nothing to benchmark. See the traceback above."
+        )
     references = {}
     comparisons = {}
     if not args.skip_reference:
         ref = run_worker(IMAGE_CLS_WORKER, {**common, "backend": "reference"}, "official image classification baseline")
+        if ref is None:
+            raise SystemExit(
+                "ERROR: the reference image-classification worker failed, so "
+                "there is nothing to compare against. Pass --skip-reference to "
+                "intentionally run fastkernels alone."
+            )
         references["reference"] = ref
-        if ours and ref:
-            comparisons["reference"] = _compare_outputs(ours, ref)
+        comparisons["reference"] = _compare_outputs(ours, ref)
+
+    # Standard comparison shape shared with the other harnesses so aggregate
+    # queries over a sweep find a `speedup` and an `alignment` here too.
+    scenarios: list[dict] = []
+    latency_scenarios: list[dict] = []
+    ref = references.get("reference")
+    if ref:
+        cmp = comparisons["reference"]
+        scenarios.append(throughput_entry(
+            f"imagecls-{args.dataset}",
+            ours.get("images_per_second"),
+            ref.get("images_per_second"),
+            metric="images_per_s",
+            alignment=alignment_from_similarity(
+                "top1_match_rate", cmp["top1_match_rate"], threshold=0.99,
+                logits_cosine=cmp["logits_cosine"], logits_mae=cmp["logits_mae"],
+            ),
+            num_images=args.num_images,
+            batch_size=args.batch_size,
+        ))
+        for bs, stats in (ours.get("latency") or {}).items():
+            ref_stats = (ref.get("latency") or {}).get(bs)
+            if not ref_stats:
+                continue
+            latency_scenarios.append(latency_entry(
+                f"batch-{bs}", stats.get("median"), ref_stats.get("median"),
+                batch_size=int(bs) if str(bs).isdigit() else bs,
+            ))
 
     results = {
         "model": args.model,
@@ -335,6 +399,9 @@ def main():
         "ours": ours,
         "references": references,
         "comparisons": comparisons,
+        "reference_name": (ref or {}).get("baseline_name") if ref else None,
+        "scenarios": scenarios,
+        "latency_scenarios": latency_scenarios,
     }
     out_file = out_dir / "results.json"
     out_file.write_text(json.dumps(results, indent=2))

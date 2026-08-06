@@ -70,6 +70,31 @@ class BitNetConfig:
         head_dim = getattr(hf, "head_dim", None)
         if head_dim is None:
             head_dim = hf.hidden_size // hf.num_attention_heads
+        # ``rope_theta`` is present in bitnet's config.json (500000.0) but the
+        # natively-registered ``BitNetConfig`` in current transformers does not
+        # expose it as an attribute, and its ``__getattribute__`` raises rather
+        # than returning None:
+        #     AttributeError: 'BitNetConfig' object has no attribute 'rope_theta'
+        # Newer transformers also moves rope settings under ``rope_parameters``
+        # / ``rope_scaling``. Resolve from whichever source has it, then fall
+        # back to the dataclass default.
+        rope_theta = getattr(hf, "rope_theta", None)
+        if rope_theta is None:
+            for holder_name in ("rope_parameters", "rope_scaling"):
+                holder = getattr(hf, holder_name, None)
+                if isinstance(holder, dict):
+                    rope_theta = holder.get("rope_theta") or holder.get("theta")
+                    if rope_theta is not None:
+                        break
+        if rope_theta is None:
+            # ``to_dict()`` reflects the raw config.json even for keys the
+            # config class does not declare.
+            try:
+                rope_theta = hf.to_dict().get("rope_theta")
+            except Exception:
+                rope_theta = None
+        if rope_theta is None:
+            rope_theta = cls.rope_theta
         return cls(
             hidden_size=hf.hidden_size,
             intermediate_size=hf.intermediate_size,
@@ -80,7 +105,7 @@ class BitNetConfig:
             vocab_size=hf.vocab_size,
             max_position_embeddings=hf.max_position_embeddings,
             rms_norm_eps=hf.rms_norm_eps,
-            rope_theta=hf.rope_theta,
+            rope_theta=float(rope_theta),
             tie_word_embeddings=getattr(hf, "tie_word_embeddings", True),
         )
 

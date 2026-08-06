@@ -26,7 +26,10 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-import vllm._C  # noqa: F401  — registers torch.ops._C_cache_ops
+try:
+    import vllm._custom_ops  # noqa: F401 — vLLM >= 0.20 registers torch.ops._C_cache_ops
+except ImportError:
+    import vllm._C  # noqa: F401 — legacy vLLM <= 0.18
 
 _KV_C_DIM = 512
 _K_PE_DIM = 64
@@ -51,22 +54,33 @@ class StoreKVCacheFP8MLA(nn.Module):
     * ``"fp8_ds_mla"``: expects a uint8 cache of shape
       ``[num_blocks, block_size, 656]``; the kernel fuses per-block
       UE8M0 FP8 quantization of ``kv_c_normed`` with BF16 ``k_pe`` storage.
+    * ``"fp8_e4m3"``: expects a ``float8_e4m3fn`` cache of shape
+      ``[num_blocks, block_size, 576]``; the kernel divides both halves by
+      ``k_scale`` and casts to fp8. This is the layout vLLM's
+      FLASHINFER_MLA_SPARSE backend uses -- plain per-tensor fp8, no block
+      scales -- and it is NOT interchangeable with ``fp8_ds_mla``.
 
     Args:
         kv_c_normed: ``[N, 512]`` BF16 — compressed KV after layernorm.
         k_pe: ``[N, 1, 64]`` or ``[N, 64]`` BF16 — RoPE key component.
-        kv_cache: ``[num_blocks, block_size, 576|656]`` (BF16 or uint8).
+        kv_cache: ``[num_blocks, block_size, 576|656]`` (BF16 / fp8 / uint8).
         slot_mapping: ``[N]`` int64 — linear slot index per token (``-1`` skips).
     """
 
     def __init__(self, kv_cache_dtype: str = "auto"):
         super().__init__()
-        assert kv_cache_dtype in ("auto", "fp8_ds_mla"), (
+        assert kv_cache_dtype in ("auto", "fp8_ds_mla", "fp8_e4m3"), (
             f"StoreKVCacheFP8MLA: unsupported kv_cache_dtype={kv_cache_dtype!r}"
         )
         self.kv_cache_dtype = kv_cache_dtype
+        # ``k_scale`` is the per-tensor dequant scale the kernel divides by on
+        # the ``fp8_e4m3`` path (it is ignored for ``auto`` and for the
+        # block-scaled ``fp8_ds_mla`` layout). vLLM initialises ``layer._k_scale``
+        # to 1.0 and only overwrites it from a checkpoint's calibration scales,
+        # which nvidia/GLM-5.2-NVFP4 does not ship -- so ONE, not zero. A zero
+        # here silently turned every stored KV element into inf/nan.
         self.register_buffer(
-            "_k_scale", torch.zeros(1, dtype=torch.float32), persistent=False,
+            "_k_scale", torch.ones(1, dtype=torch.float32), persistent=False,
         )
 
     def forward(
@@ -112,11 +126,12 @@ class GatherKVCacheFP8MLA(nn.Module):
 
 
 class GatherAndDequantKVCacheMLA(nn.Module):
-    """Gather FP8 MLA KV cache into a BF16 workspace using the
+    """Gather MLA KV cache into a BF16 workspace using the
     ``gather_and_maybe_dequant_cache`` kernel (vLLM's chunked-context helper).
 
     Required arguments match the kernel's signature:
-        ``kv_cache``: ``[num_blocks, block_size, 656]`` uint8.
+        ``kv_cache``: ``[num_blocks, block_size, 576]`` BF16 (``"auto"``) or
+                      ``[num_blocks, block_size, 656]`` uint8 (``fp8_ds_mla``).
         ``workspace``: ``[total_tokens, 576]`` BF16 output buffer.
         ``block_table``: ``[num_seqs, max_blocks]`` int32.
         ``cu_seq_lens``: ``[num_seqs+1]`` int32 cumulative sequence lengths.
@@ -125,16 +140,30 @@ class GatherAndDequantKVCacheMLA(nn.Module):
         ``workspace_starts``: ``[num_seqs]`` int32 — starting workspace row
                              per sequence (for chunked context gathers).
 
+    ``kv_cache_dtype`` selects the source layout and must match the cache the
+    owning ``MLAAttention`` allocated; vLLM likewise forwards its own
+    ``self.kv_cache_dtype`` here, and passing ``"fp8_ds_mla"`` for a BF16
+    cache reinterprets the bytes and silently corrupts the gathered context.
+
     Raises ``RuntimeError`` if the kernel is unavailable; callers should
     check :pyattr:`available` and fall back to :class:`GatherKVCacheFP8MLA`.
     """
 
     available: bool = _HAS_GATHER_AND_DEQUANT
 
-    def __init__(self):
+    def __init__(self, kv_cache_dtype: str = "fp8_ds_mla"):
         super().__init__()
+        assert kv_cache_dtype in ("auto", "fp8_ds_mla", "fp8_e4m3"), (
+            f"GatherAndDequantKVCacheMLA: unsupported "
+            f"kv_cache_dtype={kv_cache_dtype!r}"
+        )
+        self.kv_cache_dtype = kv_cache_dtype
+        # ONE, not zero: on the ``fp8_e4m3`` path the kernel MULTIPLIES the
+        # gathered fp8 values by this scale to dequantize (vLLM passes
+        # ``layer._k_scale``, default 1.0). Zero would blank the gathered
+        # context. Ignored for ``auto`` and for the block-scaled ``fp8_ds_mla``.
         self.register_buffer(
-            "_k_scale", torch.zeros(1, dtype=torch.float32), persistent=False,
+            "_k_scale", torch.ones(1, dtype=torch.float32), persistent=False,
         )
 
     def forward(
@@ -156,7 +185,7 @@ class GatherAndDequantKVCacheMLA(nn.Module):
             kv_cache, workspace,
             block_table, cu_seq_lens, token_to_seq,
             total_tokens,
-            "fp8_ds_mla",
+            self.kv_cache_dtype,
             self._k_scale,
             workspace_starts,
         )

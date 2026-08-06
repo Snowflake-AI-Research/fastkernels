@@ -323,7 +323,6 @@ class CosyVoice3Code2Wav(nn.Module):
         prompt_feat: torch.Tensor,
         embedding: torch.Tensor,
         n_timesteps: int = 10,
-        cfm_seed: int | None = None,
     ) -> torch.Tensor:
         device = token.device
         dtype = next(self.flow_model.parameters()).dtype
@@ -363,7 +362,6 @@ class CosyVoice3Code2Wav(nn.Module):
             spks=embedding,
             cond=conds,
             n_timesteps=n_timesteps,
-            cfm_seed=cfm_seed,
         )
         feat = feat[:, :, mel_len1:]
 
@@ -637,13 +635,17 @@ class CosyVoice3ForTTS(nn.Module):
 
         gen_token = torch.tensor([generated_tokens], device=device)
 
+        # code2wav's CFM draws its noise from the global RNG; seed here for
+        # determinism instead of threading cfm_seed through the (now
+        # upstream-aligned) code2wav/CFM forward signatures.
+        if cfm_seed is not None:
+            torch.manual_seed(cfm_seed)
         audio = self.code2wav(
             token=gen_token,
             prompt_token=speech_token[:1].to(device),
             prompt_feat=speech_feat[:1].to(device=device),
             embedding=spk_embedding[:1].to(device=device),
             n_timesteps=n_timesteps,
-            cfm_seed=cfm_seed,
         )
         return audio, generated_tokens
 

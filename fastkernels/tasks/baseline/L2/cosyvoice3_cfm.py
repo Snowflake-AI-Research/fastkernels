@@ -39,19 +39,15 @@ class CausalConditionalCFM(BASECFM):
 
     @torch.inference_mode()
     def forward(self, mu, mask, n_timesteps, temperature=1.0, spks=None, cond=None,
-                cfm_seed: int | None = None):
-        if cfm_seed is not None:
-            gen = torch.Generator(device=mu.device)
-            gen.manual_seed(cfm_seed)
-            z = torch.randn(
-                (mu.size(0), mu.size(1), mu.size(2)),
-                device=mu.device, dtype=mu.dtype, generator=gen,
-            ) * temperature
-        else:
-            z = torch.randn(
-                (mu.size(0), mu.size(1), mu.size(2)),
-                device=mu.device, dtype=mu.dtype,
-            ) * temperature
+                streaming: bool = False):
+        # Interface parity with upstream CausalConditionalCFM.forward (which takes
+        # `streaming`, not `cfm_seed`). Determinism is now the caller's job via
+        # torch.manual_seed(...) before invoking forward. `streaming` is accepted
+        # for signature parity and ignored (upstream passes it through unused).
+        z = torch.randn(
+            (mu.size(0), mu.size(1), mu.size(2)),
+            device=mu.device, dtype=mu.dtype,
+        ) * temperature
 
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=mu.device, dtype=mu.dtype)
         if self.t_scheduler == "cosine":

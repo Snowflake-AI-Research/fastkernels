@@ -30,15 +30,16 @@ from pathlib import Path
 import numpy as np
 
 _THIS_DIR = Path(__file__).resolve().parent
-_PACKAGE_DIR = _THIS_DIR.parent.parent
+_PACKAGE_DIR = _THIS_DIR.parent
 _PROJECT_ROOT = _PACKAGE_DIR.parent
 
-from fastkernels.validate.worker import run_worker
-from fastkernels.workloads import (
-    SEGMENTATION_LATENCY_WORKLOADS,
-    SEGMENTATION_THROUGHPUT_WORKLOADS,
-    SEGMENTATION_VIDEO_WORKLOADS,
+from fastkernels.validate.comparison import (
+    alignment_from_similarity,
+    latency_entry,
+    throughput_entry,
 )
+from fastkernels.validate.worker import run_worker
+from fastkernels.workloads import SEGMENTATION_LATENCY_WORKLOADS
 
 
 def _detect_gpu_name() -> str:
@@ -350,6 +351,7 @@ def main():
         manifest = json.load(f)
 
     num_items = cfg["num_items"]
+    correctness_items = cfg.get("correctness_items", num_items)
     entries = manifest[:num_items]
 
     model_dtype = next(model.parameters()).dtype
@@ -389,8 +391,20 @@ def main():
     print(f"  [REF] Processing {len(images)} images (full pipeline) ...", flush=True)
     per_image_stats = []
 
+    # Warm up outside the timed region. The latency probes already do this; the
+    # throughput pass did not, so lazy init and kernel autotune landed on item 0.
+    num_warmup = cfg.get("throughput_warmup", 3)
+    with torch.no_grad():
+        for _ in range(num_warmup):
+            _ = run_full_pipeline(images[0], text_queries[0])
+
     torch.cuda.synchronize()
     start = time.perf_counter()
+    # Summed per-item forward time. items_per_sec must not include the .cpu()
+    # transfers and ~68 MB/item of torch.save below: those dominated the loop
+    # (110 ms/item measured vs 61 ms of actual forward) and their variance, not
+    # the model, is what moved this row between 0.93x and 1.03x across runs.
+    forward_elapsed = 0.0
 
     with torch.no_grad():
         for i, img in enumerate(images):
@@ -401,6 +415,7 @@ def main():
 
             torch.cuda.synchronize()
             elapsed_i = time.perf_counter() - t0
+            forward_elapsed += elapsed_i
 
             pred_boxes = outputs["pred_boxes"]
             pred_logits = outputs["pred_logits"]
@@ -415,7 +430,10 @@ def main():
                 "masks_shape": list(pred_masks.shape) if pred_masks is not None else None,
             }
 
-            if feats_dir:
+            # Predictions are only saved for the correctness subset: at ~68 MB
+            # per item per side, saving all of them is what capped this workload
+            # at 100 samples.
+            if feats_dir and i < correctness_items:
                 torch.save(pred_boxes.cpu().float(), os.path.join(feats_dir, f"ref_boxes_{i}.pt"))
                 torch.save(pred_logits.cpu().float(), os.path.join(feats_dir, f"ref_logits_{i}.pt"))
                 if pred_masks is not None:
@@ -425,7 +443,8 @@ def main():
 
     torch.cuda.synchronize()
     total_elapsed = time.perf_counter() - start
-    print(f"    => {len(images)/total_elapsed:.1f} img/s ({total_elapsed:.2f}s)", flush=True)
+    print(f"    => {len(images)/forward_elapsed:.1f} img/s forward "
+          f"({forward_elapsed:.2f}s; {total_elapsed:.2f}s incl. saving)", flush=True)
 
     # --------------- Latency scenarios (full pipeline) ---------------
     latency_results = []
@@ -465,8 +484,10 @@ def main():
     with open(cfg["output_file"], "w") as f:
         json.dump({
             "total_elapsed": total_elapsed,
+            "forward_elapsed": forward_elapsed,
             "num_items": len(images),
-            "items_per_sec": len(images) / total_elapsed if total_elapsed > 0 else 0,
+            "items_per_sec": len(images) / forward_elapsed if forward_elapsed > 0 else 0,
+            "wall_items_per_sec": len(images) / total_elapsed if total_elapsed > 0 else 0,
             "per_image": per_image_stats,
             "latency": latency_results,
         }, f)
@@ -527,6 +548,7 @@ def main():
         manifest = json.load(f)
 
     num_items = cfg["num_items"]
+    correctness_items = cfg.get("correctness_items", num_items)
     entries = manifest[:num_items]
 
     # Load all images to GPU
@@ -552,8 +574,18 @@ def main():
     print(f"  [KB] Processing {len(images)} images (full pipeline) ...", flush=True)
     per_image_stats = []
 
+    # Warm up outside the timed region. The latency probes already do this; the
+    # throughput pass did not, so lazy init and kernel autotune landed on item 0.
+    num_warmup = cfg.get("throughput_warmup", 3)
+    with torch.no_grad():
+        for _ in range(num_warmup):
+            _ = model(images[0], all_token_ids[:1].cuda())
+
     torch.cuda.synchronize()
     start = time.perf_counter()
+    # See the reference worker: items_per_sec is summed forward time, so the
+    # per-item prediction writes below cannot dilute it.
+    forward_elapsed = 0.0
 
     with torch.no_grad():
         for i, img in enumerate(images):
@@ -564,6 +596,7 @@ def main():
             out = model(img, tok)
             torch.cuda.synchronize()
             elapsed_i = time.perf_counter() - t0
+            forward_elapsed += elapsed_i
 
             pred_boxes = out["pred_boxes"]
             pred_logits = out["pred_logits"]
@@ -578,7 +611,7 @@ def main():
                 "masks_shape": list(pred_masks.shape) if pred_masks is not None else None,
             }
 
-            if feats_dir:
+            if feats_dir and i < correctness_items:
                 torch.save(pred_boxes.cpu().float(), os.path.join(feats_dir, f"kb_boxes_{i}.pt"))
                 if pred_logits is not None:
                     torch.save(pred_logits.cpu().float(), os.path.join(feats_dir, f"kb_logits_{i}.pt"))
@@ -589,7 +622,8 @@ def main():
 
     torch.cuda.synchronize()
     total_elapsed = time.perf_counter() - start
-    print(f"    => {len(images)/total_elapsed:.1f} img/s ({total_elapsed:.2f}s)", flush=True)
+    print(f"    => {len(images)/forward_elapsed:.1f} img/s forward "
+          f"({forward_elapsed:.2f}s; {total_elapsed:.2f}s incl. saving)", flush=True)
 
     # --------------- Latency scenarios (full pipeline) ---------------
     latency_results = []
@@ -629,8 +663,10 @@ def main():
     with open(cfg["output_file"], "w") as f:
         json.dump({
             "total_elapsed": total_elapsed,
+            "forward_elapsed": forward_elapsed,
             "num_items": len(images),
-            "items_per_sec": len(images) / total_elapsed if total_elapsed > 0 else 0,
+            "items_per_sec": len(images) / forward_elapsed if forward_elapsed > 0 else 0,
+            "wall_items_per_sec": len(images) / total_elapsed if total_elapsed > 0 else 0,
             "per_image": per_image_stats,
             "latency": latency_results,
         }, f)
@@ -717,6 +753,54 @@ def _print_throughput_comparison(kb_raw, ref_raw):
         ref_ips = ref_raw["items_per_sec"]
         speedup = kb_ips / ref_ips if ref_ips > 0 else 0
         line += f" {ref_ips:>12.2f} {speedup:>9.2f}x"
+    print(line)
+    print()
+
+
+def _min_cosine(block) -> float | None:
+    """Lowest cosine in a SAM correctness block (image or video)."""
+    values = [
+        metrics[key]
+        for metrics in (block or {}).values()
+        if isinstance(metrics, dict)
+        for key in ("min_cosine_similarity", "avg_cosine_similarity")
+        if isinstance(metrics.get(key), (int, float))
+    ]
+    return min(values) if values else None
+
+
+def _alignment_block(correctness, passed: bool | None):
+    """comparison.py alignment entry for a SAM correctness block.
+
+    ``passed`` comes from the harness's own per-metric PASS_THRESHOLDS verdict
+    rather than a single threshold here, since boxes, masks and logits are held
+    to different bars.
+    """
+    value = _min_cosine(correctness)
+    if value is None:
+        return None
+    extra = {} if passed is None else {"passed": bool(passed)}
+    return alignment_from_similarity("min_cosine", value, **extra)
+
+
+def _print_video_throughput_comparison(kb_video_raw, ref_video_raw):
+    """Print the clip-tracking throughput ratio, not just the two rates."""
+    kb_fps = (kb_video_raw or {}).get("frames_per_sec")
+    if not kb_fps:
+        return
+    print("\n" + "=" * 90)
+    print("  VIDEO THROUGHPUT COMPARISON (frames/sec)")
+    print("=" * 90)
+    header = f"  {'Scenario':<25} {'Clips':>7} {'fastkernels':>12}"
+    if ref_video_raw:
+        header += f" {'reference':>12} {'Speedup':>10}"
+    print(header)
+    print("  " + "-" * 70)
+    clips = (kb_video_raw or {}).get("num_clips", "")
+    line = f"  {'smartglasses-val-video':<25} {clips:>7} {kb_fps:>12.2f}"
+    ref_fps = (ref_video_raw or {}).get("frames_per_sec")
+    if ref_fps:
+        line += f" {ref_fps:>12.2f} {kb_fps / ref_fps:>9.2f}x"
     print(line)
     print()
 
@@ -898,8 +982,22 @@ def main():
             os.path.join(feats_dir, "video_token_ids.pt"),
         )
 
+    correctness_clips = cfg.get("correctness_clips", len(clips))
+
+    # Warm up on the first clip; with only a handful of clips an unwarmed
+    # first pass biases the whole rate, and it biased the two engines unequally.
+    if clips:
+        _warm = torch.load(clips[0]["frame_paths"][0], map_location="cpu", weights_only=True)
+        _warm = _warm.to(device="cuda", dtype=model_dtype)
+        with torch.no_grad():
+            for _ in range(cfg.get("throughput_warmup", 1)):
+                _ = run_detection(_warm, clips[0].get("text_query", "objects"))
+        del _warm
+
     torch.cuda.synchronize()
     start = time.perf_counter()
+    # Saving 64 MB of masks per clip must not count as inference time.
+    forward_elapsed = 0.0
 
     with torch.no_grad():
         for ci, clip_info in enumerate(clips):
@@ -916,6 +1014,7 @@ def main():
 
             torch.cuda.synchronize()
             elapsed_clip = time.perf_counter() - t0
+            forward_elapsed += elapsed_clip
 
             stats = {
                 "elapsed": elapsed_clip,
@@ -923,7 +1022,7 @@ def main():
                 "text_query": text_query,
             }
 
-            if feats_dir and det_out is not None:
+            if feats_dir and ci < correctness_clips and det_out is not None:
                 det_boxes = det_out.get("pred_boxes")
                 det_masks = det_out.get("pred_masks")
                 if det_boxes is not None:
@@ -936,14 +1035,17 @@ def main():
     torch.cuda.synchronize()
     total_elapsed = time.perf_counter() - start
     total_frames = sum(s["num_frames"] for s in per_clip_stats)
-    print(f"    => {total_frames/total_elapsed:.1f} frames/s ({total_elapsed:.2f}s)", flush=True)
+    print(f"    => {total_frames/forward_elapsed:.1f} frames/s forward "
+          f"({forward_elapsed:.2f}s; {total_elapsed:.2f}s incl. saving)", flush=True)
 
     with open(cfg["output_file"], "w") as f:
         json.dump({
             "total_elapsed": total_elapsed,
             "num_clips": len(clips),
             "total_frames": total_frames,
-            "frames_per_sec": total_frames / total_elapsed if total_elapsed > 0 else 0,
+            "frames_per_sec": total_frames / forward_elapsed if forward_elapsed > 0 else 0,
+            "wall_frames_per_sec": total_frames / total_elapsed if total_elapsed > 0 else 0,
+            "forward_elapsed": forward_elapsed,
             "per_clip": per_clip_stats,
         }, f)
     print("  Reference SAM3 video done.", flush=True)
@@ -1038,8 +1140,23 @@ def main():
 
     per_clip_stats = []
 
+    correctness_clips = cfg.get("correctness_clips", len(clips))
+
+    # Warm up on the first clip; with only a handful of clips an unwarmed
+    # first pass biases the whole rate, and it biased the two engines unequally.
+    # This mirrors the timed loop below exactly: detector(frame, tok), float32.
+    if clips:
+        _warm = torch.load(clips[0]["frame_paths"][0], map_location="cpu", weights_only=True)
+        _warm = _warm.to(device="cuda", dtype=torch.float32)
+        with torch.no_grad():
+            for _ in range(cfg.get("throughput_warmup", 1)):
+                _ = detector(_warm, all_token_ids[:1].cuda())
+        del _warm
+
     torch.cuda.synchronize()
     start = time.perf_counter()
+    # Saving 64 MB of masks per clip must not count as inference time.
+    forward_elapsed = 0.0
 
     with torch.no_grad():
         for ci, clip_info in enumerate(clips):
@@ -1057,6 +1174,7 @@ def main():
 
             torch.cuda.synchronize()
             elapsed_clip = time.perf_counter() - t0
+            forward_elapsed += elapsed_clip
 
             stats = {
                 "elapsed": elapsed_clip,
@@ -1064,7 +1182,7 @@ def main():
                 "text_query": text_query,
             }
 
-            if feats_dir and det_out is not None:
+            if feats_dir and ci < correctness_clips and det_out is not None:
                 pred_boxes = det_out.get("pred_boxes")
                 pred_masks = det_out.get("pred_masks")
                 if pred_boxes is not None:
@@ -1077,14 +1195,17 @@ def main():
     torch.cuda.synchronize()
     total_elapsed = time.perf_counter() - start
     total_frames = sum(s["num_frames"] for s in per_clip_stats)
-    print(f"    => {total_frames/total_elapsed:.1f} frames/s ({total_elapsed:.2f}s)", flush=True)
+    print(f"    => {total_frames/forward_elapsed:.1f} frames/s forward "
+          f"({forward_elapsed:.2f}s; {total_elapsed:.2f}s incl. saving)", flush=True)
 
     with open(cfg["output_file"], "w") as f:
         json.dump({
             "total_elapsed": total_elapsed,
             "num_clips": len(clips),
             "total_frames": total_frames,
-            "frames_per_sec": total_frames / total_elapsed if total_elapsed > 0 else 0,
+            "frames_per_sec": total_frames / forward_elapsed if forward_elapsed > 0 else 0,
+            "wall_frames_per_sec": total_frames / total_elapsed if total_elapsed > 0 else 0,
+            "forward_elapsed": forward_elapsed,
             "per_clip": per_clip_stats,
         }, f)
     print("  fastkernels SAM3 video done.", flush=True)
@@ -1184,8 +1305,19 @@ def main():
     )
     parser.add_argument("--model", type=str, default="facebook/sam3.1")
     parser.add_argument("--tp", type=int, default=1)
-    parser.add_argument("--num-items", type=int, default=100,
-                        help="Number of images for throughput AND correctness")
+    parser.add_argument("--num-items", type=int, default=500,
+                        help="Images in the full-pipeline throughput pass. Only the "
+                             "first --correctness-items have predictions saved, so "
+                             "this scales time (~0.12s/item/side), not disk.")
+    parser.add_argument("--correctness-items", type=int, default=100,
+                        help="Images whose predictions are saved and compared. At "
+                             "~68MB per item per side, this is what drives disk use.")
+    parser.add_argument("--num-video-clips", type=int, default=50,
+                        help="Clips in the video throughput row. 10 clips is ~1s of "
+                             "forward time, far too short to be reproducible.")
+    parser.add_argument("--video-correctness-clips", type=int, default=10,
+                        help="Clips whose predictions are saved and compared "
+                             "(~64MB of masks per clip per side).")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--skip-reference", action="store_true")
     parser.add_argument("--skip-latency", action="store_true")
@@ -1223,6 +1355,8 @@ def main():
 
     all_samples = []
     num_needed = args.num_items
+    correctness_items = min(args.correctness_items, num_needed)
+    video_correctness_clips = min(args.video_correctness_clips, args.num_video_clips)
 
     # Always load SACo-VEval SmartGlasses frames (available from HuggingFace)
     veval_samples = []
@@ -1243,6 +1377,7 @@ def main():
     except Exception as e:
         print(f"  WARNING: Could not load SACo-VEval: {e}", flush=True)
 
+    image_source = None
     if args.modality in ("image", "all"):
         gold_loaded = False
         try:
@@ -1258,11 +1393,19 @@ def main():
                 print(f"  Loaded {len(gold_samples)} SACo-Gold image samples", flush=True)
                 all_samples.extend(gold_samples)
                 gold_loaded = True
+                image_source = f"SACo-Gold/{args.gold_subset}"
         except Exception as e:
             print(f"  WARNING: Could not load SACo-Gold images: {e}", flush=True)
 
         if not gold_loaded:
-            print(f"  Using SACo-VEval SmartGlasses frames as image inputs", flush=True)
+            # SACo-Gold images need ROBOFLOW_API_KEY; without it the throughput
+            # pass runs on VEval frames, and the recorded dataset must say so.
+            image_source = f"SACo-VEval/{args.veval_subset} (frames; SACo-Gold images unavailable)"
+            print(
+                "  Using SACo-VEval SmartGlasses frames as image inputs "
+                "(set ROBOFLOW_API_KEY to benchmark SACo-Gold images instead)",
+                flush=True,
+            )
             for vs in veval_samples:
                 for fi, ft in enumerate(vs["frame_tensors"]):
                     if len(all_samples) >= num_needed:
@@ -1325,9 +1468,10 @@ def main():
     print("=" * 70)
     print(f"  Model          : {args.model}")
     print(f"  GPU            : {gpu}")
-    print(f"  Dataset (img)  : SACo-Gold/{args.gold_subset}")
+    print(f"  Dataset (img)  : {image_source or f'SACo-Gold/{args.gold_subset}'}")
     print(f"  Dataset (vid)  : SACo-VEval/{args.veval_subset}")
-    print(f"  Images         : {len(all_samples)} (throughput + correctness)")
+    print(f"  Images         : {len(all_samples)} throughput, "
+          f"{min(correctness_items, len(all_samples))} correctness")
     print(f"  Seed           : {args.seed}")
     if latency_data:
         print(f"  Latency        : {', '.join(s['name'] for s in latency_data)}")
@@ -1339,6 +1483,7 @@ def main():
         ref_config = {
             "model": args.model, "seed": args.seed,
             "num_items": len(all_samples),
+            "correctness_items": correctness_items,
             "latency_scenarios": latency_data,
             "feats_dir": feats_dir,
             "manifest_path": manifest_path,
@@ -1356,6 +1501,7 @@ def main():
         "model": args.model, "seed": args.seed,
         "project_root": str(_PROJECT_ROOT), "package_name": _PACKAGE_DIR.name,
         "num_items": len(all_samples),
+        "correctness_items": correctness_items,
         "latency_scenarios": latency_data,
         "feats_dir": feats_dir,
         "checkpoint_path": checkpoint_path,
@@ -1383,18 +1529,22 @@ def main():
         latency_combined = _print_latency_comparison(kb_latency, ref_latency)
 
     # -- Correctness --
-    pred_comparison = _compare_predictions(feats_dir, num_items)
-    overall_pass = _print_correctness_comparison(pred_comparison, num_items)
+    compared_items = min(correctness_items, num_items)
+    pred_comparison = _compare_predictions(feats_dir, compared_items)
+    overall_pass = _print_correctness_comparison(pred_comparison, compared_items)
 
     # -- Video benchmark (if video clips are available) --
     video_comparison = {}
+    kb_video_raw = None
+    ref_video_raw = None
     if veval_samples and args.modality in ("video", "all"):
         print("\n" + "=" * 70)
         print("  VIDEO BENCHMARK (multi-frame tracking)")
         print("=" * 70)
 
         video_clips = _save_video_clips_for_workers(
-            veval_samples, feats_dir, max_clips=10, max_frames=16,
+            veval_samples, feats_dir,
+            max_clips=args.num_video_clips, max_frames=16,
         )
         print(f"  Prepared {len(video_clips)} video clips for benchmarking", flush=True)
 
@@ -1405,6 +1555,7 @@ def main():
                 ref_video_config = {
                     "model": args.model, "seed": args.seed,
                     "num_clips": len(video_clips),
+                    "correctness_clips": video_correctness_clips,
                     "video_clips": video_clips,
                     "feats_dir": feats_dir,
                 }
@@ -1422,6 +1573,7 @@ def main():
                 "model": args.model, "seed": args.seed,
                 "project_root": str(_PROJECT_ROOT),
                 "num_clips": len(video_clips),
+                "correctness_clips": video_correctness_clips,
                 "video_clips": video_clips,
                 "feats_dir": feats_dir,
                 "checkpoint_path": checkpoint_path,
@@ -1435,9 +1587,13 @@ def main():
                 fps = kb_video_raw.get("frames_per_sec", 0)
                 print(f"  fastkernels video: {fps:.1f} frames/sec", flush=True)
 
+            _print_video_throughput_comparison(kb_video_raw, ref_video_raw)
+
             # Video correctness comparison
             if not args.skip_reference:
-                video_comparison = _compare_video_predictions(feats_dir, len(video_clips))
+                video_comparison = _compare_video_predictions(
+                    feats_dir, min(video_correctness_clips, len(video_clips))
+                )
                 _print_video_correctness(video_comparison)
 
     # -- Save results --
@@ -1448,19 +1604,62 @@ def main():
         combined = {
             "gpu": gpu, "model": args.model, "model_type": "segmentation",
             "tp": args.tp, "seed": args.seed, "num_items": num_items,
-            "dataset_image": f"SACo-Gold/{args.gold_subset}",
+            "dataset_image": image_source or f"SACo-Gold/{args.gold_subset}",
             "dataset_video": f"SACo-VEval/{args.veval_subset}",
             "fastkernels_items_per_sec": kb_ips,
         }
         if ref_raw:
             combined["ref_items_per_sec"] = ref_raw["items_per_sec"]
             combined["speedup"] = kb_ips / ref_raw["items_per_sec"] if ref_raw["items_per_sec"] > 0 else 0
-        if latency_combined:
-            combined["latency_scenarios"] = latency_combined
         combined["correctness"] = pred_comparison
         if video_comparison:
             combined["video_correctness"] = video_comparison
         combined["overall_pass"] = overall_pass
+
+        # The clip pass measures frames/sec on both sides. It used to be printed
+        # and then dropped, so the sweep summary lost a whole throughput
+        # workload -- and on B200 it is SAM's weakest number, not a rounding
+        # detail. Persist it next to the image pass.
+        if kb_video_raw:
+            combined["fastkernels_video_frames_per_sec"] = kb_video_raw.get("frames_per_sec")
+            combined["num_video_clips"] = kb_video_raw.get("num_clips")
+            if ref_video_raw:
+                combined["ref_video_frames_per_sec"] = ref_video_raw.get("frames_per_sec")
+
+        # Standard comparison shape, so the sweep summary reads this harness
+        # through the same path as every other one (see validate/comparison.py).
+        scenarios: list[dict] = []
+        if ref_raw:
+            scenarios.append(throughput_entry(
+                "full-pipeline", kb_ips, ref_raw["items_per_sec"],
+                metric="items_per_s",
+                alignment=_alignment_block(pred_comparison, overall_pass),
+                num_items=num_items,
+                dataset=image_source or f"SACo-Gold/{args.gold_subset}",
+            ))
+        if kb_video_raw and ref_video_raw:
+            scenarios.append(throughput_entry(
+                "smartglasses-val-video",
+                kb_video_raw.get("frames_per_sec"),
+                ref_video_raw.get("frames_per_sec"),
+                metric="frames_per_s",
+                alignment=_alignment_block(video_comparison, None),
+                num_clips=kb_video_raw.get("num_clips"),
+                dataset=f"SACo-VEval/{args.veval_subset}",
+            ))
+        combined["scenarios"] = scenarios
+        combined["latency_scenarios"] = [
+            latency_entry(
+                entry["scenario"],
+                entry.get("fastkernels_median_s"),
+                entry.get("ref_median_s"),
+                batch_size=entry.get("batch_size"),
+                resolution=entry.get("resolution"),
+            )
+            for entry in (latency_combined or [])
+        ]
+        combined["reference_name"] = "sam3"
+
         with open(results_path, "w") as f:
             json.dump(combined, f, indent=2)
         print(f"\n  Results saved to: {results_path}")

@@ -23,17 +23,27 @@ import torch
 
 def compute_causal_conv1d_metadata(
     query_start_loc_p: torch.Tensor,
+    seqlens_cpu: list[int] | None = None,
 ) -> tuple[dict, torch.Tensor, torch.Tensor]:
     """Precompute the aux pointers used by vLLM's varlen causal-conv kernel.
 
     This is Mamba v1 prefill metadata, so it lives with the Mamba state
     structs rather than in the generic engine.
+
+    ``seqlens_cpu`` lets a caller that already knows the per-sequence chunk
+    lengths on the host pass them in. Without it the lengths have to be read
+    back off ``query_start_loc_p``, which is two device syncs (the ``.to("cpu")``
+    and the ``.item()``) on a path that runs once per prefill step -- and the
+    engine's chunk planner builds those lengths in Python anyway.
     """
-    seqlens = query_start_loc_p.diff().to(device="cpu", dtype=torch.int32)
+    device = query_start_loc_p.device
+    if seqlens_cpu is None:
+        seqlens = query_start_loc_p.diff().to(device="cpu", dtype=torch.int32)
+    else:
+        seqlens = torch.tensor(seqlens_cpu, dtype=torch.int32, device="cpu")
     nums_dict: dict = {}
     batch_ptr = None
     token_chunk_offset_ptr = None
-    device = query_start_loc_p.device
 
     for block_m in [8]:
         nums = torch.div(
@@ -41,9 +51,10 @@ def compute_causal_conv1d_metadata(
             block_m,
             rounding_mode="floor",
         )
+        nums_list = nums.tolist()
         nums_dict[block_m] = {}
         nums_dict[block_m]["nums"] = nums
-        nums_dict[block_m]["tot"] = nums.sum().item()
+        nums_dict[block_m]["tot"] = sum(nums_list)
 
         mlist = torch.repeat_interleave(
             torch.arange(len(nums), dtype=torch.int32, device="cpu"),
@@ -55,7 +66,7 @@ def compute_causal_conv1d_metadata(
         max_num_programs = max(1024, mlist_len) * 2
 
         offsetlist: list[int] = []
-        for num in nums.tolist():
+        for num in nums_list:
             offsetlist.extend(range(num))
         offsetlist_t = torch.tensor(offsetlist, dtype=torch.int32)
         nums_dict[block_m]["offsetlist"] = offsetlist_t
@@ -130,6 +141,15 @@ class MambaStateManager:
     deterministically pops slots in the same order, so the per-step
     state slot indices match across ranks without any cross-rank
     communication.
+
+    Slot 0 is reserved and never handed out.  vLLM's varlen prefill kernel
+    ``_causal_conv1d_fwd_kernel`` returns early for any sequence whose cache
+    index equals ``null_block_id``, which defaults to ``NULL_BLOCK_ID == 0``;
+    vLLM never passes 0 because its block allocator reserves block 0.  A
+    sequence placed on slot 0 therefore gets no conv output at all and a conv
+    state that is never written -- measured on mamba-2.8b: slot 0 produced
+    ``argmax=8808`` and an all-zero layer-0 conv state where slots 1, 2, 5, 17
+    all produced a bit-identical ``argmax=11``.
     """
 
     def __init__(
@@ -145,7 +165,7 @@ class MambaStateManager:
     ):
         self.num_slots = num_slots
         self.conv_kernel = conv_kernel
-        self._free_slots: deque[int] = deque(range(num_slots))
+        self._free_slots: deque[int] = deque(range(1, num_slots))
         self._in_use: set[int] = set()
         self._slot_views: dict[int, MambaSlotCache] = {}
 
@@ -180,9 +200,25 @@ class MambaStateManager:
         return bool(self._free_slots)
 
     def reset_slot(self, slot: int) -> None:
-        for layer_idx in range(len(self.conv_states)):
-            self.conv_states[layer_idx][slot].zero_()
-            self.ssm_states[layer_idx][slot].zero_()
+        self.reset_slots([slot])
+
+    def reset_slots(self, slots: list[int]) -> None:
+        """Zero every layer's state for ``slots`` in one pass per tensor.
+
+        Per-slot ``zero_()`` costs ``2 * num_layers`` kernel launches, so
+        admitting ~45 sequences in a step (the steady state of a 1000-prompt
+        run at 64 layers) issued nearly 6k launches -- tens of milliseconds of
+        pure launch overhead per step.  Indexing with the whole slot list keeps
+        it at ``2 * num_layers`` launches regardless of batch size.
+        """
+        if not slots:
+            return
+        idx = torch.as_tensor(
+            slots, dtype=torch.long, device=self.conv_states[0].device,
+        )
+        for conv_state, ssm_state in zip(self.conv_states, self.ssm_states):
+            conv_state[idx] = 0
+            ssm_state[idx] = 0
 
     def allocate(self, seq) -> int:
         """Claim a free slot for ``seq``.
@@ -209,7 +245,6 @@ class MambaStateManager:
             return
         if slot in self._in_use:
             self._in_use.remove(slot)
-            self.reset_slot(slot)
             self._free_slots.append(slot)
         seq.state_slot = None
 
@@ -255,7 +290,16 @@ class KimiLinearStateManager:
         self.dtype = dtype
         self.model_type = getattr(config, "model_type", "kimi_linear")
 
-        self._free_slots: deque[int] = deque(range(num_slots))
+        # Slot 0 is reserved as the null slot and never handed out. The FLA
+        # recurrent kernels and vLLM's causal-conv kernels both treat state
+        # index 0 as "skip this sequence" (``NULL_BLOCK_ID`` is 0):
+        # ``fused_recurrent_kda`` given slot 0 returns NaN and writes no
+        # state, while slots >= 1 are correct (measured: slot 0 -> nan and
+        # zero state delta; slots 1 and 3 -> clean, delta ~0.088). vLLM never
+        # hits this because its block allocator reserves block 0; ours used
+        # to hand it out, which froze the recurrence for whichever sequence
+        # landed there and poisoned its logits with NaN.
+        self._free_slots: deque[int] = deque(range(1, num_slots))
         self._in_use: set[int] = set()
 
         self.conv_q: list[torch.Tensor | None] = [None] * self.num_layers
@@ -350,36 +394,62 @@ class KimiLinearStateManager:
                     dtype=self.dtype,
                 )
             elif allocate_mha_kv_tensors:
+                # Follow the attention backend's KV layout. Qwen3-Next's
+                # full-attention layers use ``StoreKVCacheHND`` and pass
+                # ``kv_layout="HND"`` to trtllm-gen when that backend is
+                # selected, and trtllm's launcher reads ``num_kv_heads`` off
+                # ``kv_cache.shape[1]``. Allocating NHD unconditionally put the
+                # page size there instead, which the launcher rejects with
+                # "num_qo_heads must be a multiple of num_kv_heads, got
+                # num_kv_heads: 16 and num_qo_heads: 8" (16 being block_size).
+                # At tp=2 the two orders happen to share a memory layout because
+                # ``local_kv_heads`` is 1, so only the reported shape was wrong
+                # -- but at tp=1 (2 kv heads) they genuinely differ, so this also
+                # fixes the writes there.
+                from .context import get_attn_backend_config
+
+                if get_attn_backend_config().kv_layout == "HND":
+                    kv_shape = (
+                        self.num_mla_blocks,
+                        local_kv_heads,
+                        self.block_size,
+                        head_dim,
+                    )
+                else:
+                    kv_shape = (
+                        self.num_mla_blocks,
+                        self.block_size,
+                        local_kv_heads,
+                        head_dim,
+                    )
                 self.k_cache[i] = torch.zeros(
-                    self.num_mla_blocks,
-                    self.block_size,
-                    local_kv_heads,
-                    head_dim,
-                    device=self.device,
-                    dtype=self.dtype,
+                    *kv_shape, device=self.device, dtype=self.dtype,
                 )
                 self.v_cache[i] = torch.zeros(
-                    self.num_mla_blocks,
-                    self.block_size,
-                    local_kv_heads,
-                    head_dim,
-                    device=self.device,
-                    dtype=self.dtype,
+                    *kv_shape, device=self.device, dtype=self.dtype,
                 )
 
     def has_free_slot(self) -> bool:
         return bool(self._free_slots)
 
     def reset_slot(self, slot: int) -> None:
+        self.reset_slots([slot])
+
+    def reset_slots(self, slots: list[int]) -> None:
+        """Batched counterpart of ``MambaStateManager.reset_slots``."""
+        if not slots:
+            return
+        device = self.device
+        idx = torch.as_tensor(slots, dtype=torch.long, device=device)
         for layer_id in range(self.num_layers):
             if self.conv_q[layer_id] is not None:
-                self.conv_q[layer_id][slot].zero_()
-                self.conv_k[layer_id][slot].zero_()
-                self.conv_v[layer_id][slot].zero_()
-                self.recurrent[layer_id][slot].zero_()
+                self.conv_q[layer_id][idx] = 0
+                self.conv_k[layer_id][idx] = 0
+                self.conv_v[layer_id][idx] = 0
+                self.recurrent[layer_id][idx] = 0
             if self.gdn_conv[layer_id] is not None:
-                self.gdn_conv[layer_id][slot].zero_()
-                self.recurrent[layer_id][slot].zero_()
+                self.gdn_conv[layer_id][idx] = 0
+                self.recurrent[layer_id][idx] = 0
 
     def allocate(self, seq) -> int:
         if getattr(seq, "state_slot", None) is not None:
@@ -406,7 +476,6 @@ class KimiLinearStateManager:
         slot = getattr(seq, "state_slot", None)
         if slot is not None and slot in self._in_use:
             self._in_use.remove(slot)
-            self.reset_slot(slot)
             self._free_slots.append(slot)
             seq.state_slot = None
         if self._free_blocks is not None and seq.block_table:

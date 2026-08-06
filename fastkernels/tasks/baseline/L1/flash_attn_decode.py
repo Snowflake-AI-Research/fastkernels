@@ -1,29 +1,18 @@
 """Flash attention decode kernel (with paged KV cache).
 
-On Hopper (SM90) when vLLM's bundled FA3 is available, uses the unified
-``flash_attn_varlen_func(fa_version=3)`` interface which is significantly
-faster.  Falls back to ``flash_attn_with_kvcache`` (FA2) otherwise.
+Uses the unified ``flash_attn_varlen_func`` interface from vLLM's bundled
+FlashAttention build, at the version vLLM would select for this device
+(FA3 on Hopper, FA4 on Blackwell, FA2 otherwise) -- see :mod:`fa_utils`.
+That is also the only build whose paged-KV path accepts the engine's block
+size; upstream ``flash_attn`` requires page sizes divisible by 256.
 """
 
 import torch
 import torch.nn as nn
 
-_FA3_AVAILABLE = False
-_fa3_varlen_func = None
-try:
-    from vllm.vllm_flash_attn import (
-        flash_attn_varlen_func as _vllm_fa_varlen,
-        is_fa_version_supported,
-    )
-    if is_fa_version_supported(3) and torch.cuda.is_available():
-        cc = torch.cuda.get_device_capability()
-        if cc[0] >= 9:
-            _FA3_AVAILABLE = True
-            _fa3_varlen_func = _vllm_fa_varlen
-except ImportError:
-    pass
+from .fa_utils import FA_VERSION, VLLM_FA_AVAILABLE, flash_attn_varlen_func
 
-if not _FA3_AVAILABLE:
+if not VLLM_FA_AVAILABLE:  # pragma: no cover - CPU-only fallback
     from flash_attn import flash_attn_with_kvcache
 
 
@@ -45,7 +34,7 @@ class FlashAttnDecode(nn.Module):
 
     def forward(self, q, k_cache, v_cache, cache_seqlens=None, **kwargs):
         max_seq_len = kwargs.pop("max_seq_len", None)
-        if _FA3_AVAILABLE:
+        if VLLM_FA_AVAILABLE:
             block_table = kwargs.pop("block_table", None)
             softmax_scale = kwargs.pop("softmax_scale", None)
             kwargs.pop("causal", None)
@@ -57,7 +46,7 @@ class FlashAttnDecode(nn.Module):
             else:
                 max_seqlen_k = int(cache_seqlens.max().item()) if cache_seqlens.numel() > 0 else 0
 
-            fa3_kw = dict(
+            fa_kw = dict(
                 q=q,
                 k=k_cache,
                 v=v_cache,
@@ -68,10 +57,10 @@ class FlashAttnDecode(nn.Module):
                 softmax_scale=softmax_scale,
                 causal=True,
                 block_table=block_table,
-                fa_version=3,
+                fa_version=FA_VERSION,
             )
-            fa3_kw.update(kwargs)
-            return _fa3_varlen_func(**fa3_kw)
+            fa_kw.update(kwargs)
+            return flash_attn_varlen_func(**fa_kw)
 
         return flash_attn_with_kvcache(
             q.unsqueeze(1), k_cache, v_cache,

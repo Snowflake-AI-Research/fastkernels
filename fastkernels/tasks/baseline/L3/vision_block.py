@@ -27,8 +27,18 @@ class VisionBlock(nn.Module):
                  act_fn: Callable[[torch.Tensor], torch.Tensor] = QuickGELU(),
                  norm_eps: float = 1e-6):
         super().__init__()
-        self.norm1 = LayerNorm(embed_dim, eps=norm_eps)
-        self.norm2 = LayerNorm(embed_dim, eps=norm_eps)
+        # promote_fp32=False to match vLLM, whose vision blocks use a plain
+        # ``nn.LayerNorm`` on the bf16 activations (qwen3_vl.py:
+        # ``norm_layer = partial(nn.LayerNorm, eps=1e-6)``). Our default promotes
+        # to fp32 for the reduction, which exists for the DeepSeek-V3.2 indexer's
+        # k_norm and is wrong to apply here: it costs an ``x.float()`` and a
+        # ``.to(bf16)`` -- two full-tensor copies -- on every norm, and a Qwen3-VL
+        # encoder pass runs 54 of them. Profiled against vLLM's encoder, that was
+        # 11.7ms/call of aten::copy_ in ``unrolled_elementwise<direct_copy>``
+        # that vLLM never emits. PyTorch's bf16 layer_norm already accumulates in
+        # fp32 internally, so the reduction precision is unchanged.
+        self.norm1 = LayerNorm(embed_dim, eps=norm_eps, promote_fp32=False)
+        self.norm2 = LayerNorm(embed_dim, eps=norm_eps, promote_fp32=False)
         self.attn = VisionAttention(embed_dim, num_heads)
         self.mlp = VisionMLP(embed_dim, mlp_hidden_dim, act_fn=act_fn)
 

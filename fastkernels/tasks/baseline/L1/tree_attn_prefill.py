@@ -60,22 +60,19 @@ try:
 except ImportError:
     pass
 
-_FA3_AVAILABLE = False
-_FA3_VARLEN_FUNC = None
-try:
-    from vllm.vllm_flash_attn.flash_attn_interface import (
-        FA3_AVAILABLE as _VLLM_FA3_AVAILABLE,
-        flash_attn_varlen_func as _vllm_fa_varlen,
-    )
-    if _VLLM_FA3_AVAILABLE and torch.cuda.is_available():
-        cc = torch.cuda.get_device_capability()
-        if cc[0] == 9:
-            _FA3_AVAILABLE = True
-            _FA3_VARLEN_FUNC = _vllm_fa_varlen
-except ImportError:
-    pass
+# vLLM's bundled FlashAttention handles the paged (block_table + seqused_k)
+# cascade on every supported device -- FA2, FA3 and FA4 all expose it through
+# the same varlen entry point.  Upstream ``flash_attn`` only accepts paged KV
+# whose page size is a multiple of 256, so it is a dense-only fallback here.
+from .fa_utils import (  # noqa: E402
+    FA_VERSION as _FA_VERSION,
+    VLLM_FA_AVAILABLE as _VLLM_FA_AVAILABLE,
+    flash_attn_varlen_func as _VLLM_FA_VARLEN_FUNC,
+)
 
-from flash_attn import flash_attn_varlen_func as _FA2_VARLEN_FUNC
+_FA2_VARLEN_FUNC = None
+if not _VLLM_FA_AVAILABLE:  # pragma: no cover - CPU-only fallback
+    from flash_attn import flash_attn_varlen_func as _FA2_VARLEN_FUNC
 
 
 def _sgl_fa3_paged(q, k_cache, v_cache, cu_seqlens_q, cache_seqlens,
@@ -95,9 +92,9 @@ def _sgl_fa3_paged(q, k_cache, v_cache, cu_seqlens_q, cache_seqlens,
     return out, lse
 
 
-def _fa3_paged(q, k_cache, v_cache, cu_seqlens_q, seqused_k,
-               max_seqlen_q, max_seqlen_k, block_table, softmax_scale):
-    out, lse = _FA3_VARLEN_FUNC(
+def _vllm_fa_paged(q, k_cache, v_cache, cu_seqlens_q, seqused_k,
+                   max_seqlen_q, max_seqlen_k, block_table, softmax_scale):
+    out, lse = _VLLM_FA_VARLEN_FUNC(
         q, k_cache, v_cache,
         max_seqlen_q=max_seqlen_q,
         cu_seqlens_q=cu_seqlens_q,
@@ -107,7 +104,7 @@ def _fa3_paged(q, k_cache, v_cache, cu_seqlens_q, seqused_k,
         softmax_scale=softmax_scale,
         causal=False,
         return_softmax_lse=True,
-        fa_version=3,
+        fa_version=_FA_VERSION,
     )
     return out, lse
 
@@ -232,8 +229,8 @@ class TreeAttnPrefill(nn.Module):
             )
             return out
 
-        if _FA3_AVAILABLE:
-            o_prefix, lse_prefix = _fa3_paged(
+        if _VLLM_FA_AVAILABLE:
+            o_prefix, lse_prefix = _vllm_fa_paged(
                 q, kc_blk, vc_blk,
                 cu_seqlens_q=cu_seqlens_q_prefix,
                 seqused_k=cache_seqlens_prefix,
@@ -245,7 +242,7 @@ class TreeAttnPrefill(nn.Module):
 
             kc_tok = k_cache.view(-1, 1, H_kv, D)
             vc_tok = v_cache.view(-1, 1, H_kv, D)
-            o_expand, lse_expand = _fa3_paged(
+            o_expand, lse_expand = _vllm_fa_paged(
                 q, kc_tok, vc_tok,
                 cu_seqlens_q=cu_seqlens_q_expand,
                 seqused_k=cache_seqlens_expand,

@@ -39,7 +39,7 @@ from transformers import AutoTokenizer
 # Paths / package wiring
 # ---------------------------------------------------------------------------
 _THIS_DIR = Path(__file__).resolve().parent
-_PACKAGE_DIR = _THIS_DIR.parent.parent
+_PACKAGE_DIR = _THIS_DIR.parent
 _PROJECT_ROOT = _PACKAGE_DIR.parent
 
 sys.path.insert(0, str(_PROJECT_ROOT))
@@ -177,12 +177,39 @@ def main():
         max_running_requests=cfg.get("max_running_requests", 64),
         random_seed=cfg["seed"],
         log_level="error",
-        cuda_graph_max_bs=cfg.get("cuda_graph_max_bs", 16),
-        attention_backend=cfg.get("attention_backend", "fa3"),
         disable_radix_cache=True,
         context_length=cfg.get("max_model_len", 2048),
         dtype="bfloat16",
     )
+
+    # ``cuda_graph_max_bs`` was split into per-phase knobs
+    # (``cuda_graph_max_bs_decode`` / ``_prefill``); passing the old name to a
+    # current SGLang raises
+    # ``TypeError: ServerArgs.__init__() got an unexpected keyword argument``.
+    # Introspect so this works against either generation.
+    _cg_max_bs = cfg.get("cuda_graph_max_bs", 16)
+    if _cg_max_bs is not None:
+        import dataclasses as _dc
+
+        from sglang.srt.server_args import ServerArgs as _ServerArgs
+
+        _fields = {f.name for f in _dc.fields(_ServerArgs)}
+        if "cuda_graph_max_bs" in _fields:
+            engine_kwargs["cuda_graph_max_bs"] = _cg_max_bs
+        else:
+            for _name in ("cuda_graph_max_bs_decode", "cuda_graph_max_bs_prefill"):
+                if _name in _fields:
+                    engine_kwargs[_name] = _cg_max_bs
+
+    # Let SGLang pick its own attention backend unless explicitly overridden.
+    # The previous hardcoded "fa3" is Hopper-only, so on Blackwell it forces a
+    # backend SGLang would not have chosen -- the same mistake that had
+    # fastkernels silently falling back to the PyPI flash_attn build (see
+    # docs/vllm-0.26-alignment-audit.md section 1).
+    _attn_backend = cfg.get("attention_backend")
+    if _attn_backend:
+        engine_kwargs["attention_backend"] = _attn_backend
+
     if cfg.get("disable_cuda_graph", False):
         engine_kwargs["disable_cuda_graph"] = True
     engine = sgl.Engine(**engine_kwargs)
@@ -246,6 +273,17 @@ def main():
             }
             for output_len in output_lens
         ]
+
+        # Prefill warmup at this scenario's real shapes, so the first timed
+        # call does not absorb Triton JIT/autotune. max_new_tokens=1 covers
+        # prefill without paying decode.
+        engine.generate(
+            input_ids=prompt_token_ids,
+            sampling_params=[{**p, "max_new_tokens": 1} for p in sp],
+            return_logprob=True,
+            logprob_start_len=-1,
+            top_logprobs_num=0,
+        )
 
         start = time.perf_counter()
         outputs = engine.generate(
@@ -379,6 +417,15 @@ def main():
             for output_len in output_lens
         ]
 
+        # Prefill warmup at this scenario's real shapes -- see the matching
+        # comment in the SGLang reference worker. The reset() below frees
+        # what this allocated.
+        engine.generate(
+            prompt_token_ids,
+            Eagle3SamplingParams(max_tokens=1, ignore_eos=True),
+            use_tqdm=False, decode_text=False,
+        )
+
         engine.reset()
         torch.cuda.synchronize()
         start = time.perf_counter()
@@ -447,36 +494,14 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 # Alignment metric (matches bench_vllm.py).
 # ---------------------------------------------------------------------------
-def compute_alignment(a_outputs: list[dict], b_outputs: list[dict]) -> dict:
-    total_seqs = len(a_outputs)
-    exact_matches = 0
-    total_matching_tokens = 0
-    total_output_tokens = 0
-
-    for a, b in zip(a_outputs, b_outputs):
-        a_ids = a["token_ids"]
-        b_ids = b["token_ids"]
-        out_len = max(len(a_ids), len(b_ids))
-        total_output_tokens += out_len
-
-        if a_ids == b_ids:
-            exact_matches += 1
-            total_matching_tokens += len(a_ids)
-        else:
-            min_len = min(len(a_ids), len(b_ids))
-            matching = sum(1 for j in range(min_len) if a_ids[j] == b_ids[j])
-            total_matching_tokens += matching
-
-    avg_matching = total_matching_tokens / total_seqs if total_seqs else 0
-    avg_output_len = total_output_tokens / total_seqs if total_seqs else 0
-    return {
-        "exact_matches": exact_matches,
-        "total_seqs": total_seqs,
-        "total_matching_tokens": total_matching_tokens,
-        "total_output_tokens": total_output_tokens,
-        "avg_matching_tokens_per_request": avg_matching,
-        "avg_output_len": avg_output_len,
-    }
+# Alignment comes from bench_vllm so every generative harness reports the same
+# metric: the matching *prefix*, stopping at the first divergence. This module
+# used to carry a byte-identical copy that counted position-wise agreement
+# instead, which drifted from bench_microsoft_bitnet's and overstated agreement
+# (222.9 vs 204.8 tokens on a 1000-request Codestral run). bench_vllm's
+# module-level imports are stdlib-only, as bench_jamba and bench_fla already
+# rely on.
+from fastkernels.validate.bench_vllm import compute_alignment  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -560,7 +585,7 @@ def main():
     if args.output_dir is None:
         short = args.model.split("/")[-1]
         args.output_dir = str(
-            _PACKAGE_DIR / "tests" / "results" / gpu / f"{short}_eagle3"
+            _PROJECT_ROOT / "tests" / "results" / gpu / f"{short}_eagle3"
         )
 
     # Build scenarios.
@@ -646,7 +671,18 @@ def main():
             python_executable=args.sglang_python,
         )
         if sgl_raw is None:
-            print("  WARNING: sglang subprocess failed -- continuing with fastkernels only")
+            # Do not silently degrade to a fastkernels-only run: the summary
+            # then prints "SGLANG N/A / SPEEDUP N/A" and the job still exits 0,
+            # so the runner records a PASS for a scenario that never compared
+            # against its reference. SGLang is this scenario's SOTA baseline, so
+            # its absence is a failure.
+            raise SystemExit(
+                "ERROR: the SGLang reference did not run, so there is nothing "
+                "to compare against. Create the benchmark env with "
+                "`bash tests/setup_sglang_env.sh` (or point --sglang-python at "
+                "an interpreter that has sglang installed). Pass "
+                "--skip-sglang to intentionally run fastkernels alone."
+            )
 
     # ------------------ fastkernels ------------------
     kb_raw = None
@@ -688,7 +724,7 @@ def main():
         print(f"{'=' * 100}")
         print(
             f"  {'SCENARIO':<32} {'FASTKERNELS tok/s':>14} {'SGLANG tok/s':>14}"
-            f" {'SPEEDUP':>8} {'AVG MATCH TOKS':>18}"
+            f" {'SPEEDUP':>8} {'AVG PREFIX TOKS':>18}"
         )
         print(f"  {'-' * 96}")
 

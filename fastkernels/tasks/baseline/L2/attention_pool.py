@@ -65,7 +65,7 @@ class AttentionPoolLatent(nn.Module):
         if out_features > 0:
             self.proj = Linear(embed_dim, out_features, bias=True)
             self.proj_drop = nn.Dropout(drop) if drop > 0.0 else nn.Identity()
-            self.norm = LayerNorm(out_features)
+            self.norm = LayerNorm(out_features, eps=1e-6, promote_fp32=False)
             self.mlp = _PoolMlp(out_features, int(out_features * mlp_ratio), out_features)
         else:
             self.proj = nn.Identity()

@@ -58,7 +58,7 @@ from pathlib import Path
 import numpy as np
 
 _THIS_DIR = Path(__file__).resolve().parent
-_PACKAGE_DIR = _THIS_DIR.parent.parent
+_PACKAGE_DIR = _THIS_DIR.parent
 _PROJECT_ROOT = _PACKAGE_DIR.parent
 
 sys.path.insert(0, str(_PROJECT_ROOT))
@@ -1001,10 +1001,11 @@ def main():
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Path to a real reference DP3 ckpt (latest.ckpt). "
                              "If unset, a fastkernels random-init checkpoint is created.")
-    parser.add_argument("--dp3-repo", type=str,
-                        default="/raid/user_data/olu/3D-Diffusion-Policy/3D-Diffusion-Policy",
+    parser.add_argument("--dp3-repo", type=str, default=None,
                         help="Path to the cloned 3D-Diffusion-Policy repo (must be "
-                             "on PYTHONPATH for the reference worker).")
+                             "on PYTHONPATH for the reference worker). Default: "
+                             "$DP3_REPO, else the inner package dir of the checkout "
+                             "provisioned under THIRD_PARTY_DIR by `fastkernels validate`.")
     parser.add_argument("--dataset", type=str,
                         default="rishabhrj11/gym-xarm-pointcloud",
                         help="HF point-cloud robotics dataset (or 'synthetic').")
@@ -1025,6 +1026,13 @@ def main():
                         help="Use synthetic Gaussian point clouds (debug).")
     parser.add_argument("--output-dir", type=str, default=None)
     args = parser.parse_args()
+
+    if args.dp3_repo is None:
+        from fastkernels import THIRD_PARTY_DIR
+        args.dp3_repo = os.environ.get(
+            "DP3_REPO",
+            str(THIRD_PARTY_DIR / "3D-Diffusion-Policy" / "3D-Diffusion-Policy"),
+        )
 
     gpu_name = _detect_gpu_name()
     if args.output_dir is None:

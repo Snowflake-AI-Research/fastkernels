@@ -102,7 +102,7 @@ class WhisperEncoder(nn.Module):
             WhisperEncoderLayer(config)
             for _ in range(config.encoder_layers)
         ])
-        self.layer_norm = LayerNorm(embed_dim, eps=1e-5)
+        self.layer_norm = LayerNorm(embed_dim, eps=1e-5, promote_fp32=False)
 
         self.embed_positions = Embedding(config.max_source_positions, embed_dim)
 
@@ -142,7 +142,8 @@ class WhisperDecoder(nn.Module):
             WhisperDecoderLayer(config)
             for _ in range(config.decoder_layers)
         ])
-        self.layer_norm = LayerNorm(config.d_model, eps=1e-5)
+        self.layer_norm = LayerNorm(config.d_model, eps=1e-5,
+                                    promote_fp32=False)
 
     def forward(
         self,
@@ -183,6 +184,19 @@ class WhisperForConditionalGeneration(nn.Module):
         self.encoder = WhisperEncoder(config)
         self.decoder = WhisperDecoder(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.d_model)
+        # Uncompiled handle on the decoder, for the prefill call below. Wrapped
+        # in a tuple so nn.Module.__setattr__ does not register it a second
+        # time: a duplicate submodule would double every decoder weight in
+        # state_dict() and make the engine's module walk allocate two KV caches.
+        self._decoder_eager = (self.decoder,)
+
+    def set_compiled_decoder(self, compiled) -> None:
+        """Install a compiled decoder for the decode path.
+
+        The engine calls this instead of assigning ``self.decoder`` directly so
+        that ``_decoder_eager`` keeps pointing at the uncompiled module.
+        """
+        self.decoder = compiled
 
     def get_multimodal_embeddings(
         self, input_features: torch.Tensor,
@@ -218,7 +232,13 @@ class WhisperForConditionalGeneration(nn.Module):
         if encoder_outputs:
             enc_states = torch.cat(encoder_outputs, dim=0)
 
-        return self.decoder(input_ids, positions, enc_states)
+        # Prefill (enc_states present) goes to the uncompiled decoder. The
+        # compiled one is traced under ``skip_all_guards_unsafe``, so Dynamo
+        # never re-checks its inputs -- calling it with a tensor
+        # ``encoder_hidden_states`` after it was traced with None would silently
+        # reuse the decode graph and skip the cross-attn KV write entirely.
+        decoder = self.decoder if enc_states is None else self._decoder_eager[0]
+        return decoder(input_ids, positions, enc_states)
 
     def compute_logits(self, hidden_states):
         logits = self.lm_head(hidden_states)

@@ -16,6 +16,11 @@ import torch
 
 from fastkernels.infra.pointcloud_loader import DEFAULT_PTV3_CHECKPOINT_FILE
 from fastkernels.validate.worker import run_worker
+from fastkernels.validate.comparison import (
+    alignment_from_similarity,
+    latency_entry,
+    throughput_entry,
+)
 
 POINTCLOUD_WORKER = r'''
 import json, os, random, sys, time
@@ -207,6 +212,29 @@ def measure(model, batches, warmup_iters: int, measure_iters: int):
     return total_points / elapsed
 
 
+def measure_latency(model, batch, warmup_iters: int, measure_iters: int):
+    """Per-forward wall clock for one batch, as the LATENCY workloads want."""
+    samples = []
+    with torch.inference_mode():
+        for _ in range(warmup_iters):
+            forward_model(model, batch)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        for _ in range(measure_iters):
+            start = time.perf_counter()
+            forward_model(model, batch)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            samples.append(time.perf_counter() - start)
+    samples.sort()
+    return {
+        "median": samples[len(samples) // 2],
+        "mean": sum(samples) / len(samples),
+        "min": samples[0],
+        "max": samples[-1],
+    }
+
+
 def alignment_stats(ours, ref, align_batches):
     ours_feats = []
     ref_feats = []
@@ -281,6 +309,24 @@ def main():
     if not throughput_batches:
         raise RuntimeError("No full batches could be built from dataset samples")
 
+    # PointCloudSeg declares three workloads: scanobjectnn (throughput at the
+    # configured batch size), batch-8 (throughput at bs=8) and single-cloud
+    # (latency at bs=1). Only the first was measured before.
+    def _batches_at(batch_size: int, limit: int):
+        return build_batches(
+            samples=samples[:limit],
+            dataset_name=cfg["dataset"],
+            batch_size=batch_size,
+            grid_size=cfg["grid_size"],
+            feat_dim=cfg["feat_dim"],
+            device=device,
+            dtype=dtype,
+            drop_last=True,
+        )
+
+    latency_batches = _batches_at(1, 1)
+    batch8_batches = _batches_at(8, 8) if len(samples) >= 8 else []
+
     set_seed(cfg["seed"])
     ours = load_ours_point_model(cfg["model"], device=device, dtype=dtype, **model_kwargs)
     checkpoint_info = None
@@ -295,6 +341,14 @@ def main():
             raise RuntimeError(f"PTv3 state mismatch missing={missing} unexpected={unexpected}")
 
     ours_tps = measure(ours, throughput_batches, cfg["warmup_iters"], cfg["measure_iters"])
+    ours_batch8 = (
+        measure(ours, batch8_batches, cfg["warmup_iters"], cfg["measure_iters"])
+        if batch8_batches else None
+    )
+    ours_latency = (
+        measure_latency(ours, latency_batches[0], cfg["warmup_iters"], cfg["measure_iters"])
+        if latency_batches else None
+    )
 
     result = {
         "model": cfg["model"],
@@ -311,12 +365,30 @@ def main():
         "checkpoint_file": checkpoint_info["checkpoint_file"] if checkpoint_info is not None else None,
         "checkpoint_loaded_tensors": checkpoint_info["loaded_tensors"] if checkpoint_info is not None else 0,
         "correctness_metric": "final_feature_alignment",
-        "ours": {"baseline_name": "fastkernels", "points_per_second": ours_tps},
+        "ours": {
+            "baseline_name": "fastkernels",
+            "points_per_second": ours_tps,
+            "batch8_points_per_second": ours_batch8,
+            "single_cloud_latency": ours_latency,
+        },
     }
 
     if ref is not None:
         ref_tps = measure(ref, throughput_batches, cfg["warmup_iters"], cfg["measure_iters"])
-        result["reference"] = {"baseline_name": "official-detached", "points_per_second": ref_tps}
+        ref_batch8 = (
+            measure(ref, batch8_batches, cfg["warmup_iters"], cfg["measure_iters"])
+            if batch8_batches else None
+        )
+        ref_latency = (
+            measure_latency(ref, latency_batches[0], cfg["warmup_iters"], cfg["measure_iters"])
+            if latency_batches else None
+        )
+        result["reference"] = {
+            "baseline_name": "official-detached",
+            "points_per_second": ref_tps,
+            "batch8_points_per_second": ref_batch8,
+            "single_cloud_latency": ref_latency,
+        }
         result["comparison"] = alignment_stats(ours, ref, align_batches) | {
             "throughput_ratio": ours_tps / ref_tps if ref_tps > 0 else float("inf"),
         }
@@ -393,6 +465,42 @@ def main() -> None:
     data = run_worker(POINTCLOUD_WORKER, cfg, "PointTransformerV3 benchmark", timeout=7200)
     if data is None:
         raise SystemExit(1)
+
+    # Standard comparison shape (fastkernels/validate/comparison.py): previously
+    # this row reported only comparison.throughput_ratio, so the sweep summary
+    # showed no per-scenario speedup and no latency speedup at all.
+    ours = data.get("ours") or {}
+    ref = data.get("reference") or {}
+    cmp = data.get("comparison") or {}
+    scenarios: list[dict] = []
+    latency_scenarios: list[dict] = []
+    if ref:
+        alignment = alignment_from_similarity(
+            "feat_cosine", cmp.get("feat_cosine", 0.0), threshold=0.99,
+            feat_mae=cmp.get("feat_mae"),
+            alignment_num_samples=cmp.get("alignment_num_samples"),
+        )
+        scenarios.append(throughput_entry(
+            args.dataset, ours.get("points_per_second"), ref.get("points_per_second"),
+            metric="points_per_s", alignment=alignment,
+            batch_size=args.batch_size, num_samples=data.get("num_samples"),
+        ))
+        if ours.get("batch8_points_per_second") and ref.get("batch8_points_per_second"):
+            scenarios.append(throughput_entry(
+                "batch-8", ours["batch8_points_per_second"], ref["batch8_points_per_second"],
+                metric="points_per_s", alignment=alignment, batch_size=8,
+            ))
+        if ours.get("single_cloud_latency") and ref.get("single_cloud_latency"):
+            latency_scenarios.append(latency_entry(
+                "single-cloud",
+                ours["single_cloud_latency"]["median"],
+                ref["single_cloud_latency"]["median"],
+                batch_size=1,
+            ))
+    data["scenarios"] = scenarios
+    data["latency_scenarios"] = latency_scenarios
+    data["reference_name"] = ref.get("baseline_name") or None
+
     output_path = os.path.join(args.output_dir, "results.json")
     with open(output_path, "w") as f:
         json.dump(data, f, indent=2)

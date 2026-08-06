@@ -119,10 +119,25 @@ class LlamaAttention(nn.Module):
 
         # Learnable QK norm (Qwen3: before RoPE)
         if self.q_norm is not None:
-            q = q.view(N, self.num_heads, self.head_dim)
-            k = k.view(N, self.num_kv_heads, self.head_dim)
-            q = self.q_norm(q.reshape(-1, self.head_dim)).view(N, self.num_heads * self.head_dim)
-            k = self.k_norm(k.reshape(-1, self.head_dim)).view(N, self.num_kv_heads * self.head_dim)
+            # Normalise per head through a *view*, matching vLLM's
+            # Qwen3Attention.forward:
+            #     q_by_head = q.view(*q.shape[:-1], -1, head_dim)
+            #     q = self.q_norm(q_by_head).view(q.shape)
+            # The previous form reshaped to (N*heads, head_dim) first. That
+            # cannot be a view of a qkv slice -- the slice's row stride is the
+            # packed qkv width (q_size + 2*kv_size), not num_heads*head_dim --
+            # so ``reshape`` materialised a full copy of q and k on every layer:
+            # at 16384 prefill tokens that is 67 MB for q plus 17 MB for k per
+            # layer, 36 layers deep, and it showed up in the kernel profile as
+            # one Memcpy DtoD per layer per step that vLLM does not emit.
+            # Reducing over the last dim of the 3-D view is bit-identical
+            # (same 128 values per row, same order) and lets Inductor fuse the
+            # strided read straight into the following RoPE kernel.
+            q_shape, k_shape = q.shape, k.shape
+            q = self.q_norm(
+                q.view(N, self.num_heads, self.head_dim)).view(q_shape)
+            k = self.k_norm(
+                k.view(N, self.num_kv_heads, self.head_dim)).view(k_shape)
 
         rope = rotary_emb if rotary_emb is not None else self.rotary_emb
         if not self.nope and rope is not None:

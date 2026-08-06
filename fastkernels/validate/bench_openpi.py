@@ -52,13 +52,53 @@ from pathlib import Path
 import numpy as np
 
 _THIS_DIR = Path(__file__).resolve().parent
-_PACKAGE_DIR = _THIS_DIR.parent.parent
+_PACKAGE_DIR = _THIS_DIR.parent
 _PROJECT_ROOT = _PACKAGE_DIR.parent
 
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from fastkernels.validate.worker import run_worker
+from fastkernels.validate.comparison import (
+    alignment_from_similarity,
+    latency_entry,
+    throughput_entry,
+)
+from fastkernels.validate.provision import (
+    OPENPI_ASSETS_DIR,
+    OPENPI_CHECKPOINTS,
+    OPENPI_VENV_PYTHON,
+)
 from fastkernels.workloads import PI0_CONFIG
+
+_DEFAULT_PI0_CHECKPOINT = str(OPENPI_ASSETS_DIR / "pi0_aloha_pen_uncap_pytorch")
+
+
+def _resolve_pi0_checkpoint(value: str, *, what: str) -> str:
+    """Resolve an OpenPI asset name to its provisioned converted-PyTorch tree.
+
+    Both engines need a directory holding ``model.safetensors`` plus
+    ``assets/**/norm_stats.json``. The published OpenPI checkpoints are JAX/orbax
+    and live at ``gs://openpi-assets/checkpoints/<name>``, so scenario tables name
+    the asset (``pi0_aloha_pen_uncap``) and the provisioner materializes the
+    converted tree. A local directory or an HF repo id is passed through
+    unchanged.
+    """
+    if os.path.isdir(value):
+        return value
+    name = value.rstrip("/").split("/")[-1]
+    if name.endswith("_pytorch"):
+        name = name[: -len("_pytorch")]
+    candidate = OPENPI_ASSETS_DIR / f"{name}_pytorch"
+    if (candidate / "model.safetensors").is_file():
+        return str(candidate)
+    if name in OPENPI_CHECKPOINTS or value.startswith(("gs://", "openpi-assets/")):
+        raise SystemExit(
+            f"ERROR: {what} {value!r} needs the converted OpenPI checkpoint at "
+            f"{candidate}, which is not provisioned.\n"
+            f"  Provision it with: python -m fastkernels.validate.provision openpi\n"
+            f"  (`fastkernels validate <table>` provisions it automatically.)"
+        )
+    return value
 
 
 def _detect_gpu_name() -> str:
@@ -2155,8 +2195,7 @@ def _run_dataset_benchmark(
     kb_data = run_worker(FASTKERNELS_PI0_WORKER, kb_config,
                          f"fastkernels Pi0 [{dataset_name}]", timeout=36000)
     if kb_data is None:
-        print(f"ERROR: fastkernels [{dataset_name}] failed.", file=sys.stderr)
-        return {"error": "fastkernels failed"}
+        raise SystemExit(f"ERROR: fastkernels [{dataset_name}] failed.")
 
     ref_data = None
     if run_reference and args.reference == "openpi":
@@ -2199,9 +2238,13 @@ def _run_dataset_benchmark(
                               f"OpenPI [{dataset_name}]", timeout=36000,
                               python_executable=ref_py)
         if ref_data is None:
-            print(f"\nERROR: OpenPI [{dataset_name}] did not complete. "
-                  "Ensure --reference-python points at the OpenPI venv and the "
-                  "checkpoint contains model.safetensors.", file=sys.stderr)
+            raise SystemExit(
+                f"ERROR: OpenPI [{dataset_name}] did not complete. Ensure "
+                f"--reference-python points at the OpenPI venv (provision with "
+                f"`python -m fastkernels.validate.provision openpi`) and that the checkpoint "
+                f"contains model.safetensors. Pass --skip-reference to run "
+                f"fastkernels-only on purpose."
+            )
 
     elif run_reference and args.reference == "hf":
         ref_config = {**base_config, "scenarios": scenarios, "latency_scenarios": latency_scenarios}
@@ -2209,6 +2252,8 @@ def _run_dataset_benchmark(
             ref_config["actions_dir"] = ref_actions_dir
         ref_data = run_worker(HF_PI0_WORKER, ref_config,
                               f"HF Pi0 [{dataset_name}]", timeout=36000)
+        if ref_data is None:
+            raise SystemExit(f"ERROR: HF Pi0 [{dataset_name}] did not complete.")
 
     ref_label = "OpenPI" if args.reference == "openpi" else "HF"
     kb_tp = kb_data.get("throughput", [])
@@ -2234,8 +2279,10 @@ def main():
     parser = argparse.ArgumentParser(
         description="Pi0 benchmark: fastkernels vs OpenPI — ALOHA, DROID, and LIBERO workloads",
     )
-    parser.add_argument("--model", type=str, default="/raid/user_data/olu/pi0_aloha_pen_uncap_pytorch",
-                        help="Default Pi0 checkpoint for all datasets")
+    parser.add_argument("--model", type=str, default=_DEFAULT_PI0_CHECKPOINT,
+                        help="Default Pi0 checkpoint for all datasets: a local converted-PyTorch "
+                             "tree, an HF repo id, or an OpenPI asset name (e.g. "
+                             "pi0_aloha_pen_uncap) resolved to the provisioned conversion")
     parser.add_argument("--droid-model", type=str, default=None,
                         help="Checkpoint for DROID (overrides --model; use pi0_droid converted checkpoint)")
     parser.add_argument("--libero-model", type=str, default=None,
@@ -2259,7 +2306,7 @@ def main():
     parser.add_argument("--reference", choices=("openpi", "hf"), default="openpi",
                         help="Reference: openpi (paper comparison) or hf (debug only)")
     parser.add_argument("--openpi-backend", choices=("pytorch", "jax"), default="pytorch")
-    parser.add_argument("--openpi-checkpoint", default="/raid/user_data/olu/pi0_aloha_pen_uncap_pytorch",
+    parser.add_argument("--openpi-checkpoint", default=_DEFAULT_PI0_CHECKPOINT,
                         help="Default OpenPI checkpoint (model.safetensors + assets/)")
     parser.add_argument("--droid-openpi-checkpoint", type=str, default=None,
                         help="OpenPI checkpoint for DROID (overrides --openpi-checkpoint)")
@@ -2268,12 +2315,36 @@ def main():
     parser.add_argument("--openpi-train-config", default="pi0_aloha_pen_uncap",
                         help="Override OpenPI train config for ALL datasets (auto-selected per dataset by default)")
     parser.add_argument("--reference-python", default=None,
-                        help="Python executable for OpenPI subprocess. Overrides env OPENPI_PYTHON.")
+                        help="Python executable for OpenPI subprocess. Overrides env OPENPI_PYTHON; "
+                             "defaults to the provisioned OpenPI venv.")
     parser.add_argument("--output-dir", type=str, default=None)
     args = parser.parse_args()
 
     skip_reference = args.skip_reference or args.skip_openpi
+    args.model = _resolve_pi0_checkpoint(args.model, what="--model")
+    args.openpi_checkpoint = _resolve_pi0_checkpoint(
+        args.openpi_checkpoint, what="--openpi-checkpoint"
+    )
+    for _ds in ("droid", "libero"):
+        for _attr in (f"{_ds}_model", f"{_ds}_openpi_checkpoint"):
+            _value = getattr(args, _attr, None)
+            if _value:
+                setattr(
+                    args,
+                    _attr,
+                    _resolve_pi0_checkpoint(_value, what="--" + _attr.replace("_", "-")),
+                )
+
     ref_py = args.reference_python or os.environ.get("OPENPI_PYTHON")
+    if not ref_py and OPENPI_VENV_PYTHON.is_file():
+        ref_py = str(OPENPI_VENV_PYTHON)
+    if not skip_reference and args.reference == "openpi" and not ref_py:
+        raise SystemExit(
+            "ERROR: the OpenPI reference needs its own interpreter. Provision it "
+            "(`python -m fastkernels.validate.provision openpi`) or pass "
+            "--reference-python / set OPENPI_PYTHON. Use --skip-reference to run "
+            "fastkernels-only on purpose."
+        )
     gpu_name = _detect_gpu_name()
 
     if args.output_dir is None:
@@ -2328,6 +2399,65 @@ def main():
     with open(summary_path, "w") as f:
         json.dump(all_results, f, indent=2)
     print(f"\nAll results: {summary_path}")
+
+    # Also emit the standard top-level results.json every other harness writes,
+    # aggregated across datasets. Previously only summary.json existed, so the
+    # runner needed a bench_openpi special case and aggregate sweep queries
+    # found no speedup/alignment for this row.
+    scenarios: list[dict] = []
+    latency_scenarios: list[dict] = []
+
+    def _median(row):
+        vals = sorted(row.get("latencies") or [])
+        return vals[len(vals) // 2] if vals else None
+
+    for dataset_name, result in all_results.items():
+        ours = result.get("fastkernels") or {}
+        ref = result.get("reference") or {}
+        correctness = result.get("correctness") or {}
+        ref_tp = {r.get("name"): r for r in (ref.get("throughput") or [])}
+        for row in ours.get("throughput") or []:
+            peer = ref_tp.get(row.get("name"))
+            if not peer:
+                continue
+            corr = correctness.get(row.get("name"))
+            alignment = None
+            if corr:
+                alignment = alignment_from_similarity(
+                    "mean_cosine_sim", corr.get("mean_cosine_sim", 0.0),
+                    threshold=0.99, mean_mse=corr.get("mean_mse"),
+                    num_samples=corr.get("num_samples"),
+                )
+            scenarios.append(throughput_entry(
+                row["name"], row.get("inferences_per_second"),
+                peer.get("inferences_per_second"),
+                metric="inferences_per_s", alignment=alignment,
+                dataset=dataset_name,
+                num_requests=row.get("num_requests"),
+            ))
+        ref_lat = {r.get("name"): r for r in (ref.get("latency") or [])}
+
+        for row in ours.get("latency") or []:
+            peer = ref_lat.get(row.get("name"))
+            if not peer:
+                continue
+            latency_scenarios.append(latency_entry(
+                row["name"], _median(row), _median(peer),
+                dataset=dataset_name, batch_size=row.get("batch_size"),
+            ))
+
+    standard_path = os.path.join(args.output_dir, "results.json")
+    with open(standard_path, "w") as f:
+        json.dump({
+            "model": args.model,
+            "gpu": gpu_name,
+            "seed": args.seed,
+            "reference_name": args.reference,
+            "scenarios": scenarios,
+            "latency_scenarios": latency_scenarios,
+            "datasets": all_results,
+        }, f, indent=2)
+    print(f"Standard results: {standard_path}")
 
 
 if __name__ == "__main__":

@@ -8,6 +8,9 @@ import torch
 import torch.nn as nn
 from flashinfer.prefill import trtllm_batch_context_with_kv_cache
 
+from .fa_utils import FA_VERSION, VLLM_FA_AVAILABLE, flash_attn_varlen_func
+from .flashinfer_decode import prime_trtllm_sinks, trtllm_sinks
+
 
 class TRTLLMPrefill(nn.Module):
     def __init__(self, num_qo_heads: int, num_kv_heads: int, head_dim: int,
@@ -22,10 +25,16 @@ class TRTLLMPrefill(nn.Module):
                 512 * 1024 * 1024, dtype=torch.uint8, device="cuda"
             )
         self._workspace = workspace
+        self._sinks_fp32: torch.Tensor | None = None
+        self._sinks_src: torch.Tensor | None = None
+
+    def prime_sinks(self, sinks: torch.Tensor | None) -> None:
+        prime_trtllm_sinks(self, sinks)
 
     def forward(self, q, k, v, cu_seqlens_q, cu_seqlens_k,
                 max_seqlen_q, max_seqlen_k, softmax_scale=None,
-                causal=True, block_table=None, **kwargs):
+                causal=True, block_table=None, s_aux=None,
+                window_size=None, **kwargs):
         if block_table is not None:
             q = q.contiguous()
             seq_lens = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
@@ -49,13 +58,43 @@ class TRTLLMPrefill(nn.Module):
                 batch_size=batch_size,
                 cum_seq_lens_q=cu_seqlens_q,
                 cum_seq_lens_kv=cu_seqlens_k,
+                # See TRTLLMDecode: sinks and the sliding window arrive under
+                # their FlashAttention names and must be translated, not
+                # swallowed by **kwargs -- dropping them corrupts numerics
+                # silently.
+                window_left=(
+                    window_size[0] if window_size is not None
+                    and window_size[0] >= 0 else -1
+                ),
+                sinks=trtllm_sinks(self, s_aux),
                 kv_layout="HND",
             )
-        from flash_attn import flash_attn_varlen_func
+        # Dense (unpaged) fallback: same FlashAttention build/version vLLM
+        # would use for this device.  Sinks/window must be carried across here
+        # too, under FlashAttention's own parameter names.
+        fa_extra = {}
+        if s_aux is not None:
+            fa_extra["s_aux"] = s_aux
+        if window_size is not None:
+            fa_extra["window_size"] = window_size
+        if not VLLM_FA_AVAILABLE:  # pragma: no cover - CPU-only fallback
+            from flash_attn import (
+                flash_attn_varlen_func as _fa2_varlen_func,
+            )
+            return _fa2_varlen_func(
+                q, k, v,
+                cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+                softmax_scale=softmax_scale if softmax_scale is not None else self.sm_scale,
+                causal=causal,
+                **fa_extra,
+            )
         return flash_attn_varlen_func(
             q, k, v,
             cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
             max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
             softmax_scale=softmax_scale if softmax_scale is not None else self.sm_scale,
             causal=causal,
+            fa_version=FA_VERSION,
+            **fa_extra,
         )

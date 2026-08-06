@@ -72,7 +72,11 @@ class Gemma4Config:
         return cls(
             hidden_size=text["hidden_size"],
             intermediate_size=text["intermediate_size"],
-            moe_intermediate_size=text["moe_intermediate_size"],
+            moe_intermediate_size=(
+                text.get("moe_intermediate_size")
+                or text.get("expert_intermediate_size")
+                or 704
+            ),
             num_hidden_layers=text["num_hidden_layers"],
             num_attention_heads=text["num_attention_heads"],
             num_key_value_heads=text["num_key_value_heads"],
@@ -86,8 +90,8 @@ class Gemma4Config:
             attention_k_eq_v=text.get("attention_k_eq_v", False),
             hidden_activation=text.get("hidden_activation", "gelu_pytorch_tanh"),
             sliding_window=text.get("sliding_window", 1024),
-            num_experts=text["num_experts"],
-            top_k_experts=text["top_k_experts"],
+            num_experts=text.get("num_experts") or 128,
+            top_k_experts=text.get("top_k_experts") or 8,
             enable_moe_block=text.get("enable_moe_block", False),
             tie_word_embeddings=text.get("tie_word_embeddings", False),
             final_logit_softcapping=text.get("final_logit_softcapping"),

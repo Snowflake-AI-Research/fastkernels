@@ -166,7 +166,7 @@ class FluxTransformer2DModel(nn.Module):
         ])
 
         self.norm_out = AdaLayerNormContinuous(
-            inner_dim, inner_dim, elementwise_affine=False, eps=1e-6,
+            inner_dim, inner_dim, elementwise_affine=False, eps=1e-6, promote_fp32=False,
         )
         self.proj_out = Linear(
             inner_dim,
@@ -481,7 +481,13 @@ class FluxPipeline(nn.Module):
         h = 2 * (int(height) // (self.vae_scale_factor * 2))
         w = 2 * (int(width) // (self.vae_scale_factor * 2))
         shape = (batch_size, num_channels_latents, h, w)
-        latents = torch.randn(shape, generator=generator, device=device, dtype=dtype)
+        # Match vllm-omni's prepare_latents exactly: draw noise PER IMAGE via
+        # diffusers randn_tensor with a per-sample generator list. A single batched
+        # torch.randn only agrees with the per-image draw for row 0 on CUDA (the
+        # Philox offset depends on numel), so batches would otherwise diverge.
+        from diffusers.utils.torch_utils import randn_tensor
+        gen = [generator] * batch_size if isinstance(generator, torch.Generator) else generator
+        latents = randn_tensor(shape, generator=gen, device=device, dtype=dtype)
         latents = self._pack_latents(latents, batch_size, num_channels_latents, h, w)
         latent_image_ids = self._prepare_latent_image_ids(
             batch_size, h // 2, w // 2, device, dtype,

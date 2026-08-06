@@ -16,7 +16,10 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-import vllm._C  # noqa: F401  — registers torch.ops._C_cache_ops
+try:
+    import vllm._custom_ops  # noqa: F401 — vLLM >= 0.20 registers torch.ops._C_cache_ops
+except ImportError:
+    import vllm._C  # noqa: F401 — legacy vLLM <= 0.18
 
 _HEAD_DIM = 128
 _SCALE_BYTES = 4
@@ -63,16 +66,32 @@ class IndexerKCacheGather(nn.Module):
         kv_cache: torch.Tensor,
         block_table: torch.Tensor,
         cu_seq_lens: torch.Tensor,
+        total_tokens: int | None = None,
+        out_k_fp8: torch.Tensor | None = None,
+        out_k_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        total_tokens = int(cu_seq_lens[-1].item())
+        # ``total_tokens`` lets the caller pass a precomputed KV token count so
+        # we skip the ``cu_seq_lens[-1].item()`` D2H sync on the indexer hot
+        # path (chunked prefill knows it on CPU). ``out_*`` let the caller pass
+        # a reused workspace (sliced here to ``total_tokens``) instead of a
+        # fresh per-call allocation. Both fall back to the old behaviour when
+        # omitted, so existing eager callers are unchanged.
+        if total_tokens is None:
+            total_tokens = int(cu_seq_lens[-1].item())
         device = kv_cache.device
 
-        k_fp8 = torch.empty(
-            total_tokens, _HEAD_DIM, dtype=torch.float8_e4m3fn, device=device,
-        )
-        k_scale = torch.empty(
-            total_tokens, _SCALE_BYTES, dtype=torch.uint8, device=device,
-        )
+        if out_k_fp8 is not None:
+            k_fp8 = out_k_fp8[:total_tokens]
+        else:
+            k_fp8 = torch.empty(
+                total_tokens, _HEAD_DIM, dtype=torch.float8_e4m3fn, device=device,
+            )
+        if out_k_scale is not None:
+            k_scale = out_k_scale[:total_tokens]
+        else:
+            k_scale = torch.empty(
+                total_tokens, _SCALE_BYTES, dtype=torch.uint8, device=device,
+            )
 
         torch.ops._C_cache_ops.cp_gather_indexer_k_quant_cache(
             kv_cache, k_fp8, k_scale, block_table, cu_seq_lens,

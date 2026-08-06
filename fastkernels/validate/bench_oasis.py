@@ -69,9 +69,38 @@ from fastkernels.workloads import (  # noqa: E402
     OASIS_THROUGHPUT_WORKLOADS,
     OasisWorkload,
 )
+from fastkernels.validate.comparison import (  # noqa: E402
+    alignment_from_similarity,
+    latency_entry,
+    throughput_entry,
+)
+
+from fastkernels import THIRD_PARTY_DIR  # noqa: E402
 
 
 OPEN_OASIS_REPO = "https://github.com/etched-ai/open-oasis.git"
+# Pin the reference checkout for reproducibility. bench_oasis only consumes the
+# DiT/VAE models and reimplements sigmoid_beta_schedule locally (see below), so
+# this need not track upstream HEAD.
+OPEN_OASIS_COMMIT = "f59deef2c019c212bd0c5a3a5b986a51f3701847"
+
+
+def _sigmoid_beta_schedule(timesteps, start=-3, end=3, tau=1, clamp_min=1e-5):
+    """Oasis diffusion noise schedule.
+
+    Copied verbatim from open-oasis ``utils.sigmoid_beta_schedule`` so we do not
+    have to import that module: its top-level ``from torchvision.io import
+    read_video`` (used only by a prompt-loading helper we never call) no longer
+    resolves under torchvision >=0.26.
+    """
+    steps = timesteps + 1
+    t = torch.linspace(0, timesteps, steps, dtype=torch.float64) / timesteps
+    v_start = torch.tensor(start / tau).sigmoid()
+    v_end = torch.tensor(end / tau).sigmoid()
+    alphas_cumprod = (-((t * (end - start) + start) / tau).sigmoid() + v_end) / (v_end - v_start)
+    alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+    betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+    return torch.clip(betas, 0, 0.999)
 OASIS_MODEL = "Etched/oasis-500m"
 CACHE_FORMAT_VERSION = 3
 WARMUP_ITERS = 2
@@ -172,7 +201,7 @@ def _default_cache_dir() -> Path:
 
 
 def _default_open_oasis_dir() -> Path:
-    return Path(__file__).resolve().parent.parent.parent / "data" / "open_oasis_src"
+    return THIRD_PARTY_DIR / "open-oasis"
 
 
 def _ensure_open_oasis_source(open_oasis_src: str | None, *, repo: str) -> Path:
@@ -191,8 +220,17 @@ def _ensure_open_oasis_source(open_oasis_src: str | None, *, repo: str) -> Path:
     src.parent.mkdir(parents=True, exist_ok=True)
     if src.exists():
         shutil.rmtree(src)
-    _log(f"cloning open-oasis into {src}")
-    subprocess.run(["git", "clone", "--depth", "1", repo, str(src)], check=True)
+    _log(f"cloning open-oasis@{OPEN_OASIS_COMMIT[:12]} into {src}")
+    # Shallow-fetch exactly the pinned commit (a bare `clone --depth 1` only
+    # gets the default-branch tip, which cannot be pinned).
+    src.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "-C", str(src), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(src), "remote", "add", "origin", repo], check=True)
+    subprocess.run(
+        ["git", "-C", str(src), "fetch", "--depth", "1", "origin", OPEN_OASIS_COMMIT],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(src), "checkout", "-q", "FETCH_HEAD"], check=True)
     _log("open-oasis clone ready")
     return src
 
@@ -201,12 +239,11 @@ def _import_open_oasis_modules(open_oasis_src: Path):
     src = str(open_oasis_src)
     if src not in sys.path:
         sys.path.insert(0, src)
-    for name in ("dit", "vae", "utils", "attention", "rotary_embedding_torch"):
+    for name in ("dit", "vae", "attention", "rotary_embedding_torch"):
         sys.modules.pop(name, None)
     dit = importlib.import_module("dit")
     vae = importlib.import_module("vae")
-    utils = importlib.import_module("utils")
-    return dit, vae, utils
+    return dit, vae
 
 
 def _checkpoint_paths(model_dir: str) -> tuple[str, str]:
@@ -226,7 +263,7 @@ def _build_open_oasis(
     device: torch.device,
 ) -> tuple[torch.nn.Module, torch.nn.Module, Any]:
     _log("building open-oasis reference models")
-    dit_mod, vae_mod, utils_mod = _import_open_oasis_modules(open_oasis_src)
+    dit_mod, vae_mod = _import_open_oasis_modules(open_oasis_src)
     model_path, vae_path = _checkpoint_paths(model_dir)
 
     model = dit_mod.DiT_models["DiT-S/2"]()
@@ -238,7 +275,7 @@ def _build_open_oasis(
     model = model.to(device=device).eval()
     vae = vae.to(device=device).eval()
     _log("open-oasis reference ready")
-    return model, vae, utils_mod.sigmoid_beta_schedule
+    return model, vae, _sigmoid_beta_schedule
 
 
 def _build_fastkernels(model_dir: str, *, device: torch.device, dtype: torch.dtype) -> OasisPipeline:
@@ -705,7 +742,7 @@ def _print_results_summary(results: dict[str, Any]) -> None:
     print(f"  DType      : {results['dtype']}")
     print(f"  Correctness: {results['correctness_dtype']}")
     print(f"  Dataset    : {results['input']['name']} ({results['input']['split']})")
-    print(f"  Scenarios  : {', '.join(s['name'] for s in results['scenarios'])}")
+    print(f"  Scenarios  : {', '.join(s['name'] for s in results['workloads'])}")
     print(f"{'=' * 110}")
 
     if throughput:
@@ -816,7 +853,9 @@ def main() -> None:
         "dtype": str(dtype),
         "correctness_dtype": str(torch.float32),
         "input": input_info,
-        "scenarios": [s.__dict__ for s in scenarios],
+        # Renamed from "scenarios": that key now carries the standard throughput
+        # comparison entries shared with the other harnesses.
+        "workloads": [s.__dict__ for s in scenarios],
     }
 
     if scenarios:
@@ -909,6 +948,57 @@ def main() -> None:
                     )
             throughput_results.append(item)
         results["performance"] = throughput_results
+
+    # Standard comparison shape (see fastkernels/validate/comparison.py). Before
+    # this, oasis reported 5 throughput speedups but no latency speedup at all,
+    # because latency_ratio_p50 lived only inside `performance`.
+    std_throughput: list[dict[str, Any]] = []
+    std_latency: list[dict[str, Any]] = []
+    for item in results.get("performance", []):
+        scenario = item.get("scenario") or {}
+        name = scenario.get("name")
+        ours = item.get("fastkernels") or {}
+        ref = item.get("open_oasis") or {}
+        if not ref:
+            continue
+        if scenario.get("kind") == "latency":
+            std_latency.append(latency_entry(
+                name,
+                ours.get("latency_ms_p50", 0.0) / 1000.0,
+                ref.get("latency_ms_p50", 0.0) / 1000.0,
+                batch_clips=scenario.get("batch_clips"),
+                num_frames=scenario.get("num_frames"),
+                ddim_steps=scenario.get("ddim_steps"),
+            ))
+            continue
+        correctness = item.get("correctness") or {}
+        alignment = None
+        cosines = [
+            v["cosine"] for v in correctness.values()
+            if isinstance(v, dict) and isinstance(v.get("cosine"), (int, float))
+        ]
+        if cosines:
+            alignment = alignment_from_similarity(
+                "min_cosine", min(cosines),
+                threshold=0.99,
+                overall_pass=correctness.get("overall_pass"),
+                per_tensor={
+                    key: value.get("cosine")
+                    for key, value in correctness.items()
+                    if isinstance(value, dict)
+                },
+            )
+        std_throughput.append(throughput_entry(
+            name,
+            ours.get("videos_per_second"), ref.get("videos_per_second"),
+            metric="videos_per_s", alignment=alignment,
+            batch_clips=scenario.get("batch_clips"),
+            num_frames=scenario.get("num_frames"),
+            ddim_steps=scenario.get("ddim_steps"),
+        ))
+    results["scenarios"] = std_throughput
+    results["latency_scenarios"] = std_latency
+    results["reference_name"] = "open-oasis"
 
     output_dir = Path(args.output_dir) if args.output_dir else Path("tests/results") / _detect_gpu_name() / "oasis-500m"
     output_dir.mkdir(parents=True, exist_ok=True)

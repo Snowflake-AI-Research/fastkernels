@@ -188,20 +188,31 @@ class DiffusionEngine:
         self,
         prompts: str | list[str],
         params: DiffusionSamplingParams | HunyuanVideoDiffusionSamplingParams | None = None,
+        generator: torch.Generator | None = None,
     ) -> DiffusionOutput | HunyuanVideoDiffusionOutput:
-        """Generate images/video from text prompts."""
+        """Generate images/video from text prompts.
+
+        The RNG generator is created ONCE and reused across calls (its state
+        advances), matching vllm-omni's diffusion runner. The previous behavior
+        re-seeded a fresh generator on every call, so repeated ``generate`` calls
+        produced identical noise. Callers may pass an explicit ``generator`` (e.g.
+        one built per benchmark scenario) to control the seed lifecycle exactly.
+        """
         pipeline = self._get_pipeline()
 
         if self._model_type == "hunyuan_video":
             params = params or HunyuanVideoDiffusionSamplingParams()
-            seed = params.seed if params.seed is not None else self.seed
-            generator = torch.Generator(device=self.device).manual_seed(seed)
-            return pipeline.forward(prompts, params, generator=generator)
         else:
             params = params or DiffusionSamplingParams()
+
+        if generator is None:
             seed = params.seed if params.seed is not None else self.seed
-            generator = torch.Generator(device=self.device).manual_seed(seed)
-            return pipeline.forward(prompts, params, generator=generator)
+            if getattr(self, "_generator", None) is None or self._generator_seed != seed:
+                self._generator = torch.Generator(device=self.device).manual_seed(seed)
+                self._generator_seed = seed
+            generator = self._generator
+
+        return pipeline.forward(prompts, params, generator=generator)
 
     def warmup(self, num_steps: int = 2) -> None:
         """Run a small warmup generation to prime CUDA graphs / compile."""

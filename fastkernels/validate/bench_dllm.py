@@ -22,10 +22,17 @@ from pathlib import Path
 from typing import Any
 
 _THIS_DIR = Path(__file__).resolve().parent
-_PACKAGE_DIR = _THIS_DIR.parent.parent
-sys.path.insert(0, str(_PACKAGE_DIR))
+_PACKAGE_DIR = _THIS_DIR.parent
+_PROJECT_ROOT = _PACKAGE_DIR.parent
+sys.path.insert(0, str(_PROJECT_ROOT))
 
+from fastkernels import THIRD_PARTY_DIR
 from fastkernels.validate.worker import run_worker
+from fastkernels.validate.comparison import (
+    alignment_from_token_ids,
+    latency_entry,
+    throughput_entry,
+)
 
 
 DEFAULT_TASK = "humaneval"
@@ -35,7 +42,10 @@ DEFAULT_GEN_LENGTH = 256
 DEFAULT_BLOCK_LENGTH = 32
 DEFAULT_THRESHOLD = 0.9
 DEFAULT_OURS_BACKEND = "dual"
-DEFAULT_FASTDLLM_ROOT = "third_party/Fast-dLLM"
+# The official Fast-dLLM reference repo is cloned under THIRD_PARTY_DIR by the
+# provisioner. Upstream moved the LLaDA reference (generate.py + model/) under a
+# ``v1/`` subtree, so the root the harness adds to sys.path is <repo>/v1.
+DEFAULT_FASTDLLM_ROOT = str(THIRD_PARTY_DIR / "Fast-dLLM" / "v1")
 DEFAULT_FEWSHOT_SEED = 1234
 MASK_TOKEN_ID = 126336
 FASTDLLM_IGNORE_TOKEN_ID = 126081
@@ -266,6 +276,33 @@ def _finalize_batch_outputs(raw_generated_ids, requests, tokenizer, ignore_token
     return outputs, token_count
 
 
+def _patch_llada_for_transformers_v5(cls):
+    """Make the reference LLaDAModelLM loadable under transformers >=5.
+
+    LLaDAModelLM is a barebones PreTrainedModel subclass: its __init__ never
+    calls post_init(), and it predates two transformers changes.
+
+    1. post_init() is what assigns ``all_tied_weights_keys``, which
+       _finalize_model_loading -> _move_missing_keys_from_meta_to_device now
+       reads unguarded. LLaDA's config sets weight_tying=false, so the correct
+       value here is an empty mapping.
+    2. transformers now calls ``tie_weights(missing_keys=..., recompute_mapping=...)``;
+       the reference override takes no kwargs.
+
+    Both are in the loading path only -- forward is unaffected, and the loaded
+    weights are bitwise identical to what the pre-5.x path produced.
+    """
+    if "all_tied_weights_keys" not in cls.__dict__:
+        cls.all_tied_weights_keys = {}
+    original_tie_weights = cls.tie_weights
+    if getattr(original_tie_weights, "_fastkernels_kwarg_tolerant", False):
+        return
+    def tie_weights(self, *args, **kwargs):
+        return original_tie_weights(self)
+    tie_weights._fastkernels_kwarg_tolerant = True
+    cls.tie_weights = tie_weights
+
+
 def _run_backend(cfg):
     device = cfg.get("device", "cuda")
     dtype = torch.bfloat16 if cfg.get("use_bf16", True) else torch.float16
@@ -301,6 +338,12 @@ def _run_backend(cfg):
         tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         config = FastDLLMConfig.from_pretrained(model_name)
         config.flash_attention = True
+        # modeling_llada.forward reads config.use_cache when the caller omits it;
+        # transformers >=5 no longer defaults it on PretrainedConfig. True was the
+        # pre-5.x default.
+        if not hasattr(config, "use_cache"):
+            config.use_cache = True
+        _patch_llada_for_transformers_v5(FastDLLMLLaDAModelLM)
         model = FastDLLMLLaDAModelLM.from_pretrained(
             model_name,
             trust_remote_code=True,
@@ -522,7 +565,7 @@ def main():
     input_info["protocol"] = "fastdllm-official-like"
 
     common = {
-        "project_root": str(_PACKAGE_DIR),
+        "project_root": str(_PROJECT_ROOT),
         "model": args.model,
         "requests": requests,
         "batch_size": args.batch_size,
@@ -586,6 +629,70 @@ def main():
 
     out_file = out_dir / _result_filename(args, input_info, resolved_reference_backends)
     out_file.write_text(json.dumps(results, indent=2))
+
+    # Standard results.json alongside the detailed scenario-named file. Without
+    # it the runner found no artifact for this row (it looks for results.json)
+    # and aggregate sweep queries saw no speedup/alignment for LLaDA.
+    scenarios: list[dict] = []
+    latency_scenarios: list[dict] = []
+    for backend, ref in references.items():
+        if not ref:
+            continue
+        alignment = alignment_from_token_ids(
+            [o["token_ids"] for o in ours["outputs"]],
+            [o["token_ids"] for o in ref["outputs"]],
+        )
+        cmp = comparisons.get(backend) or {}
+        alignment.update({
+            "token_match_rate": cmp.get("token_match_rate"),
+            "sequence_exact_match_rate": cmp.get("sequence_exact_match_rate"),
+            "logits_cosine": cmp.get("logits_cosine"),
+        })
+        scenarios.append(throughput_entry(
+            f"{input_info['task']}-{backend}",
+            ours.get("tokens_per_second"), ref.get("tokens_per_second"),
+            metric="tokens_per_s", alignment=alignment,
+            reference_backend=backend,
+            batch_size=args.batch_size,
+            num_samples=input_info["num_samples"],
+            avg_nfe_per_batch=ours.get("avg_nfe_per_batch"),
+            reference_avg_nfe_per_batch=ref.get("avg_nfe_per_batch"),
+        ))
+        # dLLM times one batched sweep rather than per-request, so the latency
+        # figure is mean wall-clock per batch. Both sides use identical batch
+        # composition, so the ratio is like-for-like.
+        ours_batches = max(ours.get("num_batches") or 0, 1)
+        ref_batches = max(ref.get("num_batches") or 0, 1)
+        latency_scenarios.append(latency_entry(
+            f"{input_info['task']}-{backend}-batch{args.batch_size}",
+            (ours.get("elapsed") or 0.0) / ours_batches,
+            (ref.get("elapsed") or 0.0) / ref_batches,
+            metric="mean_batch_s",
+            reference_backend=backend,
+            batch_size=args.batch_size,
+        ))
+
+    # Summary only: the per-sample token ids and logit samples stay in the
+    # detailed file, which is ~5 MB on HumanEval and would otherwise be written
+    # twice.
+    def _light(backend_result):
+        if not backend_result:
+            return backend_result
+        return {
+            key: value for key, value in backend_result.items()
+            if key not in {"outputs", "logits_sample"}
+        }
+
+    standard = {
+        **{k: v for k, v in results.items() if k not in {"ours", "references"}},
+        "ours": _light(ours),
+        "references": {name: _light(ref) for name, ref in references.items()},
+        "reference_name": resolved_reference_backends if not args.skip_reference else None,
+        "scenarios": scenarios,
+        "latency_scenarios": latency_scenarios,
+        "detailed_results_file": out_file.name,
+    }
+    (out_dir / "results.json").write_text(json.dumps(standard, indent=2))
     print(
         json.dumps(
             {

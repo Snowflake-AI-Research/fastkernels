@@ -31,6 +31,43 @@ import torch.nn as nn
 
 from .csrc import _C
 
+# The pybind11 entry points below are raw C++ extension functions, not torch
+# ops, so Dynamo cannot trace them: compiling a model that calls one fails with
+# "Dynamo does not know how to trace the builtin ... router_gemm_bf16_fp32".
+# That is what blocked compiling Kimi-Linear (which in turn cost it the
+# AR+RMSNorm post-grad fusion and all Inductor elementwise fusion).
+#
+# ``torch._dynamo.disable`` is NOT sufficient here: it graph-breaks, and
+# ``compile_model`` uses fullgraph=True, which rejects breaks outright
+# ("Skip calling torch.compiler.disable()'d function"). Registering real custom
+# ops makes them opaque *without* breaking the graph -- the same reason
+# ``fastkernels::unified_attention`` exists for attention.
+
+
+@torch.library.custom_op("fastkernels::router_gemm_bf16_fp32", mutates_args=())
+def _router_gemm_bf16_fp32(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return _C.router_gemm_bf16_fp32(x, weight)
+
+
+@_router_gemm_bf16_fp32.register_fake
+def _(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return x.new_empty((x.shape[0], weight.shape[0]), dtype=torch.float32)
+
+
+@torch.library.custom_op(
+    "fastkernels::dsv3_router_gemm", mutates_args={"output"})
+def _dsv3_router_gemm_op(
+    output: torch.Tensor, hidden_states: torch.Tensor,
+    router_weight: torch.Tensor,
+) -> None:
+    _C.dsv3_router_gemm(output, hidden_states, router_weight)
+
+
+@_dsv3_router_gemm_op.register_fake
+def _(output: torch.Tensor, hidden_states: torch.Tensor,
+      router_weight: torch.Tensor) -> None:
+    return None
+
 
 @functools.cache
 def _is_hopper_or_blackwell() -> bool:
@@ -43,24 +80,38 @@ def _is_hopper_or_blackwell() -> bool:
     return (cap[0], cap[1]) == (9, 0) or cap[0] == 10
 
 
+@functools.cache
+def _dsv3_max_batch() -> int:
+    """Max ``num_tokens`` routed to the DSV3 kernel: ``16`` on Hopper, ``8``
+    otherwise (Blackwell). Mirrors vLLM ``GateLinear._dsv3_max_batch``
+    (``16 if is_hopper else 8``; see vLLM PR #44217)."""
+    if not torch.cuda.is_available():
+        return 16
+    cap = torch.cuda.get_device_capability()
+    return 16 if (cap[0], cap[1]) == (9, 0) else 8
+
+
 def _dsv3_router_gemm(
     hidden_states: torch.Tensor,
     router_weight: torch.Tensor,
-    output_dtype: torch.dtype,
+    output_dtype: torch.dtype | None,
 ) -> torch.Tensor:
     """Allocates the output and dispatches to the DSV3 specialized kernel.
 
-    Mirrors vLLM's ``_custom_ops.dsv3_router_gemm`` Python wrapper exactly:
-    the underlying CUDA op takes ``output`` as an in/out parameter, so the
-    allocation lives on the Python side.
+    Mirrors vLLM's ``_custom_ops.dsv3_router_gemm`` Python wrapper: the
+    underlying CUDA op takes ``output`` as an in/out parameter, so the
+    allocation lives on the Python side. ``output_dtype=None`` mirrors vLLM's
+    ``torch.empty(dtype=None)``, which resolves to FP32 at inference time —
+    fastkernels sets a global bf16 default dtype, so we pin FP32 explicitly
+    to keep the decode router logits at FP32 like vLLM.
     """
     output = torch.empty(
         hidden_states.shape[0],
         router_weight.shape[0],
         device=hidden_states.device,
-        dtype=output_dtype,
+        dtype=output_dtype if output_dtype is not None else torch.float32,
     )
-    _C.dsv3_router_gemm(output, hidden_states, router_weight)
+    _dsv3_router_gemm_op(output, hidden_states, router_weight)
     return output
 
 
@@ -76,17 +127,21 @@ class GateLinear(nn.Module):
         self,
         x: torch.Tensor,
         weight: torch.Tensor,
-        out_dtype: torch.dtype = torch.float32,
+        out_dtype: torch.dtype | None = torch.float32,
     ) -> torch.Tensor:
         """Compute router logits with vLLM-parity dispatch.
 
         Args:
             x: ``(num_tokens, hidden_size)`` activations (BF16).
             weight: ``(num_experts, hidden_size)`` gate weight (BF16).
-            out_dtype: Desired output dtype (FP32 for DeepSeek-V3 monolithic).
+            out_dtype: Desired output dtype. ``None`` mirrors vLLM's
+                ``GateLinear.out_dtype is None`` (its CUDA default): the DSV3
+                kernel emits FP32 (decode) and the F.linear fallback emits the
+                weight dtype / BF16 (prefill), which is what DeepSeek-V3.2 and
+                GLM-5.2 use on CUDA (``set_out_dtype`` is only called on ROCm).
 
         Returns:
-            ``(num_tokens, num_experts)`` router logits in ``out_dtype``.
+            ``(num_tokens, num_experts)`` router logits.
         """
         num_tokens = x.shape[0]
         num_experts = weight.shape[0]
@@ -96,34 +151,40 @@ class GateLinear(nn.Module):
         bf16_input = x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
 
         # Tier 1: DSV3 specialized kernel. Matches vLLM's ``GateLinear.forward``
-        # which dispatches here for any ``out_dtype`` (BF16 or FP32) as long as
-        # ``batch<=16`` and the hidden/num_experts dims match. Previously we
-        # also required ``out_dtype == torch.float32``, which diverted the BF16
-        # router path (used by non-monolithic FP8 MoE in DeepSeek-V3.2) to the
-        # fallback F.linear — producing slightly different router_logits and
-        # boundary-flipping the grouped-topk at layers 3+.
+        # / ``allow_dsv3_router_gemm`` eligibility: SM90+, BF16 in, batch <=
+        # ``_dsv3_max_batch`` (16 Hopper / 8 Blackwell), and a supported
+        # (hidden_size, num_experts) shape — (7168, 256/384) [DeepSeek/Kimi] or
+        # (6144, 256) [GLM-5.2]; (6144, 384) is unsupported. Dispatches for any
+        # ``out_dtype`` (incl. None -> FP32 output), matching vLLM.
+        dsv3_shape_ok = (
+            (hidden_size == 7168 and num_experts in (256, 384))
+            or (hidden_size == 6144 and num_experts == 256)
+        )
         if (
             is_hopper_or_blackwell
             and bf16_input
-            and num_tokens <= 16
-            and num_experts in (256, 384)
-            and hidden_size == 7168
+            and num_tokens <= _dsv3_max_batch()
+            and dsv3_shape_ok
         ):
             return _dsv3_router_gemm(x, weight, out_dtype)
 
-        # Tier 2: cuBLAS BF16 x BF16 -> FP32.
+        # Tier 2: cuBLAS BF16 x BF16 -> FP32. Only when FP32 output is requested
+        # (vLLM's ``allow_cublas_router_gemm`` requires ``out_dtype == float32``;
+        # with out_dtype None this tier is skipped, matching vLLM).
         if (
             is_hopper_or_blackwell
             and bf16_input
             and out_dtype == torch.float32
         ):
-            return _C.router_gemm_bf16_fp32(x, weight)
+            return _router_gemm_bf16_fp32(x, weight)
 
-        # Tier 3: F.linear fallback. Match vLLM's behaviour (cast input to
-        # weight dtype, then cast output to out_dtype).
+        # Tier 3: F.linear fallback. Match vLLM's behaviour: cast input to
+        # weight dtype, and cast the output to out_dtype only when a concrete
+        # dtype was requested (out_dtype None -> keep weight/BF16 dtype, as vLLM
+        # does when ``self.out_dtype is None``).
         if x.dtype != weight.dtype:
             x = x.to(weight.dtype)
         out = torch.nn.functional.linear(x, weight)
-        if out.dtype != out_dtype:
+        if out_dtype is not None and out.dtype != out_dtype:
             out = out.to(out_dtype)
         return out

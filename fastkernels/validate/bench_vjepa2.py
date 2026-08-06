@@ -7,8 +7,14 @@ The default path benchmarks the predictive world-model forward:
   - masked-context alignment
   - predictor output alignment
 
+``--workloads`` runs every declared workload in one invocation, which is how the
+validate sweep drives this harness: the model forwards (predictor / encoder /
+classification) are throughput workloads and single-video is the batch-1 latency
+probe. ``--task`` remains for benchmarking one forward by hand.
+
 Usage:
     python tests/bench_vjepa2.py --model facebook/vjepa2-vitl-fpc64-256
+    python tests/bench_vjepa2.py --workloads predictor,encoder,single-video
     python tests/bench_vjepa2.py --skip-reference
     python tests/bench_vjepa2.py --skip-latency
     python tests/bench_vjepa2.py --task encoder
@@ -30,8 +36,14 @@ from pathlib import Path
 
 import torch
 
+from fastkernels.validate.comparison import (
+    alignment_from_similarity,
+    latency_entry,
+    throughput_entry,
+)
+
 _THIS_DIR = Path(__file__).resolve().parent
-_PACKAGE_DIR = _THIS_DIR.parent.parent
+_PACKAGE_DIR = _THIS_DIR.parent
 if not (_PACKAGE_DIR / "__init__.py").exists() and (_PACKAGE_DIR / "fastkernels" / "__init__.py").exists():
     _PACKAGE_DIR = _PACKAGE_DIR / "fastkernels"
 
@@ -96,7 +108,6 @@ import json
 import os
 import sys
 import time
-import warnings
 
 import torch
 from tqdm import tqdm
@@ -159,6 +170,19 @@ def _load_model(cfg):
     else:
         from fastkernels.tasks.baseline.L4.vjepa2 import VJEPA2Model as ModelCls
     model = ModelCls.from_pretrained(cfg["model"]).to(device=device, dtype=dtype).eval()
+    untrained = getattr(model, "untrained_parameters", ())
+    if task == "classification" and untrained:
+        # The classification workload compares logits. With no head weights in the
+        # checkpoint, both sides run a randomly initialized head and the resulting
+        # cosine/MSE describes nothing -- fail instead of reporting noise.
+        raise SystemExit(
+            f"ERROR: {cfg['model']} has no classification head in its checkpoint "
+            f"({len(untrained)} untrained parameter(s), e.g. {list(untrained)[:3]}), "
+            f"so --task classification would compare two randomly initialized "
+            f"heads. Use a fine-tuned checkpoint (e.g. one of the "
+            f"facebook/vjepa2-*-ssv2 / -diving48 classification releases) or run "
+            f"--task predictor / encoder."
+        )
     return model, model.config, dtype
 
 
@@ -205,7 +229,17 @@ def _sample_frame_indices(num_frames, frames_per_clip):
 
 
 def _load_video_paths(dataset_name, dataset_split, num_needed, seed):
+    import datasets.config
     from datasets import Video, load_dataset
+
+    # We never decode through datasets (decode=False here, decord below), but
+    # Video.encode_example imports torchcodec before its str/bytes branches, so
+    # split generation dies if torchcodec is present-but-unusable. datasets gates
+    # that import on find_spec() alone, which is exactly the case that fails:
+    # vllm pulls torchcodec in unconditionally, and the wheel dlopens a system
+    # libavutil that pip cannot install. Declaring it unavailable keeps
+    # encode_example on the path/bytes path.
+    datasets.config.TORCHCODEC_AVAILABLE = False
 
     print(
         f"Loading {num_needed} videos from {dataset_name} ({dataset_split})...",
@@ -236,18 +270,10 @@ def _load_video_paths(dataset_name, dataset_split, num_needed, seed):
 
 
 def _preprocess_dataset_videos(cfg, config, dtype, device, total_videos):
-    try:
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message="The video decoding and encoding capabilities of torchvision are deprecated.*",
-            )
-            from torchvision.io import read_video
-    except Exception as exc:
-        raise RuntimeError(
-            "Real video dataset benchmarking requires torchvision video decoding support. "
-            "Install PyAV, e.g. `python -m pip install av`."
-        ) from exc
+    # torchvision >=0.26 removed torchvision.io.read_video, so decode with
+    # decord (a runtime dependency). len(reader) gives the frame count without
+    # decoding, so we only decode the frames we actually sample.
+    import decord
 
     from transformers import AutoVideoProcessor
 
@@ -258,9 +284,9 @@ def _preprocess_dataset_videos(cfg, config, dtype, device, total_videos):
 
     clips = []
     for path in video_paths:
-        video, _, _ = read_video(path, pts_unit="sec")
-        indices = _sample_frame_indices(video.shape[0], config.frames_per_clip)
-        clip = video.index_select(0, indices).numpy()
+        reader = decord.VideoReader(path, num_threads=1)
+        indices = _sample_frame_indices(len(reader), config.frames_per_clip)
+        clip = reader.get_batch(indices.tolist()).asnumpy()  # (T, H, W, C) uint8
         clips.append(clip)
 
     pixel_values = processor(clips, return_tensors="pt")["pixel_values_videos"]
@@ -454,10 +480,63 @@ def _print_alignment(metrics: dict[str, dict[str, float]]) -> None:
         print(f"  {key}: cosine={values['cosine']:.6f} mae={values['mae']:.6e}")
 
 
+# Declared workload names, as fastkernels.workloads.VideoRepresentation spells
+# them. The three model forwards are throughput workloads and map onto --task;
+# single-video is the batch-1 latency probe.
+_TASK_WORKLOADS = ("predictor", "encoder", "classification")
+_LATENCY_WORKLOAD_BATCH_SIZES = {"single-video": 1}
+
+
+def _resolve_workloads(declared: str, task: str, latency_batch_sizes: str):
+    """Split a declared workload list into (throughput tasks, latency batches).
+
+    Without --workloads the harness keeps its historical single-task behaviour,
+    so a manual `--task encoder` run is unaffected. With --workloads the sweep's
+    declaration drives the run, which is what keeps the summary table's coverage
+    honest: an unrecognised name is an error rather than a silently skipped row.
+    """
+    parsed_batches = [int(x) for x in latency_batch_sizes.split(",") if x]
+    if not declared:
+        return [task], parsed_batches
+
+    tasks: list[str] = []
+    batches: list[int] = []
+    for name in (entry.strip() for entry in declared.split(",")):
+        if not name:
+            continue
+        if name in _TASK_WORKLOADS:
+            if name not in tasks:
+                tasks.append(name)
+        elif name in _LATENCY_WORKLOAD_BATCH_SIZES:
+            batch_size = _LATENCY_WORKLOAD_BATCH_SIZES[name]
+            if batch_size not in batches:
+                batches.append(batch_size)
+        else:
+            raise SystemExit(
+                f"ERROR: --workloads entry {name!r} is not a V-JEPA 2 workload. "
+                f"Throughput: {', '.join(_TASK_WORKLOADS)}. "
+                f"Latency: {', '.join(_LATENCY_WORKLOAD_BATCH_SIZES)}."
+            )
+    if not tasks:
+        raise SystemExit(
+            f"ERROR: --workloads {declared!r} names no throughput workload; "
+            f"expected at least one of {', '.join(_TASK_WORKLOADS)}."
+        )
+    return tasks, batches
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark fastkernels V-JEPA 2 vs transformers")
     parser.add_argument("--model", default="facebook/vjepa2-vitl-fpc64-256")
-    parser.add_argument("--task", choices=["predictor", "encoder", "classification"], default="predictor")
+    parser.add_argument("--task", choices=list(_TASK_WORKLOADS), default="predictor")
+    parser.add_argument(
+        "--workloads",
+        default="",
+        help="Comma-separated declared workloads to run in this one invocation "
+        f"({', '.join(_TASK_WORKLOADS)} as throughput tasks, "
+        f"{', '.join(_LATENCY_WORKLOAD_BATCH_SIZES)} as latency). Overrides "
+        "--task and --latency-batch-sizes.",
+    )
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", choices=["fp32", "fp16", "bf16"], default=None)
     parser.add_argument("--input-source", choices=["dataset", "synthetic"], default="dataset")
@@ -480,16 +559,17 @@ def main() -> None:
     args = parser.parse_args()
 
     args.dtype = args.dtype or _default_dtype(args.device)
-    latency_batch_sizes = [int(x) for x in args.latency_batch_sizes.split(",") if x]
+    tasks, latency_batch_sizes = _resolve_workloads(
+        args.workloads, args.task, args.latency_batch_sizes
+    )
 
     output_dir = Path(args.output_dir) if args.output_dir else Path(
         tempfile.mkdtemp(prefix="vjepa2_bench_")
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    worker_base = {
+    shared = {
         "model": args.model,
-        "task": args.task,
         "device": args.device,
         "dtype": args.dtype,
         "input_source": args.input_source,
@@ -503,102 +583,173 @@ def main() -> None:
 
     results: dict[str, object] = {
         "model": args.model,
-        "task": args.task,
+        "tasks_run": list(tasks),
         "device": args.device,
         "dtype": args.dtype,
         "gpu": _detect_gpu_name(),
         "input_source": args.input_source,
         "dataset_name": args.dataset,
         "dataset_split": args.dataset_split,
-        "throughput": {},
-        "latency": {},
-        "alignment": {},
+        "tasks": {},
     }
 
-    if not args.skip_throughput:
-        ours_cfg = worker_base | {
-            "backend": "local",
-            "mode": "throughput",
-            "num_videos": args.num_videos,
-            "batch_size": args.batch_size,
-        }
-        ours = _run_phase(ours_cfg, "fastkernels V-JEPA 2 throughput")
-        if ours is None:
-            raise SystemExit(1)
-        results["throughput"]["ours"] = ours
+    scenarios: list[dict] = []
+    latency_scenarios: list[dict] = []
 
-        ref = None
-        if not args.skip_reference:
-            ref_cfg = worker_base | {
-                "backend": "reference",
-                "mode": "throughput",
-                "num_videos": args.num_videos,
-                "batch_size": args.batch_size,
-            }
-            ref = _run_phase(ref_cfg, "transformers V-JEPA 2 throughput")
-            if ref is None:
+    for task in tasks:
+        worker_base = shared | {"task": task}
+        per_task: dict[str, dict] = {"throughput": {}, "alignment": {}}
+        results["tasks"][task] = per_task
+        alignment_entry = None
+
+        if not args.skip_alignment:
+            ours_tensor = str(output_dir / f"ours_alignment_{task}.pt")
+            ours = _run_phase(
+                worker_base | {
+                    "backend": "local",
+                    "mode": "alignment",
+                    "alignment_videos": args.alignment_videos,
+                    "tensor_file": ours_tensor,
+                },
+                f"fastkernels V-JEPA 2 alignment [{task}]",
+            )
+            if ours is None:
                 raise SystemExit(1)
-            results["throughput"]["reference"] = ref
+            per_task["alignment"]["ours"] = ours
 
-        _print_throughput_result("V-JEPA 2", ours, ref)
+            if not args.skip_reference:
+                ref_tensor = str(output_dir / f"reference_alignment_{task}.pt")
+                ref = _run_phase(
+                    worker_base | {
+                        "backend": "reference",
+                        "mode": "alignment",
+                        "alignment_videos": args.alignment_videos,
+                        "tensor_file": ref_tensor,
+                    },
+                    f"transformers V-JEPA 2 alignment [{task}]",
+                )
+                if ref is None:
+                    raise SystemExit(1)
+                per_task["alignment"]["reference"] = ref
+                metrics = _alignment_metrics(task, ours_tensor, ref_tensor)
+                per_task["alignment"]["metrics"] = metrics
+                _print_alignment(metrics)
+                cosines = [
+                    values["cosine"]
+                    for values in metrics.values()
+                    if isinstance(values.get("cosine"), (int, float))
+                ]
+                if cosines:
+                    alignment_entry = alignment_from_similarity(
+                        "min_cosine",
+                        min(cosines),
+                        threshold=0.99,
+                        max_mae=max(
+                            values.get("mae", 0.0) for values in metrics.values()
+                        ),
+                        tensors=sorted(metrics),
+                    )
 
-    if not args.skip_latency:
-        ours_cfg = worker_base | {
-            "backend": "local",
-            "mode": "latency",
+        if not args.skip_throughput:
+            ours = _run_phase(
+                worker_base | {
+                    "backend": "local",
+                    "mode": "throughput",
+                    "num_videos": args.num_videos,
+                    "batch_size": args.batch_size,
+                },
+                f"fastkernels V-JEPA 2 throughput [{task}]",
+            )
+            if ours is None:
+                raise SystemExit(1)
+            per_task["throughput"]["ours"] = ours
+
+            ref = None
+            if not args.skip_reference:
+                ref = _run_phase(
+                    worker_base | {
+                        "backend": "reference",
+                        "mode": "throughput",
+                        "num_videos": args.num_videos,
+                        "batch_size": args.batch_size,
+                    },
+                    f"transformers V-JEPA 2 throughput [{task}]",
+                )
+                if ref is None:
+                    raise SystemExit(1)
+                per_task["throughput"]["reference"] = ref
+
+            _print_throughput_result(f"V-JEPA 2 [{task}]", ours, ref)
+            if ref is not None:
+                scenarios.append(
+                    throughput_entry(
+                        task,
+                        ours.get("videos_per_second"),
+                        ref.get("videos_per_second"),
+                        metric="videos_per_s",
+                        alignment=alignment_entry,
+                        batch_size=args.batch_size,
+                        num_videos=args.num_videos,
+                    )
+                )
+
+    # One latency row per declared latency workload, measured on the first
+    # declared task: the workload table asks for a single single-video number,
+    # and the task it was taken on is recorded on the entry.
+    if not args.skip_latency and latency_batch_sizes:
+        latency_task = tasks[0]
+        worker_base = shared | {"task": latency_task}
+        latency_cfg = {
             "latency_batch_sizes": latency_batch_sizes,
             "latency_warmup": args.latency_warmup,
             "latency_iters": args.latency_iters,
         }
-        ours = _run_phase(ours_cfg, "fastkernels V-JEPA 2 latency")
+        ours = _run_phase(
+            worker_base | {"backend": "local", "mode": "latency"} | latency_cfg,
+            f"fastkernels V-JEPA 2 latency [{latency_task}]",
+        )
         if ours is None:
             raise SystemExit(1)
-        results["latency"]["ours"] = ours
+        latency: dict[str, object] = {"task": latency_task, "ours": ours}
 
         ref = None
         if not args.skip_reference:
-            ref_cfg = worker_base | {
-                "backend": "reference",
-                "mode": "latency",
-                "latency_batch_sizes": latency_batch_sizes,
-                "latency_warmup": args.latency_warmup,
-                "latency_iters": args.latency_iters,
-            }
-            ref = _run_phase(ref_cfg, "transformers V-JEPA 2 latency")
+            ref = _run_phase(
+                worker_base | {"backend": "reference", "mode": "latency"} | latency_cfg,
+                f"transformers V-JEPA 2 latency [{latency_task}]",
+            )
             if ref is None:
                 raise SystemExit(1)
-            results["latency"]["reference"] = ref
+            latency["reference"] = ref
+        results["latency"] = latency
 
-        _print_latency_result("V-JEPA 2", ours, ref)
-
-    if not args.skip_alignment:
-        ours_tensor = str(output_dir / "ours_alignment.pt")
-        ours_cfg = worker_base | {
-            "backend": "local",
-            "mode": "alignment",
-            "alignment_videos": args.alignment_videos,
-            "tensor_file": ours_tensor,
-        }
-        ours = _run_phase(ours_cfg, "fastkernels V-JEPA 2 alignment")
-        if ours is None:
-            raise SystemExit(1)
-        results["alignment"]["ours"] = ours
-
-        if not args.skip_reference:
-            ref_tensor = str(output_dir / "reference_alignment.pt")
-            ref_cfg = worker_base | {
-                "backend": "reference",
-                "mode": "alignment",
-                "alignment_videos": args.alignment_videos,
-                "tensor_file": ref_tensor,
+        _print_latency_result(f"V-JEPA 2 [{latency_task}]", ours, ref)
+        if ref is not None:
+            reference_by_batch = {
+                entry["batch_size"]: entry for entry in ref["results"]
             }
-            ref = _run_phase(ref_cfg, "transformers V-JEPA 2 alignment")
-            if ref is None:
-                raise SystemExit(1)
-            results["alignment"]["reference"] = ref
-            metrics = _alignment_metrics(args.task, ours_tensor, ref_tensor)
-            results["alignment"]["metrics"] = metrics
-            _print_alignment(metrics)
+            names_by_batch = {
+                batch_size: name
+                for name, batch_size in _LATENCY_WORKLOAD_BATCH_SIZES.items()
+            }
+            for entry in ours["results"]:
+                batch_size = entry["batch_size"]
+                reference_entry = reference_by_batch.get(batch_size)
+                if reference_entry is None:
+                    continue
+                latency_scenarios.append(
+                    latency_entry(
+                        names_by_batch.get(batch_size, f"video-batch-{batch_size}"),
+                        statistics.median(entry["latencies"]),
+                        statistics.median(reference_entry["latencies"]),
+                        batch_size=batch_size,
+                        task=latency_task,
+                    )
+                )
+
+    results["scenarios"] = scenarios
+    results["latency_scenarios"] = latency_scenarios
+    results["reference_name"] = "transformers"
 
     with open(output_dir / "results.json", "w") as f:
         json.dump(results, f, indent=2)

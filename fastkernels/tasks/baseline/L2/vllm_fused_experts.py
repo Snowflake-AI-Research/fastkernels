@@ -48,7 +48,10 @@ import torch
 import torch.nn as nn
 import triton
 
-import vllm._C  # noqa: F401  - registers torch.ops._C.silu_and_mul + per_token_group_fp8_quant
+try:
+    import vllm._custom_ops  # noqa: F401 — vLLM >= 0.20 registers torch.ops._C.silu_and_mul + per_token_group_fp8_quant
+except ImportError:
+    import vllm._C  # noqa: F401 — legacy vLLM <= 0.18
 
 from ..L1.csrc import _C
 from ..L1.fp8_linear import PerTokenGroupQuantFp8

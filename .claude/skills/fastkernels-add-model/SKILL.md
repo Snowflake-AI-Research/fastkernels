@@ -1,7 +1,7 @@
 ---
 name: fastkernels-add-model
 description: Implement a new model architecture in fastkernels from a SOTA reference library (vLLM or SGLang), matching its interface, kernels, libraries, and dtypes exactly — no shortcuts. Invoke with /fastkernels-add-model <HF model id or arch> [reference lib].
-disable-model-invocation: true
+disable-model-invocation: false
 ---
 
 # Add a model architecture to fastkernels
