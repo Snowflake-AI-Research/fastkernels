@@ -26,7 +26,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-import vllm._custom_ops  # noqa: F401 — registers torch.ops._C_cache_ops
+from .csrc import _C
 
 _KV_C_DIM = 512
 _K_PE_DIM = 64
@@ -37,7 +37,7 @@ _BF16_ELEMS_PER_TOKEN = _KV_C_DIM + _K_PE_DIM  # 576
 class StoreKVCacheFP8MLA(nn.Module):
     """Store ``kv_c_normed`` and ``k_pe`` into MLA paged cache.
 
-    Wraps ``torch.ops._C_cache_ops.concat_and_cache_mla``. Dispatches on
+    Wraps vendored ``_C.concat_and_cache_mla``. Dispatches on
     ``kv_cache_dtype``:
 
     * ``"auto"``: expects a BF16 cache of shape
@@ -83,7 +83,7 @@ class StoreKVCacheFP8MLA(nn.Module):
         slot_mapping: torch.Tensor,
     ) -> None:
         k_pe_2d = k_pe.reshape(k_pe.shape[0], -1)
-        torch.ops._C_cache_ops.concat_and_cache_mla(
+        _C.concat_and_cache_mla(
             kv_c_normed, k_pe_2d, kv_cache, slot_mapping,
             self.kv_cache_dtype, self._k_scale,
         )
@@ -92,7 +92,7 @@ class StoreKVCacheFP8MLA(nn.Module):
 class GatherKVCacheFP8MLA(nn.Module):
     """Gather and upconvert KV from FP8 MLA paged cache to BF16.
 
-    Wraps ``torch.ops._C_cache_ops.cp_gather_and_upconvert_fp8_kv_cache``
+    Wraps vendored ``_C.cp_gather_and_upconvert_fp8_kv_cache``
     which gathers FP8-quantized kv_c_normed and BF16 k_pe from paged cache,
     dequantizes the FP8 portion, and writes the result as a contiguous
     BF16 workspace tensor.
@@ -111,9 +111,12 @@ class GatherKVCacheFP8MLA(nn.Module):
         num_seqs: int,
         workspace: torch.Tensor,
     ) -> None:
-        torch.ops._C_cache_ops.cp_gather_and_upconvert_fp8_kv_cache(
-            kv_cache, workspace, block_table, seq_lens,
-            workspace_starts, num_seqs,
+        # ``seq_lens`` is unused by the kernel; lengths are implied by
+        # ``workspace_starts`` + ``workspace.size(0)``. Kept in the Module API
+        # for call-site compatibility.
+        del seq_lens
+        _C.cp_gather_and_upconvert_fp8_kv_cache(
+            kv_cache, workspace, block_table, workspace_starts, num_seqs, None,
         )
 
 
@@ -163,7 +166,7 @@ class GatherAndDequantKVCacheMLA(nn.Module):
         total_tokens: int,
         workspace_starts: torch.Tensor,
     ) -> None:
-        torch.ops._C_cache_ops.gather_and_maybe_dequant_cache(
+        _C.gather_and_maybe_dequant_cache(
             kv_cache, workspace,
             block_table, cu_seq_lens, token_to_seq,
             total_tokens,

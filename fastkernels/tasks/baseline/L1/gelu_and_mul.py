@@ -11,8 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# vLLM registers torch.ops._C.gelu*_and_mul from ``vllm._custom_ops``.
-import vllm._custom_ops  # noqa: F401
+from .csrc import _C
 
 
 class GeluAndMul(nn.Module):
@@ -24,9 +23,9 @@ class GeluAndMul(nn.Module):
         if approximate not in ("none", "tanh"):
             raise ValueError(f"Unsupported GELU approximation: {approximate}")
         self.op = (
-            torch.ops._C.gelu_tanh_and_mul
+            _C.gelu_tanh_and_mul
             if approximate == "tanh"
-            else torch.ops._C.gelu_and_mul
+            else _C.gelu_and_mul
         )
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:

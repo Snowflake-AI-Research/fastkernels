@@ -31,15 +31,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# vLLM's C extension registers torch.ops._C.rms_norm / fused_add_rms_norm.
-import vllm._custom_ops  # noqa: F401
-
 from .csrc import _C
 
 # ---------------------------------------------------------------------------
 # Register _C ops as torch.library custom ops for torch.compile compatibility.
 # Used by ``rms_norm_native`` / ``rmsnorm_quant`` (not by this module's eager
-# path, which always goes through vLLM's ``torch.ops._C``).
+# path, which goes through the vendored vLLM ``_C.rms_norm``).
 # ---------------------------------------------------------------------------
 
 _lib = torch.library.Library("fastkernels_norm", "DEF")
@@ -141,9 +138,9 @@ class RMSNorm(nn.Module):
                 residual = residual.contiguous()
             if residual is None:
                 out = torch.empty_like(x)
-                torch.ops._C.rms_norm(out, x, weight, eps)
+                _C.rms_norm(out, x, weight, eps)
                 return out
-            torch.ops._C.fused_add_rms_norm(x, residual, weight, eps)
+            _C.fused_add_rms_norm(x, residual, weight, eps)
             return x, residual
         if residual is None:
             return F.rms_norm(x, (x.size(-1),), eps=eps)

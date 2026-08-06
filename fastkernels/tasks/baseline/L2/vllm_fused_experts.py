@@ -30,10 +30,9 @@ already verified produce bit-identical outputs to vLLM's:
 
 * ``_C.moe_align_block_size``           (fastkernels binding of the same
                                          sgl-kernel CUDA source vLLM uses)
-* ``_per_token_group_quant_fp8``        (calls ``torch.ops._C.per_token_group_fp8_quant``)
+* ``_per_token_group_quant_fp8``        (calls vendored ``_C.per_token_group_fp8_quant``)
 * ``MoeGroupedGemm._fused_moe_kernel``  (Triton kernel forked from vLLM)
-* ``torch.ops._C.silu_and_mul``         (vLLM's packed CUDA kernel; fastkernels
-                                         re-uses the same op)
+* ``_C.silu_and_mul``                   (vendored vLLM packed CUDA kernel)
 * ``_C.moe_sum``                        (fastkernels CUDA kernel; falls back to
                                          ``at::sum_out`` for top_k > 4 which
                                          matches vLLM's PyTorch reference for
@@ -47,8 +46,6 @@ import math
 import torch
 import torch.nn as nn
 import triton
-
-import vllm._custom_ops  # noqa: F401 — registers torch.ops._C.silu_and_mul + per_token_group_fp8_quant
 
 from ..L1.csrc import _C
 from ..L1.fp8_linear import PerTokenGroupQuantFp8
@@ -201,7 +198,7 @@ class VllmFusedExperts(nn.Module):
         # SiLU + mul, in place into ``intermediate_cache2``.  Same
         # packed-bf16x2/half2 kernel vLLM uses
         # (``vllm/csrc/activation_kernels.cu``).
-        torch.ops._C.silu_and_mul(intermediate_cache2, intermediate_cache1)
+        _C.silu_and_mul(intermediate_cache2, intermediate_cache1)
 
         # Quantize the SiLU output for GEMM2.  Same kernel as a1, but
         # the input hidden dim is ``N`` (= ``intermediate_size_per_tp``

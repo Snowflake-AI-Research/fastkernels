@@ -226,18 +226,15 @@ def _fp8_group_quant_kernel(
     tl.store(scale_base, scale)
 
 
-_HAS_VLLM_CUDA_QUANT: bool | None = None
+_HAS_LOCAL_CUDA_QUANT: bool | None = None
 
 
-def _check_vllm_cuda_quant() -> bool:
-    global _HAS_VLLM_CUDA_QUANT
-    if _HAS_VLLM_CUDA_QUANT is None:
-        # vLLM registers the fp8 quant ops from ``vllm._custom_ops``.
-        import vllm._custom_ops  # noqa: F401
-        _HAS_VLLM_CUDA_QUANT = hasattr(torch.ops, "_C") and hasattr(
-            torch.ops._C, "per_token_group_fp8_quant"
-        )
-    return _HAS_VLLM_CUDA_QUANT
+def _check_local_cuda_quant() -> bool:
+    global _HAS_LOCAL_CUDA_QUANT
+    if _HAS_LOCAL_CUDA_QUANT is None:
+        from .csrc import _C
+        _HAS_LOCAL_CUDA_QUANT = hasattr(_C, "per_token_group_fp8_quant")
+    return _HAS_LOCAL_CUDA_QUANT
 
 
 def _per_token_group_quant_fp8(x: torch.Tensor,
@@ -258,18 +255,19 @@ def _per_token_group_quant_fp8(x: torch.Tensor,
     so the SF layout matches DeepGEMM's expectation without a
     post-quant transpose.
 
-    Prefers vLLM's CUDA C++ kernel when available for lower launch overhead;
-    falls back to Triton.
+    Prefers the vendored CUDA C++ kernel when available for lower launch
+    overhead; falls back to Triton.
     """
     M, K = x.shape
-    if _check_vllm_cuda_quant() and x.is_cuda and x.is_contiguous() and use_ue8m0:
+    if _check_local_cuda_quant() and x.is_cuda and x.is_contiguous() and use_ue8m0:
+        from .csrc import _C
         # ``True`` for ``use_ue8m0`` and ``False`` for ``tma_aligned_scales``
         # is what vLLM's ``W8A8BlockFp8LinearOp._run_deepgemm`` ends up
         # passing for ``column_major_scales=True`` without TMA padding (the
         # scale buffer is allocated by ``_alloc_colmajor_scale`` below with
         # plain ``(num_groups, M)`` row-major + permute).  Match vLLM's
         # ``eps=1e-10`` (fastkernels previously used ``1e-12``).
-        torch.ops._C.per_token_group_fp8_quant(
+        _C.per_token_group_fp8_quant(
             x, out_fp8, out_scale, int(_GROUP_SIZE),
             _QUANT_EPS, _FP8_INFO.min, _FP8_INFO.max, True,
             column_major_scales, False,

@@ -41,15 +41,32 @@ import torch.nn as nn
 
 @functools.cache
 def _ensure_triton_kernels_on_path() -> None:
-    """Ensure the ``triton_kernels`` package is importable via vLLM's bundle.
+    """Make the OpenAI ``triton_kernels`` package importable.
 
-    Mirrors vLLM's ``import_triton_kernels`` shim but performs only
-    filesystem / sys.path manipulation -- no vLLM functions are called.
+    ``triton_kernels`` is an external dependency; prefer an already-installed
+    copy. Only if that is missing do we extend ``sys.path`` with an explicit
+    override (``FASTKERNELS_TRITON_KERNELS_PATH``) or, as a last resort, vLLM's
+    bundled ``third_party`` dir -- without requiring the vLLM package.
     """
+    if importlib.util.find_spec("triton_kernels") is not None:
+        return
+
+    candidates: list[str] = []
+    override = os.environ.get("FASTKERNELS_TRITON_KERNELS_PATH")
+    if override:
+        candidates.append(override)
+
+    # Last resort: vLLM bundles triton_kernels under third_party. Locate it
+    # only if vLLM happens to be installed; never call into vLLM.
     vllm_spec = importlib.util.find_spec("vllm")
-    third_party = os.path.join(os.path.dirname(vllm_spec.origin), "third_party")
-    if third_party not in sys.path:
-        sys.path.insert(0, third_party)
+    if vllm_spec is not None and vllm_spec.origin is not None:
+        candidates.append(
+            os.path.join(os.path.dirname(vllm_spec.origin), "third_party")
+        )
+
+    for path in candidates:
+        if os.path.isdir(path) and path not in sys.path:
+            sys.path.insert(0, path)
 
 
 # ---------------------------------------------------------------------------

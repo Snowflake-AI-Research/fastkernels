@@ -38,10 +38,10 @@ _TRITON_NUM_PAR_SOFTMAX_SEGMENTS = 16
 # paged path tops out here too; above it vLLM drops to TRITON_ATTN.
 _TRTLLM_MAX_HEAD_SIZE = 256
 
-from vllm.v1.attention.ops.triton_unified_attention import (
+from ..L1.triton_unified_attention import (
     unified_attention as _triton_unified_attention,
 )
-from vllm.v1.kv_cache_interface import KVQuantMode as _VllmKVQuantMode
+from ..L1.kv_quant_mode import KVQuantMode as _VllmKVQuantMode
 import inspect as _inspect
 
 _TRITON_UNIFIED_ACCEPTS_KV_QUANT = (

@@ -2,22 +2,19 @@
 
 Compiles and caches the extension once; all task modules import _C from here.
 
-The first import JIT-compiles ~15 CUDA sources (~2 min). That build is otherwise
-silent -- capture/bench appear to hang before doing anything -- so when a build
-is actually pending (cold cache, or a source edited since the last build) we
-announce it and pass ``verbose=True`` so ninja's per-file ``[k/n]`` progress
-streams. A warm cache stays completely silent.
+The first import JIT-compiles the CUDA sources. When a build is pending (cold
+cache, or a source edited since the last build) we announce it and pass
+``verbose=True`` so ninja's per-file ``[k/n]`` progress streams.
 
-We also pin that build to the *local* GPU architecture. An inherited multi-arch
-``TORCH_CUDA_ARCH_LIST`` (e.g. ``7.5 8.0 8.6 9.0 10.0 12.0+PTX``) makes nvcc
-compile every source once per arch (~6x the work) even though this JIT'd
-extension only ever runs on the machine that built it. Set
-``FASTKERNELS_CUDA_ARCH_LIST`` to override the target list verbatim (e.g.
-``"9.0 10.0"`` to force multi-arch), or to the empty string to leave
-``TORCH_CUDA_ARCH_LIST`` untouched.
+We also pin that build to the *local* GPU architecture. Set
+``FASTKERNELS_CUDA_ARCH_LIST`` to override the target list verbatim, or to the
+empty string to leave ``TORCH_CUDA_ARCH_LIST`` untouched.
 """
 
+from __future__ import annotations
+
 import os
+import site
 import subprocess
 
 from torch.utils.cpp_extension import _get_build_directory, load as _load_ext
@@ -25,31 +22,64 @@ from torch.utils.cpp_extension import _get_build_directory, load as _load_ext
 _DIR = os.path.dirname(os.path.abspath(__file__))
 _NAME = "fastkernels_L1_ops"
 
+# Vendored vLLM 0.26 CUDA kernels (verbatim device code; host wrappers adapted
+# from torch::stable::Tensor -> torch::Tensor). See vllm_port/.
+_VLLM_PORT = [
+    "vllm_port/libtorch_stable/layernorm_kernels.cu",
+    "vllm_port/libtorch_stable/activation_kernels.cu",
+    "vllm_port/libtorch_stable/pos_encoding_kernels.cu",
+    "vllm_port/libtorch_stable/cache_kernels.cu",
+    "vllm_port/libtorch_stable/nvfp4_kv_cache_kernels.cu",
+    "vllm_port/libtorch_stable/cuda_utils_kernels.cu",
+    "vllm_port/libtorch_stable/quantization/w8a8/fp8/common.cu",
+    "vllm_port/libtorch_stable/quantization/w8a8/fp8/per_token_group_quant.cu",
+    "vllm_port/libtorch_stable/quantization/fp4/nvfp4_quant_kernels.cu",
+    "vllm_port/libtorch_stable/quantization/fp4/nvfp4_quant_entry.cu",
+    "vllm_port/libtorch_stable/cutlass_extensions/common.cpp",
+    "vllm_port/libtorch_stable/sampler.cu",
+    "vllm_port/libtorch_stable/topk.cu",
+    "vllm_port/libtorch_stable/cooperative_topk.cu",
+    "vllm_port/libtorch_stable/attention/merge_attn_states.cu",
+    "vllm_port/libtorch_stable/mamba/selective_scan_fwd.cu",
+]
+
 _SOURCES = [
     "binding.cpp", "rmsnorm.cu", "rmsnorm_quant.cu",
-    "pos_enc.cu",
+    # pos_enc.cu replaced by vLLM's pos_encoding_kernels.cu (bit-identical rope).
     "moe_sum.cu", "moe_align.cu", "moe_topk_softmax.cu",
     "eagle_utils.cu",
-    # DeepSeek-V3 router ops (verbatim port of vLLM csrc/moe sources;
-    # see binding.cpp for op-level descriptions).
     "dsv3_router_gemm_entry.cu",
     "dsv3_router_gemm_float_out.cu",
     "dsv3_router_gemm_bf16_out.cu",
     "router_gemm_bf16_fp32.cu",
     "grouped_topk_kernels.cu",
-]
+] + _VLLM_PORT
 _SOURCE_PATHS = [os.path.join(_DIR, f) for f in _SOURCES]
 
 
-def _build_pending() -> bool:
-    """Whether importing this module will trigger a (slow) JIT recompile.
+def _cutlass_include() -> str | None:
+    try:
+        import flashinfer.data  # type: ignore
+        base = os.path.join(
+            os.path.dirname(flashinfer.data.__file__), "cutlass", "include")
+        if os.path.isdir(base):
+            return base
+    except Exception:
+        pass
+    for sp in site.getsitepackages() + [site.getusersitepackages()]:
+        for rel in (
+            "flashinfer/data/cutlass/include",
+            "cutlass_library/source/include",
+            "tilelang/3rdparty/cutlass/include",
+            "deep_gemm/include",
+        ):
+            p = os.path.join(sp, rel)
+            if os.path.isdir(p):
+                return p
+    return None
 
-    ``True`` when the compiled ``.so`` is missing (cold cache) or any source is
-    newer than it (an edited kernel). Best-effort: used only to decide whether
-    to show build progress -- ``cpp_extension.load`` still makes the
-    authoritative content-hash decision. Errs toward ``True`` (show progress)
-    if the build directory can't be resolved.
-    """
+
+def _build_pending() -> bool:
     try:
         so_path = os.path.join(
             _get_build_directory(_NAME, verbose=False), f"{_NAME}.so")
@@ -62,12 +92,6 @@ def _build_pending() -> bool:
 
 
 def _local_cuda_arch() -> str | None:
-    """Compute capability/ies of the visible GPU(s), e.g. ``"10.0"``.
-
-    Read from ``nvidia-smi`` so no CUDA context is created at import time.
-    Multiple distinct arches are space-joined (mixed-GPU boxes). ``None`` if it
-    can't be determined (no GPU / nvidia-smi unavailable).
-    """
     try:
         out = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
@@ -75,16 +99,19 @@ def _local_cuda_arch() -> str | None:
     except Exception:
         return None
     caps = sorted({c.strip() for c in out.splitlines() if c.strip()})
-    return " ".join(caps) or None
+    # NVFP4 / Blackwell family features need the 'a' (architecture-specific)
+    # variant; plain 10.0 rejects e2m1x2 in ptxas.
+    mapped = []
+    for c in caps:
+        major = c.split(".")[0]
+        if major in ("9", "10", "12"):
+            mapped.append(f"{c}a" if not c.endswith("a") else c)
+        else:
+            mapped.append(c)
+    return " ".join(mapped) or None
 
 
 def _pin_build_arch() -> None:
-    """Point ``TORCH_CUDA_ARCH_LIST`` at the local GPU arch for the pending build.
-
-    ``FASTKERNELS_CUDA_ARCH_LIST`` takes precedence: a non-empty value is used
-    verbatim (force a specific/multi-arch build); an empty value leaves
-    ``TORCH_CUDA_ARCH_LIST`` untouched (restore stock torch auto-detection).
-    """
     override = os.environ.get("FASTKERNELS_CUDA_ARCH_LIST")
     if override is not None:
         if override.strip():
@@ -95,12 +122,26 @@ def _pin_build_arch() -> None:
         os.environ["TORCH_CUDA_ARCH_LIST"] = arch
 
 
-# Pin the local GPU arch for the build UNCONDITIONALLY. torch's JIT compile-cache
-# key includes TORCH_CUDA_ARCH_LIST, so pinning it only when a build already
-# looks pending would flip the key between runs (pinned vs inherited multi-arch)
-# and force torch to rebuild every time the key changes. Doing it on every import
-# keeps the key stable: build once, then always a cache hit.
+def _nvfp4_flags(arch: str | None) -> list[str]:
+    """Enable the matching NVFP4 quant kernel for the local arch."""
+    if not arch:
+        return []
+    # Take the first (primary) arch token, e.g. "10.0" from "10.0" / "10.0 9.0".
+    major = arch.split()[0].split(".")[0]
+    if major == "10":
+        return ["-DENABLE_NVFP4_SM100=1"]
+    if major == "12":
+        return ["-DENABLE_NVFP4_SM120=1"]
+    return []
+
+
 _pin_build_arch()
+_arch = os.environ.get("TORCH_CUDA_ARCH_LIST")
+_EXTRA_INCLUDE = [os.path.join(_DIR, "vllm_port")]
+_cutlass = _cutlass_include()
+if _cutlass:
+    _EXTRA_INCLUDE.append(_cutlass)
+
 _verbose = _build_pending()
 if _verbose:
     print(f"[fastkernels] Building CUDA extension {_NAME!r} ({len(_SOURCES)} "
@@ -110,18 +151,19 @@ if _verbose:
 _C = _load_ext(
     name=_NAME,
     sources=_SOURCE_PATHS,
-    extra_cuda_cflags=["-O3",
-                       "-DFLASHINFER_ENABLE_BF16", "-DFLASHINFER_ENABLE_F16",
-                       # vLLM's CMake unsets these so its noaux_tc grouped-topk
-                       # kernel (ported verbatim into ``grouped_topk_kernels.cu``)
-                       # can rely on implicit ``half``/``__nv_bfloat16``<->``float``
-                       # constructors.  ``torch.utils.cpp_extension`` defines them
-                       # by default; we undefine them here to match vLLM.
-                       "-U__CUDA_NO_HALF_OPERATORS__",
-                       "-U__CUDA_NO_HALF_CONVERSIONS__",
-                       "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-                       "-U__CUDA_NO_HALF2_OPERATORS__"],
-    extra_cflags=["-O3"],
-    extra_ldflags=["-lcublas"],
+    extra_include_paths=_EXTRA_INCLUDE,
+    extra_cuda_cflags=[
+        "-O3",
+        "-DENABLE_FP8",
+        "-DFLASHINFER_ENABLE_BF16", "-DFLASHINFER_ENABLE_F16",
+        "-U__CUDA_NO_HALF_OPERATORS__",
+        "-U__CUDA_NO_HALF_CONVERSIONS__",
+        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+        "-U__CUDA_NO_HALF2_OPERATORS__",
+        "--expt-extended-lambda",
+        *_nvfp4_flags(_arch),
+    ],
+    extra_cflags=["-O3", "-DENABLE_FP8"],
+    extra_ldflags=["-lcublas", "-lcuda"],
     verbose=_verbose,
 )

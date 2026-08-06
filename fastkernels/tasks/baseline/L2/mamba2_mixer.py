@@ -38,13 +38,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # vLLM-aligned kernels (bit-identical numerics with vLLM's MambaMixer2).
-from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+from ..L1.mamba_ops.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
-from vllm.model_executor.layers.mamba.ops.layernorm_gated import rms_norm_gated
-from vllm.model_executor.layers.mamba.ops.mamba_ssm import selective_state_update
-from vllm.model_executor.layers.mamba.ops.ssd_combined import (
+from ..L1.mamba_ops.layernorm_gated import rms_norm_gated
+from ..L1.mamba_ops.mamba_ssm import selective_state_update
+from ..L1.mamba_ops.ssd_combined import (
     mamba_chunk_scan_combined_varlen,
 )
 

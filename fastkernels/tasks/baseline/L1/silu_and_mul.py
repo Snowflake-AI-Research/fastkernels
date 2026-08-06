@@ -6,9 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# vLLM registers torch.ops._C.silu_and_mul from ``vllm._custom_ops``.
-import vllm._custom_ops  # noqa: F401
-_silu_and_mul_kernel = torch.ops._C.silu_and_mul
+from .csrc import _C
 
 
 class SiluAndMul(nn.Module):
@@ -26,7 +24,7 @@ class SiluAndMul(nn.Module):
         d = x.size(-1) // 2
         output_shape = x.shape[:-1] + (d,)
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
-        _silu_and_mul_kernel(out, x)
+        _C.silu_and_mul(out, x)
         return out
 
     def forward(self, x):

@@ -1,0 +1,101 @@
+# Regression check for:
+#   - bd3d47ae "remove soft imports"
+#   - fla.py split (gated_delta_rule / kda / rms_norm_gated)
+#
+# Covering subset of full.yaml: one row per uniquely affected code path.
+# Schema matches full.yaml. Run with:
+#   fastkernels validate --scenarios soft_imports_regression
+
+scenarios:
+  # Standard dense LLM: attention_impl, flash_attn_*, fa_utils, rms_norm, silu_and_mul
+  - model: meta-llama/Llama-3.1-8B-Instruct
+    tp: 1
+    dtype: bfloat16
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+
+  # tree_attn_prefill (EAGLE-3 speculative)
+  - model: meta-llama/Llama-3.1-8B-Instruct
+    draft_model: jamesliu1/sglang-EAGLE3-Llama-3.1-Instruct-8B
+    tp: 1
+    dtype: bfloat16
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+
+  # bitnet_rms_norm
+  - model: microsoft/bitnet-b1.58-2B-4T
+    tp: 1
+    dtype: bfloat16
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request]
+
+  # moe_grouped_gemm / vllm_fused_experts
+  - model: mistralai/Mixtral-8x7B-Instruct-v0.1
+    tp: 2
+    dtype: bfloat16
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+
+  # mxfp4_moe / trtllm_mxfp4_moe
+  - model: openai/gpt-oss-120b
+    tp: 2
+    dtype: mxfp4
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+
+  # gemma4_moe
+  - model: google/gemma-4-26B-A4B-it
+    tp: 1
+    dtype: bfloat16
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+
+  # MLA + NVFP4 MoE: mla_attention_impl, flash_mla_*, flashinfer_mla_*,
+  # store_kvcache_fp8_mla, top_k_per_row, indexer_k_cache, merge_attn_states, trtllm_fp4_moe
+  - model: nvidia/GLM-5.2-NVFP4
+    tp: 8
+    dtype: nvfp4
+    kv_cache_dtype: fp8_e4m3
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+
+  # qwen3_next_attention + flashinfer_allreduce_fusion + gated_delta_rule / RMSNormGated
+  - model: Qwen/Qwen3-Next-80B-A3B-Instruct
+    tp: 2
+    dtype: bfloat16
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+
+  # kda + FusedRMSNormGated (+ hybrid MLA)
+  - model: moonshotai/Kimi-Linear-48B-A3B-Instruct
+    tp: 2
+    dtype: bfloat16
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+
+  # fp8_linear / fp8_grouped_gemm / trtllm_fp8_moe
+  - model: Qwen/Qwen3-VL-235B-A22B-Instruct-FP8
+    tp: 4
+    dtype: fp8
+    workloads: [VLM.text_only, VLM.image, VLM.video, VLM.single_image, VLM.single_video]
+
+  # flash_attn_varlen / whisper attention path
+  - model: openai/whisper-large-v3
+    tp: 1
+    dtype: float16
+    workloads: [ASR.librispeech, ASR.single_utterance, ASR.fixed_batch_32]
+
+  # cosyvoice3_hifigan (+ DenseAttention)
+  - model: FunAudioLLM/Fun-CosyVoice3-0.5B-2512
+    tp: 1
+    dtype: bfloat16
+    workloads: [TTS.tts_short, TTS.tts_medium, TTS.tts_long, TTS.single_utterance]
+
+  # dense_attention (flux path)
+  - model: black-forest-labs/FLUX.1-dev
+    tp: 1
+    dtype: bfloat16
+    workloads: [Diffusion.res_1024, Diffusion.res_512, Diffusion.single_1024, Diffusion.single_512]
+
+  # sam3_vit_block
+  - model: facebook/sam3.1
+    tp: 1
+    dtype: float32
+    workloads: [Segmentation.full_pipeline, Segmentation.smartglasses_val_video, Segmentation.single_image_1008, Segmentation.batch_4_image_1008, Segmentation.single_video_frame_1008]
+
+  # pointtransformerv3_layers
+  - model: Pointcept/PointTransformerV3
+    tp: 1
+    dtype: float32
+    workloads: [PointCloudSeg.scanobjectnn, PointCloudSeg.single_cloud, PointCloudSeg.batch_8]

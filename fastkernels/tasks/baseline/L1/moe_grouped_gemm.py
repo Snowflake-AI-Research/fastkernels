@@ -10,7 +10,6 @@ as vLLM), falling back to hardcoded defaults when no file is found.
 from __future__ import annotations
 
 import functools
-import importlib.util
 import json
 import os
 
@@ -214,21 +213,9 @@ def _get_moe_configs(E: int, N: int, dtype: str | None,
     if os.path.isdir(vllm_configs_dir):
         config_file_paths.append(os.path.join(vllm_configs_dir, json_file_name))
 
-    # The pinned vLLM wheel ships its tuned H200/B200 tables as package data.
-    # Prefer those over the heuristic when no adjacent source checkout exists.
-    vllm_spec = importlib.util.find_spec("vllm")
-    if vllm_spec is not None and vllm_spec.submodule_search_locations:
-        installed_configs_dir = os.path.join(
-            next(iter(vllm_spec.submodule_search_locations)),
-            "model_executor",
-            "layers",
-            "fused_moe",
-            "configs",
-        )
-        config_file_paths.append(
-            os.path.join(installed_configs_dir, json_file_name)
-        )
-
+    # Tuned tables ship as package data under ``moe_configs/`` (the commonly
+    # needed device tables were vendored there); no dependency on an installed
+    # vLLM package.
     local_configs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "moe_configs")
     if os.path.isdir(local_configs_dir):
         config_file_paths.append(os.path.join(local_configs_dir, json_file_name))

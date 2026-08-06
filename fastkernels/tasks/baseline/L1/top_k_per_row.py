@@ -7,9 +7,10 @@ import os
 import torch
 import torch.nn as nn
 
-import vllm._custom_ops  # noqa: F401 — registers torch.ops._C
 import flashinfer as _flashinfer
 from flashinfer import TopKTieBreak as _TopKTieBreak
+
+from .csrc import _C
 
 
 # vLLM's DSA decode indexer uses a radix-histogram top-k fast path for the
@@ -162,7 +163,7 @@ class TopKPerRow(nn.Module):
             indices.copy_(det)
             return indices
 
-        torch.ops._C.top_k_per_row_prefill(
+        _C.top_k_per_row_prefill(
             logits,
             cu_seqlen_ks,
             cu_seqlen_ke,
@@ -248,14 +249,14 @@ class TopKPerRow(nn.Module):
                 and cap_major >= 9
             )
             if use_cooperative:
-                torch.ops._C.cooperative_topk(
+                _C.cooperative_topk(
                     logits, row_lens, indices, ws, topk, coop_msl)
             else:
-                torch.ops._C.persistent_topk(
+                _C.persistent_topk(
                     logits, row_lens, indices, ws, topk, logits.shape[1])
             return indices
 
-        torch.ops._C.top_k_per_row_decode(
+        _C.top_k_per_row_decode(
             logits,
             next_n,
             seq_lens,
