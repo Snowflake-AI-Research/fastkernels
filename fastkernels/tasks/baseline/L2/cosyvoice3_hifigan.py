@@ -15,10 +15,7 @@ from torch import pow, sin
 from torch.nn import Conv1d, ConvTranspose1d
 from torch.nn.utils import remove_weight_norm
 
-try:
-    from torch.nn.utils.parametrizations import weight_norm
-except ImportError:
-    from torch.nn.utils import weight_norm
+from torch.nn.utils.parametrizations import weight_norm
 
 from torch.distributions.uniform import Uniform
 from torch.nn import Parameter

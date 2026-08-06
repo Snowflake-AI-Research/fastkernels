@@ -27,7 +27,7 @@ _NAME = "fastkernels_L1_ops"
 
 _SOURCES = [
     "binding.cpp", "rmsnorm.cu", "rmsnorm_quant.cu",
-    "activation.cu", "pos_enc.cu",
+    "pos_enc.cu",
     "moe_sum.cu", "moe_align.cu", "moe_topk_softmax.cu",
     "eagle_utils.cu",
     # DeepSeek-V3 router ops (verbatim port of vLLM csrc/moe sources;

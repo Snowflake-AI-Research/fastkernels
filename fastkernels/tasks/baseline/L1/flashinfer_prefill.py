@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from flashinfer.prefill import trtllm_batch_context_with_kv_cache
 
-from .fa_utils import FA_VERSION, VLLM_FA_AVAILABLE, flash_attn_varlen_func
+from .fa_utils import FA_VERSION, flash_attn_varlen_func
 from .flashinfer_decode import prime_trtllm_sinks, trtllm_sinks
 
 
@@ -77,18 +77,6 @@ class TRTLLMPrefill(nn.Module):
             fa_extra["s_aux"] = s_aux
         if window_size is not None:
             fa_extra["window_size"] = window_size
-        if not VLLM_FA_AVAILABLE:  # pragma: no cover - CPU-only fallback
-            from flash_attn import (
-                flash_attn_varlen_func as _fa2_varlen_func,
-            )
-            return _fa2_varlen_func(
-                q, k, v,
-                cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
-                softmax_scale=softmax_scale if softmax_scale is not None else self.sm_scale,
-                causal=causal,
-                **fa_extra,
-            )
         return flash_attn_varlen_func(
             q, k, v,
             cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,

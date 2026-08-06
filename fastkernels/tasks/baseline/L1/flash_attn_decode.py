@@ -10,10 +10,7 @@ size; upstream ``flash_attn`` requires page sizes divisible by 256.
 import torch
 import torch.nn as nn
 
-from .fa_utils import FA_VERSION, VLLM_FA_AVAILABLE, flash_attn_varlen_func
-
-if not VLLM_FA_AVAILABLE:  # pragma: no cover - CPU-only fallback
-    from flash_attn import flash_attn_with_kvcache
+from .fa_utils import FA_VERSION, flash_attn_varlen_func
 
 
 class FlashAttnDecode(nn.Module):
@@ -34,35 +31,29 @@ class FlashAttnDecode(nn.Module):
 
     def forward(self, q, k_cache, v_cache, cache_seqlens=None, **kwargs):
         max_seq_len = kwargs.pop("max_seq_len", None)
-        if VLLM_FA_AVAILABLE:
-            block_table = kwargs.pop("block_table", None)
-            softmax_scale = kwargs.pop("softmax_scale", None)
-            kwargs.pop("causal", None)
+        block_table = kwargs.pop("block_table", None)
+        softmax_scale = kwargs.pop("softmax_scale", None)
+        kwargs.pop("causal", None)
 
-            n = q.shape[0]
-            cu_seqlens_q = self._get_cu_seqlens_q(n, q.device)
-            if max_seq_len is not None:
-                max_seqlen_k = max_seq_len
-            else:
-                max_seqlen_k = int(cache_seqlens.max().item()) if cache_seqlens.numel() > 0 else 0
+        n = q.shape[0]
+        cu_seqlens_q = self._get_cu_seqlens_q(n, q.device)
+        if max_seq_len is not None:
+            max_seqlen_k = max_seq_len
+        else:
+            max_seqlen_k = int(cache_seqlens.max().item()) if cache_seqlens.numel() > 0 else 0
 
-            fa_kw = dict(
-                q=q,
-                k=k_cache,
-                v=v_cache,
-                cu_seqlens_q=cu_seqlens_q,
-                max_seqlen_q=1,
-                seqused_k=cache_seqlens,
-                max_seqlen_k=max_seqlen_k,
-                softmax_scale=softmax_scale,
-                causal=True,
-                block_table=block_table,
-                fa_version=FA_VERSION,
-            )
-            fa_kw.update(kwargs)
-            return flash_attn_varlen_func(**fa_kw)
-
-        return flash_attn_with_kvcache(
-            q.unsqueeze(1), k_cache, v_cache,
-            cache_seqlens=cache_seqlens, **kwargs,
-        ).squeeze(1)
+        fa_kw = dict(
+            q=q,
+            k=k_cache,
+            v=v_cache,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=1,
+            seqused_k=cache_seqlens,
+            max_seqlen_k=max_seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=True,
+            block_table=block_table,
+            fa_version=FA_VERSION,
+        )
+        fa_kw.update(kwargs)
+        return flash_attn_varlen_func(**fa_kw)

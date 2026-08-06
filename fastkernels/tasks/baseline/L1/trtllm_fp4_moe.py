@@ -49,6 +49,10 @@ _NVFP4_GROUP = 16
 _CACHE_PERMUTE_INDICES: dict[torch.Size, torch.Tensor] = {}
 
 
+import flashinfer
+import flashinfer.fused_moe as _fm
+
+
 def trtllm_fp4_moe_available() -> bool:
     """True iff the TRTLLM NVFP4 block-scale MoE path should be used.
 
@@ -62,15 +66,9 @@ def trtllm_fp4_moe_available() -> bool:
         return False
     if torch.cuda.get_device_capability()[0] != 10:
         return False
-    try:
-        import flashinfer  # noqa: F401
-        import flashinfer.fused_moe as fm
-
-        return hasattr(fm, "trtllm_fp4_block_scale_moe") and hasattr(
-            flashinfer, "nvfp4_block_scale_interleave"
-        )
-    except Exception:
-        return False
+    return hasattr(_fm, "trtllm_fp4_block_scale_moe") and hasattr(
+        flashinfer, "nvfp4_block_scale_interleave"
+    )
 
 
 def _reorder_w1w3_to_w3w1(

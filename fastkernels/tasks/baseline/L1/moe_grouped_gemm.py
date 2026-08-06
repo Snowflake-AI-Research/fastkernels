@@ -19,19 +19,14 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-try:
-    import deep_gemm as _dg
-    _HAS_DEEP_GEMM = True
-except ImportError:
-    _dg = None
-    _HAS_DEEP_GEMM = False
+import deep_gemm as _dg
 
 
 _BLOCK_ALIGNMENT = 128
 
 
 def _is_deep_gemm_supported() -> bool:
-    if not _HAS_DEEP_GEMM:
+    if not torch.cuda.is_available():
         return False
     cap = torch.cuda.get_device_capability()
     return cap[0] >= 9
@@ -39,12 +34,7 @@ def _is_deep_gemm_supported() -> bool:
 
 @functools.cache
 def _deep_gemm_alignment() -> int:
-    if not _HAS_DEEP_GEMM:
-        return _BLOCK_ALIGNMENT
-    try:
-        return _dg.get_mk_alignment_for_contiguous_layout()
-    except AttributeError:
-        return _BLOCK_ALIGNMENT
+    return _dg.get_mk_alignment_for_contiguous_layout()
 
 
 def _valid_deep_gemm_shape(M: int, N: int, K: int) -> bool:

@@ -28,16 +28,8 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-# DeepGEMM provides the FP8 fast path on Hopper+; on environments
-# without it the BF16 / Triton fallbacks still work.  Import lazily
-# so importing this module from a non-FP8 codepath (e.g. the BF16
-# Jamba-tiny-dev MoE) doesn't fail on machines without DeepGEMM.
-try:
-    import deep_gemm
-    _HAS_DEEP_GEMM = True
-except ImportError:  # pragma: no cover -- exercised at import time
-    deep_gemm = None  # type: ignore[assignment]
-    _HAS_DEEP_GEMM = False
+# DeepGEMM provides the FP8 fast path on Hopper+.
+import deep_gemm
 
 from .fp8_grouped_gemm_contiguous import _is_deep_gemm_e8m0_used
 
@@ -92,11 +84,8 @@ def _maybe_get_flashinfer_fp8_gemm():
     cap = torch.cuda.get_device_capability()
     if cap[0] != 9:  # Hopper only — same gate as vLLM.
         return None
-    try:
-        from flashinfer.gemm import fp8_blockscale_gemm_sm90
-        _FLASHINFER_FN = fp8_blockscale_gemm_sm90
-    except Exception:
-        _FLASHINFER_FN = None
+    from flashinfer.gemm import fp8_blockscale_gemm_sm90
+    _FLASHINFER_FN = fp8_blockscale_gemm_sm90
     return _FLASHINFER_FN
 
 # ---------------------------------------------------------------------------
@@ -243,19 +232,11 @@ _HAS_VLLM_CUDA_QUANT: bool | None = None
 def _check_vllm_cuda_quant() -> bool:
     global _HAS_VLLM_CUDA_QUANT
     if _HAS_VLLM_CUDA_QUANT is None:
-        try:
-            # vLLM registers the fp8 quant ops from ``vllm._custom_ops`` (>=0.20);
-            # ``vllm._C`` no longer exists in 0.24, so importing it here failed and
-            # forced the fastkernels fallback quant, diverging from vLLM's numerics.
-            try:
-                import vllm._custom_ops  # noqa: F401 — vLLM >= 0.20
-            except ImportError:
-                import vllm._C  # noqa: F401 — legacy vLLM <= 0.18
-            _HAS_VLLM_CUDA_QUANT = hasattr(torch.ops, "_C") and hasattr(
-                torch.ops._C, "per_token_group_fp8_quant"
-            )
-        except (ImportError, AttributeError):
-            _HAS_VLLM_CUDA_QUANT = False
+        # vLLM registers the fp8 quant ops from ``vllm._custom_ops``.
+        import vllm._custom_ops  # noqa: F401
+        _HAS_VLLM_CUDA_QUANT = hasattr(torch.ops, "_C") and hasattr(
+            torch.ops._C, "per_token_group_fp8_quant"
+        )
     return _HAS_VLLM_CUDA_QUANT
 
 

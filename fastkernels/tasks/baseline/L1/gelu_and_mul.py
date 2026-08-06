@@ -11,22 +11,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-try:
-    # vLLM registers torch.ops._C.gelu*_and_mul from ``vllm._custom_ops`` (>=0.20);
-    # ``vllm._C`` was the pre-0.20 entry point and no longer exists in 0.24.
-    try:
-        import vllm._custom_ops  # noqa: F401 — vLLM >= 0.20
-    except ImportError:
-        import vllm._C  # noqa: F401 — legacy vLLM <= 0.18
-    # Importing the extension does not guarantee the ops are registered in the
-    # ``_C`` namespace (varies by vLLM build). Verify before binding, otherwise
-    # fall back to the pure-PyTorch path (there is no fastkernels csrc gelu
-    # kernel, unlike silu_and_mul).
-    _VLLM_GELU_AVAILABLE = hasattr(torch.ops._C, "gelu_and_mul") and hasattr(
-        torch.ops._C, "gelu_tanh_and_mul"
-    )
-except ImportError:
-    _VLLM_GELU_AVAILABLE = False
+# vLLM registers torch.ops._C.gelu*_and_mul from ``vllm._custom_ops``.
+import vllm._custom_ops  # noqa: F401
 
 
 class GeluAndMul(nn.Module):
@@ -37,14 +23,11 @@ class GeluAndMul(nn.Module):
         self.approximate = approximate
         if approximate not in ("none", "tanh"):
             raise ValueError(f"Unsupported GELU approximation: {approximate}")
-        if _VLLM_GELU_AVAILABLE:
-            self.op = (
-                torch.ops._C.gelu_tanh_and_mul
-                if approximate == "tanh"
-                else torch.ops._C.gelu_and_mul
-            )
-        else:
-            self.op = None
+        self.op = (
+            torch.ops._C.gelu_tanh_and_mul
+            if approximate == "tanh"
+            else torch.ops._C.gelu_and_mul
+        )
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
@@ -57,6 +40,6 @@ class GeluAndMul(nn.Module):
         return out
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.op is None or torch.compiler.is_compiling():
+        if torch.compiler.is_compiling():
             return self.forward_native(x)
         return self.forward_cuda(x)

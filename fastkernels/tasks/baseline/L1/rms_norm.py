@@ -3,8 +3,7 @@
 Mirrors vLLM's ``CustomOp`` dispatch pattern:
   - ``forward_cuda``: calls vLLM's ``torch.ops._C.rms_norm`` /
     ``torch.ops._C.fused_add_rms_norm`` CUDA kernels for bitwise-identical
-    numerics with vLLM.  Falls back to ``fastkernels_norm.*`` if vLLM ops
-    are not available.
+    numerics with vLLM.
   - ``forward_native``: pure PyTorch implementation (f32 promotion, variance,
     rsqrt, weight multiply).  Used when torch.compile is active so Inductor
     can inline, fuse, and optimise the norm with adjacent ops — this is the
@@ -32,32 +31,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .csrc import _C
+# vLLM's C extension registers torch.ops._C.rms_norm / fused_add_rms_norm.
+import vllm._custom_ops  # noqa: F401
 
-try:
-    # vLLM's C extension registers torch.ops._C.rms_norm / fused_add_rms_norm.
-    # The module that triggers registration differs across versions: vLLM <=0.18
-    # exposed ``vllm._C`` directly, while 0.24 removed that name and registers the
-    # ops from ``vllm._custom_ops``. Import whichever is present so we use vLLM's
-    # bitwise-identical norm kernels instead of silently falling back to
-    # fastkernels' own — the fallback diverges slightly per layer and, summed
-    # over every RMSNorm in a deep model, measurably erodes vLLM output parity.
-    try:
-        import vllm._custom_ops  # noqa: F401 — vLLM >= 0.20 registration path
-    except ImportError:
-        import vllm._C  # noqa: F401 — legacy vLLM (<= 0.18) registration path
-    # Importing the extension is not sufficient: some vLLM builds don't register
-    # rms_norm / fused_add_rms_norm into the ``_C`` op namespace. Verify the ops
-    # actually exist, otherwise fall back to fastkernels' own CUDA kernels.
-    _VLLM_NORM_AVAILABLE = hasattr(torch.ops._C, "rms_norm") and hasattr(
-        torch.ops._C, "fused_add_rms_norm"
-    )
-except ImportError:
-    _VLLM_NORM_AVAILABLE = False
+from .csrc import _C
 
 # ---------------------------------------------------------------------------
 # Register _C ops as torch.library custom ops for torch.compile compatibility.
-# These are used in eager mode and as CUDA graph replay targets.
+# Used by ``rms_norm_native`` / ``rmsnorm_quant`` (not by this module's eager
+# path, which always goes through vLLM's ``torch.ops._C``).
 # ---------------------------------------------------------------------------
 
 _lib = torch.library.Library("fastkernels_norm", "DEF")
@@ -137,8 +119,6 @@ class RMSNorm(nn.Module):
         return x, residual
 
     # -- CUDA kernel path (used in eager mode / CUDA graph replay) --
-    # Prefers vLLM's CUDA kernels for bitwise-identical numerics;
-    # falls back to fastkernels's own kernels when vLLM is unavailable.
 
     @staticmethod
     def forward_cuda(
@@ -159,31 +139,17 @@ class RMSNorm(nn.Module):
             x = x.contiguous()
             if residual is not None:
                 residual = residual.contiguous()
-            if _VLLM_NORM_AVAILABLE:
-                if residual is None:
-                    out = torch.empty_like(x)
-                    torch.ops._C.rms_norm(out, x, weight, eps)
-                    return out
-                else:
-                    torch.ops._C.fused_add_rms_norm(x, residual, weight, eps)
-                    return x, residual
-            else:
-                if residual is None:
-                    out = torch.empty_like(x)
-                    torch.ops.fastkernels_norm.rmsnorm(out, x, weight, eps)
-                    return out
-                else:
-                    torch.ops.fastkernels_norm.fused_add_rmsnorm(
-                        x, residual, weight, eps,
-                    )
-                    return x, residual
-        else:
             if residual is None:
-                return F.rms_norm(x, (x.size(-1),), eps=eps)
-            else:
-                x = x + residual
-                residual = x
-                return F.rms_norm(x, (x.size(-1),), eps=eps), residual
+                out = torch.empty_like(x)
+                torch.ops._C.rms_norm(out, x, weight, eps)
+                return out
+            torch.ops._C.fused_add_rms_norm(x, residual, weight, eps)
+            return x, residual
+        if residual is None:
+            return F.rms_norm(x, (x.size(-1),), eps=eps)
+        x = x + residual
+        residual = x
+        return F.rms_norm(x, (x.size(-1),), eps=eps), residual
 
     def forward(self, x, residual=None):
         if torch.compiler.is_compiling():

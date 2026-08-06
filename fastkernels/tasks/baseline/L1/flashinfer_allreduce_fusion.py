@@ -70,6 +70,10 @@ _MiB = 1024 * 1024
 _MAX_BATCHED_TOKENS = 16384
 
 
+import flashinfer.comm as flashinfer_comm
+from flashinfer.comm.mnnvl import TorchDistBackend
+
+
 def fi_ar_fusion_available() -> bool:
     """True when FlashInfer exposes ``allreduce_fusion`` and it is not disabled."""
     global _FI_AVAILABLE, _flashinfer_comm, _TorchDistBackend
@@ -78,15 +82,9 @@ def fi_ar_fusion_available() -> bool:
     if os.environ.get("FASTKERNELS_FI_ALLREDUCE_FUSION", "1") == "0":
         _FI_AVAILABLE = False
         return False
-    try:
-        import flashinfer.comm as flashinfer_comm
-        from flashinfer.comm.mnnvl import TorchDistBackend
-
-        _FI_AVAILABLE = hasattr(flashinfer_comm, "allreduce_fusion")
-        _flashinfer_comm = flashinfer_comm
-        _TorchDistBackend = TorchDistBackend
-    except ImportError:
-        _FI_AVAILABLE = False
+    _FI_AVAILABLE = hasattr(flashinfer_comm, "allreduce_fusion")
+    _flashinfer_comm = flashinfer_comm
+    _TorchDistBackend = TorchDistBackend
     return _FI_AVAILABLE
 
 

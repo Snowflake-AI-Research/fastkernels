@@ -7,10 +7,9 @@ import os
 import torch
 import torch.nn as nn
 
-try:
-    import vllm._custom_ops  # noqa: F401 — vLLM >= 0.20 registers torch.ops._C
-except ImportError:
-    import vllm._C  # noqa: F401 — legacy vLLM <= 0.18
+import vllm._custom_ops  # noqa: F401 — registers torch.ops._C
+import flashinfer as _flashinfer
+from flashinfer import TopKTieBreak as _TopKTieBreak
 
 
 # vLLM's DSA decode indexer uses a radix-histogram top-k fast path for the
@@ -19,7 +18,7 @@ _RADIX_TOPK_SIZES = (512, 1024, 2048)
 _RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024  # bytes (matches vLLM RADIX_TOPK_WORKSPACE_SIZE)
 
 
-# --- Optional DETERMINISTIC DSA top-k ------------------------------------
+# --- DETERMINISTIC DSA top-k (diagnostic) --------------------------------
 # vLLM's radix top-k kernels (cooperative_topk / persistent_topk /
 # top_k_per_row_*) emit the correct top-k SET but in a NONDETERMINISTIC ORDER
 # (atomic-append), plus a rarer SET race at exact score ties on the k-th
@@ -35,13 +34,6 @@ _RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024  # bytes (matches vLLM RADIX_TOPK_WORKS
 # top-k path aborts during graph replay, so use it together with
 # ``--enforce-eager`` (which is how ``forced_decode.py`` drives it).
 _DETERMINISTIC_TOPK = os.environ.get("FASTKERNELS_DSA_DETERMINISTIC_TOPK", "0") != "0"
-try:
-    import flashinfer as _flashinfer
-    from flashinfer import TopKTieBreak as _TopKTieBreak
-    _HAS_FI_TOPK = hasattr(_flashinfer, "top_k")
-except Exception:  # pragma: no cover - flashinfer optional
-    _flashinfer = None
-    _HAS_FI_TOPK = False
 
 
 def _deterministic_topk_indices(
@@ -165,7 +157,7 @@ class TopKPerRow(nn.Module):
         if M == 0:
             return indices
 
-        if _DETERMINISTIC_TOPK and _HAS_FI_TOPK:
+        if _DETERMINISTIC_TOPK:
             det = _deterministic_topk_indices(logits, cu_seqlen_ks, cu_seqlen_ke, topk)
             indices.copy_(det)
             return indices
@@ -210,7 +202,7 @@ class TopKPerRow(nn.Module):
         if total_rows == 0:
             return indices
 
-        if _DETERMINISTIC_TOPK and _HAS_FI_TOPK and logits.is_cuda:
+        if _DETERMINISTIC_TOPK and logits.is_cuda:
             # Per-row causal length (same cap as the radix path: seq_len for
             # next_n==1, else max(0, seq_len - next_n + 1 + j)). Window is
             # [0, row_len); flashinfer gives a deterministic set+order.

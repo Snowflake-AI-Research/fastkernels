@@ -51,18 +51,9 @@ _CUDNN_MAX_HEAD_DIM = 128
 
 
 def _resolve_flash_attn_func():
-    """Return the best available flash-attention callable, or None."""
-    for import_path in (
-        ("fa3_fwd_interface", "flash_attn_func"),
-        ("flash_attn_interface", "flash_attn_func"),
-        ("flash_attn", "flash_attn_func"),
-    ):
-        try:
-            mod = __import__(import_path[0], fromlist=[import_path[1]])
-            return getattr(mod, import_path[1])
-        except ImportError:
-            continue
-    return None
+    """Return the flash-attention callable for Ampere/Hopper."""
+    from flash_attn import flash_attn_func
+    return flash_attn_func
 
 
 class DenseAttention(nn.Module):
@@ -105,12 +96,6 @@ class DenseAttention(nn.Module):
 
         if backend == "flash_attn":
             self.fa_func = _resolve_flash_attn_func()
-            if self.fa_func is None:
-                raise ImportError(
-                    "backend='flash_attn' requested but no flash-attention "
-                    "package is installed (tried fa3_fwd_interface, "
-                    "flash_attn_interface, flash_attn)"
-                )
             return
 
         # backend == "auto": flash-attn on Ampere/Hopper (80<=cc<100); cuDNN flash

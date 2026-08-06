@@ -46,6 +46,12 @@ _sparse_workspace: torch.Tensor | None = None
 _ragged_workspace: torch.Tensor | None = None
 
 
+from flashinfer.decode import (  # noqa: F401
+    trtllm_batch_decode_with_kv_cache_mla,
+)
+from flashinfer.prefill import trtllm_ragged_attention_deepseek  # noqa: F401
+
+
 def flashinfer_mla_sparse_available() -> bool:
     """True iff vLLM's FLASHINFER_MLA_SPARSE backend would be usable here.
 
@@ -56,17 +62,7 @@ def flashinfer_mla_sparse_available() -> bool:
     """
     if not torch.cuda.is_available():
         return False
-    if torch.cuda.get_device_capability()[0] != 10:
-        return False
-    try:
-        from flashinfer.decode import (  # noqa: F401
-            trtllm_batch_decode_with_kv_cache_mla,
-        )
-        from flashinfer.prefill import trtllm_ragged_attention_deepseek  # noqa: F401
-
-        return True
-    except ImportError:
-        return False
+    return torch.cuda.get_device_capability()[0] == 10
 
 
 def ensure_workspaces(device: torch.device) -> None:

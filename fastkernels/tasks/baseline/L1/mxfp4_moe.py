@@ -41,28 +41,15 @@ import torch.nn as nn
 
 @functools.cache
 def _ensure_triton_kernels_on_path() -> None:
-    """Ensure the ``triton_kernels`` package is importable.
+    """Ensure the ``triton_kernels`` package is importable via vLLM's bundle.
 
     Mirrors vLLM's ``import_triton_kernels`` shim but performs only
     filesystem / sys.path manipulation -- no vLLM functions are called.
-    Prefers a top-level install if present and otherwise falls back to
-    the copy bundled inside the installed vLLM package.
     """
-    if importlib.util.find_spec("triton_kernels") is not None:
-        return
-
     vllm_spec = importlib.util.find_spec("vllm")
-    if vllm_spec is not None and vllm_spec.origin is not None:
-        third_party = os.path.join(os.path.dirname(vllm_spec.origin), "third_party")
-        if os.path.isdir(os.path.join(third_party, "triton_kernels")):
-            if third_party not in sys.path:
-                sys.path.insert(0, third_party)
-            return
-
-    raise ImportError(
-        "triton_kernels is required for MXFP4 MoE. Install it from "
-        "https://github.com/triton-lang/triton/tree/main/python/triton_kernels"
-    )
+    third_party = os.path.join(os.path.dirname(vllm_spec.origin), "third_party")
+    if third_party not in sys.path:
+        sys.path.insert(0, third_party)
 
 
 # ---------------------------------------------------------------------------

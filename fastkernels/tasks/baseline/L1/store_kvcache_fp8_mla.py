@@ -26,20 +26,12 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-try:
-    import vllm._custom_ops  # noqa: F401 — vLLM >= 0.20 registers torch.ops._C_cache_ops
-except ImportError:
-    import vllm._C  # noqa: F401 — legacy vLLM <= 0.18
+import vllm._custom_ops  # noqa: F401 — registers torch.ops._C_cache_ops
 
 _KV_C_DIM = 512
 _K_PE_DIM = 64
 _FP8_BYTES_PER_TOKEN = 656
 _BF16_ELEMS_PER_TOKEN = _KV_C_DIM + _K_PE_DIM  # 576
-
-_HAS_GATHER_AND_DEQUANT = (
-    hasattr(torch.ops, "_C_cache_ops")
-    and hasattr(torch.ops._C_cache_ops, "gather_and_maybe_dequant_cache")
-)
 
 
 class StoreKVCacheFP8MLA(nn.Module):
@@ -144,12 +136,7 @@ class GatherAndDequantKVCacheMLA(nn.Module):
     owning ``MLAAttention`` allocated; vLLM likewise forwards its own
     ``self.kv_cache_dtype`` here, and passing ``"fp8_ds_mla"`` for a BF16
     cache reinterprets the bytes and silently corrupts the gathered context.
-
-    Raises ``RuntimeError`` if the kernel is unavailable; callers should
-    check :pyattr:`available` and fall back to :class:`GatherKVCacheFP8MLA`.
     """
-
-    available: bool = _HAS_GATHER_AND_DEQUANT
 
     def __init__(self, kv_cache_dtype: str = "fp8_ds_mla"):
         super().__init__()
@@ -176,11 +163,6 @@ class GatherAndDequantKVCacheMLA(nn.Module):
         total_tokens: int,
         workspace_starts: torch.Tensor,
     ) -> None:
-        if not _HAS_GATHER_AND_DEQUANT:
-            raise RuntimeError(
-                "torch.ops._C_cache_ops.gather_and_maybe_dequant_cache is "
-                "unavailable; use GatherKVCacheFP8MLA instead.",
-            )
         torch.ops._C_cache_ops.gather_and_maybe_dequant_cache(
             kv_cache, workspace,
             block_table, cu_seq_lens, token_to_seq,

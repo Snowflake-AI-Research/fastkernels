@@ -24,6 +24,10 @@ import torch.nn as nn
 _FP8_BLOCK = 128
 
 
+import flashinfer  # noqa: F401
+import flashinfer.fused_moe as _fm
+
+
 def trtllm_fp8_moe_available() -> bool:
     """True iff the TRTLLM fp8 block-scale routed-MoE path should be used.
 
@@ -38,14 +42,10 @@ def trtllm_fp8_moe_available() -> bool:
         return False
     if torch.cuda.get_device_capability()[0] != 10:
         return False
-    try:
-        import flashinfer.fused_moe as fm  # noqa: F401
-        return all(
-            hasattr(fm, f)
-            for f in ("trtllm_fp8_block_scale_routed_moe", "trtllm_fp8_block_scale_moe")
-        )
-    except Exception:
-        return False
+    return all(
+        hasattr(_fm, f)
+        for f in ("trtllm_fp8_block_scale_routed_moe", "trtllm_fp8_block_scale_moe")
+    )
 
 
 def _swap_w13_to_w31(x: torch.Tensor) -> torch.Tensor:

@@ -33,13 +33,8 @@ import os
 import torch
 import torch.nn as nn
 
-try:
-    from flashinfer.fused_moe import trtllm_bf16_moe as _trtllm_bf16_moe
+from flashinfer.fused_moe import trtllm_bf16_moe as _trtllm_bf16_moe
 
-    _TRTLLM_BF16_MOE_AVAILABLE = True
-except Exception:  # pragma: no cover - optional dependency
-    _trtllm_bf16_moe = None
-    _TRTLLM_BF16_MOE_AVAILABLE = False
 
 # ``RoutingMethodType`` values (vllm/model_executor/layers/fused_moe/config.py).
 # The kernel implements each scoring/normalization scheme internally, so the
@@ -79,7 +74,7 @@ def trtllm_bf16_moe_supported() -> bool:
     """
     if os.environ.get("FASTKERNELS_TRTLLM_BF16_MOE", "1") == "0":
         return False
-    if not _TRTLLM_BF16_MOE_AVAILABLE or not torch.cuda.is_available():
+    if not torch.cuda.is_available():
         return False
     return torch.cuda.get_device_capability()[0] == 10
 

@@ -8,10 +8,7 @@ FA2 otherwise) -- see :mod:`fa_utils`.
 import torch
 import torch.nn as nn
 
-from .fa_utils import FA_VERSION, VLLM_FA_AVAILABLE, flash_attn_varlen_func
-
-if not VLLM_FA_AVAILABLE:  # pragma: no cover - CPU-only fallback
-    from flash_attn import flash_attn_varlen_func as _fa2_varlen_func
+from .fa_utils import FA_VERSION, flash_attn_varlen_func
 
 
 class FlashAttnPrefill(nn.Module):
@@ -23,24 +20,20 @@ class FlashAttnPrefill(nn.Module):
         self.sm_scale = head_dim ** -0.5
 
     def forward(self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs):
-        if VLLM_FA_AVAILABLE:
-            # vLLM's wrapper takes keyword args in a different order than the
-            # standard flash_attn signature.  With a ``block_table`` the
-            # kernel needs per-sequence ``seqused_k`` rather than cumulative
-            # ``cu_seqlens_k``.
-            fa_kw = dict(
-                max_seqlen_q=max_seqlen_q,
-                cu_seqlens_q=cu_seqlens_q,
-                max_seqlen_k=max_seqlen_k,
-                fa_version=FA_VERSION,
-            )
-            if kwargs.get("block_table") is not None:
-                seqused_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
-                fa_kw["seqused_k"] = seqused_k
-            else:
-                fa_kw["cu_seqlens_k"] = cu_seqlens_k
-            fa_kw.update(kwargs)
-            return flash_attn_varlen_func(q, k, v, **fa_kw)
-        return _fa2_varlen_func(
-            q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs,
+        # vLLM's wrapper takes keyword args in a different order than the
+        # standard flash_attn signature.  With a ``block_table`` the
+        # kernel needs per-sequence ``seqused_k`` rather than cumulative
+        # ``cu_seqlens_k``.
+        fa_kw = dict(
+            max_seqlen_q=max_seqlen_q,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_k=max_seqlen_k,
+            fa_version=FA_VERSION,
         )
+        if kwargs.get("block_table") is not None:
+            seqused_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+            fa_kw["seqused_k"] = seqused_k
+        else:
+            fa_kw["cu_seqlens_k"] = cu_seqlens_k
+        fa_kw.update(kwargs)
+        return flash_attn_varlen_func(q, k, v, **fa_kw)

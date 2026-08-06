@@ -38,31 +38,15 @@ _TRITON_NUM_PAR_SOFTMAX_SEGMENTS = 16
 # paged path tops out here too; above it vLLM drops to TRITON_ATTN.
 _TRTLLM_MAX_HEAD_SIZE = 256
 
-try:
-    from vllm.v1.attention.ops.triton_unified_attention import (
-        unified_attention as _triton_unified_attention,
-    )
+from vllm.v1.attention.ops.triton_unified_attention import (
+    unified_attention as _triton_unified_attention,
+)
+from vllm.v1.kv_cache_interface import KVQuantMode as _VllmKVQuantMode
+import inspect as _inspect
 
-    _TRITON_UNIFIED_AVAILABLE = True
-except Exception:  # pragma: no cover - optional vLLM runtime dependency.
-    _triton_unified_attention = None
-    _TRITON_UNIFIED_AVAILABLE = False
-
-try:
-    from vllm.v1.kv_cache_interface import KVQuantMode as _VllmKVQuantMode
-except Exception:  # pragma: no cover - optional vLLM runtime dependency.
-    _VllmKVQuantMode = None
-
-if _TRITON_UNIFIED_AVAILABLE:
-    import inspect as _inspect
-
-    _TRITON_UNIFIED_ACCEPTS_KV_QUANT = (
-        _VllmKVQuantMode is not None
-        and "kv_quant_mode"
-        in _inspect.signature(_triton_unified_attention).parameters
-    )
-else:
-    _TRITON_UNIFIED_ACCEPTS_KV_QUANT = False
+_TRITON_UNIFIED_ACCEPTS_KV_QUANT = (
+    "kv_quant_mode" in _inspect.signature(_triton_unified_attention).parameters
+)
 
 
 def _chunked_prefill_remap(
@@ -438,11 +422,10 @@ class Attention(nn.Module):
         block_tables: torch.Tensor | None,
     ) -> bool:
         return (
-            _TRITON_UNIFIED_AVAILABLE
             # The kernel reads the cache as [num_blocks, block_size,
             # num_kv_heads, head_size]; an HND-allocated layer would have its
             # head and block dims transposed.
-            and self.kv_layout == "NHD"
+            self.kv_layout == "NHD"
             and self.attention_chunk_size is None
             and k_cache.numel() > 0
             and block_tables is not None

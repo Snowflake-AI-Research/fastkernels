@@ -17,10 +17,7 @@ from ..L1.pointtransformerv3_offsets import Batch2Offset, Offset2Batch, Offset2B
 from ..L1.segment_csr import SegmentCSR
 from ..L1.pointtransformerv3_serialization import PointTransformerV3Serialization
 
-try:
-    import flash_attn
-except ImportError:
-    flash_attn = None
+import flash_attn
 
 
 _BATCH2OFFSET = Batch2Offset()
@@ -247,7 +244,6 @@ class SerializedAttention(PointModule):
             assert not enable_rpe
             assert not upcast_attention
             assert not upcast_softmax
-            assert flash_attn is not None, "Make sure flash_attn is installed."
             self.patch_size = patch_size
             self.attn_drop = attn_drop
         else:
