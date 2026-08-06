@@ -6,7 +6,7 @@ Operators are organized into four levels of abstraction (L1 single-kernel, L2 fu
 
 ## Quick Start
 
-Requires Python 3.10+, CUDA 12.x, and a recent NVIDIA GPU (Hopper / Blackwell tested; Ampere supported for a subset of kernels).
+Requires Python 3.10+, CUDA 12+, and a recent NVIDIA GPU (Hopper / Blackwell tested; Ampere supported for a subset of kernels).
 
 ```bash
 git clone https://github.com/Snowflake-AI-Research/fastkernels.git
