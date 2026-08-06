@@ -59,6 +59,14 @@ _BULK_CHUNK_CAP = 512
 # -- see ``tasks/baseline/L2/mamba_mixer._padded_token_cat``.
 _MAMBA_GEMM_ALIGN = 8
 
+# How many audio sequences to push through the Whisper encoder per forward. The
+# encoder is not covered by the KV-cache memory budget, so this -- not
+# max_num_seqs -- is what bounds its activation peak. See the call site in
+# LlamaEngine.generate. Override for A/B.
+_WHISPER_ENCODER_CHUNK = int(
+    os.environ.get("FASTKERNELS_WHISPER_ENCODER_CHUNK", "64")
+)
+
 
 def _load_tokenizer(model_name: str):
     try:
@@ -9317,13 +9325,39 @@ class LlamaEngine:
                                 if s.encoder_features is not None and not s.encoder_computed]
                 if encoder_seqs:
                     model = self.model_runner.model
-                    features_batch = torch.stack([
-                        s.encoder_features.to(
-                            device=f"cuda:{self.model_runner.rank}",
-                            dtype=self.model_runner.dtype,
-                        ) for s in encoder_seqs
-                    ], dim=0)
-                    encoder_outputs = model.get_multimodal_embeddings(features_batch)
+                    dev = f"cuda:{self.model_runner.rank}"
+                    # Run the encoder in chunks rather than stacking every
+                    # admitted sequence into one forward. The encoder's cost is
+                    # linear in the batch and nothing reserves memory for it:
+                    # allocate_kv_cache hands the KV cache everything
+                    # gpu_memory_utilization allows minus the (peak - current)
+                    # transient it measured during warmup, and _warmup_whisper
+                    # runs the encoder at batch 1. So the reserve was ~1/338 of
+                    # the real peak, while a step admitting max_num_seqs=338
+                    # sequences needs 338 x 1500 x 5120 x 2 = 4.84 GiB for the
+                    # FFN intermediate alone and ~15 GiB live -- against the
+                    # 18.1 GiB left over, which OOM'd in the encoder MLP on the
+                    # full librispeech scenario.
+                    #
+                    # Chunking bounds the peak independently of max_num_seqs
+                    # instead of shrinking the KV cache for every whisper run.
+                    # 64 x 1500 = 96k encoder tokens per forward already
+                    # saturates a B200, so this is not paying throughput for the
+                    # headroom. The per-chunk output tensors stay alive either
+                    # way (encoder_outputs holds unbind views of them), so what
+                    # this actually frees is the transient FFN activation, which
+                    # is the term that scales.
+                    encoder_outputs = []
+                    for i in range(0, len(encoder_seqs), _WHISPER_ENCODER_CHUNK):
+                        chunk = encoder_seqs[i:i + _WHISPER_ENCODER_CHUNK]
+                        features_batch = torch.stack([
+                            s.encoder_features.to(
+                                device=dev, dtype=self.model_runner.dtype,
+                            ) for s in chunk
+                        ], dim=0)
+                        encoder_outputs.extend(
+                            model.get_multimodal_embeddings(features_batch))
+                        del features_batch
                     for seq, enc_out in zip(encoder_seqs, encoder_outputs):
                         seq.encoder_computed = True
                         seq.encoder_seq_len = enc_out.shape[0]

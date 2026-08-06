@@ -30,7 +30,16 @@ class BasicTransformerBlock(nn.Module):
         cross_attention_dim: int | None = None,
     ):
         super().__init__()
-        self.norm1 = LayerNorm(dim)
+        # promote_fp32=False: diffusers' BasicTransformerBlock uses a plain
+        # nn.LayerNorm, and ATen's layer_norm already accumulates the reduction
+        # in fp32 for a bf16 input, so the promotion was a parity deviation and
+        # 2 extra cast kernels at each of the 3 sites per block. It also broke
+        # the compiled UNet outright: the promote path caches w.float() on the
+        # module, that cast runs inside the cudagraph-managed subgraph, and the
+        # next invocation overwrites the pool the cached tensor points into --
+        # "accessing tensor output of CUDAGraphs that has been overwritten by a
+        # subsequent run", raised on the first warmup call. See L1/layer_norm.
+        self.norm1 = LayerNorm(dim, promote_fp32=False)
         self.attn1 = SDXLAttention(
             query_dim=dim,
             heads=num_attention_heads,
@@ -38,7 +47,7 @@ class BasicTransformerBlock(nn.Module):
             cross_attention_dim=None,
         )
 
-        self.norm2 = LayerNorm(dim)
+        self.norm2 = LayerNorm(dim, promote_fp32=False)
         self.attn2 = SDXLAttention(
             query_dim=dim,
             heads=num_attention_heads,
@@ -46,7 +55,7 @@ class BasicTransformerBlock(nn.Module):
             cross_attention_dim=cross_attention_dim,
         )
 
-        self.norm3 = LayerNorm(dim)
+        self.norm3 = LayerNorm(dim, promote_fp32=False)
         self.ff = FeedForward(dim)
 
     def forward(
