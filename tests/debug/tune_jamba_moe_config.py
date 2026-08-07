@@ -18,9 +18,10 @@ the padding: the win here is real but small, and it does not come from where it
 looks like it should.
 
 Rather than change the shared heuristic (every MoE model in the repo reads it),
-this writes a tuned table to ``L1/moe_configs/``, which ``_get_moe_configs``
-searches and which is keyed by ``E`` and ``N`` -- so it applies to Jamba's expert
-shape and nothing else.
+this emits a tuned table for Jamba's ``(E, N)`` only. Bundled defaults now live
+inline as ``MOE_TRITON_CONFIGS`` in ``L1/moe_grouped_gemm.py``; ``--write``
+prints a Python dict fragment to paste there (and also drops a JSON file that
+``FASTKERNELS_TUNED_CONFIG_FOLDER`` can load without editing the op).
 
 Measures the whole ``FusedExperts`` op, not one GEMM, so the moe_align/moe_sum
 cost of a given BLOCK_SIZE_M is included in the choice. It still measures it in
@@ -100,7 +101,8 @@ def main():
                     help="Spot-check a small grid at a few M instead of the "
                          "full sweep.")
     ap.add_argument("--write", action="store_true",
-                    help="Write the winning configs to L1/moe_configs/.")
+                    help="Emit winning configs as a MOE_TRITON_CONFIGS fragment "
+                         "(+ JSON for FASTKERNELS_TUNED_CONFIG_FOLDER).")
     ap.add_argument(
         "--max-tuned-m", type=int, default=64,
         help="Keys above this get the heuristic's 'large' config rather than "
@@ -196,17 +198,30 @@ def main():
                 best[m] = dict(heuristic_large)
         print(f"\n  pinned {pinned} keys above M={args.max_tuned_m} to the "
               f"heuristic's large config")
-        out_dir = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "..", "..", "fastkernels", "tasks", "baseline", "L1", "moe_configs",
-        )
-        os.makedirs(out_dir, exist_ok=True)
+        # JSON override (loadable via FASTKERNELS_TUNED_CONFIG_FOLDER).
         name = _get_config_file_name(NUM_EXPERTS, INTERMEDIATE, None)
-        path = os.path.join(out_dir, name)
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
         with open(path, "w") as f:
             json.dump({str(k): v for k, v in sorted(best.items())}, f, indent=2)
             f.write("\n")
-        print(f"\n  wrote {os.path.normpath(path)}")
+        print(f"\n  wrote override JSON {os.path.normpath(path)}")
+        print("  (point FASTKERNELS_TUNED_CONFIG_FOLDER at this directory, or")
+        print("   paste the fragment below into MOE_TRITON_CONFIGS in")
+        print("   L1/moe_grouped_gemm.py)")
+        device = torch.cuda.get_device_name().replace(" ", "_")
+        if "H200" in device.split("_"):
+            device = "NVIDIA_H200"
+        print(f"\n    ({NUM_EXPERTS}, {INTERMEDIATE}, {device!r}, None, None): {{")
+        for m, cfg in sorted(best.items()):
+            order = [
+                "BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K",
+                "GROUP_SIZE_M", "num_warps", "num_stages",
+            ]
+            parts = ", ".join(
+                f"{k!r}: {cfg[k]}" for k in order if k in cfg
+            )
+            print(f"        {m}: {{{parts}}},")
+        print("    },")
 
 
 if __name__ == "__main__":
