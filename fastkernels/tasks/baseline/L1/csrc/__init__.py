@@ -45,7 +45,7 @@ _VLLM_PORT = [
 
 _SOURCES = [
     "binding.cpp", "rmsnorm.cu", "rmsnorm_quant.cu",
-    # pos_enc.cu replaced by vLLM's pos_encoding_kernels.cu (bit-identical rope).
+    # RoPE: vLLM's pos_encoding_kernels.cu (below in _VLLM_PORT).
     "moe_sum.cu", "moe_align.cu", "moe_topk_softmax.cu",
     "eagle_utils.cu",
     "dsv3_router_gemm_entry.cu",

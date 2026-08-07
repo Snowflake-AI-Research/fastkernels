@@ -4,6 +4,17 @@
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 # Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/selective_state_update.py
 
+"""Mamba selective SSM L1 ops (scan + decode state update).
+
+Vendored from vLLM / mamba_ssm Triton+CUDA kernels. Public entry points:
+
+* :func:`selective_scan_fn` / :class:`SelectiveScan` — varlen prefill CUDA scan
+* :func:`selective_state_update` / :class:`SelectiveStateUpdate` — decode step
+
+Tuned ``selective_state_update`` launch configs are inlined below as
+``SSM_SELECTIVE_STATE_UPDATE_CONFIGS``.
+"""
+
 import functools
 import json
 import os
@@ -12,14 +23,24 @@ from contextlib import contextmanager
 from typing import Any
 
 import torch
+import torch.nn as nn
 from packaging import version
 
 import triton
 import triton.language as tl
 
-from ..csrc import _C as ops
-from .triton_helpers import fast_exp
-from .constants import NULL_BLOCK_ID
+from .csrc import _C as ops
+
+# Verbatim from vllm.v1.attention.backends.utils.
+NULL_BLOCK_ID = 0
+
+
+@triton.jit
+def fast_exp(x):
+    """Faster alternative to tl.exp() using the hardware exp2 instruction."""
+    LOG2E = tl.constexpr(1.4426950408889634)
+    return tl.math.exp2(LOG2E * x)
+
 
 HAS_TRITON = True
 
@@ -27,21 +48,343 @@ TRITON3 = HAS_TRITON and (version.parse(triton.__version__) >= version.parse("3.
 
 
 # ---------------------------------------------------------------------------
-# JSON config loading
+# Bundled selective_state_update launch configs
+# Keyed by (headdim, dstate, device_name, cache_dtype) -> {M: {BLOCK_SIZE_M, num_warps}}
+# Override at runtime via VLLM_TUNED_CONFIG_FOLDER (JSON).
 # ---------------------------------------------------------------------------
 
-_CONFIGS_DIR = os.path.join(
-    os.path.dirname(os.path.realpath(__file__)), "configs", "selective_state_update"
-)
+# (headdim, dstate, device_name, cache_dtype) -> {M: launch config}
+SSM_SELECTIVE_STATE_UPDATE_CONFIGS: dict[
+    tuple[int, int, str, str], dict[int, dict[str, int]]
+] = {
+    (64, 128, 'AMD_Instinct_MI300X', 'float16'): {
+        128: {'BLOCK_SIZE_M': 32, 'num_warps': 8},
+        256: {'BLOCK_SIZE_M': 16, 'num_warps': 4},
+        1024: {'BLOCK_SIZE_M': 64, 'num_warps': 1},
+        2048: {'BLOCK_SIZE_M': 32, 'num_warps': 2},
+        4096: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        8192: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        16384: {'BLOCK_SIZE_M': 32, 'num_warps': 2},
+        32768: {'BLOCK_SIZE_M': 64, 'num_warps': 8},
+        65536: {'BLOCK_SIZE_M': 64, 'num_warps': 8},
+        131072: {'BLOCK_SIZE_M': 64, 'num_warps': 4},
+        196608: {'BLOCK_SIZE_M': 32, 'num_warps': 4},
+        262144: {'BLOCK_SIZE_M': 32, 'num_warps': 4},
+    },
+    (64, 128, 'AMD_Instinct_MI300X', 'float32'): {
+        128: {'BLOCK_SIZE_M': 8, 'num_warps': 4},
+        256: {'BLOCK_SIZE_M': 8, 'num_warps': 4},
+        1024: {'BLOCK_SIZE_M': 64, 'num_warps': 1},
+        2048: {'BLOCK_SIZE_M': 32, 'num_warps': 4},
+        4096: {'BLOCK_SIZE_M': 32, 'num_warps': 4},
+        8192: {'BLOCK_SIZE_M': 8, 'num_warps': 1},
+        16384: {'BLOCK_SIZE_M': 32, 'num_warps': 4},
+        32768: {'BLOCK_SIZE_M': 8, 'num_warps': 1},
+        65536: {'BLOCK_SIZE_M': 64, 'num_warps': 4},
+        131072: {'BLOCK_SIZE_M': 64, 'num_warps': 4},
+        196608: {'BLOCK_SIZE_M': 64, 'num_warps': 1},
+        262144: {'BLOCK_SIZE_M': 64, 'num_warps': 4},
+    },
+    (64, 128, 'AMD_Instinct_MI350_OAM', 'float16'): {
+        128: {'BLOCK_SIZE_M': 16, 'num_warps': 4},
+        256: {'BLOCK_SIZE_M': 32, 'num_warps': 4},
+        1024: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        2048: {'BLOCK_SIZE_M': 8, 'num_warps': 1},
+        4096: {'BLOCK_SIZE_M': 8, 'num_warps': 1},
+        8192: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        16384: {'BLOCK_SIZE_M': 8, 'num_warps': 1},
+        32768: {'BLOCK_SIZE_M': 8, 'num_warps': 1},
+        65536: {'BLOCK_SIZE_M': 8, 'num_warps': 1},
+        131072: {'BLOCK_SIZE_M': 16, 'num_warps': 1},
+        196608: {'BLOCK_SIZE_M': 16, 'num_warps': 1},
+        262144: {'BLOCK_SIZE_M': 8, 'num_warps': 1},
+    },
+    (64, 128, 'AMD_Instinct_MI350_OAM', 'float32'): {
+        128: {'BLOCK_SIZE_M': 16, 'num_warps': 4},
+        256: {'BLOCK_SIZE_M': 16, 'num_warps': 4},
+        1024: {'BLOCK_SIZE_M': 8, 'num_warps': 1},
+        2048: {'BLOCK_SIZE_M': 8, 'num_warps': 1},
+        4096: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        8192: {'BLOCK_SIZE_M': 32, 'num_warps': 2},
+        16384: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        32768: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        65536: {'BLOCK_SIZE_M': 64, 'num_warps': 8},
+        131072: {'BLOCK_SIZE_M': 64, 'num_warps': 8},
+        196608: {'BLOCK_SIZE_M': 64, 'num_warps': 2},
+        262144: {'BLOCK_SIZE_M': 64, 'num_warps': 8},
+    },
+    (64, 128, 'AMD_Instinct_MI355_OAM', 'float16'): {
+        128: {'BLOCK_SIZE_M': 16, 'num_warps': 4},
+        256: {'BLOCK_SIZE_M': 32, 'num_warps': 4},
+        1024: {'BLOCK_SIZE_M': 8, 'num_warps': 1},
+        2048: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        4096: {'BLOCK_SIZE_M': 16, 'num_warps': 1},
+        8192: {'BLOCK_SIZE_M': 16, 'num_warps': 1},
+        16384: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        32768: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        65536: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        131072: {'BLOCK_SIZE_M': 64, 'num_warps': 2},
+        196608: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        262144: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+    },
+    (64, 128, 'AMD_Instinct_MI355_OAM', 'float32'): {
+        128: {'BLOCK_SIZE_M': 16, 'num_warps': 4},
+        256: {'BLOCK_SIZE_M': 16, 'num_warps': 4},
+        1024: {'BLOCK_SIZE_M': 8, 'num_warps': 1},
+        2048: {'BLOCK_SIZE_M': 8, 'num_warps': 1},
+        4096: {'BLOCK_SIZE_M': 16, 'num_warps': 8},
+        8192: {'BLOCK_SIZE_M': 8, 'num_warps': 2},
+        16384: {'BLOCK_SIZE_M': 8, 'num_warps': 2},
+        32768: {'BLOCK_SIZE_M': 64, 'num_warps': 4},
+        65536: {'BLOCK_SIZE_M': 64, 'num_warps': 2},
+        131072: {'BLOCK_SIZE_M': 64, 'num_warps': 2},
+        196608: {'BLOCK_SIZE_M': 64, 'num_warps': 2},
+        262144: {'BLOCK_SIZE_M': 64, 'num_warps': 2},
+    },
+    (64, 128, 'NVIDIA_B200', 'float16'): {
+        8: {'BLOCK_SIZE_M': 4, 'num_warps': 4},
+        16: {'BLOCK_SIZE_M': 8, 'num_warps': 8},
+        32: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        64: {'BLOCK_SIZE_M': 16, 'num_warps': 4},
+        128: {'BLOCK_SIZE_M': 32, 'num_warps': 4},
+        256: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        512: {'BLOCK_SIZE_M': 32, 'num_warps': 4},
+        1024: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        2048: {'BLOCK_SIZE_M': 32, 'num_warps': 2},
+        4096: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        8192: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        12288: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        16384: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        24576: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        32768: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        49152: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        65536: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        98304: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        131072: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        196608: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        262144: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+    },
+    (64, 128, 'NVIDIA_B200', 'float32'): {
+        8: {'BLOCK_SIZE_M': 4, 'num_warps': 4},
+        16: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        32: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        64: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        128: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        256: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        512: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        1024: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        2048: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        4096: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        8192: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        12288: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        16384: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        24576: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        32768: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        49152: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        65536: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        98304: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        131072: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        196608: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        262144: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+    },
+    (64, 128, 'NVIDIA_GB200', 'float16'): {
+        8: {'BLOCK_SIZE_M': 4, 'num_warps': 4},
+        16: {'BLOCK_SIZE_M': 8, 'num_warps': 8},
+        32: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        64: {'BLOCK_SIZE_M': 16, 'num_warps': 4},
+        128: {'BLOCK_SIZE_M': 32, 'num_warps': 4},
+        256: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        512: {'BLOCK_SIZE_M': 32, 'num_warps': 1},
+        1024: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        2048: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        4096: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        8192: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        12288: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        16384: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        24576: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        32768: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        49152: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        65536: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        98304: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        131072: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        196608: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        262144: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+    },
+    (64, 128, 'NVIDIA_GB200', 'float32'): {
+        8: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        16: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        32: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        64: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        128: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        256: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        512: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        1024: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        2048: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        4096: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        8192: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        12288: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        16384: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        24576: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        32768: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        49152: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        65536: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        98304: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        131072: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        196608: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        262144: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+    },
+    (64, 128, 'NVIDIA_H100_80GB_HBM3', 'float16'): {
+        8: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        16: {'BLOCK_SIZE_M': 16, 'num_warps': 4},
+        32: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        64: {'BLOCK_SIZE_M': 16, 'num_warps': 4},
+        128: {'BLOCK_SIZE_M': 8, 'num_warps': 2},
+        256: {'BLOCK_SIZE_M': 8, 'num_warps': 2},
+        512: {'BLOCK_SIZE_M': 8, 'num_warps': 2},
+        1024: {'BLOCK_SIZE_M': 8, 'num_warps': 1},
+        2048: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        4096: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        8192: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        12288: {'BLOCK_SIZE_M': 16, 'num_warps': 4},
+        16384: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        24576: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        32768: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        49152: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        65536: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        98304: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        131072: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        196608: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        262144: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+    },
+    (64, 128, 'NVIDIA_H100_80GB_HBM3', 'float32'): {
+        8: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        16: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        32: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        64: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        128: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        256: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        512: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        1024: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        2048: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        4096: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        8192: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        12288: {'BLOCK_SIZE_M': 64, 'num_warps': 8},
+        16384: {'BLOCK_SIZE_M': 16, 'num_warps': 1},
+        24576: {'BLOCK_SIZE_M': 64, 'num_warps': 8},
+        32768: {'BLOCK_SIZE_M': 16, 'num_warps': 1},
+        49152: {'BLOCK_SIZE_M': 64, 'num_warps': 8},
+        65536: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        98304: {'BLOCK_SIZE_M': 16, 'num_warps': 1},
+        131072: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        196608: {'BLOCK_SIZE_M': 16, 'num_warps': 1},
+        262144: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+    },
+    (64, 128, 'NVIDIA_H200', 'float16'): {
+        8: {'BLOCK_SIZE_M': 4, 'num_warps': 2},
+        16: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        32: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        64: {'BLOCK_SIZE_M': 16, 'num_warps': 4},
+        128: {'BLOCK_SIZE_M': 8, 'num_warps': 2},
+        256: {'BLOCK_SIZE_M': 8, 'num_warps': 2},
+        512: {'BLOCK_SIZE_M': 16, 'num_warps': 1},
+        1024: {'BLOCK_SIZE_M': 16, 'num_warps': 1},
+        2048: {'BLOCK_SIZE_M': 8, 'num_warps': 2},
+        4096: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        8192: {'BLOCK_SIZE_M': 32, 'num_warps': 2},
+        12288: {'BLOCK_SIZE_M': 32, 'num_warps': 4},
+        16384: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        24576: {'BLOCK_SIZE_M': 32, 'num_warps': 4},
+        32768: {'BLOCK_SIZE_M': 32, 'num_warps': 2},
+        49152: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        65536: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        98304: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        131072: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        196608: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+        262144: {'BLOCK_SIZE_M': 16, 'num_warps': 2},
+    },
+    (64, 128, 'NVIDIA_H200', 'float32'): {
+        8: {'BLOCK_SIZE_M': 8, 'num_warps': 4},
+        16: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        32: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        64: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        128: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        256: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        512: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        1024: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        2048: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        4096: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        8192: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        12288: {'BLOCK_SIZE_M': 8, 'num_warps': 1},
+        16384: {'BLOCK_SIZE_M': 8, 'num_warps': 1},
+        24576: {'BLOCK_SIZE_M': 8, 'num_warps': 1},
+        32768: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        49152: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        65536: {'BLOCK_SIZE_M': 8, 'num_warps': 2},
+        98304: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        131072: {'BLOCK_SIZE_M': 32, 'num_warps': 4},
+        196608: {'BLOCK_SIZE_M': 16, 'num_warps': 1},
+        262144: {'BLOCK_SIZE_M': 16, 'num_warps': 1},
+    },
+    (64, 128, 'NVIDIA_RTX_PRO_6000_Blackwell_Server_Edition', 'float16'): {
+        8: {'BLOCK_SIZE_M': 4, 'num_warps': 4},
+        16: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        32: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        64: {'BLOCK_SIZE_M': 8, 'num_warps': 8},
+        128: {'BLOCK_SIZE_M': 16, 'num_warps': 8},
+        256: {'BLOCK_SIZE_M': 16, 'num_warps': 8},
+        512: {'BLOCK_SIZE_M': 16, 'num_warps': 8},
+        1024: {'BLOCK_SIZE_M': 16, 'num_warps': 8},
+        2048: {'BLOCK_SIZE_M': 16, 'num_warps': 8},
+        4096: {'BLOCK_SIZE_M': 16, 'num_warps': 8},
+        8192: {'BLOCK_SIZE_M': 32, 'num_warps': 1},
+        12288: {'BLOCK_SIZE_M': 16, 'num_warps': 1},
+        16384: {'BLOCK_SIZE_M': 32, 'num_warps': 4},
+        24576: {'BLOCK_SIZE_M': 32, 'num_warps': 4},
+        32768: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        49152: {'BLOCK_SIZE_M': 32, 'num_warps': 2},
+        65536: {'BLOCK_SIZE_M': 32, 'num_warps': 1},
+        98304: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        131072: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        196608: {'BLOCK_SIZE_M': 32, 'num_warps': 1},
+        262144: {'BLOCK_SIZE_M': 16, 'num_warps': 1},
+    },
+    (64, 128, 'NVIDIA_RTX_PRO_6000_Blackwell_Server_Edition', 'float32'): {
+        8: {'BLOCK_SIZE_M': 8, 'num_warps': 8},
+        16: {'BLOCK_SIZE_M': 8, 'num_warps': 8},
+        32: {'BLOCK_SIZE_M': 8, 'num_warps': 8},
+        64: {'BLOCK_SIZE_M': 8, 'num_warps': 8},
+        128: {'BLOCK_SIZE_M': 8, 'num_warps': 8},
+        256: {'BLOCK_SIZE_M': 8, 'num_warps': 8},
+        512: {'BLOCK_SIZE_M': 8, 'num_warps': 8},
+        1024: {'BLOCK_SIZE_M': 16, 'num_warps': 8},
+        2048: {'BLOCK_SIZE_M': 16, 'num_warps': 8},
+        4096: {'BLOCK_SIZE_M': 16, 'num_warps': 1},
+        8192: {'BLOCK_SIZE_M': 4, 'num_warps': 8},
+        12288: {'BLOCK_SIZE_M': 16, 'num_warps': 1},
+        16384: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        24576: {'BLOCK_SIZE_M': 4, 'num_warps': 1},
+        32768: {'BLOCK_SIZE_M': 4, 'num_warps': 4},
+        49152: {'BLOCK_SIZE_M': 16, 'num_warps': 4},
+        65536: {'BLOCK_SIZE_M': 64, 'num_warps': 8},
+        98304: {'BLOCK_SIZE_M': 16, 'num_warps': 1},
+        131072: {'BLOCK_SIZE_M': 8, 'num_warps': 1},
+        196608: {'BLOCK_SIZE_M': 64, 'num_warps': 8},
+        262144: {'BLOCK_SIZE_M': 64, 'num_warps': 4},
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Launch-config loading
+# ---------------------------------------------------------------------------
 
 
 def get_ssm_config_file_name(
     headdim: int, dstate: int, cache_dtype: str, device_name: str
 ) -> str:
-    """Return the JSON filename for the given kernel shape.
+    """Return the override JSON filename for the given kernel shape.
 
-    Layout: ``configs/selective_state_update/
-    headdim=<H>,dstate=<D>,device_name=<dev>,cache_dtype=<dt>.json``.
+    Layout (``VLLM_TUNED_CONFIG_FOLDER`` only):
+    ``headdim=<H>,dstate=<D>,device_name=<dev>,cache_dtype=<dt>.json``.
     """
     return (
         f"headdim={headdim},dstate={dstate},"
@@ -67,36 +410,32 @@ def get_ssm_configs(
     """
     Return tuned (BLOCK_SIZE_M, num_warps) configs for *selective_state_update*
     keyed by ``effective_batch = batch * nheads``, or ``None`` if no config
-    file is found for the (headdim, dstate, cache_dtype, device) combination.
+    is found for the (headdim, dstate, cache_dtype, device) combination.
 
-    They can be generated with:
-        benchmarks/kernels/benchmark_selective_state_update.py --save-configs
+    Preference order:
+      1. ``VLLM_TUNED_CONFIG_FOLDER`` JSON override (same filename scheme as vLLM)
+      2. Bundled ``SSM_SELECTIVE_STATE_UPDATE_CONFIGS`` table
     """
     cache_dtype = _canonical_cache_dtype(cache_dtype)
     device_name = get_ssm_device_name()
     json_file_name = get_ssm_config_file_name(headdim, dstate, cache_dtype, device_name)
 
-    config_file_paths: list[str] = []
-
-    # User-supplied override
+    # User-supplied override (still JSON so external sweep scripts work).
     user_defined_config_folder = os.environ.get("VLLM_TUNED_CONFIG_FOLDER")
     if user_defined_config_folder is not None:
-        config_file_paths.append(
-            os.path.join(user_defined_config_folder, json_file_name)
-        )
-
-    # Bundled default
-    config_file_paths.append(os.path.join(_CONFIGS_DIR, json_file_name))
-
-    for path in config_file_paths:
+        path = os.path.join(user_defined_config_folder, json_file_name)
         if os.path.exists(path):
             with open(path) as f:
                 raw = json.load(f)
-                if isinstance(raw, dict):
-                    # triton_version included in the config file only for reference
-                    raw.pop("triton_version", None)
-                    return {int(k): v for k, v in raw.items() if k.isdigit()}
+            if isinstance(raw, dict):
+                raw.pop("triton_version", None)
+                return {int(k): v for k, v in raw.items() if k.isdigit()}
 
+    bundled = SSM_SELECTIVE_STATE_UPDATE_CONFIGS.get(
+        (headdim, dstate, device_name, cache_dtype)
+    )
+    if bundled is not None:
+        return dict(bundled)
     return None
 
 
@@ -808,3 +1147,22 @@ def selective_scan_fn(
         return delta  # output written inplace to delta
     else:
         return z  # output written inplace to z
+
+
+# ---------------------------------------------------------------------------
+# nn.Module wrappers (L1 tasks are Modules; free fns kept for SOTA-call parity)
+# ---------------------------------------------------------------------------
+
+
+class SelectiveScan(nn.Module):
+    """L1 wrapper around :func:`selective_scan_fn`."""
+
+    def forward(self, *args, **kwargs):
+        return selective_scan_fn(*args, **kwargs)
+
+
+class SelectiveStateUpdate(nn.Module):
+    """L1 wrapper around :func:`selective_state_update`."""
+
+    def forward(self, *args, **kwargs):
+        return selective_state_update(*args, **kwargs)
