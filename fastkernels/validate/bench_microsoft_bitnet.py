@@ -1073,7 +1073,7 @@ os._exit(0)
 
 
 def run_worker(script: str, config: dict, label: str) -> dict | None:
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, dir="/tmp") as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
         f.write(script)
         wpath = f.name
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:

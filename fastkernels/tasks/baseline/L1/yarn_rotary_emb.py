@@ -39,14 +39,10 @@ except Exception:
     _USE_FLASHINFER_ROPE = False
 
 
-# GLM-5.2's plain "default" rope: applied via the vendored vLLM
-# ``_C.rotary_embedding`` (base RotaryEmbedding.forward_cuda). fastkernels'
-# own rope kernel differs from that kernel by ~1 bf16 ULP (verified:
-# max|Δ|=3.1e-2 on identical input+cache), which is the ROPE half of the
-# MLA-core divergence. Call the vendored kernel so q_pe/k_pe are
-# bit-identical to vLLM.
-from .csrc import _C
-
+# GLM-5.2's plain "default" rope is applied via the vendored vLLM rotary
+# kernel (base RotaryEmbedding.forward_cuda), exposed as the
+# ``torch.ops.fastkernels_rope.rotary_embedding`` custom op registered by
+# ``rotary_emb``. Importing it here ensures the op is defined.
 from .rotary_emb import RotaryEmbedding
 
 
@@ -252,15 +248,13 @@ class YarnRotaryEmbedding(nn.Module):
         cache = self.cos_sin_cache
         if cache.dtype != query.dtype:
             cache = cache.to(query.dtype)
-        if self.is_plain:
-            # GLM-5.2 plain "default" rope: call the vendored vLLM rotary
-            # kernel so q_pe/k_pe are bit-identical to vLLM (local rope
-            # kernel is ~1 ULP off).
-            _C.rotary_embedding(
-                positions, query, key, self.head_dim, cache, self.is_neox_style,
-            )
-        else:
-            torch.ops.fastkernels_rope.rotary_embedding(
-                positions, query, key, self.head_dim, cache, self.is_neox_style,
-            )
+        # GLM-5.2 plain "default" rope and the scaled path both go through the
+        # vendored vLLM rotary kernel. Call it via the registered
+        # ``fastkernels_rope`` custom op (whose CUDA impl is exactly
+        # ``_C.rotary_embedding``) rather than the raw pybind function, so
+        # ``torch.compile`` / cudagraph capture can trace it. Numerically
+        # identical to calling ``_C.rotary_embedding`` directly.
+        torch.ops.fastkernels_rope.rotary_embedding(
+            positions, query, key, self.head_dim, cache, self.is_neox_style,
+        )
         return query, key

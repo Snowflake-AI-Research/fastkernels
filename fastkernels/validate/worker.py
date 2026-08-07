@@ -70,7 +70,7 @@ def run_worker(
         return None
 
     with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".py", delete=False, dir="/tmp",
+        mode="w", suffix=".py", delete=False,
     ) as f:
         f.write(script)
         script_path = f.name
@@ -79,7 +79,7 @@ def run_worker(
         output_path = f.name
 
     with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".json", delete=False, dir="/tmp",
+        mode="w", suffix=".json", delete=False,
     ) as f:
         config["output_file"] = output_path
         json.dump(config, f)
