@@ -59,17 +59,8 @@ class AllReduce(nn.Module):
 # Custom all-reduce via CUDA IPC
 # ---------------------------------------------------------------------------
 def _load_ops():
-    from torch.utils.cpp_extension import load
-    src = os.path.join(
-        os.path.dirname(__file__), "csrc", "custom_allreduce_kernels.cu",
-    )
-    return load(
-        name="custom_allreduce_kernels",
-        sources=[src],
-        extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
-        extra_ldflags=["-lcuda"],
-        verbose=False,
-    )
+    from ....infra.cuda_ext import load_op
+    return load_op("allreduce", "allreduce.cu")
 
 
 _ops = None

@@ -26,20 +26,15 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-try:
-    from xformers.ops import rms_norm as _xf_rms_norm
-    from xformers.ops import rms_norm_add as _xf_rms_norm_add
-    _HAS_XFORMERS_RMS = True
-except ImportError:
-    _HAS_XFORMERS_RMS = False
+from xformers.ops.rmsnorm import rms_norm as _xf_rms_norm
+from xformers.ops.rmsnorm import rms_norm_add as _xf_rms_norm_add
 
 
 class BitNetRMSNorm(nn.Module):
     """Drop-in for ``RMSNorm`` that matches SOTA's xformers kernel exactly.
 
-    Falls back to the same eager pure-PyTorch path as the base RMSNorm
-    when xformers is not installed (we still keep the entire chain in
-    fp32 to match xformers' behaviour bit-exactly).
+    Falls back to a pure-PyTorch path (still keeping the ``x*rstd*w`` chain
+    in fp32) when tensors are not CUDA-contiguous.
     """
 
     def __init__(self, hidden_size: int, eps: float = 1e-6,
@@ -73,7 +68,7 @@ class BitNetRMSNorm(nn.Module):
         # SOTA semantics: the *new* residual is ``x + residual`` (in the
         # input dtype) and the norm operates on that sum.
         if residual is not None:
-            if (_HAS_XFORMERS_RMS and x.is_cuda and x.is_contiguous()
+            if (x.is_cuda and x.is_contiguous()
                     and residual.is_cuda and residual.is_contiguous()
                     and weight is not None):
                 # ``rms_norm_add`` writes the in-place sum back to ``x`` and
@@ -86,7 +81,6 @@ class BitNetRMSNorm(nn.Module):
             out = self._native_forward(new_residual, weight, self.eps)
             return out, new_residual
 
-        if (_HAS_XFORMERS_RMS and x.is_cuda and x.is_contiguous()
-                and weight is not None):
+        if (x.is_cuda and x.is_contiguous() and weight is not None):
             return _xf_rms_norm(x, weight, self.eps)
         return self._native_forward(x, weight, self.eps)

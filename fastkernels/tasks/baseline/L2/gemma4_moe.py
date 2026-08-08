@@ -10,12 +10,8 @@ from ....infra.tp import _tp_rank, _tp_size
 from ..L1.allreduce import AllReduce
 from ..L1.gemma4_routing import Gemma4Routing
 from ..L1.rms_norm import RMSNorm
+from ..L1.gate_linear import _router_gemm_bf16_fp32
 from .fused_experts import FusedExperts
-
-try:
-    import vllm._custom_ops as vllm_ops
-except ImportError:
-    vllm_ops = None
 
 
 class Gemma4GateLinear(nn.Module):
@@ -28,13 +24,11 @@ class Gemma4GateLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if (
-            vllm_ops is not None
-            and hasattr(vllm_ops, "router_gemm_bf16_fp32")
-            and x.is_cuda
+            x.is_cuda
             and x.dtype == torch.bfloat16
             and self.weight.dtype == torch.bfloat16
         ):
-            return vllm_ops.router_gemm_bf16_fp32(x, self.weight)
+            return _router_gemm_bf16_fp32(x, self.weight)
         return F.linear(x.to(self.weight.dtype), self.weight).float()
 
 

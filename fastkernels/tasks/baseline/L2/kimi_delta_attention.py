@@ -4,19 +4,28 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+import triton
 from einops import rearrange
 
-from vllm.third_party.flash_linear_attention.ops.kda import (
-    FusedRMSNormGated,
+from ..L1.rms_norm_gated import FusedRMSNormGated
+from ..L1.kda import (
     chunk_kda_with_fused_gate,
     fused_kda_gate,
     fused_recurrent_kda,
 )
-from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+from ..L1.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
-from vllm.triton_utils.allocation import set_triton_allocator
+
+
+def set_triton_allocator(device: torch.device):
+    """Verbatim from vLLM's ``triton_utils.allocation.set_triton_allocator``."""
+
+    def alloc_fn(size: int, alignment: int, stream: int | None):
+        return torch.empty(size, device=device, dtype=torch.int8)
+
+    triton.set_allocator(alloc_fn)
 
 from ....infra.context import get_context
 from ....infra.tp import _tp_rank, _tp_size

@@ -26,26 +26,20 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-try:
-    import vllm._custom_ops  # noqa: F401 — vLLM >= 0.20 registers torch.ops._C_cache_ops
-except ImportError:
-    import vllm._C  # noqa: F401 — legacy vLLM <= 0.18
+from ....infra.cuda_ext import lazy_op
+
+_C = lazy_op("store_kvcache_fp8_mla", "store_kvcache_fp8_mla.cu")
 
 _KV_C_DIM = 512
 _K_PE_DIM = 64
 _FP8_BYTES_PER_TOKEN = 656
 _BF16_ELEMS_PER_TOKEN = _KV_C_DIM + _K_PE_DIM  # 576
 
-_HAS_GATHER_AND_DEQUANT = (
-    hasattr(torch.ops, "_C_cache_ops")
-    and hasattr(torch.ops._C_cache_ops, "gather_and_maybe_dequant_cache")
-)
-
 
 class StoreKVCacheFP8MLA(nn.Module):
     """Store ``kv_c_normed`` and ``k_pe`` into MLA paged cache.
 
-    Wraps ``torch.ops._C_cache_ops.concat_and_cache_mla``. Dispatches on
+    Wraps vendored ``_C.concat_and_cache_mla``. Dispatches on
     ``kv_cache_dtype``:
 
     * ``"auto"``: expects a BF16 cache of shape
@@ -91,7 +85,7 @@ class StoreKVCacheFP8MLA(nn.Module):
         slot_mapping: torch.Tensor,
     ) -> None:
         k_pe_2d = k_pe.reshape(k_pe.shape[0], -1)
-        torch.ops._C_cache_ops.concat_and_cache_mla(
+        _C.concat_and_cache_mla(
             kv_c_normed, k_pe_2d, kv_cache, slot_mapping,
             self.kv_cache_dtype, self._k_scale,
         )
@@ -100,7 +94,7 @@ class StoreKVCacheFP8MLA(nn.Module):
 class GatherKVCacheFP8MLA(nn.Module):
     """Gather and upconvert KV from FP8 MLA paged cache to BF16.
 
-    Wraps ``torch.ops._C_cache_ops.cp_gather_and_upconvert_fp8_kv_cache``
+    Wraps vendored ``_C.cp_gather_and_upconvert_fp8_kv_cache``
     which gathers FP8-quantized kv_c_normed and BF16 k_pe from paged cache,
     dequantizes the FP8 portion, and writes the result as a contiguous
     BF16 workspace tensor.
@@ -119,9 +113,12 @@ class GatherKVCacheFP8MLA(nn.Module):
         num_seqs: int,
         workspace: torch.Tensor,
     ) -> None:
-        torch.ops._C_cache_ops.cp_gather_and_upconvert_fp8_kv_cache(
-            kv_cache, workspace, block_table, seq_lens,
-            workspace_starts, num_seqs,
+        # ``seq_lens`` is unused by the kernel; lengths are implied by
+        # ``workspace_starts`` + ``workspace.size(0)``. Kept in the Module API
+        # for call-site compatibility.
+        del seq_lens
+        _C.cp_gather_and_upconvert_fp8_kv_cache(
+            kv_cache, workspace, block_table, workspace_starts, num_seqs, None,
         )
 
 
@@ -144,12 +141,7 @@ class GatherAndDequantKVCacheMLA(nn.Module):
     owning ``MLAAttention`` allocated; vLLM likewise forwards its own
     ``self.kv_cache_dtype`` here, and passing ``"fp8_ds_mla"`` for a BF16
     cache reinterprets the bytes and silently corrupts the gathered context.
-
-    Raises ``RuntimeError`` if the kernel is unavailable; callers should
-    check :pyattr:`available` and fall back to :class:`GatherKVCacheFP8MLA`.
     """
-
-    available: bool = _HAS_GATHER_AND_DEQUANT
 
     def __init__(self, kv_cache_dtype: str = "fp8_ds_mla"):
         super().__init__()
@@ -176,12 +168,7 @@ class GatherAndDequantKVCacheMLA(nn.Module):
         total_tokens: int,
         workspace_starts: torch.Tensor,
     ) -> None:
-        if not _HAS_GATHER_AND_DEQUANT:
-            raise RuntimeError(
-                "torch.ops._C_cache_ops.gather_and_maybe_dequant_cache is "
-                "unavailable; use GatherKVCacheFP8MLA instead.",
-            )
-        torch.ops._C_cache_ops.gather_and_maybe_dequant_cache(
+        _C.gather_and_maybe_dequant_cache(
             kv_cache, workspace,
             block_table, cu_seq_lens, token_to_seq,
             total_tokens,

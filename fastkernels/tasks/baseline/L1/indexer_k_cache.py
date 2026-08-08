@@ -11,15 +11,12 @@ Cache format per token (132 bytes):
 Cache tensor shape: ``[num_blocks, block_size, 132]`` with ``dtype=torch.uint8``.
 """
 
-from __future__ import annotations
-
 import torch
 import torch.nn as nn
 
-try:
-    import vllm._custom_ops  # noqa: F401 — vLLM >= 0.20 registers torch.ops._C_cache_ops
-except ImportError:
-    import vllm._C  # noqa: F401 — legacy vLLM <= 0.18
+from ....infra.cuda_ext import lazy_op
+
+_C = lazy_op("indexer_k_cache", "indexer_k_cache.cu")
 
 _HEAD_DIM = 128
 _SCALE_BYTES = 4
@@ -30,7 +27,7 @@ _QUANT_BLOCK_SIZE = 128
 class IndexerKCacheStore(nn.Module):
     """Quantize K to FP8 and store in indexer paged cache via CUDA kernel.
 
-    Wraps ``torch.ops._C_cache_ops.indexer_k_quant_and_cache`` which fuses
+    Wraps vendored ``_C.indexer_k_quant_and_cache`` which fuses
     FP8 quantization (UE8M0 scale) with paged cache insertion.
 
     Args:
@@ -45,7 +42,7 @@ class IndexerKCacheStore(nn.Module):
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> None:
-        torch.ops._C_cache_ops.indexer_k_quant_and_cache(
+        _C.indexer_k_quant_and_cache(
             k, kv_cache, slot_mapping, _QUANT_BLOCK_SIZE, "ue8m0",
         )
 
@@ -53,7 +50,7 @@ class IndexerKCacheStore(nn.Module):
 class IndexerKCacheGather(nn.Module):
     """Gather K from indexer paged cache in FP8 form via CUDA kernel.
 
-    Wraps ``torch.ops._C_cache_ops.cp_gather_indexer_k_quant_cache`` which
+    Wraps vendored ``_C.cp_gather_indexer_k_quant_cache`` which
     gathers FP8 keys and their float32 scales from a paged cache.
 
     Returns:
@@ -93,7 +90,7 @@ class IndexerKCacheGather(nn.Module):
                 total_tokens, _SCALE_BYTES, dtype=torch.uint8, device=device,
             )
 
-        torch.ops._C_cache_ops.cp_gather_indexer_k_quant_cache(
+        _C.cp_gather_indexer_k_quant_cache(
             kv_cache, k_fp8, k_scale, block_table, cu_seq_lens,
         )
 

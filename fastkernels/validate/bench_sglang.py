@@ -564,12 +564,11 @@ def main():
     )
     parser.add_argument(
         "--sglang-python", type=str,
-        default="/home/yak/miniconda3/envs/sglang-bench/bin/python",
-        help="Python interpreter to use for the sglang subprocess. We launch "
-             "sglang in an isolated conda env so its torch / CUDA versions do "
-             "not conflict with fastkernels's (e.g. sglang ships torch 2.9 + cu128, "
-             "fastkernels runs on torch 2.10 + cu130). Default points at the "
-             "`sglang-bench` env created by tests/setup_sglang_env.sh.",
+        default=None,
+        help="Python interpreter for the sglang subprocess. Defaults to the "
+             "`sglang-bench` conda env created by `fastkernels.validate.provision` "
+             "(or `tests/setup_sglang_env.sh`). Isolated so SGLang's torch/CUDA "
+             "do not conflict with the main fastkernels env.",
     )
     parser.add_argument(
         "--output-dir", type=str, default=None,
@@ -580,6 +579,9 @@ def main():
     args.spec_steps = spec_steps
     args.spec_topk = spec_topk
     args.gpu_memory_utilization = gpu_memory_utilization
+    if not args.sglang_python:
+        from fastkernels.validate.provision import _sglang_python
+        args.sglang_python = str(_sglang_python())
 
     gpu = _detect_gpu_name()
     if args.output_dir is None:
@@ -678,10 +680,11 @@ def main():
             # its absence is a failure.
             raise SystemExit(
                 "ERROR: the SGLang reference did not run, so there is nothing "
-                "to compare against. Create the benchmark env with "
-                "`bash tests/setup_sglang_env.sh` (or point --sglang-python at "
-                "an interpreter that has sglang installed). Pass "
-                "--skip-sglang to intentionally run fastkernels alone."
+                "to compare against. Provision the benchmark env with "
+                "`python -m fastkernels.validate.provision sglang` "
+                "(or `bash tests/setup_sglang_env.sh`), or point "
+                "--sglang-python at an interpreter that has sglang installed. "
+                "Pass --skip-sglang to intentionally run fastkernels alone."
             )
 
     # ------------------ fastkernels ------------------

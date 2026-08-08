@@ -42,11 +42,11 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+from ..L1.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
-from vllm.model_executor.layers.mamba.ops.mamba_ssm import (
+from ..L1.mamba_ssm import (
     selective_scan_fn,
     selective_state_update,
 )

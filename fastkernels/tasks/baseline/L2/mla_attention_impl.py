@@ -56,13 +56,7 @@ from ..L1.flashinfer_mla_sparse import (
 from ..L1.merge_attn_states import MergeAttnStates
 from ..L1.bmm import BatchMatMul
 from ..L1.convert_indices import ConvertIndicesToGlobal
-
-try:
-    from vllm.v1.attention.ops.triton_merge_attn_states import (
-        mask_empty_context as _mask_empty_context,
-    )
-except ImportError:  # pragma: no cover - optional vLLM runtime dependency
-    _mask_empty_context = None
+from ..L1.mask_empty_context import mask_empty_context as _mask_empty_context
 
 # Sentinel for the per-step batch-metadata memo: ``None`` is a meaningful
 # result there (no block table => nothing to attend to), so absence needs its own
@@ -207,9 +201,7 @@ class MLAAttention(nn.Module):
         self.decode_op = FlashMLADecode()
         # Dense FP8 decode entry-point (matches vLLM's
         # ``flash_mla_with_kvcache_fp8`` path used in
-        # ``vllm/v1/attention/backends/mla/flashmla.py``). Falls back to the
-        # generic ``FlashMLADecode`` with ``is_fp8_kvcache=True`` when the
-        # specialized kernel is not available (older vLLM builds).
+        # ``vllm/v1/attention/backends/mla/flashmla.py``).
         self.decode_op_fp8 = FlashMLADecodeFP8()
         # Blackwell: FlashMLA's dense decode is SM90a-only, so use the
         # trtllm-gen MLA decode kernel vLLM selects there (FLASHINFER_MLA).
@@ -450,22 +442,13 @@ class MLAAttention(nn.Module):
                 ctx.prefill_block_tables if ctx.is_mixed else ctx.block_tables
             )
 
-            if GatherAndDequantKVCacheMLA.available:
-                self.gather_dequant_kvcache(
-                    kv_cache, workspace, block_table,
-                    chunked_ctx.cu_seq_lens[i],
-                    chunked_ctx.token_to_seq[i],
-                    chunked_ctx.chunk_total_token[i],
-                    chunked_ctx.starts[i],
-                )
-            else:
-                self.gather_kvcache(
-                    kv_cache, block_table,
-                    chunked_ctx.cu_seq_lens[i],
-                    chunked_ctx.starts[i],
-                    chunked_ctx.cu_seq_lens[i].shape[0] - 1,
-                    workspace,
-                )
+            self.gather_dequant_kvcache(
+                kv_cache, workspace, block_table,
+                chunked_ctx.cu_seq_lens[i],
+                chunked_ctx.token_to_seq[i],
+                chunked_ctx.chunk_total_token[i],
+                chunked_ctx.starts[i],
+            )
 
             kv_c_normed = workspace[:toks, :self.kv_lora_rank]
             k_pe = workspace[:toks, self.kv_lora_rank:].unsqueeze(1)
@@ -494,8 +477,7 @@ class MLAAttention(nn.Module):
             # NaN/Inf) even though the LSE is -inf.  Neutralize before the
             # merge, exactly as vLLM does.
             if (
-                _mask_empty_context is not None
-                and i < len(chunked_ctx.has_empty_context)
+                i < len(chunked_ctx.has_empty_context)
                 and chunked_ctx.has_empty_context[i]
             ):
                 _mask_empty_context(
@@ -625,38 +607,21 @@ class MLAAttention(nn.Module):
 
         # Mirrors vLLM's dense FP8 MLA decode path
         # (vllm/v1/attention/backends/mla/flashmla.py:289-302):
-        # use the specialized ``flash_mla_with_kvcache_fp8`` kernel with
-        # per-layer ``descale_q`` / ``descale_k`` and ``causal=True``.
-        if self.decode_op_fp8.available:
-            tile_sched_meta, num_splits = self.get_metadata_dense_fp8(
-                cache_seqlens, self.num_heads, num_heads_k=1,
-            )
-            o, _ = self.decode_op_fp8(
-                q.unsqueeze(1), kv_cache.view(torch.uint8).unsqueeze(-2),
-                block_table, cache_seqlens,
-                head_dim_v=_MLA_HEAD_DIM_V,
-                tile_scheduler_metadata=tile_sched_meta,
-                num_splits=num_splits,
-                softmax_scale=self.scale,
-                causal=True,
-                descale_q=self._q_scale.reshape(1),
-                descale_k=self._k_scale.reshape(1),
-            )
-            o = o.reshape(-1, o.shape[-2], o.shape[-1])
-            return self._v_up_proj(o)
-
-        # Fallback: generic kernel with is_fp8_kvcache=True (older vLLM).
-        tile_sched_meta, _ = self.get_metadata(
+        # specialized ``flash_mla_with_kvcache_fp8`` with per-layer
+        # ``descale_q`` / ``descale_k`` and ``causal=True``.
+        tile_sched_meta, num_splits = self.get_metadata_dense_fp8(
             cache_seqlens, self.num_heads, num_heads_k=1,
-            is_fp8_kvcache=True)
-        o, _ = self.decode_op(
+        )
+        o, _ = self.decode_op_fp8(
             q.unsqueeze(1), kv_cache.view(torch.uint8).unsqueeze(-2),
             block_table, cache_seqlens,
             head_dim_v=_MLA_HEAD_DIM_V,
             tile_scheduler_metadata=tile_sched_meta,
+            num_splits=num_splits,
             softmax_scale=self.scale,
             causal=True,
-            is_fp8_kvcache=True,
+            descale_q=self._q_scale.reshape(1),
+            descale_k=self._k_scale.reshape(1),
         )
         o = o.reshape(-1, o.shape[-2], o.shape[-1])
         return self._v_up_proj(o)
@@ -1479,7 +1444,7 @@ class MLAAttention(nn.Module):
                 )
                 o = o.reshape(-1, o.shape[-2], o.shape[-1])
                 out[np_:] = self._v_up_proj(o)
-            elif self.decode_op_fp8.available:
+            else:
                 tile_sched_meta, num_splits = self.get_metadata_dense_fp8(
                     cache_seqlens, self.num_heads, num_heads_k=1,
                 )
@@ -1493,21 +1458,6 @@ class MLAAttention(nn.Module):
                     causal=True,
                     descale_q=self._q_scale.reshape(1),
                     descale_k=self._k_scale.reshape(1),
-                )
-                o = o.reshape(-1, o.shape[-2], o.shape[-1])
-                out[np_:] = self._v_up_proj(o)
-            else:
-                tile_sched_meta, _ = self.get_metadata(
-                    cache_seqlens, self.num_heads, num_heads_k=1,
-                    is_fp8_kvcache=True)
-                o, _ = self.decode_op(
-                    q_dc.unsqueeze(1), kv_cache.view(torch.uint8).unsqueeze(-2),
-                    block_table, cache_seqlens,
-                    head_dim_v=_MLA_HEAD_DIM_V,
-                    tile_scheduler_metadata=tile_sched_meta,
-                    softmax_scale=self.scale,
-                    causal=True,
-                    is_fp8_kvcache=True,
                 )
                 o = o.reshape(-1, o.shape[-2], o.shape[-1])
                 out[np_:] = self._v_up_proj(o)

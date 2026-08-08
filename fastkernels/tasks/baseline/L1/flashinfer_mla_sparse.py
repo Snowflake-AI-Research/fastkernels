@@ -46,6 +46,12 @@ _sparse_workspace: torch.Tensor | None = None
 _ragged_workspace: torch.Tensor | None = None
 
 
+from flashinfer.decode import (  # noqa: F401
+    trtllm_batch_decode_with_kv_cache_mla,
+)
+from flashinfer.prefill import trtllm_ragged_attention_deepseek  # noqa: F401
+
+
 def flashinfer_mla_sparse_available() -> bool:
     """True iff vLLM's FLASHINFER_MLA_SPARSE backend would be usable here.
 
@@ -56,17 +62,7 @@ def flashinfer_mla_sparse_available() -> bool:
     """
     if not torch.cuda.is_available():
         return False
-    if torch.cuda.get_device_capability()[0] != 10:
-        return False
-    try:
-        from flashinfer.decode import (  # noqa: F401
-            trtllm_batch_decode_with_kv_cache_mla,
-        )
-        from flashinfer.prefill import trtllm_ragged_attention_deepseek  # noqa: F401
-
-        return True
-    except ImportError:
-        return False
+    return torch.cuda.get_device_capability()[0] == 10
 
 
 def ensure_workspaces(device: torch.device) -> None:
@@ -271,8 +267,11 @@ class QuantFp8MLAQuery(nn.Module):
         q: torch.Tensor,         # [N, H, kv_lora_rank + qk_rope_head_dim]
         scale: torch.Tensor,     # [1] fp32
     ) -> torch.Tensor:
-        from vllm import _custom_ops as ops
+        from .fp8_linear import _C
 
         flat = q.reshape(q.shape[0], -1)
-        out, _ = ops.scaled_fp8_quant(flat, scale)
+        out = torch.empty(
+            flat.shape, device=flat.device, dtype=torch.float8_e4m3fn,
+        )
+        _C.static_scaled_fp8_quant(out, flat, scale, None)
         return out.view(q.shape)

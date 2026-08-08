@@ -8,10 +8,10 @@ which has a three-tier dispatch:
    ``hidden_size == 7168``, batch ``<= 16``. BF16 x BF16 -> FP32 fused kernel
    that internally accumulates in FP32. Routes to
    ``_C.dsv3_router_gemm`` (verbatim port of vLLM's CUDA kernel — see
-   ``tasks/baseline/L1/csrc/dsv3_router_gemm_*.cu``).
+   the amalgamated ``tasks/baseline/L1/gate_linear.cu``).
 2. **cuBLAS BF16 -> FP32** — Hopper/Blackwell + BF16 weight + FP32 out. Routes
    to ``_C.router_gemm_bf16_fp32`` (verbatim port of vLLM's cuBLAS wrapper —
-   see ``tasks/baseline/L1/csrc/router_gemm_bf16_fp32.cu``).
+   see the amalgamated ``tasks/baseline/L1/gate_linear.cu``).
 3. **PyTorch fallback** — vanilla ``F.linear`` at the input dtype, with cast
    back to FP32 at the end.
 
@@ -29,7 +29,9 @@ import functools
 import torch
 import torch.nn as nn
 
-from .csrc import _C
+from ....infra.cuda_ext import lazy_op
+
+_C = lazy_op("gate_linear", "gate_linear.cu")
 
 # The pybind11 entry points below are raw C++ extension functions, not torch
 # ops, so Dynamo cannot trace them: compiling a model that calls one fails with

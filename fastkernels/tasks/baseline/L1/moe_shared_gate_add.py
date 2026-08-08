@@ -24,7 +24,8 @@ from __future__ import annotations
 
 import torch
 
-from vllm.triton_utils import tl, triton
+import triton
+import triton.language as tl
 
 
 @triton.jit

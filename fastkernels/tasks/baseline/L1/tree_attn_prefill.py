@@ -42,37 +42,21 @@ import torch
 import torch.nn as nn
 
 from .merge_state import merge_state
-
-_SGL_FA3_AVAILABLE = False
-_SGL_FA3_WITH_KVCACHE = None
-_SGL_MERGE_STATE_V2 = None
-try:
-    from sgl_kernel import merge_state_v2 as _sgl_merge_state_v2
-    from sgl_kernel.flash_attn import (
-        flash_attn_with_kvcache as _sgl_flash_attn_with_kvcache,
-    )
-    if torch.cuda.is_available():
-        cc = torch.cuda.get_device_capability()
-        if cc[0] == 9:
-            _SGL_FA3_AVAILABLE = True
-            _SGL_FA3_WITH_KVCACHE = _sgl_flash_attn_with_kvcache
-            _SGL_MERGE_STATE_V2 = _sgl_merge_state_v2
-except ImportError:
-    pass
-
-# vLLM's bundled FlashAttention handles the paged (block_table + seqused_k)
-# cascade on every supported device -- FA2, FA3 and FA4 all expose it through
-# the same varlen entry point.  Upstream ``flash_attn`` only accepts paged KV
-# whose page size is a multiple of 256, so it is a dense-only fallback here.
-from .fa_utils import (  # noqa: E402
+from .fa_utils import (
     FA_VERSION as _FA_VERSION,
-    VLLM_FA_AVAILABLE as _VLLM_FA_AVAILABLE,
     flash_attn_varlen_func as _VLLM_FA_VARLEN_FUNC,
 )
 
-_FA2_VARLEN_FUNC = None
-if not _VLLM_FA_AVAILABLE:  # pragma: no cover - CPU-only fallback
-    from flash_attn import flash_attn_varlen_func as _FA2_VARLEN_FUNC
+# Hopper (SM90): sgl_kernel FA3 cascade. Elsewhere: vLLM's bundled FA.
+_SGL_FA3_AVAILABLE = False
+_SGL_FA3_WITH_KVCACHE = None
+_SGL_MERGE_STATE_V2 = None
+if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9:
+    from sgl_kernel import merge_state_v2 as _SGL_MERGE_STATE_V2
+    from sgl_kernel.flash_attn import (
+        flash_attn_with_kvcache as _SGL_FA3_WITH_KVCACHE,
+    )
+    _SGL_FA3_AVAILABLE = True
 
 
 def _sgl_fa3_paged(q, k_cache, v_cache, cu_seqlens_q, cache_seqlens,
@@ -105,37 +89,6 @@ def _vllm_fa_paged(q, k_cache, v_cache, cu_seqlens_q, seqused_k,
         causal=False,
         return_softmax_lse=True,
         fa_version=_FA_VERSION,
-    )
-    return out, lse
-
-
-def _fa2_paged(q, k_cache, v_cache, cu_seqlens_q, cu_seqlens_k,
-               max_seqlen_q, max_seqlen_k, block_table, softmax_scale):
-    out, lse, _ = _FA2_VARLEN_FUNC(
-        q, k_cache, v_cache,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_k,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        block_table=block_table,
-        softmax_scale=softmax_scale,
-        causal=False,
-        return_attn_probs=True,
-    )
-    return out, lse
-
-
-def _fa2_dense(q, k_flat, v_flat, cu_seqlens_q, cu_seqlens_k,
-               max_seqlen_q, max_seqlen_k, softmax_scale):
-    out, lse, _ = _FA2_VARLEN_FUNC(
-        q, k_flat, v_flat,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_k,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        softmax_scale=softmax_scale,
-        causal=False,
-        return_attn_probs=True,
     )
     return out, lse
 
@@ -229,70 +182,27 @@ class TreeAttnPrefill(nn.Module):
             )
             return out
 
-        if _VLLM_FA_AVAILABLE:
-            o_prefix, lse_prefix = _vllm_fa_paged(
-                q, kc_blk, vc_blk,
-                cu_seqlens_q=cu_seqlens_q_prefix,
-                seqused_k=cache_seqlens_prefix,
-                max_seqlen_q=max_seqlen_q_prefix,
-                max_seqlen_k=max_seqlen_k_prefix,
-                block_table=block_table_prefix,
-                softmax_scale=scale,
-            )
+        o_prefix, lse_prefix = _vllm_fa_paged(
+            q, kc_blk, vc_blk,
+            cu_seqlens_q=cu_seqlens_q_prefix,
+            seqused_k=cache_seqlens_prefix,
+            max_seqlen_q=max_seqlen_q_prefix,
+            max_seqlen_k=max_seqlen_k_prefix,
+            block_table=block_table_prefix,
+            softmax_scale=scale,
+        )
 
-            kc_tok = k_cache.view(-1, 1, H_kv, D)
-            vc_tok = v_cache.view(-1, 1, H_kv, D)
-            o_expand, lse_expand = _vllm_fa_paged(
-                q, kc_tok, vc_tok,
-                cu_seqlens_q=cu_seqlens_q_expand,
-                seqused_k=cache_seqlens_expand,
-                max_seqlen_q=1,
-                max_seqlen_k=max_seqlen_k_expand,
-                block_table=page_table_expand,
-                softmax_scale=scale,
-            )
-        else:
-            cu_seqlens_k_prefix = torch.zeros(
-                cache_seqlens_prefix.shape[0] + 1,
-                dtype=torch.int32, device=q.device,
-            )
-            cu_seqlens_k_prefix[1:] = torch.cumsum(
-                cache_seqlens_prefix, dim=0, dtype=torch.int32,
-            )
-            o_prefix, lse_prefix = _fa2_paged(
-                q, kc_blk, vc_blk,
-                cu_seqlens_q=cu_seqlens_q_prefix,
-                cu_seqlens_k=cu_seqlens_k_prefix,
-                max_seqlen_q=max_seqlen_q_prefix,
-                max_seqlen_k=max_seqlen_k_prefix,
-                block_table=block_table_prefix,
-                softmax_scale=scale,
-            )
-
-            BN, N = page_table_expand.shape
-            row_arange = torch.arange(N, device=q.device)
-            valid_mask = (
-                row_arange[None, :] < cache_seqlens_expand[:, None].long()
-            )                                                         # [B*N, N]
-            flat_slots = page_table_expand[valid_mask].long()         # [total_k]
-            kc_flat = k_cache.view(-1, H_kv, D)
-            vc_flat = v_cache.view(-1, H_kv, D)
-            k_gathered = kc_flat[flat_slots]                          # [total_k, H_kv, D]
-            v_gathered = vc_flat[flat_slots]
-            cu_seqlens_k_expand = torch.zeros(
-                BN + 1, dtype=torch.int32, device=q.device,
-            )
-            cu_seqlens_k_expand[1:] = torch.cumsum(
-                cache_seqlens_expand, dim=0, dtype=torch.int32,
-            )
-            o_expand, lse_expand = _fa2_dense(
-                q, k_gathered, v_gathered,
-                cu_seqlens_q=cu_seqlens_q_expand,
-                cu_seqlens_k=cu_seqlens_k_expand,
-                max_seqlen_q=1,
-                max_seqlen_k=max_seqlen_k_expand,
-                softmax_scale=scale,
-            )
+        kc_tok = k_cache.view(-1, 1, H_kv, D)
+        vc_tok = v_cache.view(-1, 1, H_kv, D)
+        o_expand, lse_expand = _vllm_fa_paged(
+            q, kc_tok, vc_tok,
+            cu_seqlens_q=cu_seqlens_q_expand,
+            seqused_k=cache_seqlens_expand,
+            max_seqlen_q=1,
+            max_seqlen_k=max_seqlen_k_expand,
+            block_table=page_table_expand,
+            softmax_scale=scale,
+        )
 
         out, _ = merge_state(
             o_prefix, lse_prefix,

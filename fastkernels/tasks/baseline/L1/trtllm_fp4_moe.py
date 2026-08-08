@@ -35,6 +35,10 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from ....infra.cuda_ext import lazy_op
+
+_C = lazy_op("trtllm_fp4_moe", "trtllm_fp4_moe.cu", need_cutlass=True)
+
 # ``epilogue_tile_m`` for the TRTLLM-gen NVFP4 MoE kernels. Matches
 # ``prepare_static_weights_for_trtllm_fp4_moe``
 # (vllm/.../quantization/utils/flashinfer_fp4_moe.py:180).
@@ -47,6 +51,10 @@ _NVFP4_GROUP = 16
 # layer); the indices depend only on the shape, so hoisting the cache to module
 # scope is a pure load-time saving with identical results.
 _CACHE_PERMUTE_INDICES: dict[torch.Size, torch.Tensor] = {}
+
+
+import flashinfer
+import flashinfer.fused_moe as _fm
 
 
 def trtllm_fp4_moe_available() -> bool:
@@ -62,15 +70,9 @@ def trtllm_fp4_moe_available() -> bool:
         return False
     if torch.cuda.get_device_capability()[0] != 10:
         return False
-    try:
-        import flashinfer  # noqa: F401
-        import flashinfer.fused_moe as fm
-
-        return hasattr(fm, "trtllm_fp4_block_scale_moe") and hasattr(
-            flashinfer, "nvfp4_block_scale_interleave"
-        )
-    except Exception:
-        return False
+    return hasattr(_fm, "trtllm_fp4_block_scale_moe") and hasattr(
+        flashinfer, "nvfp4_block_scale_interleave"
+    )
 
 
 def _reorder_w1w3_to_w3w1(
@@ -279,10 +281,43 @@ def prepare_trtllm_fp4_moe_weights(
     }
 
 
+def _create_fp4_scale_tensor(
+    m: int,
+    n: int,
+    device: torch.device,
+    is_sf_swizzled_layout: bool,
+) -> torch.Tensor:
+    """Allocate the output scale tensor for scaled_fp4_quant (vLLM helper)."""
+    block_size = 16
+    if is_sf_swizzled_layout:
+        rounded_m = ((m + 127) // 128) * 128
+        scale_n = n // block_size
+        rounded_n = ((scale_n + 3) // 4) * 4
+        return torch.zeros(
+            (rounded_m, rounded_n // 4), device=device, dtype=torch.int32,
+        )
+    return torch.empty((m, n // block_size), device=device, dtype=torch.uint8)
+
+
+def _create_fp4_output_tensors(
+    m: int,
+    n: int,
+    device: torch.device,
+    is_sf_swizzled_layout: bool,
+    padded_n: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    physical_n = padded_n if padded_n is not None else n
+    output = torch.empty((m, physical_n // 2), device=device, dtype=torch.uint8)
+    output_scale = _create_fp4_scale_tensor(
+        m, physical_n, device, is_sf_swizzled_layout,
+    )
+    return output, output_scale
+
+
 class NvFp4Quantize(nn.Module):
     """NVFP4-quantize activations with a static per-tensor global scale.
 
-    Wraps ``torch.ops._C.scaled_fp4_quant`` exactly as vLLM's
+    Wraps vendored ``_C.scaled_fp4_quant_out`` exactly as vLLM's
     ``_nvfp4_quantize`` -> ``ops.scaled_fp4_quant`` does
     (vllm/_custom_ops.py:scaled_fp4_quant, reached from
     ``MoEPrepareAndFinalizeNoDPEPMonolithic.prepare``).
@@ -299,17 +334,13 @@ class NvFp4Quantize(nn.Module):
     def forward(
         self, x: torch.Tensor, global_scale: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        from vllm._custom_ops import create_fp4_output_tensors
-
         assert x.dim() == 2, f"expected 2D activations, got {tuple(x.shape)}"
         m, n = x.shape
         assert n % _NVFP4_GROUP == 0, f"last dim {n} is not a multiple of 16"
-        out, out_scale = create_fp4_output_tensors(
+        out, out_scale = _create_fp4_output_tensors(
             m, n, x.device, False,  # is_sf_swizzled_layout=False
         )
-        torch.ops._C.scaled_fp4_quant.out(
-            x, global_scale, False, output=out, output_scale=out_scale,
-        )
+        _C.scaled_fp4_quant_out(x, global_scale, False, out, out_scale)
         return out, out_scale.view(torch.float8_e4m3fn)
 
 

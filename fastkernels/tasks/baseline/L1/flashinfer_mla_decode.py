@@ -22,18 +22,12 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-try:
-    from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
-
-    _FLASHINFER_MLA_AVAILABLE = True
-except Exception:  # pragma: no cover - optional dependency
-    trtllm_batch_decode_with_kv_cache_mla = None
-    _FLASHINFER_MLA_AVAILABLE = False
+from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
 
 
 def flashinfer_mla_decode_supported() -> bool:
     """True when the trtllm-gen MLA decode kernel can run on this device."""
-    if not _FLASHINFER_MLA_AVAILABLE or not torch.cuda.is_available():
+    if not torch.cuda.is_available():
         return False
     # trtllm-gen MLA is a Blackwell (SM100) path.
     return torch.cuda.get_device_capability()[0] >= 10

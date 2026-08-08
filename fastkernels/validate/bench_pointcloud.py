@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 _KB_ROOT = Path(__file__).resolve().parents[2]
@@ -432,7 +433,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-fp16", action="store_true")
     parser.add_argument("--enable-flash", action="store_true")
     parser.add_argument("--skip-reference", action="store_true")
-    parser.add_argument("--output-dir", default="/tmp/pointtransv3_bench")
+    parser.add_argument(
+        "--output-dir",
+        default=os.path.join(tempfile.gettempdir(), "pointtransv3_bench"),
+    )
     return parser.parse_args()
 
 

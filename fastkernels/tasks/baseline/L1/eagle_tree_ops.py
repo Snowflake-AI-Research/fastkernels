@@ -1,6 +1,6 @@
 """EAGLE-3 tree-construction and tree-verify CUDA ops.
 
-Vendored kernels (see csrc/eagle_utils.cu) ported from sglang's sgl-kernel
+Vendored kernels (see the amalgamated ``eagle_tree_ops.cu``) ported from sglang's sgl-kernel
 (Apache-2.0). Python wrappers mirror sglang's
 sglang/srt/speculative/eagle_utils.py one-for-one but call into the fastkernels
 JIT extension instead of `sgl_kernel`.
@@ -14,7 +14,9 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from .csrc import _C
+from ....infra.cuda_ext import lazy_op
+
+_C = lazy_op("eagle_tree_ops", "eagle_tree_ops.cu")
 
 
 class TreeMaskMode(IntEnum):
@@ -244,7 +246,7 @@ def verify_tree_greedy(
     """Greedy verification of a draft tree against target predictions.
 
     Mutates `predicts`, `accept_index`, `accept_token_num`. See
-    csrc/eagle_utils.cu :: VerifyTreeGreedy for shape semantics.
+    ``eagle_tree_ops.cu`` :: VerifyTreeGreedy for shape semantics.
     """
     _C.verify_tree_greedy(
         predicts,

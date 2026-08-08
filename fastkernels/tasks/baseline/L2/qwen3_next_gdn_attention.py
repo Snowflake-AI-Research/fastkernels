@@ -44,19 +44,27 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-from vllm.third_party.flash_linear_attention.ops import (
+import triton
+import triton.language as tl
+
+from ..L1.gated_delta_rule import (
     chunk_gated_delta_rule as _vllm_chunk_gated_delta_rule,
+    fused_post_conv_prep as _vllm_fused_post_conv_prep,
     fused_sigmoid_gating_delta_rule_update as _vllm_fused_sigmoid_gating_update,
 )
-from vllm.third_party.flash_linear_attention.ops.fused_gdn_prefill_post_conv import (
-    fused_post_conv_prep as _vllm_fused_post_conv_prep,
-)
-from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+from ..L1.causal_conv1d import (
     causal_conv1d_fn as _vllm_causal_conv1d_fn,
     causal_conv1d_update as _vllm_causal_conv1d_update,
 )
-from vllm.triton_utils import tl, triton
-from vllm.triton_utils.allocation import set_triton_allocator
+
+
+def set_triton_allocator(device: torch.device):
+    """Verbatim from vLLM's ``triton_utils.allocation.set_triton_allocator``."""
+
+    def alloc_fn(size: int, alignment: int, stream: int | None):
+        return torch.empty(size, device=device, dtype=torch.int8)
+
+    triton.set_allocator(alloc_fn)
 
 from ....infra.context import get_context
 from ....infra.tp import _tp_size, _tp_rank

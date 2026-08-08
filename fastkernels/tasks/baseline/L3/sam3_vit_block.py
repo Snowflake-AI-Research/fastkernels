@@ -115,11 +115,8 @@ class Sam3ViTBlock(nn.Module):
 
         self.drop_path = nn.Identity()
         if drop_path > 0.0:
-            try:
-                from timm.layers import DropPath
-                self.drop_path = DropPath(drop_path)
-            except ImportError:
-                pass
+            from timm.layers import DropPath
+            self.drop_path = DropPath(drop_path)
 
         self.dropout = nn.Dropout(dropout) if dropout > 0.0 else nn.Identity()
 

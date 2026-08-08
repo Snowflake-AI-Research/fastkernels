@@ -35,13 +35,8 @@ import os
 import torch
 import torch.nn as nn
 
-try:
-    from flashinfer import trtllm_fp4_block_scale_moe
+from flashinfer import trtllm_fp4_block_scale_moe
 
-    _TRTLLM_MXFP4_MOE_AVAILABLE = True
-except Exception:  # pragma: no cover - optional dependency
-    trtllm_fp4_block_scale_moe = None
-    _TRTLLM_MXFP4_MOE_AVAILABLE = False
 
 # vLLM's TRTLLM_BACKENDS branch of
 # ``mxfp4_round_up_hidden_size_and_intermediate_size``.
@@ -85,7 +80,7 @@ def trtllm_mxfp4_moe_supported() -> bool:
     """
     if os.environ.get("FASTKERNELS_TRTLLM_MXFP4_MOE", "1") == "0":
         return False
-    if not _TRTLLM_MXFP4_MOE_AVAILABLE or not torch.cuda.is_available():
+    if not torch.cuda.is_available():
         return False
     return torch.cuda.get_device_capability()[0] == 10
 

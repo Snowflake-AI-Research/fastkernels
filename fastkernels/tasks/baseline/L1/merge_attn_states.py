@@ -1,19 +1,20 @@
 """Online softmax merge for two attention partitions.
 
-Wraps vLLM's fused CUDA kernel ``merge_attn_states`` which combines two
-partial attention results (prefix and suffix) using their log-sum-exps so
-the result is numerically equivalent to a single attention over the full
-KV span.  Falls back to a pure PyTorch implementation when the vLLM
-kernel is unavailable.
+Combines two partial attention results (prefix and suffix) using their
+log-sum-exps so the result is numerically equivalent to a single attention over
+the full KV span.
 
-Interface matches ``vllm.v1.attention.ops.merge_attn_states``:
+Dispatches exactly like ``vllm.v1.attention.ops.merge_attn_states``: the fused
+CUDA kernel (``merge_attn_states.cu`` via ``_C.merge_attn_states``) when the input dtype/head_size are
+supported on CUDA, otherwise the vendored Triton fallback.
 
-    merge(output, output_lse, prefix_output, prefix_lse,
-          suffix_output, suffix_lse)
+Interface:
 
-where ``output`` and ``output_lse`` are written in-place.  ``output_lse``
-may be ``None`` if the caller does not need the merged LSE (final
-reduction step).
+    merge(output, prefix_output, prefix_lse, suffix_output, suffix_lse,
+          output_lse=None)
+
+where ``output`` and ``output_lse`` are written in-place. ``output_lse`` may be
+``None`` if the caller does not need the merged LSE (final reduction step).
 """
 
 from __future__ import annotations
@@ -21,49 +22,82 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-_merge_attn_states_impl = None
-try:
-    from vllm.v1.attention.ops.merge_attn_states import (
-        merge_attn_states as _merge_attn_states_impl,
-    )
-except ImportError:
-    _merge_attn_states_impl = None
+from ....infra.cuda_ext import lazy_op
+
+_C = lazy_op("merge_attn_states", "merge_attn_states.cu")
 
 
-def _merge_attn_states_pytorch(
+# Implements section 2.2 of https://www.arxiv.org/pdf/2501.01005
+# can be used to combine partial attention results (in the split-KV case)
+def merge_attn_states(
     output: torch.Tensor,
-    output_lse: torch.Tensor | None,
     prefix_output: torch.Tensor,
     prefix_lse: torch.Tensor,
     suffix_output: torch.Tensor,
     suffix_lse: torch.Tensor,
+    output_lse: torch.Tensor | None = None,
+    prefill_tokens_with_context: int | None = None,
+    output_scale: torch.Tensor | None = None,
 ) -> None:
-    """Reference PyTorch implementation of online softmax merge.
+    # Both the CUDA and Triton kernels derive the suffix head stride from
+    # prefix_output, so suffix_output must share the same head stride.
+    assert prefix_output.stride(1) == suffix_output.stride(1), (
+        "merge_attn_states requires prefix_output and suffix_output to have "
+        f"matching head strides, got {prefix_output.stride(1)} and "
+        f"{suffix_output.stride(1)}"
+    )
 
-    Follows the standard log-sum-exp trick:
+    # NOTE(DefTruth): Currently, custom merge_attn_states CUDA kernel
+    # does not support FP8 dtype for inputs, fallback to use Triton kernel.
+    # However, when output_scale is provided, the inputs are still BF16/FP16
+    # and the output is FP8 — both CUDA and Triton support this.
+    # FP8 output requires output_scale to be set.
+    if output.dtype not in (torch.float32, torch.half, torch.bfloat16):
+        assert output_scale is not None, (
+            f"output_scale is required when output is {output.dtype}"
+        )
 
-        m      = max(l_p, l_s)
-        w_p    = exp(l_p - m);  w_s = exp(l_s - m)
-        out    = (w_p * o_p + w_s * o_s) / (w_p + w_s)
-        lse_m  = m + log(w_p + w_s)
-    """
-    p_lse = prefix_lse.to(torch.float32)
-    s_lse = suffix_lse.to(torch.float32)
-    m = torch.maximum(p_lse, s_lse)
-    wp = torch.exp(p_lse - m)
-    ws = torch.exp(s_lse - m)
-    denom = wp + ws
+    def supported_dtypes(prefix: torch.Tensor) -> bool:
+        return prefix.dtype in [torch.float32, torch.half, torch.bfloat16]
 
-    wp_b = wp.transpose(0, 1).unsqueeze(-1)
-    ws_b = ws.transpose(0, 1).unsqueeze(-1)
-    denom_b = denom.transpose(0, 1).unsqueeze(-1)
+    # NOTE(DefTruth): Currently, custom merge_attn_states CUDA
+    # kernel load/store 128b(16 bytes) per memory issue within
+    # thread. Namely, the headsize(headdim) must be multiple of
+    # pack_size based on input dtype (float32 -> 4, half/bfloat16 -> 8).
+    def supported_headdim(prefix: torch.Tensor) -> bool:
+        headdim = prefix.shape[2]  # [NUM_TOKENS, NUM_HEADS, HEAD_SIZE]
+        if prefix.dtype == torch.float32:
+            return headdim % 4 == 0
+        return headdim % 8 == 0
 
-    merged = (wp_b * prefix_output.to(torch.float32)
-              + ws_b * suffix_output.to(torch.float32)) / denom_b
-    output.copy_(merged.to(output.dtype))
+    if (
+        prefix_output.is_cuda
+        and supported_dtypes(prefix_output)
+        and supported_headdim(prefix_output)
+    ):
+        _C.merge_attn_states(
+            output,
+            output_lse,
+            prefix_output,
+            prefix_lse,
+            suffix_output,
+            suffix_lse,
+            prefill_tokens_with_context,
+            output_scale,
+        )
+    else:
+        from .triton_merge_attn_states import merge_attn_states as _triton_merge
 
-    if output_lse is not None:
-        output_lse.copy_((m + torch.log(denom)).to(output_lse.dtype))
+        _triton_merge(
+            output,
+            prefix_output,
+            prefix_lse,
+            suffix_output,
+            suffix_lse,
+            output_lse,
+            prefill_tokens_with_context,
+            output_scale,
+        )
 
 
 class MergeAttnStates(nn.Module):
@@ -78,20 +112,11 @@ class MergeAttnStates(nn.Module):
         suffix_lse: torch.Tensor,
         output_lse: torch.Tensor | None = None,
     ) -> None:
-        if _merge_attn_states_impl is not None:
-            kwargs = dict(
-                output=output,
-                prefix_output=prefix_output,
-                prefix_lse=prefix_lse,
-                suffix_output=suffix_output,
-                suffix_lse=suffix_lse,
-            )
-            if output_lse is not None:
-                kwargs["output_lse"] = output_lse
-            _merge_attn_states_impl(**kwargs)
-            return
-        _merge_attn_states_pytorch(
-            output, output_lse,
-            prefix_output, prefix_lse,
-            suffix_output, suffix_lse,
+        merge_attn_states(
+            output=output,
+            prefix_output=prefix_output,
+            prefix_lse=prefix_lse,
+            suffix_output=suffix_output,
+            suffix_lse=suffix_lse,
+            output_lse=output_lse,
         )

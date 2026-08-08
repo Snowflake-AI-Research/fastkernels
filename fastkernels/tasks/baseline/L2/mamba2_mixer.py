@@ -5,7 +5,7 @@ Implementation mirrors vLLM's ``MambaMixer2``
 
   - the kernel calls (causal_conv1d_fn, causal_conv1d_update,
     mamba_chunk_scan_combined_varlen, selective_state_update,
-    rms_norm_gated) are bit-for-bit identical to vLLM
+    rmsnorm_fn) are bit-for-bit identical to vLLM
   - the parameter layout / weight names match HF Mamba2 checkpoints
   - tensor parallelism reuses vLLM's
     ``mamba_v2_sharded_weight_loader`` and
@@ -38,13 +38,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # vLLM-aligned kernels (bit-identical numerics with vLLM's MambaMixer2).
-from vllm.model_executor.layers.mamba.ops.causal_conv1d import (
+from ..L1.causal_conv1d import (
     causal_conv1d_fn,
     causal_conv1d_update,
 )
-from vllm.model_executor.layers.mamba.ops.layernorm_gated import rms_norm_gated
-from vllm.model_executor.layers.mamba.ops.mamba_ssm import selective_state_update
-from vllm.model_executor.layers.mamba.ops.ssd_combined import (
+from ..L1.rms_norm_gated import rmsnorm_fn
+from ..L1.mamba_ssm import selective_state_update
+from ..L1.mamba_chunk_scan import (
     mamba_chunk_scan_combined_varlen,
 )
 
@@ -177,7 +177,7 @@ class Mixer2RMSNormGated(nn.Module):
             return x * F.silu(gate.to(torch.float32)).to(input_dtype)
         if self.n_groups != 1:
             return self.forward_native(x, gate)
-        return rms_norm_gated(
+        return rmsnorm_fn(
             x,
             self.weight.data,
             bias=None,

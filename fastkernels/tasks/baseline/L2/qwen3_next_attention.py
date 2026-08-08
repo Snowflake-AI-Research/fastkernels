@@ -33,17 +33,10 @@ from ..L1.flash_attn_decode import FlashAttnDecode
 from ..L1.flash_attn_prefill import FlashAttnPrefill
 from ..L1.gemma_rms_norm import GemmaRMSNorm
 from ..L1.store_kvcache import StoreKVCache, StoreKVCacheHND
+from ..L1.fused_qk_norm_rope import (
+    fused_qk_rmsnorm_rope_gate as _vllm_fused_qk_rmsnorm_rope_gate,
+)
 from .parallel_linear import QKVParallelLinear, RowParallelLinear
-
-try:
-    from vllm.model_executor.layers.fused_qk_norm_rope import (
-        fused_qk_rmsnorm_rope_gate as _vllm_fused_qk_rmsnorm_rope_gate,
-    )
-
-    _FUSED_QK_ROPE_GATE_AVAILABLE = True
-except ImportError:  # pragma: no cover - older vLLM without the fused kernel
-    _vllm_fused_qk_rmsnorm_rope_gate = None
-    _FUSED_QK_ROPE_GATE_AVAILABLE = False
 
 
 @triton.jit
@@ -131,7 +124,7 @@ class Qwen3NextAttention(nn.Module):
         # nine kernels per attention layer -- two gate/q slices, two norms, two
         # rotary slices, the rotary op and two cats -- which at batch 1 is pure
         # launch overhead.
-        self._fused_qk_rope_gate = _FUSED_QK_ROPE_GATE_AVAILABLE
+        self._fused_qk_rope_gate = True
         self._norm_gain_cache: tuple[torch.Tensor, torch.Tensor] | None = None
         if self._use_trtllm:
             from ..L1.flashinfer_decode import TRTLLMDecode

@@ -30,10 +30,9 @@ already verified produce bit-identical outputs to vLLM's:
 
 * ``_C.moe_align_block_size``           (fastkernels binding of the same
                                          sgl-kernel CUDA source vLLM uses)
-* ``_per_token_group_quant_fp8``        (calls ``torch.ops._C.per_token_group_fp8_quant``)
+* ``_per_token_group_quant_fp8``        (calls vendored ``_C.per_token_group_fp8_quant``)
 * ``MoeGroupedGemm._fused_moe_kernel``  (Triton kernel forked from vLLM)
-* ``torch.ops._C.silu_and_mul``         (vLLM's packed CUDA kernel; fastkernels
-                                         re-uses the same op)
+* ``_C.silu_and_mul``                   (vendored vLLM packed CUDA kernel)
 * ``_C.moe_sum``                        (fastkernels CUDA kernel; falls back to
                                          ``at::sum_out`` for top_k > 4 which
                                          matches vLLM's PyTorch reference for
@@ -48,12 +47,9 @@ import torch
 import torch.nn as nn
 import triton
 
-try:
-    import vllm._custom_ops  # noqa: F401 — vLLM >= 0.20 registers torch.ops._C.silu_and_mul + per_token_group_fp8_quant
-except ImportError:
-    import vllm._C  # noqa: F401 — legacy vLLM <= 0.18
-
-from ..L1.csrc import _C
+from ..L1.moe_align import _C as _moe_align_C
+from ..L1.moe_sum import _C as _moe_sum_C
+from ..L1.silu_and_mul import _C as _silu_C
 from ..L1.fp8_linear import PerTokenGroupQuantFp8
 from ..L1.moe_grouped_gemm import MoeGroupedGemm, get_triton_config
 
@@ -87,7 +83,7 @@ def _moe_align_block_size_fresh(
     num_tokens_post_pad = torch.empty(1, dtype=torch.int32, device=device)
     cumsum_buffer = torch.zeros(num_experts + 1, dtype=torch.int32, device=device)
 
-    _C.moe_align_block_size(
+    _moe_align_C.moe_align_block_size(
         topk_ids.view(-1).contiguous(),
         num_experts,
         block_size,
@@ -204,7 +200,7 @@ class VllmFusedExperts(nn.Module):
         # SiLU + mul, in place into ``intermediate_cache2``.  Same
         # packed-bf16x2/half2 kernel vLLM uses
         # (``vllm/csrc/activation_kernels.cu``).
-        torch.ops._C.silu_and_mul(intermediate_cache2, intermediate_cache1)
+        _silu_C.silu_and_mul(intermediate_cache2, intermediate_cache1)
 
         # Quantize the SiLU output for GEMM2.  Same kernel as a1, but
         # the input hidden dim is ``N`` (= ``intermediate_size_per_tp``
@@ -236,5 +232,5 @@ class VllmFusedExperts(nn.Module):
         # ``at::sum_out`` — the same FP-summation order vLLM's
         # ``ops.moe_sum`` uses for top_k > 4.
         out_hidden_states = torch.empty(M, K, device=device, dtype=dtype)
-        _C.moe_sum(intermediate_cache3.view(M, top_k, K), out_hidden_states)
+        _moe_sum_C.moe_sum(intermediate_cache3.view(M, top_k, K), out_hidden_states)
         return out_hidden_states

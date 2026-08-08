@@ -23,38 +23,23 @@ import os
 import torch
 import torch.nn as nn
 
-# Lazy import: DeepGEMM is only required for the FP8 path on Hopper+
-# GPUs.  Skipping it lets BF16 codepaths import this module on systems
-# (or branches) where DeepGEMM isn't installed.
-try:
-    import deep_gemm
-    _HAS_DEEP_GEMM = True
-except ImportError:  # pragma: no cover
-    deep_gemm = None  # type: ignore[assignment]
-    _HAS_DEEP_GEMM = False
+# DeepGEMM is required for the FP8 path on Hopper+.
+import deep_gemm
 
 
 @functools.cache
 def _is_deep_gemm_supported() -> bool:
     """Mirror ``vllm.utils.deep_gemm.is_deep_gemm_supported``.
 
-    Three independent conditions:
+    Conditions:
     1. ``VLLM_USE_DEEP_GEMM`` env var is non-zero (default 1).
-    2. ``deep_gemm`` is importable on the system.
-    3. GPU is Hopper (SM90) or Blackwell-class (SM100/SM10x).
+    2. GPU is Hopper (SM90) or Blackwell-class (SM100/SM10x).
     """
     if not bool(int(os.environ.get("VLLM_USE_DEEP_GEMM", "1"))):
         return False
-    try:
-        import deep_gemm  # noqa: F401
-    except ImportError:
-        return False
     if not torch.cuda.is_available():
         return False
-    try:
-        major, _ = torch.cuda.get_device_capability()
-    except Exception:
-        return False
+    major, _ = torch.cuda.get_device_capability()
     return major in (9, 10)
 
 
@@ -62,17 +47,8 @@ def _is_deep_gemm_supported() -> bool:
 def _is_deep_gemm_e8m0_used() -> bool:
     """Match vLLM's ``is_deep_gemm_e8m0_used`` exactly
     (``vllm/utils/deep_gemm.py:80-104``).
-
-    Adds two checks the previous oracle was missing:
-    * DeepGEMM is *supported* (env + arch + import OK).
-    * ``deep_gemm.fp8_gemm_nt`` symbol exists on this build (otherwise
-      the per-token scale layout differs and UE8M0 must stay off).
     """
     if not _is_deep_gemm_supported():
-        return False
-    try:
-        import deep_gemm
-    except ImportError:
         return False
     if getattr(deep_gemm, "fp8_gemm_nt", None) is None:
         return False

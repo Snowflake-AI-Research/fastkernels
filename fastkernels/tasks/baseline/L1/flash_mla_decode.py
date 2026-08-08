@@ -21,33 +21,15 @@ import torch.nn as nn
 
 # vLLM ships a fully vendored copy of FlashMLA under
 # ``vllm.third_party.flashmla.flash_mla_interface`` together with its
-# compiled ``vllm._flashmla_C`` / ``vllm._flashmla_extension_C`` kernels,
-# so fastkernels does not need to build FlashMLA separately.  The standalone
-# ``flash_mla`` package remains supported as a fallback for environments
-# that predate the vendored copy.
-try:
-    from vllm.third_party.flashmla.flash_mla_interface import (
-        flash_mla_with_kvcache,
-        get_mla_metadata,
-    )
-except ImportError:  # pragma: no cover
-    from flash_mla import (  # type: ignore[no-redef]
-        flash_mla_with_kvcache,
-        get_mla_metadata,
-    )
-
-# FP8-specific dense decode entry points (vLLM-only). Falls back to ``None``
-# when the vendored kernels are not available, which forces the dense FP8
-# path to use the generic ``flash_mla_with_kvcache(..., is_fp8_kvcache=True)``
-# fallback (matches behaviour on hardware without the FP8-specialized kernel).
-try:
-    from vllm.v1.attention.ops.flashmla import (
-        flash_mla_with_kvcache_fp8,
-        get_mla_metadata_dense_fp8,
-    )
-except ImportError:  # pragma: no cover
-    flash_mla_with_kvcache_fp8 = None  # type: ignore[assignment]
-    get_mla_metadata_dense_fp8 = None  # type: ignore[assignment]
+# compiled ``vllm._flashmla_C`` / ``vllm._flashmla_extension_C`` kernels.
+from vllm.third_party.flashmla.flash_mla_interface import (
+    flash_mla_with_kvcache,
+    get_mla_metadata,
+)
+from vllm.v1.attention.ops.flashmla import (
+    flash_mla_with_kvcache_fp8,
+    get_mla_metadata_dense_fp8,
+)
 
 
 class FlashMLADecode(nn.Module):
@@ -97,8 +79,6 @@ class FlashMLADecodeFP8(nn.Module):
     :class:`FlashMLAGetMetadataDenseFP8`.
     """
 
-    available: bool = flash_mla_with_kvcache_fp8 is not None
-
     def forward(
         self,
         q: torch.Tensor,
@@ -113,10 +93,6 @@ class FlashMLADecodeFP8(nn.Module):
         descale_q: torch.Tensor | None = None,
         descale_k: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        assert flash_mla_with_kvcache_fp8 is not None, (
-            "flash_mla_with_kvcache_fp8 not available — "
-            "vLLM build must include _flashmla_extension_C"
-        )
         return flash_mla_with_kvcache_fp8(
             q=q,
             k_cache=k_cache,

@@ -2,14 +2,16 @@
 # One-shot setup for the isolated sglang benchmark environment.
 #
 # We keep sglang in its own conda env (`sglang-bench`) so that its preferred
-# torch / CUDA versions (currently torch 2.9.1 + cu128) do not conflict with
-# the main `dev` env (torch 2.10 + cu130) that fastkernels runs in.
+# torch / CUDA stack does not conflict with the main `dev` env that
+# fastkernels runs in. Prefer letting validate provision this automatically:
 #
-# Usage:
+#   python -m fastkernels.validate.provision sglang
+#
+# Or run this script by hand:
 #   bash tests/setup_sglang_env.sh
 #
 # Then point the bench script at it (this is already the default):
-#   python tests/bench_sglang.py \
+#   python -m fastkernels.validate.bench_sglang \
 #       --sglang-python "$(conda info --base)/envs/sglang-bench/bin/python"
 
 set -euo pipefail
