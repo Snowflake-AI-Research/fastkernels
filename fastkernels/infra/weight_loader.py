@@ -146,25 +146,10 @@ _EMBED_WEIGHT_RE = re.compile(
 _VISION_PATCH_EMBED_RE = re.compile(r"(visual\.patch_embed\.proj)\.(weight|bias)")
 
 
-# Llama4 fused expert weight patterns
-_LLAMA4_FUSED_EXPERT_RE = re.compile(
-    r"(.+\.feed_forward)\.experts\.(gate_up_proj|down_proj)"
-)
-
 _GEMMA4_FUSED_EXPERT_RE = re.compile(
     r"(.+\.moe)\.(gate_up_proj|down_proj)$"
 )
 _GEMMA4_LAYER_RE = re.compile(r"model\.layers\.(\d+)\.")
-
-
-def _permute_qk_for_rotary(weight: torch.Tensor, n_heads: int) -> torch.Tensor:
-    """Permute Q/K weights from interleaved to contiguous layout for rotary."""
-    f_out, f_in = weight.shape
-    return (
-        weight.view(n_heads, f_out // n_heads // 2, 2, f_in)
-        .transpose(1, 2)
-        .reshape(f_out, f_in)
-    )
 
 
 def _permute_bitnet_qk_to_sota(weight: torch.Tensor, n_heads: int) -> torch.Tensor:
@@ -661,11 +646,8 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
     is_qwen3_vl_moe = model_type == "qwen3_vl_moe"
     is_qwen2_5_omni = model_type == "qwen2_5_omni"
     is_qwen_vl = is_qwen2_vl or is_qwen3_vl or is_qwen2_5_omni
-    is_llama4 = model_type == "llama4"
     is_gemma4 = model_type == "gemma4"
     is_mamba = model_type in ("mamba", "mamba2")
-    if is_llama4:
-        llama4_config = model.config
     if is_gemma4:
         gemma4_config = model.config
         gemma4_k_eq_v_layers = {
@@ -779,51 +761,6 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                         except AttributeError:
                             pass
                         break
-
-        # Llama4: strip language_model. prefix, skip vision weights
-        if is_llama4:
-            if not mapped_name.startswith("language_model."):
-                continue
-            mapped_name = mapped_name[len("language_model."):]
-
-            m_fused = _LLAMA4_FUSED_EXPERT_RE.match(mapped_name)
-            if m_fused:
-                prefix_part, proj = m_fused.groups()
-                tensor = _get_tensor()
-                if proj == "gate_up_proj":
-                    param_name = f"{prefix_part}.w13"
-                    try:
-                        param = model.get_parameter(param_name)
-                    except AttributeError:
-                        continue
-                    weight = tensor.transpose(-1, -2)
-                    E = weight.shape[0]
-                    full_inter = weight.shape[1] // 2
-                    tp = param.shape[1] // 2
-                    rank = 0
-                    if full_inter != tp:
-                        from .tp import _tp_rank
-                        rank = _tp_rank()
-                    gate = weight[:, :full_inter, :]
-                    up = weight[:, full_inter:, :]
-                    param.data[:, :tp, :].copy_(gate[:, rank * tp:(rank + 1) * tp, :])
-                    param.data[:, tp:, :].copy_(up[:, rank * tp:(rank + 1) * tp, :])
-                else:
-                    param_name = f"{prefix_part}.w2"
-                    try:
-                        param = model.get_parameter(param_name)
-                    except AttributeError:
-                        continue
-                    weight = tensor.transpose(-1, -2)
-                    full_inter = weight.shape[2]
-                    tp_inter = param.shape[2]
-                    rank = 0
-                    if full_inter != tp_inter:
-                        from .tp import _tp_rank
-                        rank = _tp_rank()
-                    param.data.copy_(weight[:, :, rank * tp_inter:(rank + 1) * tp_inter])
-                loaded += 1
-                continue
 
         # Gemma4 checkpoints are multimodal wrappers.  The text stack lives
         # under model.language_model.*, while vision/audio weights are skipped.
@@ -1032,7 +969,7 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
         # Handle packed modules (qkv_proj, gate_up_proj)
         matched = False
         for orig_key, (packed_name, shard_id) in packed.items():
-            if (is_llama4 or is_qwen3_vl_moe) and "experts." in mapped_name:
+            if is_qwen3_vl_moe and "experts." in mapped_name:
                 continue
             if orig_key in mapped_name:
                 param_name = mapped_name.replace(orig_key, packed_name)
@@ -1041,17 +978,7 @@ def load_weights(model, model_path: str, model_type: str = "llama") -> None:
                 except AttributeError:
                     break
                 weight_loader = getattr(param, "weight_loader")
-                if is_llama4 and orig_key in ("q_proj", "k_proj"):
-                    tensor = _get_tensor()
-                    n_heads = (
-                        llama4_config.num_key_value_heads
-                        if orig_key == "k_proj"
-                        else llama4_config.num_attention_heads
-                    )
-                    tensor = _permute_qk_for_rotary(tensor, n_heads)
-                    weight_loader(param, tensor, shard_id)
-                else:
-                    weight_loader(param, _get_tensor(), shard_id)
+                weight_loader(param, _get_tensor(), shard_id)
                 loaded += 1
                 matched = True
                 break
@@ -1551,14 +1478,6 @@ def load_model(
         print(f"  Allocating Whisper model (enc={config.encoder_layers}L, "
               f"dec={config.decoder_layers}L, d={config.d_model})...")
         model = WhisperForConditionalGeneration(config)
-    elif model_type == "llama4":
-        from ..tasks.baseline.L4.llama4 import Llama4Config, Llama4ForCausalLM
-        config = Llama4Config.from_pretrained(model_name)
-        config.dtype = dtype
-        _apply_max_layers(config, max_layers)
-        print(f"  Allocating Llama4 model ({config.num_local_experts} experts, "
-              f"top-{config.num_experts_per_tok})...")
-        model = Llama4ForCausalLM(config)
     elif model_type == "mixtral":
         from ..tasks.baseline.L4.mixtral import MixtralConfig, MixtralForCausalLM
         config = MixtralConfig.from_pretrained(model_name)

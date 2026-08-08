@@ -37,8 +37,8 @@ _C = lazy_op("rms_norm", "rms_norm.cu")
 
 # ---------------------------------------------------------------------------
 # Register _C ops as torch.library custom ops for torch.compile compatibility.
-# Used by ``rms_norm_native`` / ``rmsnorm_quant`` (not by this module's eager
-# path, which goes through the vendored vLLM ``_C.rms_norm``).
+# Used by ``rms_norm_native`` (not by this module's eager path, which goes
+# through the vendored vLLM ``_C.rms_norm``).
 # ---------------------------------------------------------------------------
 
 _lib = torch.library.Library("fastkernels_norm", "DEF")
