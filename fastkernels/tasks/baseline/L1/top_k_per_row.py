@@ -10,7 +10,9 @@ import torch.nn as nn
 import flashinfer as _flashinfer
 from flashinfer import TopKTieBreak as _TopKTieBreak
 
-from .csrc import _C
+from ....infra.cuda_ext import lazy_op
+
+_C = lazy_op("top_k_per_row", "top_k_per_row.cu")
 
 
 # vLLM's DSA decode indexer uses a radix-histogram top-k fast path for the

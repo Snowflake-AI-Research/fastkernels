@@ -14,7 +14,9 @@ Cache tensor shape: ``[num_blocks, block_size, 132]`` with ``dtype=torch.uint8``
 import torch
 import torch.nn as nn
 
-from .csrc import _C
+from ....infra.cuda_ext import lazy_op
+
+_C = lazy_op("indexer_k_cache", "indexer_k_cache.cu")
 
 _HEAD_DIM = 128
 _SCALE_BYTES = 4

@@ -356,9 +356,12 @@ class LlamaEagle3Engine:
         if self._target_verify_runner is not None:
             return
 
-        from ..tasks.baseline.L1.tree_attn_prefill import _VLLM_FA_AVAILABLE
+        # Tree-verify CUDA graphs need vLLM's bundled FA (paged cascade on
+        # non-Hopper; sgl_kernel FA3 on SM90). Gate on fa_utils, not the
+        # Hopper-only `_SGL_FA3_AVAILABLE` flag in tree_attn_prefill.
+        from ..tasks.baseline.L1.fa_utils import VLLM_FA_AVAILABLE
 
-        if not _VLLM_FA_AVAILABLE:
+        if not VLLM_FA_AVAILABLE:
             print(
                 "[EAGLE-3] Skipping CUDA graph capture: vLLM's bundled "
                 "FlashAttention (paged tree attention) is unavailable in "

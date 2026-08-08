@@ -18,7 +18,7 @@ with full parity for:
 Returns FP32 ``topk_weights`` to match vLLM.
 
 Fast path uses ``_C.grouped_topk`` (verbatim port of vLLM's fused noaux_tc
-CUDA kernel — see ``tasks/baseline/L1/csrc/grouped_topk_kernels.cu``).
+CUDA kernel — see the amalgamated ``tasks/baseline/L1/grouped_topk.cu``).
 """
 
 from __future__ import annotations
@@ -28,7 +28,9 @@ import os
 import torch
 import torch.nn as nn
 
-from .csrc import _C
+from ....infra.cuda_ext import lazy_op
+
+_C = lazy_op("grouped_topk", "grouped_topk.cu")
 
 
 def _is_batch_invariant() -> bool:

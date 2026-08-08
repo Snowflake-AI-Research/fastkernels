@@ -267,7 +267,7 @@ class QuantFp8MLAQuery(nn.Module):
         q: torch.Tensor,         # [N, H, kv_lora_rank + qk_rope_head_dim]
         scale: torch.Tensor,     # [1] fp32
     ) -> torch.Tensor:
-        from .csrc import _C
+        from .fp8_linear import _C
 
         flat = q.reshape(q.shape[0], -1)
         out = torch.empty(

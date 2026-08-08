@@ -12,7 +12,9 @@ import math
 import torch
 import torch.nn as nn
 
-from .csrc import _C
+from ....infra.cuda_ext import lazy_op
+
+_C = lazy_op("rotary_emb", "rotary_emb.cu")
 
 # ---------------------------------------------------------------------------
 # Register in-place rotary embedding op for torch.compile compatibility.

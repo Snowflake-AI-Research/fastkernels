@@ -10,7 +10,9 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from .csrc import _C
+from ....infra.cuda_ext import lazy_op
+
+_C = lazy_op("topk_softmax", "topk_softmax.cu")
 
 
 class TopKSoftmax(nn.Module):

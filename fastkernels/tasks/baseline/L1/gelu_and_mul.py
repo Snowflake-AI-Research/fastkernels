@@ -11,7 +11,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .csrc import _C
+from ....infra.cuda_ext import lazy_op
+
+_C = lazy_op("gelu_and_mul", "gelu_and_mul.cu")
 
 
 class GeluAndMul(nn.Module):

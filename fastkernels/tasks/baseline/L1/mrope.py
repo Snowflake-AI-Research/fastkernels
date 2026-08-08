@@ -17,7 +17,6 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-from .csrc import _C  # noqa: F401
 from . import rotary_emb as _rotary_emb_reg  # noqa: F401 — registers fastkernels_rope ops
 
 

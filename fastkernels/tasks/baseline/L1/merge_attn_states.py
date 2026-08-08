@@ -5,7 +5,7 @@ log-sum-exps so the result is numerically equivalent to a single attention over
 the full KV span.
 
 Dispatches exactly like ``vllm.v1.attention.ops.merge_attn_states``: the fused
-CUDA kernel (``.csrc._C.merge_attn_states``) when the input dtype/head_size are
+CUDA kernel (``merge_attn_states.cu`` via ``_C.merge_attn_states``) when the input dtype/head_size are
 supported on CUDA, otherwise the vendored Triton fallback.
 
 Interface:
@@ -22,7 +22,9 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from .csrc import _C
+from ....infra.cuda_ext import lazy_op
+
+_C = lazy_op("merge_attn_states", "merge_attn_states.cu")
 
 
 # Implements section 2.2 of https://www.arxiv.org/pdf/2501.01005

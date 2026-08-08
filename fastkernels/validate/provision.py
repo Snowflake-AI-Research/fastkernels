@@ -10,7 +10,10 @@ compares against.
 Everything installed here is idempotent and lands in the active Python
 environment (``sys.executable``) or under ``THIRD_PARTY_DIR``
 (``~/.fastkernels/third_party`` by default, override with
-``FASTKERNELS_THIRD_PARTY_DIR``).
+``FASTKERNELS_THIRD_PARTY_DIR``). Two components need their own
+interpreters because their torch/CUDA pins conflict with the main env:
+``openpi`` (a ``uv`` venv under ``THIRD_PARTY_DIR``) and ``sglang`` (a
+conda env named ``sglang-bench``).
 
 Usage::
 
@@ -65,6 +68,31 @@ OPENPI_ASSETS_DIR = THIRD_PARTY_DIR / "openpi-assets"
 OPENPI_CHECKPOINTS: dict[str, str] = {
     "pi0_aloha_pen_uncap": "gs://openpi-assets/checkpoints/pi0_aloha_pen_uncap",
 }
+# SGLang lives in its own conda env so its torch/CUDA stack does not fight the
+# main fastkernels env. The setup script is the source of truth for create +
+# install; provision just shells out to it. bench_sglang defaults
+# --sglang-python to this path.
+SGLANG_ENV_NAME = os.environ.get("FASTKERNELS_SGLANG_ENV", "sglang-bench")
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+SGLANG_SETUP_SCRIPT = _REPO_ROOT / "tests" / "setup_sglang_env.sh"
+
+
+def _sglang_python() -> Path:
+    """``.../envs/sglang-bench/bin/python``, resolved via ``conda info --base``."""
+    conda = shutil.which("conda")
+    if conda is None:
+        # Fall back to the conventional miniconda layout next to the active env.
+        base = Path(sys.prefix).resolve().parents[1]  # .../envs/dev -> .../miniconda3
+    else:
+        base = Path(
+            subprocess.run(
+                [conda, "info", "--base"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+        )
+    return base / "envs" / SGLANG_ENV_NAME / "bin" / "python"
 
 
 # --- Shell helpers ---------------------------------------------------------
@@ -546,6 +574,44 @@ def _check_bitnet() -> bool:
     )
 
 
+def _prov_sglang() -> None:
+    """Create the isolated ``sglang-bench`` conda env used by ``bench_sglang``.
+
+    SGLang's preferred torch/CUDA cannot share the main fastkernels env, so the
+    harness launches the reference side under a separate interpreter. The
+    ``tests/setup_sglang_env.sh`` script owns the create + install details;
+    provision just runs it (idempotent: it reuses the env if it already exists
+    and re-installs ``sglang``).
+    """
+    if not SGLANG_SETUP_SCRIPT.is_file():
+        raise RuntimeError(
+            f"SGLang setup script missing: {SGLANG_SETUP_SCRIPT}. "
+            "Expected tests/setup_sglang_env.sh next to the package."
+        )
+    if shutil.which("conda") is None:
+        raise RuntimeError(
+            "conda is required to build the sglang-bench env "
+            "(SGLang cannot share the fastkernels torch). Install Miniconda/Anaconda "
+            "and re-run, or create the env by hand: bash tests/setup_sglang_env.sh"
+        )
+    env = {**os.environ, "ENV_NAME": SGLANG_ENV_NAME}
+    _run(["bash", str(SGLANG_SETUP_SCRIPT)], env=env)
+
+
+def _check_sglang() -> bool:
+    py = _sglang_python()
+    if not py.is_file():
+        return False
+    return (
+        subprocess.run(
+            [str(py), "-c", "import sglang, torch"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode
+        == 0
+    )
+
+
 # --- Component registry ----------------------------------------------------
 @dataclass(frozen=True)
 class Component:
@@ -569,6 +635,13 @@ COMPONENTS: dict[str, Component] = {
         Component("instant_ngp", "instant-ngp pyngp source build + fox scene", ("bench_instantngp",), _prov_instant_ngp, _check_instant_ngp),
         Component("openpi", "OpenPI reference venv + converted PyTorch Pi0 checkpoint", ("bench_openpi",), _prov_openpi, _check_openpi),
         Component("bitnet", "Microsoft BitNet GPU kernel + int2/fp16 checkpoints", ("bench_microsoft_bitnet",), _prov_bitnet, _check_bitnet),
+        Component(
+            "sglang",
+            "isolated sglang-bench conda env (SGLang EAGLE-3 reference)",
+            ("bench_sglang",),
+            _prov_sglang,
+            _check_sglang,
+        ),
     )
 }
 

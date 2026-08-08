@@ -28,6 +28,10 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
+from ....infra.cuda_ext import lazy_op
+
+_C = lazy_op("fp8_linear", "fp8_linear.cu")
+
 # DeepGEMM provides the FP8 fast path on Hopper+.
 import deep_gemm
 
@@ -232,7 +236,6 @@ _HAS_LOCAL_CUDA_QUANT: bool | None = None
 def _check_local_cuda_quant() -> bool:
     global _HAS_LOCAL_CUDA_QUANT
     if _HAS_LOCAL_CUDA_QUANT is None:
-        from .csrc import _C
         _HAS_LOCAL_CUDA_QUANT = hasattr(_C, "per_token_group_fp8_quant")
     return _HAS_LOCAL_CUDA_QUANT
 
@@ -260,7 +263,6 @@ def _per_token_group_quant_fp8(x: torch.Tensor,
     """
     M, K = x.shape
     if _check_local_cuda_quant() and x.is_cuda and x.is_contiguous() and use_ue8m0:
-        from .csrc import _C
         # ``True`` for ``use_ue8m0`` and ``False`` for ``tma_aligned_scales``
         # is what vLLM's ``W8A8BlockFp8LinearOp._run_deepgemm`` ends up
         # passing for ``column_major_scales=True`` without TMA padding (the

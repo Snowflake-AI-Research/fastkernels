@@ -35,7 +35,9 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from .csrc import _C
+from ....infra.cuda_ext import lazy_op
+
+_C = lazy_op("trtllm_fp4_moe", "trtllm_fp4_moe.cu", need_cutlass=True)
 
 # ``epilogue_tile_m`` for the TRTLLM-gen NVFP4 MoE kernels. Matches
 # ``prepare_static_weights_for_trtllm_fp4_moe``

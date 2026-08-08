@@ -6,7 +6,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .csrc import _C
+from ....infra.cuda_ext import lazy_op
+
+_C = lazy_op("silu_and_mul", "silu_and_mul.cu")
 
 
 class SiluAndMul(nn.Module):

@@ -29,7 +29,9 @@ from packaging import version
 import triton
 import triton.language as tl
 
-from .csrc import _C as ops
+from ....infra.cuda_ext import lazy_op
+
+ops = lazy_op("mamba_ssm", "mamba_ssm.cu")
 
 # Verbatim from vllm.v1.attention.backends.utils.
 NULL_BLOCK_ID = 0

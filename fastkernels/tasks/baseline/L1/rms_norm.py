@@ -31,7 +31,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .csrc import _C
+from ....infra.cuda_ext import lazy_op
+
+_C = lazy_op("rms_norm", "rms_norm.cu")
 
 # ---------------------------------------------------------------------------
 # Register _C ops as torch.library custom ops for torch.compile compatibility.

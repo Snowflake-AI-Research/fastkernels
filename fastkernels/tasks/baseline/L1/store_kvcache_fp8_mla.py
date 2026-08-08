@@ -26,7 +26,9 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from .csrc import _C
+from ....infra.cuda_ext import lazy_op
+
+_C = lazy_op("store_kvcache_fp8_mla", "store_kvcache_fp8_mla.cu")
 
 _KV_C_DIM = 512
 _K_PE_DIM = 64
