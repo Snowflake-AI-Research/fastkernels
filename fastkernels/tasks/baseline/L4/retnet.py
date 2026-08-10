@@ -24,7 +24,7 @@ from ..L1.embedding import Embedding
 from ..L1.linear import Linear
 from ..L1.rms_norm import RMSNorm
 from ..L3.retnet_decoder import RetNetDecoderLayer
-from .recurrent_cache import CausalLMOutputWithPast, RecurrentCache
+from ....infra.recurrent_cache import CausalLMOutputWithPast, RecurrentCache
 
 
 @dataclass

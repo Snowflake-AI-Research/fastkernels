@@ -8,7 +8,7 @@ FA2 otherwise) -- see :mod:`fa_utils`.
 import torch
 import torch.nn as nn
 
-from .fa_utils import FA_VERSION, flash_attn_varlen_func
+from ....infra.fa_utils import FA_VERSION, flash_attn_varlen_func
 
 
 class FlashAttnPrefill(nn.Module):

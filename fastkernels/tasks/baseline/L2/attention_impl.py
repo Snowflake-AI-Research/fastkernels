@@ -41,7 +41,7 @@ _TRTLLM_MAX_HEAD_SIZE = 256
 from ..L1.triton_unified_attention import (
     unified_attention as _triton_unified_attention,
 )
-from ..L1.kv_quant_mode import KVQuantMode as _VllmKVQuantMode
+from ....infra.kv_quant_mode import KVQuantMode as _VllmKVQuantMode
 import inspect as _inspect
 
 _TRITON_UNIFIED_ACCEPTS_KV_QUANT = (
@@ -276,7 +276,7 @@ class Attention(nn.Module):
                 self.num_heads, self.num_kv_heads, head_size,
             )
 
-        from ..L1.tree_attn_prefill import TreeAttnPrefill
+        from .tree_attn_prefill import TreeAttnPrefill
         self.tree_attn_op = TreeAttnPrefill(
             self.num_heads, self.num_kv_heads, head_size,
         )

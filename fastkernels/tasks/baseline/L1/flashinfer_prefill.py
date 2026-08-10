@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from flashinfer.prefill import trtllm_batch_context_with_kv_cache
 
-from .fa_utils import FA_VERSION, flash_attn_varlen_func
+from ....infra.fa_utils import FA_VERSION, flash_attn_varlen_func
 from .flashinfer_decode import prime_trtllm_sinks, trtllm_sinks
 
 

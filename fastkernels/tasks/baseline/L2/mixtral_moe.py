@@ -9,7 +9,7 @@ from ....infra.tp import _tp_rank, _tp_size
 from ..L1.allreduce import AllReduce
 from ..L1.linear import Linear
 from ..L1.topk_softmax import TopKSoftmax
-from ..L1.trtllm_bf16_moe import (
+from .trtllm_bf16_moe import (
     ROUTING_RENORMALIZE,
     TrtLlmBf16MoE,
     prepare_trtllm_bf16_moe_weights,

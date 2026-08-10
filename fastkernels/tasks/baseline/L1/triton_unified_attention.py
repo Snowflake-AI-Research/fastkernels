@@ -15,7 +15,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .triton_attention_helpers import (
+from ....infra.triton_attention_helpers import (
     apply_alibi_to_score,
     apply_softcap,
     cdiv_fn,
@@ -28,7 +28,7 @@ from .triton_attention_helpers import (
     softmax_step,
     store_segm_reduce_scalars,
 )
-from .kv_quant_mode import KVQuantMode
+from ....infra.kv_quant_mode import KVQuantMode
 
 _FP8_DTYPE = torch.float8_e4m3fn
 

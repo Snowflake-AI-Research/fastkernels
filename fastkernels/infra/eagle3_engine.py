@@ -49,7 +49,7 @@ from .context import (
     set_forward_context,
 )
 from .weight_loader import load_eagle3_draft_model, load_model
-from ..tasks.baseline.L1.eagle_tree_ops import (
+from .eagle_tree_ops import (
     build_tree_kernel_efficient_with_metadata,
     organize_draft_results,
     verify_tree_greedy,
@@ -359,7 +359,7 @@ class LlamaEagle3Engine:
         # Tree-verify CUDA graphs need vLLM's bundled FA (paged cascade on
         # non-Hopper; sgl_kernel FA3 on SM90). Gate on fa_utils, not the
         # Hopper-only `_SGL_FA3_AVAILABLE` flag in tree_attn_prefill.
-        from ..tasks.baseline.L1.fa_utils import VLLM_FA_AVAILABLE
+        from .fa_utils import VLLM_FA_AVAILABLE
 
         if not VLLM_FA_AVAILABLE:
             print(

@@ -195,7 +195,7 @@ class _SlotCache:
         cache holds contiguous ``[B, *state_shape]`` tensors (one
         index_select per layer).
         """
-        from fastkernels.tasks.baseline.L4.recurrent_cache import RecurrentCache
+        from fastkernels.infra.recurrent_cache import RecurrentCache
         c = RecurrentCache()
         for k, buf in self.states.items():
             c.states[k] = buf.index_select(0, slot_ids)
@@ -405,7 +405,7 @@ class FLAEngine:
         """Return a RecurrentCache covering ``active``, reusing the live
         cache if possible.
         """
-        from fastkernels.tasks.baseline.L4.recurrent_cache import RecurrentCache
+        from fastkernels.infra.recurrent_cache import RecurrentCache
         if self._same_active(active, self._live_active):
             cache = self._live_cache
         else:
@@ -441,7 +441,7 @@ class FLAEngine:
         chunks. Skipping the lm_head copy for the latter halves the
         return-side memory bandwidth in chunked-prefill paths.
         """
-        from fastkernels.tasks.baseline.L4.recurrent_cache import RecurrentCache
+        from fastkernels.infra.recurrent_cache import RecurrentCache
 
         # Prefill writes the slots in ``seqs``. If any of those slots is
         # currently held by the live decode cache, flush so the

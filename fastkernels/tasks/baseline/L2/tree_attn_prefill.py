@@ -41,8 +41,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from .merge_state import merge_state
-from .fa_utils import (
+from ..L1.merge_state import merge_state
+from ....infra.fa_utils import (
     FA_VERSION as _FA_VERSION,
     flash_attn_varlen_func as _VLLM_FA_VARLEN_FUNC,
 )

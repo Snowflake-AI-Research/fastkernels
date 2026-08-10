@@ -212,13 +212,13 @@ def _unfused(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
     """
     out = torch.ops.fastkernels.custom_all_reduce(x)
     if weight_bias == 1.0:
-        from .gemma_rms_norm import GemmaRMSNorm
+        from ..L1.gemma_rms_norm import GemmaRMSNorm
 
         return GemmaRMSNorm._forward_static_with_residual(
             weight, eps, out, residual,
         )
 
-    from .rms_norm import RMSNorm
+    from ..L1.rms_norm import RMSNorm
 
     res = residual.clone()
     return RMSNorm.forward_cuda(out, weight, eps, res)
@@ -359,11 +359,11 @@ def fused_allreduce_rmsnorm(
     if workspace is None or zeros is None or num_tokens > max_token_num:
         out = torch.ops.fastkernels.custom_all_reduce(x)
         if weight_bias == 1.0:
-            from .gemma_rms_norm import GemmaRMSNorm
+            from ..L1.gemma_rms_norm import GemmaRMSNorm
 
             return GemmaRMSNorm._forward_static_no_residual(weight, eps, out), out
 
-        from .rms_norm import RMSNorm
+        from ..L1.rms_norm import RMSNorm
 
         return RMSNorm.forward_cuda(out, weight, eps), out
 

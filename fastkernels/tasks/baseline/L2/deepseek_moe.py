@@ -30,10 +30,10 @@ from .fused_experts import FusedExperts
 from .llama_mlp import LlamaMLP
 from .vllm_fused_experts import VllmFusedExperts
 from ..L1.fp8_linear import PerTokenGroupQuantFp8
-from ..L1.trtllm_fp8_moe import (
+from .trtllm_fp8_moe import (
     TrtllmFp8MoE, prepare_trtllm_moe_weights, trtllm_fp8_moe_available,
 )
-from ..L1.trtllm_fp4_moe import (
+from .trtllm_fp4_moe import (
     NvFp4Quantize, TrtllmFp4MoE, prepare_trtllm_fp4_moe_weights,
     trtllm_fp4_moe_available,
 )
