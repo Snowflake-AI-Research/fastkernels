@@ -26,7 +26,9 @@ from .workloads import (
     BenchmarkScenario,
     Purpose,
     Workload,
+    _module_from_name,
     module_for,
+    resolve_benchmark,
 )
 
 
@@ -331,9 +333,21 @@ def discover_operator_targets() -> list[OpTarget]:
     return targets
 
 
-def print_model_operator_map() -> None:
-    """Print which operators each model uses, and which models each operator belongs to."""
+def print_model_operator_map(models: set[str] | None = None) -> None:
+    """Print which operators each model uses, and which models each operator belongs to.
+
+    When *models* is given, both sections are restricted to those architecture
+    module keys (the scenario view); otherwise every registered architecture is
+    covered. Restricting drops non-matching models from each operator's model
+    list and hides operators no restricted model reaches.
+    """
     targets = discover_operator_targets()
+    if models is not None:
+        targets = [
+            OpTarget(t.name, t.level, t.class_name, kept)
+            for t in targets
+            if (kept := [m for m in t.models if m in models])
+        ]
 
     by_model: dict[str, list[OpTarget]] = {}
     for t in targets:
@@ -350,6 +364,64 @@ def print_model_operator_map() -> None:
     for t in sorted(targets, key=lambda t: (t.level, t.name)):
         print(f"  L{t.level}  {t.name:<25} {','.join(t.models)}")
     print()
+
+
+def print_operators_by_level(targets: list[OpTarget], title: str) -> None:
+    """Print the unique operators in *targets*, grouped by level (L1 -> L4).
+
+    Each ``OpTarget`` is already a unique ``(level, name, class)`` triple, so the
+    union across several models is naturally free of duplicates.
+    """
+    by_level: dict[int, list[OpTarget]] = {}
+    for t in targets:
+        by_level.setdefault(t.level, []).append(t)
+
+    print(f"\n{'=' * 70}\n  {title}\n{'=' * 70}")
+    total = 0
+    for level in sorted(by_level):
+        ops = sorted(by_level[level], key=lambda t: (t.name, t.class_name))
+        print(f"\n  L{level} ({len(ops)}):")
+        for t in ops:
+            print(f"    {t.name:<25} {t.class_name}")
+        total += len(ops)
+    print(f"\n  Total: {total} operator(s) across {len(by_level)} level(s)")
+    print()
+
+
+def print_scenario_operator_map(scenario_ref: str) -> None:
+    """Print the operator map restricted to a scenario's models, then the set of
+    operators those models exercise (deduplicated), grouped by level.
+
+    ``scenario_ref`` is a registered scenario name (``full`` / ``default`` /
+    ``minimal``) or a path to a scenario YAML. Each model is resolved to its L4
+    architecture module, preferring the offline name-based match and falling back
+    to the config-driven ``module_for``.
+    """
+    scenarios = resolve_benchmark(scenario_ref)
+
+    model_to_module: dict[str, str | None] = {}
+    for bs in scenarios:
+        if bs.hf_name not in model_to_module:
+            model_to_module[bs.hf_name] = (
+                _module_from_name(bs.hf_name) or module_for(bs.hf_name)
+            )
+
+    modules = {m for m in model_to_module.values() if m is not None}
+    unresolved = sorted(n for n, m in model_to_module.items() if m is None)
+
+    print(f"\n{'=' * 70}\n  SCENARIO: {scenario_ref}\n{'=' * 70}")
+    print(f"  {len(model_to_module)} model(s) -> {len(modules)} architecture(s)\n")
+    for hf_name in sorted(model_to_module):
+        module = model_to_module[hf_name]
+        print(f"    {hf_name:<45} {module if module else '(unresolved)'}")
+    if unresolved:
+        print(f"\n  Note: {len(unresolved)} model(s) had no architecture match "
+              f"and are excluded from the operator map below.")
+
+    print_model_operator_map(models=modules)
+
+    used = [t for t in discover_operator_targets() if any(m in modules for m in t.models)]
+    print_operators_by_level(used, "OPERATORS EXERCISED ACROSS SCENARIO (deduplicated)")
 
 
 # ---------------------------------------------------------------------------
@@ -479,6 +551,9 @@ def _apply_candidates_from_env() -> None:
     _candidates_applied = True
 
 
+_MAP_ALL = object()  # ``--map`` given with no scenario argument
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="fastkernels list",
@@ -487,9 +562,12 @@ def main(argv: list[str] | None = None) -> None:
     )
     view = parser.add_mutually_exclusive_group()
     view.add_argument(
-        "--map", action="store_true",
-        help="Print operators-by-model and models-by-operator mappings instead "
-             "of the family/architecture/benchmark registry.",
+        "--map", nargs="?", const=_MAP_ALL, default=None, metavar="SCENARIO",
+        help="Print the model<->operator map. With no argument, covers every "
+             "registered architecture. Given a SCENARIO (a registered name such "
+             "as 'full'/'default'/'minimal', or a path to a scenario YAML), "
+             "restrict the map to that scenario's models and also list the "
+             "operators they exercise, deduplicated and grouped by level.",
     )
     view.add_argument(
         "--workloads", action="store_true",
@@ -498,8 +576,14 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
 
-    if args.map:
-        print_model_operator_map()
+    if args.map is not None:
+        if args.map is _MAP_ALL:
+            print_model_operator_map()
+        else:
+            try:
+                print_scenario_operator_map(args.map)
+            except (FileNotFoundError, ValueError) as e:
+                parser.error(str(e))
         return
 
     if args.workloads:
