@@ -154,6 +154,38 @@ _RECORDS: dict[str, dict] = {}
 # qualified_name -> {"calls": int, "keys": {json_key: count}}
 _HOOK_RECORDS: dict[str, dict] = {}
 
+# A few operators (MLA attention) read the process-global inference ``Context``
+# *inside* their forward instead of taking it as an argument, so their captured
+# arg shapes alone don't say which code path ran. For just those ops we also
+# record a coarse, bucketed context snapshot -- enough to rebuild a
+# representative prefill Context offline (see ``fastkernels.bench``) but low-
+# cardinality (a couple of bucketed scalars) so it dedups across layers/steps
+# instead of exploding into one forward variant per call. Gated to this set so
+# it never touches the dedup of any other op.
+_CTX_SUMMARY_OPS = {
+    "fastkernels.tasks.baseline.L2.mla_attention_impl:MLAAttention",
+}
+
+
+def _bucket_pow2(x: int) -> int:
+    """Round ``x`` down to a power of two (0 stays 0) -- keeps a captured count
+    low-cardinality so it does not defeat forward-variant dedup."""
+    x = int(x or 0)
+    return 1 << (x.bit_length() - 1) if x > 0 else 0
+
+
+def _context_summary() -> dict:
+    """Coarse snapshot of the global inference ``Context`` for the ops in
+    ``_CTX_SUMMARY_OPS``. Best-effort: an empty dict if the context is
+    unavailable (e.g. imported outside an engine run)."""
+    try:
+        from .infra.context import get_context
+        ctx = get_context()
+        return {"prefill": bool(ctx.is_prefill),
+                "pf_seqs": _bucket_pow2(getattr(ctx, "num_prefill_seqs", 0))}
+    except Exception:
+        return {}
+
 
 # ---------------------------------------------------------------------------
 # Value summarization
@@ -532,6 +564,12 @@ def _wrap_method(cls, method_name: str):
                 payload = _summarize_call(sig, args, kwargs)
             else:
                 payload = {"_args": [_summarize(v) for v in args[1:]]}
+            # For context-reading ops, fold a coarse snapshot of the global
+            # inference Context into the forward variant so the code path it ran
+            # can be reconstructed offline. Injected identically in the hook
+            # below so Verification #1's key cross-check still agrees.
+            if record_key == "forward" and q in _CTX_SUMMARY_OPS:
+                payload["_ctx"] = _context_summary()
             # On ``forward``, look up which ``__init__`` variant built this
             # instance so the call is attributed to those init args.
             init_key = (
@@ -593,6 +631,21 @@ def _discover_operator_classes() -> list[type]:
         for name, exc in failed[:10]:
             print(f"    - {name}: {type(exc).__name__}: {exc}")
 
+    # Restrict to list.py operator *targets*: never instrument/record a
+    # non-target helper (e.g. an inner model class excluded via ``__targets__``)
+    # that only runs as part of a bigger op.
+    try:
+        from .list import discover_operator_targets
+        allowed = {
+            f"{_BASELINE_PACKAGE}.L{t.level}.{t.name}:{t.class_name}"
+            for t in discover_operator_targets()
+        }
+    except Exception as exc:  # noqa: BLE001 - never let target discovery break capture
+        print(f"  (operator-target filter unavailable, capturing all: {exc!r})")
+        allowed = None
+    if allowed:
+        classes = {k: v for k, v in classes.items() if k in allowed}
+
     return list(classes.values())
 
 
@@ -628,6 +681,10 @@ def _make_forward_hook(qualname: str, sig):
                 if sig is not None
                 else {"_args": [_summarize(v) for v in args]}
             )
+            # Mirror the monkey-patch's context snapshot (see ``_wrap_method``)
+            # so the two records produce identical keys for these ops.
+            if qualname in _CTX_SUMMARY_OPS:
+                summary["_ctx"] = _context_summary()
             rec = _HOOK_RECORDS.setdefault(qualname, {"calls": 0, "keys": {}})
             rec["calls"] += 1
             key = json.dumps(summary, sort_keys=True, default=str)

@@ -295,13 +295,46 @@ def _discover_operators(reports: list[dict]) -> dict[str, Operator]:
     return ops
 
 
+def _case_size(case: dict) -> int:
+    """Total captured input elements of a case (its problem size)."""
+    total = 0
+    for spec in _iter_tensor_specs(case["fwd_args"]):
+        n = 1
+        for s in spec["shape"]:
+            n *= int(s)
+        total += n
+    return total
+
+
+def _select_spread(cases: list[dict], max_shapes: int) -> list[dict]:
+    """Pick a representative spread of at most *max_shapes* cases: the smallest,
+    largest and median by problem size, then fill the rest with the hottest
+    (highest ``count``). Covers the size distribution instead of only the hot
+    decode shape, which matters for roofline-style operator benchmarking."""
+    if len(cases) <= max_shapes:
+        return sorted(cases, key=lambda c: -c["count"])
+    by_size = sorted(cases, key=_case_size)
+    priority = [0, len(by_size) - 1, len(by_size) // 2]  # min, max, median
+    priority += sorted(range(len(by_size)), key=lambda i: -by_size[i]["count"])
+    picked, seen = [], set()
+    for i in priority:
+        if i in seen:
+            continue
+        seen.add(i)
+        picked.append(by_size[i])
+        if len(picked) >= max_shapes:
+            break
+    return picked
+
+
 def _collect_cases(op: Operator, reports: list[dict], max_shapes: int) -> list[dict]:
     """Select up to *max_shapes* distinct (init, forward) cases for *op*.
 
     Each case pairs a captured ``forward`` variant with the ``__init__`` variant
     that built the instance it ran on (``init_variant_ids``). Cases are
-    deduplicated across reports by (init args, forward args) and ranked by
-    observed call ``count`` so the hottest real shapes are benchmarked first.
+    deduplicated across reports by (init args, forward args), then a
+    representative spread by problem size (smallest / largest / median) plus the
+    hottest shapes is selected (see :func:`_select_spread`).
     """
     cases: list[dict] = []
     seen: set[tuple] = set()
@@ -329,8 +362,7 @@ def _collect_cases(op: Operator, reports: list[dict], max_shapes: int) -> list[d
                 "fwd_args": fwd_args,
                 "count": int(fv.get("count", 0)),
             })
-    cases.sort(key=lambda c: -c["count"])
-    return cases[:max_shapes]
+    return _select_spread(cases, max_shapes)
 
 
 # ###########################################################################
@@ -433,6 +465,36 @@ def _init_fp8_module_weights(module: nn.Module) -> None:
             sub.weight_scale_inv = torch.nn.Parameter(weight_scale_inv, requires_grad=False)
 
 
+def _init_nvfp4_module_weights(module: nn.Module) -> None:
+    """Give every NVFP4 MoE submodule *valid* TRTLLM-gen fp4 expert weights.
+
+    The NVFP4 analogue of :func:`_init_fp8_module_weights`. A reconstructed
+    NVFP4 MoE allocates its pre-quant expert weights with ``torch.empty`` and
+    relies on the checkpoint loader to fill them + ``prepare_fp4_weights()`` to
+    transform them into the kernel's block-scaled layout; fresh, those params
+    hold garbage. Here we fill the high-precision weights with a small random
+    reference and run the module's own ``prepare_fp4_weights()`` (exactly what
+    ``weight_loader._postprocess_nvfp4_weights`` does after loading) so the op
+    runs. Duck-typed (no import) and best-effort -- a GPU without the TRTLLM-gen
+    kernel just leaves the case to skip. Both baseline + candidate are init'd,
+    then weights are shared via ``load_state_dict``."""
+    _HIGH_PREC = (torch.float16, torch.bfloat16, torch.float32)
+    for sub in module.modules():
+        prepare = getattr(sub, "prepare_fp4_weights", None)
+        if not (callable(prepare) and getattr(sub, "use_nvfp4", False)):
+            continue
+        with torch.no_grad():
+            for p in sub.parameters(recurse=True):
+                if p.dtype in _HIGH_PREC and p.numel() > 0 and (
+                        not torch.isfinite(p).all()
+                        or p.detach().abs().max().item() > 1e4):
+                    p.normal_(0, 0.02)
+        try:
+            prepare()
+        except Exception:  # noqa: BLE001 - no TRTLLM-gen kernel here; case skips
+            pass
+
+
 def _sanitize_float_params(module: nn.Module) -> None:
     """Re-initialize any high-precision float param that is *uninitialized
     garbage* to a small normal.
@@ -533,6 +595,13 @@ def _materialize_int(name: str, shape, dt: torch.dtype, device: str, init_args: 
                     or init_args.get("vocab_size") or 1024)
     elif "position" in lname:
         bound = int(init_args.get("max_position_embeddings") or 2048)
+    elif "expert" in lname or "topk_id" in lname:
+        # Expert indices: bound by the captured expert count so routing stays
+        # in range. ``slot_mapping`` / ``block_table`` are bounded against the
+        # sibling cache tensor in ``_fix_structured_inputs`` instead.
+        bound = int(init_args.get("num_experts")
+                    or init_args.get("n_routed_experts")
+                    or init_args.get("num_local_experts") or 8)
     elif ("slot" in lname or "block_table" in lname or "cache_seqlen" in lname
           or "seqlen" in lname or "seq_len" in lname):
         bound = 256
@@ -610,6 +679,41 @@ def _fix_structured_inputs(kwargs: dict) -> None:
         act = _activation_for(cn)
         if act is not None:
             kwargs[cn] = _partition_cu(act.shape[0], cu.numel() - 1, cu.device, cu.dtype)
+
+    # General safety net for ops without a dedicated builder: bound any
+    # ``slot_mapping`` / ``block_table`` against a sibling ``*cache*`` tensor so
+    # the indices stay in range -- slots index the flat (num_blocks *
+    # block_size) space, block tables index blocks (num_blocks). Ops with a
+    # registered builder (the KV stores) never reach here.
+    cache = next((t for k, t in kwargs.items()
+                  if "cache" in k.lower() and isinstance(t, torch.Tensor)
+                  and t.dim() >= 3), None)
+    if cache is not None:
+        num_blocks = int(cache.shape[0])
+        num_slots = num_blocks * int(cache.shape[1])
+        for k, t in kwargs.items():
+            lk = k.lower()
+            if not (isinstance(t, torch.Tensor) and t.numel() > 0
+                    and not t.is_floating_point()):
+                continue
+            if "block_table" in lk:
+                kwargs[k] = _valid_slot_mapping(cache, num_blocks, t)
+            elif "slot" in lk:
+                kwargs[k] = _valid_slot_mapping(cache, num_slots, t)
+
+    # Bound request-id vectors to the block table's request count. The
+    # convert-indices kernel indexes ``block_table[req_id]``; an out-of-range
+    # req_id reads adjacent GPU memory -> nondeterministic global slots.
+    bt = next((t for k, t in kwargs.items()
+               if "block_table" in k.lower() and isinstance(t, torch.Tensor)
+               and t.dim() == 2), None)
+    if bt is not None:
+        num_reqs = max(1, int(bt.shape[0]))
+        for k, t in kwargs.items():
+            if ("req_id" in k.lower() and isinstance(t, torch.Tensor)
+                    and t.numel() > 0 and not t.is_floating_point()):
+                kwargs[k] = torch.randint(0, num_reqs, tuple(t.shape),
+                                          device=t.device, dtype=t.dtype)
 
 
 def _build_call(cls: type, fwd_args: dict, device: str, init_args: dict):
@@ -709,9 +813,183 @@ def _build_fp8_linear_inputs(fwd_args, device, init_args):
                 "weight_scale_inv": weight_scale_inv, "bias": bias}
 
 
+# ---------------------------------------------------------------------------
+# Index-based ops: KV-cache stores + MoE grouped GEMM.
+#
+# Their integer inputs are *not* free: a ``slot_mapping`` must point at a real
+# paged-cache slot, and a fused-MoE launch needs mutually-consistent routing
+# metadata. The generic ``randint`` materializer would index out of range
+# (illegal memory) or feed the kernel garbage. We regenerate those tensors from
+# the *captured shapes* (cache size, expert count) so every index is valid --
+# the same idea as SOL-ExecBench's ``custom_inputs_entrypoint``.
+# ---------------------------------------------------------------------------
+def _materialize_all(fwd_args: dict, device: str, init_args: dict, skip=()) -> dict:
+    """Materialize every forward arg by keyword, skipping the given names
+    (which the caller regenerates itself)."""
+    return {k: _materialize_value(k, v, device, init_args)
+            for k, v in fwd_args.items() if k not in skip}
+
+
+def _valid_slot_mapping(cache: torch.Tensor, num_slots: int, ref: torch.Tensor):
+    """Distinct in-bounds slot indices (or ``randint`` when the mapping is
+    longer than the cache), shaped/typed like the captured ``slot_mapping``."""
+    n = ref.numel()
+    num_slots = max(1, int(num_slots))
+    if n <= num_slots:
+        slots = torch.randperm(num_slots, device=cache.device)[:n]
+    else:
+        slots = torch.randint(0, num_slots, (n,), device=cache.device)
+    return slots.to(ref.dtype).reshape(ref.shape)
+
+
+def _build_store_kvcache_inputs(cache_key: str, num_slots_fn):
+    """Factory for a KV-cache-store builder: materialize generically, then
+    rebind ``slot_mapping`` to valid slots derived from the cache tensor's
+    shape (``num_slots_fn`` encodes the NHD/HND/MLA layout)."""
+    def _builder(fwd_args, device, init_args):
+        kw = _materialize_all(fwd_args, device, init_args)
+        cache = kw.get(cache_key)
+        sm = kw.get("slot_mapping")
+        if not (isinstance(cache, torch.Tensor) and isinstance(sm, torch.Tensor)):
+            raise _UnsupportedInput("KV store: missing cache/slot_mapping")
+        kw["slot_mapping"] = _valid_slot_mapping(cache, num_slots_fn(cache.shape), sm)
+        return [], kw
+    return _builder
+
+
+def _build_indexer_k_cache_gather_inputs(fwd_args, device, init_args):
+    """Inputs for ``IndexerKCacheGather.forward(kv_cache, block_table,
+    cu_seq_lens, ...)``. The paged cache is uint8 ``[num_blocks, block_size,
+    132]`` holding fp8 keys plus a float32 scale per token; random bytes decode
+    to NaN/Inf (a random 4-byte scale is almost never finite), so the gather
+    returns NaN. Zero the cache (a valid empty cache), bound ``block_table`` to
+    the cache's block count, and drop the captured output workspace /
+    ``total_tokens`` so they stay consistent with the generated cu_seq_lens."""
+    kw = _materialize_all(fwd_args, device, init_args,
+                          skip=("total_tokens", "out_k_fp8", "out_k_scale"))
+    cache = kw.get("kv_cache")
+    bt = kw.get("block_table")
+    if not (isinstance(cache, torch.Tensor) and isinstance(bt, torch.Tensor)):
+        raise _UnsupportedInput("IndexerKCacheGather: missing kv_cache/block_table")
+    cache.zero_()
+    kw["block_table"] = _valid_slot_mapping(cache, int(cache.shape[0]), bt)
+    return [], kw
+
+
+def _build_moe_grouped_gemm_inputs(fwd_args, device, init_args):
+    """Consistent inputs for ``MoeGroupedGemm.forward``.
+
+    The routing metadata (``sorted_token_ids`` / ``expert_ids`` /
+    ``num_tokens_post_padded``) is regenerated from a random top-k assignment
+    via the model's own ``MoeAlign`` so every block maps to a valid expert and
+    every token id stays ``< num_tokens * top_k``. ``A``/``B``/``C`` and the
+    routing weights keep their captured shapes."""
+    try:
+        from fastkernels.tasks.baseline.L1.moe_align import MoeAlign
+        from fastkernels.tasks.baseline.L1.moe_grouped_gemm import _get_default_config
+    except Exception as exc:  # noqa: BLE001
+        raise _UnsupportedInput(f"MoeGroupedGemm: {exc!r}")
+
+    def _shape(key):
+        spec = fwd_args.get(key)
+        if not (isinstance(spec, dict) and isinstance(spec.get("shape"), list)):
+            raise _UnsupportedInput(f"MoeGroupedGemm: missing tensor arg {key!r}")
+        return [int(s) for s in spec["shape"]]
+
+    a_shape, b_shape = _shape("A"), _shape("B")
+    top_k = fwd_args.get("top_k")
+    if not (isinstance(top_k, int) and top_k >= 1):
+        raise _UnsupportedInput("MoeGroupedGemm: missing/invalid top_k")
+    num_tokens, num_experts = a_shape[0], b_shape[0]
+    meta = {"sorted_token_ids", "expert_ids", "num_tokens_post_padded", "config"}
+    kw = _materialize_all(fwd_args, device, init_args, skip=meta)
+    try:
+        config = _get_default_config(num_tokens, N=b_shape[1])
+        topk_ids = torch.randint(0, num_experts, (num_tokens, top_k),
+                                 device=device, dtype=torch.int32)
+        sorted_ids, expert_ids, num_padded = MoeAlign().to(device)(
+            topk_ids, config["BLOCK_SIZE_M"], num_experts)
+    except Exception as exc:  # noqa: BLE001
+        raise _UnsupportedInput(f"MoeGroupedGemm: routing metadata ({exc!r})")
+    kw.update(sorted_token_ids=sorted_ids, expert_ids=expert_ids,
+              num_tokens_post_padded=num_padded, config=config)
+    return [], kw
+
+
+def _build_mla_attention_inputs(fwd_args, device, init_args):
+    """Inputs for ``MLAAttention.forward`` driving its reconstructable *prefill*
+    path (``_forward_mha``).
+
+    The captured path is sparse decode, which needs a populated paged KV cache
+    (block tables, slot mapping, valid top-k into cached tokens) we do not
+    capture. Its dense-prefill sibling needs none of that: with the module's
+    default empty ``k_cache`` and a prefill ``Context``, the decode/sparse
+    branches (guarded by ``kv_cache.ndim >= 2``) are skipped and forward runs the
+    ``kv_b_proj`` up-projection + varlen attention over the new tokens. We wire a
+    fresh bf16 ``kv_b_proj`` (the projection the parent ``DeepSeekMLAAttention``
+    shares into ``_kv_b_proj``) and synthesize ``cu_seqlens`` by splitting the N
+    tokens across the captured (bucketed) prefill sequence count (``_ctx``)."""
+    import itertools
+    from fastkernels.tasks.baseline.L2.parallel_linear import ColumnParallelLinear
+    from fastkernels.infra.context import set_context
+
+    kw = _materialize_all(fwd_args, device, init_args,
+                          skip=("kv_b_proj", "topk_indices", "output_shape", "_ctx"))
+    q, kv_c = kw.get("q"), kw.get("kv_c_normed")
+    if not (isinstance(q, torch.Tensor) and isinstance(kv_c, torch.Tensor)):
+        raise _UnsupportedInput("MLAAttention: missing q/kv_c_normed")
+    try:
+        kv_lora = int(init_args["kv_lora_rank"])
+        out = int(init_args["num_heads"]) * (
+            int(init_args["qk_nope_head_dim"]) + int(init_args["v_head_dim"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise _UnsupportedInput(f"MLAAttention: init dims ({exc!r})")
+
+    # bf16 kv_b_proj (local per-rank width matches the captured num_heads); a
+    # forward arg, not a submodule, so its weights are filled here rather than by
+    # the module-level sanitizers. Shared by baseline + candidate (not cloned).
+    kvbp = ColumnParallelLinear(kv_lora, out, bias=False, quant_config=None)
+    with torch.no_grad():
+        kvbp.weight.normal_(0, 0.02)
+    kw["kv_b_proj"] = kvbp.to(device=device, dtype=kv_c.dtype)
+
+    # Prefill Context: split the N tokens across the captured (bucketed) prefill
+    # sequence count; each becomes one varlen segment.
+    n = int(q.shape[0])
+    ctx = fwd_args.get("_ctx") or {}
+    s = int(ctx.get("pf_seqs") or 0) if ctx.get("prefill") else 0
+    s = max(1, min(s or 1, n))
+    base, rem = divmod(n, s)
+    sizes = [base + (1 if i < rem else 0) for i in range(s)]
+    cu = torch.tensor([0, *itertools.accumulate(sizes)], device=device,
+                      dtype=torch.int32)
+    set_context(is_prefill=True, cu_seqlens_q=cu, cu_seqlens_k=cu,
+                max_seqlen_q=max(sizes), max_seqlen_k=max(sizes))
+    return [], kw
+
+
 # qualname -> builder(fwd_args, device, init_args) -> (args, kwargs).
 _INPUT_BUILDERS = {
     "fastkernels.tasks.baseline.L1.fp8_linear:Fp8Linear": _build_fp8_linear_inputs,
+    # KV-cache stores: bound slot_mapping by the paged cache's num_slots
+    # (num_blocks * block_size), whose position differs by layout.
+    "fastkernels.tasks.baseline.L1.store_kvcache:StoreKVCache":
+        _build_store_kvcache_inputs("k_cache", lambda s: int(s[0]) * int(s[1])),
+    "fastkernels.tasks.baseline.L1.store_kvcache:StoreKVCacheHND":
+        _build_store_kvcache_inputs("k_cache", lambda s: int(s[0]) * int(s[2])),
+    "fastkernels.tasks.baseline.L1.store_kvcache_fp8_mla:StoreKVCacheFP8MLA":
+        _build_store_kvcache_inputs("kv_cache", lambda s: int(s[0]) * int(s[1])),
+    # Indexer K-cache gather: zero the paged fp8 cache so gathered scales are
+    # finite (random bytes decode to NaN), and bound block_table in range.
+    "fastkernels.tasks.baseline.L1.indexer_k_cache:IndexerKCacheGather":
+        _build_indexer_k_cache_gather_inputs,
+    # Fused MoE grouped GEMM: regenerate valid routing metadata.
+    "fastkernels.tasks.baseline.L1.moe_grouped_gemm:MoeGroupedGemm":
+        _build_moe_grouped_gemm_inputs,
+    # MLA attention: drive the dense-prefill path (empty cache + prefill ctx),
+    # wiring kv_b_proj and synthesizing cu_seqlens from the captured composition.
+    "fastkernels.tasks.baseline.L2.mla_attention_impl:MLAAttention":
+        _build_mla_attention_inputs,
     # Grouped-GEMM (Fp8GroupedGemmContiguous / fused_experts) and MLA fp8 ops
     # slot in here with the same reference-quantize approach; deferred until
     # there are captures for those models (DeepSeek / Kimi) to validate against.
@@ -1091,11 +1369,14 @@ def _bench_one_case(op: Operator, baseline_cls, candidate_cls, case: dict,
 
     baseline = _prepare_module(baseline, dtype, device)
     candidate = _prepare_module(candidate, dtype, device)
-    # Give any FP8 linear submodules valid block-scaled weights, and repair any
-    # uninitialized (torch.empty) high-precision weights, on both modules (so
-    # param shapes match) before sharing weights baseline -> candidate.
+    # Give any FP8 linear / NVFP4 MoE submodules valid quantized weights, and
+    # repair any uninitialized (torch.empty) high-precision weights, on both
+    # modules (so param shapes match) before sharing weights baseline ->
+    # candidate.
     _init_fp8_module_weights(baseline)
     _init_fp8_module_weights(candidate)
+    _init_nvfp4_module_weights(baseline)
+    _init_nvfp4_module_weights(candidate)
     _sanitize_float_params(baseline)
     _sanitize_float_params(candidate)
     try:
@@ -1474,7 +1755,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--target", default=None,
                    help="Only this operator (module stem or class name).")
     p.add_argument("--level", type=int, choices=[1, 2, 3, 4], default=None,
-                   help="Only operators at this level.")
+                   help="Only operators at this level. L4 whole-model ops are "
+                        "skipped by default; pass --level 4 or --target to run them.")
     p.add_argument("--self-test", action="store_true",
                    help="Benchmark each baseline against itself (identity check).")
     p.add_argument("--gpus", default=None,
@@ -1507,8 +1789,22 @@ def _resolve_operators(args) -> list[Operator]:
     captures_dir = Path(args.captures)
     reports = _load_reports(captures_dir)
     ops = list(_discover_operators(reports).values())
+    # Restrict to list.py operator *targets*: never benchmark a non-target helper
+    # (e.g. an inner model class excluded via ``__targets__``) that only ran as
+    # part of a bigger op.
+    try:
+        from .list import discover_operator_targets
+        targets = {(t.level, t.name, t.class_name) for t in discover_operator_targets()}
+    except Exception:  # noqa: BLE001 - fall back to unfiltered if discovery fails
+        targets = None
+    if targets:
+        ops = [o for o in ops if (o.level, o.stem, o.class_name) in targets]
     if args.level is not None:
         ops = [o for o in ops if o.level == args.level]
+    elif args.target is None:
+        # L4 ops are whole-model wrappers, not kernels: rebuilding a TP-sharded
+        # model on one GPU OOMs. Skip by default; opt in via --level 4/--target.
+        ops = [o for o in ops if o.level != 4]
     if args.target is not None:
         ops = [o for o in ops if o.stem == args.target or o.class_name == args.target]
     if not args.self_test:
