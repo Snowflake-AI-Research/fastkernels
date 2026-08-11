@@ -1244,13 +1244,32 @@ def _detect_model_type(model_name: str) -> str:
         # natively).  In both cases reading config.json directly works.
         model_type = _load_config_dict(model_name).get("model_type", "llama")
     if model_type in ("deepseek_v32", "glm_moe_dsa"):
-        # GLM-5.2 (``glm_moe_dsa`` / ``GlmMoeDsaForCausalLM``) is a pure config
-        # variant of DeepSeek-V3.2 -- in vLLM ``GlmMoeDsaForCausalLM`` subclasses
+        # GLM-5.2 (``glm_moe_dsa`` / ``GlmMoeDsaForCausalLM``) is a config variant
+        # of DeepSeek-V3.2 -- in vLLM ``GlmMoeDsaForCausalLM`` subclasses
         # ``DeepseekV2ForCausalLM`` with an empty body -- so it shares the entire
-        # MLA + DSA + MoE stack (weight names, MLA-absorbed weights, TP KV-head
-        # exemption, FP8 block dequant). Route it through the DeepSeek path.
+        # MLA + DSA + MoE *weight-loading* stack (weight names, MLA-absorbed
+        # weights, TP KV-head exemption, FP8 block dequant). Collapse both to the
+        # shared ``deepseek_v3`` loader path; the concrete model CLASS (DeepSeek's
+        # vs GLM's own L4 entry point) is chosen separately via ``_is_glm_moe_dsa``.
         model_type = "deepseek_v3"
     return model_type
+
+
+def _is_glm_moe_dsa(model_name: str) -> bool:
+    """Whether *model_name* is GLM-5.2 (``glm_moe_dsa``) rather than DeepSeek-V3.2.
+
+    GLM and DeepSeek share the ``deepseek_v3`` weight-loading path (see
+    ``_detect_model_type``), but GLM is built as its own ``L4.glm`` entry point.
+    Recognized by the raw ``model_type`` or a ``GlmMoeDsaForCausalLM`` entry in
+    ``architectures`` (the value transformers cannot parse, hence the raw read).
+    """
+    try:
+        cfg = _load_config_dict(model_name)
+    except Exception:
+        return False
+    if cfg.get("model_type") == "glm_moe_dsa":
+        return True
+    return "GlmMoeDsaForCausalLM" in (cfg.get("architectures") or [])
 
 
 def _detect_quant_config(model_name: str) -> dict | None:
@@ -1550,10 +1569,22 @@ def load_model(
               f"intermediate={config.intermediate_size}, state={config.state_size})...")
         model = MambaForCausalLM(config)
     elif model_type == "deepseek_v3":
-        from ..tasks.baseline.L4.deepseek import (
-            DeepSeekV3Config, DeepSeekV3ForCausalLM,
-        )
-        config = DeepSeekV3Config.from_pretrained(model_name)
+        # GLM-5.2 and DeepSeek-V3.2 share this loader, but each builds its own L4
+        # entry point. GLM's is a thin subclass reusing the DeepSeek stack, so the
+        # config (GLM-specific fields and all) is parsed the same way.
+        if _is_glm_moe_dsa(model_name):
+            from ..tasks.baseline.L4.glm import (
+                GlmMoeDsaConfig as _CausalLMConfig,
+                GlmMoeDsaForCausalLM as _CausalLM,
+            )
+            _model_label = "GLM-5.2"
+        else:
+            from ..tasks.baseline.L4.deepseek import (
+                DeepSeekV3Config as _CausalLMConfig,
+                DeepSeekV3ForCausalLM as _CausalLM,
+            )
+            _model_label = "DeepSeek-V3.2"
+        config = _CausalLMConfig.from_pretrained(model_name)
         config.dtype = dtype
         # DSA topk_indices_buffer is sized from this (vLLM uses
         # scheduler_config.max_num_batched_tokens); the HF config has no such
@@ -1570,10 +1601,10 @@ def load_model(
         if kv_cache_dtype is not None:
             config.kv_cache_dtype = kv_cache_dtype
         _apply_max_layers(config, max_layers)
-        print(f"  Allocating DeepSeek-V3.2 / GLM-5.2 (MLA+DSA+MoE) model "
+        print(f"  Allocating {_model_label} (MLA+DSA+MoE) model "
               f"({config.n_routed_experts} experts, "
               f"top-{config.num_experts_per_tok}, DSA topk={config.index_topk})...")
-        model = DeepSeekV3ForCausalLM(config, quant_config=quant_config)
+        model = _CausalLM(config, quant_config=quant_config)
     elif model_type == "bitnet":
         from ..tasks.baseline.L4.bitnet import BitNetConfig, BitNetForCausalLM
         config = BitNetConfig.from_pretrained(model_name)
