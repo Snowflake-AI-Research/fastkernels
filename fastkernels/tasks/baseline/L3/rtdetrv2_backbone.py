@@ -11,6 +11,9 @@ from ..L1.interpolate import Interpolate
 from ..L2.rtdetrv2_resnet import RTDetrV2ResNetEmbeddings, RTDetrV2ResNetStage
 
 
+__targets__ = ["RTDetrV2ConvEncoder"]
+
+
 class RTDetrV2ResNetEncoder(nn.Module):
     def __init__(self, backbone_config, frozen_batch_norm: bool = False):
         super().__init__()

@@ -325,6 +325,9 @@ def rmsnorm_fn(
     )
 
 
+__targets__ = ["RMSNormGated", "FusedRMSNormGated"]
+
+
 class RMSNormGated(nn.Module):
     """Fused gated RMSNorm: ``out = activation(z) * RMSNorm(x, weight)``."""
 

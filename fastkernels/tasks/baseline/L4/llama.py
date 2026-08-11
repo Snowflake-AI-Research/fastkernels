@@ -18,6 +18,9 @@ from ..L1.rotary_emb import RotaryEmbedding
 from ..L3.llama_decoder import LlamaDecoderLayer
 
 
+__targets__ = ["LlamaForCausalLM"]
+
+
 @dataclass
 class LlamaConfig:
     hidden_size: int = 4096

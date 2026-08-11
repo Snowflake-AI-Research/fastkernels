@@ -40,6 +40,9 @@ from ..L2.parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from ..L3.bitnet_decoder import BitNetDecoderLayer
 
 
+__targets__ = ["BitNetForCausalLM"]
+
+
 @dataclass
 class BitNetConfig:
     model_type: str = "bitnet"

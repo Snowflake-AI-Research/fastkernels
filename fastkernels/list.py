@@ -198,14 +198,109 @@ def _internal_deps(filepath: Path, seen: set[Path] | None = None) -> set[Path]:
     return seen
 
 
-def _last_class_name(filepath: Path) -> str | None:
-    """The file's last top-level class (its primary operator), or None."""
+def _declared_targets(tree: ast.Module) -> list[str] | None:
+    """The file's explicit ``__targets__ = ["A", "B"]`` declaration, or None.
+
+    A task file may pin exactly which of its ``nn.Module`` classes are operator
+    targets (the rest being helpers) with a module-level ``__targets__`` list of
+    class-name strings. Files without one fall back to auto-detection.
+    """
+    for node in tree.body:
+        target = None
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name) and t.id == "__targets__":
+                    target = node.value
+                    break
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name) and node.target.id == "__targets__":
+                target = node.value
+        if target is None:
+            continue
+        if isinstance(target, (ast.List, ast.Tuple)):
+            return [
+                e.value for e in target.elts
+                if isinstance(e, ast.Constant) and isinstance(e.value, str)
+            ]
+        return []
+    return None
+
+
+def _nn_module_class_names(filepath: Path) -> list[str]:
+    """Auto-detected non-helper ``nn.Module`` subclasses in *filepath*.
+
+    A class qualifies when it subclasses ``nn.Module`` -- directly, via any
+    ``nn.*`` / ``torch.nn.*`` base, or transitively through another class
+    defined in the same file -- and its name does not start with an underscore.
+    Pure ``ast`` (torch is never imported), preserving source order.
+    """
     try:
         tree = ast.parse(filepath.read_text(), filename=str(filepath))
     except (OSError, SyntaxError):
-        return None
-    names = [n.name for n in tree.body if isinstance(n, ast.ClassDef)]
-    return names[-1] if names else None
+        return []
+
+    classes = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
+
+    def _base_is_nn_module(base: ast.expr) -> bool:
+        # ``nn.Module`` / ``torch.nn.Module`` and, more broadly, any ``nn.*``
+        # (Linear, Conv2d, LayerNorm, ...) which are all nn.Module subclasses.
+        if isinstance(base, ast.Attribute):
+            if base.attr == "Module":
+                return True
+            value = base.value
+            if isinstance(value, ast.Name) and value.id == "nn":
+                return True
+            if isinstance(value, ast.Attribute) and value.attr == "nn":
+                return True
+        if isinstance(base, ast.Name) and base.id == "Module":
+            return True
+        return False
+
+    cache: dict[str, bool] = {}
+
+    def _is_module(name: str, seen: set[str] | None = None) -> bool:
+        if name in cache:
+            return cache[name]
+        seen = seen or set()
+        if name in seen:
+            return False
+        seen.add(name)
+        node = classes.get(name)
+        if node is None:
+            return False
+        result = False
+        for base in node.bases:
+            if _base_is_nn_module(base) or (
+                isinstance(base, ast.Name) and _is_module(base.id, seen)
+            ):
+                result = True
+                break
+        cache[name] = result
+        return result
+
+    return [
+        name
+        for name, node in classes.items()
+        if not name.startswith("_") and _is_module(name)
+    ]
+
+
+def _target_class_names(filepath: Path) -> list[str]:
+    """The operator-target ``nn.Module`` classes for a task file.
+
+    Honors an explicit ``__targets__`` declaration when present (returning only
+    those classes, in declared order); otherwise auto-detects every non-helper
+    ``nn.Module`` subclass in the file.
+    """
+    try:
+        tree = ast.parse(filepath.read_text(), filename=str(filepath))
+    except (OSError, SyntaxError):
+        return []
+    declared = _declared_targets(tree)
+    if declared is not None:
+        class_names = {n.name for n in tree.body if isinstance(n, ast.ClassDef)}
+        return [name for name in declared if name in class_names]
+    return _nn_module_class_names(filepath)
 
 
 def discover_operator_targets() -> list[OpTarget]:
@@ -226,10 +321,12 @@ def discover_operator_targets() -> list[OpTarget]:
             if path.name.startswith("_"):
                 continue
             models = sorted(op_models.get(f"tasks.baseline.L{level}.{path.stem}", ()))
-            class_name = _last_class_name(path)
-            # Skip operators no architecture reaches, and class-less files (e.g.
-            # the pure-function Triton kernel ``merge_state``).
-            if models and class_name:
+            if not models:
+                continue
+            # One target per non-helper nn.Module class in the file. Skip files
+            # no architecture reaches, and class-less files (e.g. the pure
+            # -function Triton kernel ``merge_state``).
+            for class_name in _target_class_names(path):
                 targets.append(OpTarget(path.stem, level, class_name, models))
     return targets
 

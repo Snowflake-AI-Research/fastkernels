@@ -19,6 +19,9 @@ def apply_masks(tensor: torch.Tensor, masks: list[torch.Tensor]) -> torch.Tensor
     return torch.cat(masked_tensors, dim=0)
 
 
+__targets__ = ["VJEPA2Predictor"]
+
+
 class VJEPA2PredictorEmbeddings(nn.Module):
     def __init__(self, config):
         super().__init__()

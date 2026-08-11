@@ -36,6 +36,9 @@ from ..L1.tanh import Tanh
 _CHUNK_THRESHOLD = 64
 
 
+__targets__ = ["RWKV7Attention"]
+
+
 class LoRA(nn.Module):
     """Low-rank adapter: Linear -> activation -> Linear.
 

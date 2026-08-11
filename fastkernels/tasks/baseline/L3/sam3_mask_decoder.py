@@ -20,6 +20,9 @@ import torch.nn.functional as F
 from .sam3_rope_attention import Sam3Attention
 
 
+__targets__ = ["Sam3MaskDecoder"]
+
+
 class MLPBlock(nn.Module):
     def __init__(self, embedding_dim: int, mlp_dim: int, act: Type[nn.Module] = nn.GELU):
         super().__init__()

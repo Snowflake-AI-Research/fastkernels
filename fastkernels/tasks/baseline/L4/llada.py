@@ -20,6 +20,9 @@ from ..L2.parallel_linear import ReplicatedLinear
 from ..L3.llada_block import LLaDABlock
 
 
+__targets__ = ["LLaDAModelLM"]
+
+
 @dataclass
 class LLaDAConfig:
     d_model: int = 4096

@@ -49,6 +49,9 @@ from ..L3.jamba_decoder import (
 # Config (mirrors transformers.models.jamba.configuration_jamba.JambaConfig
 # field-for-field for the bits the pipeline actually consumes).
 # ---------------------------------------------------------------------------
+__targets__ = ["JambaForCausalLM"]
+
+
 @dataclass
 class JambaConfig:
     # ---- Common LLM fields ----

@@ -32,6 +32,9 @@ def inverse_sigmoid(x, eps=1e-5):
     return torch.log(x1 / x2)
 
 
+__targets__ = ["RTDetrV2Decoder"]
+
+
 class RTDetrV2DecoderLayer(nn.Module):
     def __init__(self, config):
         super().__init__()

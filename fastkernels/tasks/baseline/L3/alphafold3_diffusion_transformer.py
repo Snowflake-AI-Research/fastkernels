@@ -15,6 +15,9 @@ from ..L2.alphafold3_attention_pair_bias import AttentionPairBias, CrossAttentio
 from ..L2.alphafold3_swiglu_transition import ConditionedTransitionBlock
 
 
+__targets__ = ["DiffusionTransformer"]
+
+
 class DiffusionTransformerBlock(nn.Module):
     """AF3 Algorithm 23: Diffusion transformer block.
 

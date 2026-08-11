@@ -16,6 +16,9 @@ from ..L2.t5_attention import T5SelfAttention
 from ..L2.t5_dense import T5DenseActDense, T5DenseGatedActDense
 
 
+__targets__ = ["T5Block"]
+
+
 class T5LayerSelfAttention(nn.Module):
     def __init__(self, config: T5Config, has_relative_attention_bias: bool = False):
         super().__init__()

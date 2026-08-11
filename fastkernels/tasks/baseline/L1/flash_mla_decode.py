@@ -32,6 +32,9 @@ from vllm.v1.attention.ops.flashmla import (
 )
 
 
+__targets__ = ["FlashMLADecode", "FlashMLADecodeFP8"]
+
+
 class FlashMLADecode(nn.Module):
     """Wraps ``flash_mla_with_kvcache`` for paged MLA decode.
 

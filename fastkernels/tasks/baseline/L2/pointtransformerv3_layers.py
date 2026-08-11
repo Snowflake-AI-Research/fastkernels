@@ -27,6 +27,9 @@ _SEGMENT_CSR = SegmentCSR()
 _SERIALIZE = PointTransformerV3Serialization()
 
 
+__targets__ = ["Block", "SerializedPooling", "SerializedUnpooling", "Embedding"]
+
+
 class Point(Dict):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

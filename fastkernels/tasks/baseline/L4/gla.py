@@ -28,6 +28,9 @@ from ..L3.gla_decoder import GLADecoderLayer
 from ....infra.recurrent_cache import CausalLMOutputWithPast, RecurrentCache
 
 
+__targets__ = ["GLAForCausalLM"]
+
+
 @dataclass
 class GLAConfig:
     hidden_size: int = 2560

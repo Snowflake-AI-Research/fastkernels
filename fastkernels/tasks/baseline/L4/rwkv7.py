@@ -33,6 +33,9 @@ from ..L3.rwkv7_decoder import RWKV7Block
 from ....infra.recurrent_cache import CausalLMOutputWithPast, RecurrentCache
 
 
+__targets__ = ["RWKV7ForCausalLM"]
+
+
 @dataclass
 class RWKV7Config:
     hidden_size: int = 2560

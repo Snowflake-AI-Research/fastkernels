@@ -11,6 +11,9 @@ from ..L1.layer_norm import LayerNorm
 from ..L1.linear import Linear
 
 
+__targets__ = ["EncoderAttention"]
+
+
 class EncoderSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()

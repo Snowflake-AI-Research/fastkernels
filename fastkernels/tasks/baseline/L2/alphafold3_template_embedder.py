@@ -18,6 +18,9 @@ from .alphafold3_pair_block import PairBlock
 from .alphafold3_swiglu_transition import SwiGLUTransition
 
 
+__targets__ = ["TemplateEmbedder"]
+
+
 class TemplatePairEmbedder(nn.Module):
     """Embeds template pair features (Algorithm 16, lines 1-5).
 

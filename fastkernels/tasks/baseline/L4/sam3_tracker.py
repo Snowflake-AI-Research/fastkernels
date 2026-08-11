@@ -75,6 +75,9 @@ def fill_holes_in_mask_scores(mask, max_area=0):
     return mask
 
 
+__targets__ = ["Sam3TrackerPredictor"]
+
+
 class Sam3TrackerBase(nn.Module):
     """Core frame-by-frame tracker with memory bank.
 

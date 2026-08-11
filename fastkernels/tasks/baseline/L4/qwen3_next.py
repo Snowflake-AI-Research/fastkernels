@@ -65,6 +65,9 @@ def _default_layer_types() -> list[str]:
     ]
 
 
+__targets__ = ["Qwen3NextForCausalLM"]
+
+
 @dataclass
 class Qwen3NextConfig:
     hidden_size: int = 2048

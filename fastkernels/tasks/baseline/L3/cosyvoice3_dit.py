@@ -38,6 +38,9 @@ def get_pos_embed_indices(start, length, max_pos, scale=1.0):
     return pos
 
 
+__targets__ = ["DiT"]
+
+
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim, theta=10000.0, theta_rescale_factor=1.0,
                  freqs_for="lang", max_freq=10, num_freqs=1):

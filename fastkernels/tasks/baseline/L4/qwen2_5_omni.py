@@ -29,6 +29,9 @@ from ..L2.vision_patch_embed import VisionPatchEmbed
 from .qwen2_vl import Qwen2Model
 
 
+__targets__ = ["Qwen2_5OmniThinkerForConditionalGeneration"]
+
+
 @dataclass
 class Qwen2_5OmniVisionConfig:
     depth: int = 32

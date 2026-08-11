@@ -12,6 +12,9 @@ import torch
 import torch.nn as nn
 
 
+__targets__ = ["CausalConditionalCFM"]
+
+
 class BASECFM(nn.Module, ABC):
     def __init__(self, n_feats, cfm_params, n_spks=1, spk_emb_dim=128):
         super().__init__()

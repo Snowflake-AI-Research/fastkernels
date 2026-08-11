@@ -22,6 +22,9 @@ from ..L1.layer_norm import LayerNorm
 from .sam3_vit_block import Sam3ViTBlock
 
 
+__targets__ = ["Sam3ViT"]
+
+
 class Sam3PatchEmbed(nn.Module):
     """Image to patch embedding via convolution."""
 

@@ -19,6 +19,9 @@ from ..L3.vjepa2_pooler import VJEPA2AttentivePooler
 from ..L3.vjepa2_predictor import VJEPA2Predictor, apply_masks
 
 
+__targets__ = ["VJEPA2ForVideoClassification"]
+
+
 @dataclass
 class VJEPA2WithMaskedInputPredictorOutput:
     last_hidden_state: torch.Tensor

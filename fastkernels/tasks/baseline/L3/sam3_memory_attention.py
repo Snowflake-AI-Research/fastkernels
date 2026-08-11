@@ -33,6 +33,9 @@ def _get_clones(module: nn.Module, N: int) -> nn.ModuleList:
     return nn.ModuleList([deepcopy(module) for _ in range(N)])
 
 
+__targets__ = ["Sam3MemoryAttention"]
+
+
 class Sam3MemoryAttentionLayer(nn.Module):
     """Pre-norm transformer layer with RoPE self-attention + RoPE cross-attention + FFN.
 

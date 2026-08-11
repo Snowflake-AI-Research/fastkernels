@@ -15,6 +15,9 @@ from ..L1.linear import Linear
 from ..L3.convnextv2_stage import ConvNeXtV2Stage
 
 
+__targets__ = ["ConvNextV2ForImageClassification"]
+
+
 @dataclass
 class ImageClassifierOutput:
     logits: torch.Tensor

@@ -21,6 +21,9 @@ def _drop_path(input: torch.Tensor, drop_prob: float = 0.0, training: bool = Fal
     return input.div(keep_prob) * random_tensor
 
 
+__targets__ = ["VJEPA2Layer"]
+
+
 class VJEPA2DropPath(nn.Module):
     def __init__(self, drop_prob: Optional[float] = None):
         super().__init__()

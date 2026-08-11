@@ -9,6 +9,9 @@ from ..L2.vjepa2_attention import VJEPA2PoolerCrossAttention, VJEPA2PoolerSelfAt
 from ..L2.vjepa2_mlp import VJEPA2MLP
 
 
+__targets__ = ["VJEPA2AttentivePooler"]
+
+
 class VJEPA2PoolerSelfAttentionLayer(nn.Module):
     def __init__(self, config):
         super().__init__()

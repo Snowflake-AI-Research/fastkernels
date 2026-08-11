@@ -45,6 +45,9 @@ logger = logging.getLogger(__name__)
 # Config
 # ---------------------------------------------------------------------------
 
+__targets__ = ["SDXLPipeline"]
+
+
 @dataclass
 class SDXLConfig:
     """Configuration for SDXL UNet2DConditionModel."""

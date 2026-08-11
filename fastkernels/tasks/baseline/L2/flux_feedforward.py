@@ -12,6 +12,9 @@ from ..L1.gelu import GELU
 from .parallel_linear import ColumnParallelLinear, RowParallelLinear
 
 
+__targets__ = ["FeedForward"]
+
+
 class ColumnParallelApproxGELU(nn.Module):
     def __init__(self, dim_in: int, dim_out: int, *, approximate: str, bias: bool = True,
                  quant_config: dict | None = None):

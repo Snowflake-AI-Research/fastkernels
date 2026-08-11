@@ -13,6 +13,9 @@ from ..L2.parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from ..L3.kimi_linear_decoder import KimiLinearDecoderLayer
 
 
+__targets__ = ["KimiLinearForCausalLM"]
+
+
 @dataclass
 class KimiLinearConfig:
     hidden_size: int = 2304

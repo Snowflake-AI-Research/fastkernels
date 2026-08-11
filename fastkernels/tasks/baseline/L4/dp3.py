@@ -60,6 +60,9 @@ logger = logging.getLogger(__name__)
 # Config
 # ---------------------------------------------------------------------------
 
+__targets__ = ["DP3Pipeline"]
+
+
 @dataclass
 class DP3Config:
     """DP3 / Simple-DP3 configuration.

@@ -292,6 +292,9 @@ def _aggregate_atom_feat_to_tokens(
     return result
 
 
+__targets__ = ["AtomAttentionEncoder", "AtomAttentionDecoder"]
+
+
 class RefAtomFeatureEmbedder(nn.Module):
     """Embeds reference atom features (Algorithm 5, lines 1-6).
 

@@ -33,6 +33,9 @@ from ..L1.silu_and_mul import SiluAndMul
 from ..L2.attention_impl import Attention
 
 
+__targets__ = ["LlamaForCausalLMEagle3"]
+
+
 @dataclass
 class LlamaEagle3Config:
     hidden_size: int = 4096

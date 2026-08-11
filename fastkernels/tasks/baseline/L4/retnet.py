@@ -27,6 +27,9 @@ from ..L3.retnet_decoder import RetNetDecoderLayer
 from ....infra.recurrent_cache import CausalLMOutputWithPast, RecurrentCache
 
 
+__targets__ = ["RetNetForCausalLM"]
+
+
 @dataclass
 class RetNetConfig:
     hidden_size: int = 2560

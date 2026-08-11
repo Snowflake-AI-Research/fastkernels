@@ -184,16 +184,50 @@ def _needs_init_stub(cls: type) -> bool:
     return "__init__" in cls.__dict__
 
 
-def generate_stub(cls: type, level: int, name: str) -> str:
-    """Generate a stub module string for an operator class."""
+def _stub_class_block(cls: type) -> str:
+    """Render a single ``nn.Module`` stub class (init + forward signatures)."""
     class_name = cls.__name__
-
     init_sig = inspect.signature(cls.__init__) if _needs_init_stub(cls) else None
     forward_sig = inspect.signature(cls.forward)
 
+    lines = [f"class {class_name}(nn.Module):"]
+
+    if init_sig is not None:
+        init_params = _build_signature_str(init_sig)
+        lines.append(f"    def __init__({init_params}):")
+        lines.append(f"        super().__init__()")
+        lines.append(f"        # TODO: implement custom initialization here")
+        lines.append(f"        pass")
+    else:
+        lines.append(f"    def __init__(self):")
+        lines.append(f"        super().__init__()")
+        lines.append(f"        # TODO: add custom state or buffers here if needed")
+        lines.append(f"        pass")
+
+    lines.append("")
+    fwd_params = _build_signature_str(forward_sig)
+    fwd_ret = _format_return_annotation(forward_sig)
+    lines.append(f"    def forward({fwd_params}){fwd_ret}:")
+    lines.append(f"        # TODO: implement custom forward kernel here")
+    lines.append(f"        # To call a custom CUDA op: result = _custom_ops.my_op(tensor)")
+    lines.append(f"        raise NotImplementedError")
+
+    return "\n".join(lines)
+
+
+def generate_stub(classes, level: int, name: str) -> str:
+    """Generate a stub module string covering every target class in a file.
+
+    ``classes`` may be a single class or a list of classes (files with more than
+    one non-helper ``nn.Module`` target get all of them in one stub module).
+    """
+    if not isinstance(classes, (list, tuple)):
+        classes = [classes]
+    joined = ", ".join(c.__name__ for c in classes)
+
     lines = []
 
-    lines.append(f'"""Stub replacement for {class_name} (L{level}/{name})."""')
+    lines.append(f'"""Stub replacement(s) for L{level}/{name}: {joined}."""')
     lines.append("")
     lines.append("from __future__ import annotations")
     lines.append("")
@@ -231,33 +265,13 @@ def generate_stub(cls: type, level: int, name: str) -> str:
     lines.append("#       verbose=False,")
     lines.append("#   )")
     lines.append("# -------------------------------------------------")
-    lines.append("")
-    lines.append("")
 
-    lines.append(f"class {class_name}(nn.Module):")
-
-    if init_sig is not None:
-        init_params = _build_signature_str(init_sig)
-        lines.append(f"    def __init__({init_params}):")
-        lines.append(f"        super().__init__()")
-        lines.append(f"        # TODO: implement custom initialization here")
-        lines.append(f"        pass")
-    else:
-        lines.append(f"    def __init__(self):")
-        lines.append(f"        super().__init__()")
-        lines.append(f"        # TODO: add custom state or buffers here if needed")
-        lines.append(f"        pass")
+    for cls in classes:
+        lines.append("")
+        lines.append("")
+        lines.append(_stub_class_block(cls))
 
     lines.append("")
-    fwd_params = _build_signature_str(forward_sig)
-    fwd_ret = _format_return_annotation(forward_sig)
-    fwd_call = _build_call_args(forward_sig)
-    lines.append(f"    def forward({fwd_params}){fwd_ret}:")
-    lines.append(f"        # TODO: implement custom forward kernel here")
-    lines.append(f"        # To call a custom CUDA op: result = _custom_ops.my_op(tensor)")
-    lines.append(f"        raise NotImplementedError")
-    lines.append("")
-
     return "\n".join(lines)
 
 
@@ -329,26 +343,41 @@ def main(argv: list[str] | None = None):
 
     _CANDIDATE_DIR.mkdir(parents=True, exist_ok=True)
 
-    print(f"\nCreating stubs for up to {len(targets)} operators:\n")
+    # Group by file: a file with several non-helper nn.Module targets gets a
+    # single stub module containing all of them.
+    from collections import OrderedDict
+
+    by_file: "OrderedDict[tuple[int, str], list]" = OrderedDict()
+    for t in targets:
+        by_file.setdefault((t.level, t.name), []).append(t)
+
+    print(f"\nCreating stubs for up to {len(by_file)} operator file(s):\n")
     written = 0
     skipped: list[tuple[str, str]] = []
-    for t in targets:
-        module_path = f"tasks.baseline.L{t.level}.{t.name}"
-        try:
-            cls = _resolve_operator_class(module_path, t.class_name)
-        except Exception as exc:  # noqa: BLE001 - usually a missing optional dep
-            skipped.append((f"L{t.level}/{t.name}", f"{type(exc).__name__}: {exc}"))
-            continue
-        if cls is None:
-            skipped.append((f"L{t.level}/{t.name}", "no nn.Module class found"))
+    for (level, name), file_targets in by_file.items():
+        module_path = f"tasks.baseline.L{level}.{name}"
+        classes = []
+        for t in file_targets:
+            try:
+                cls = _resolve_operator_class(module_path, t.class_name)
+            except Exception as exc:  # noqa: BLE001 - usually a missing optional dep
+                skipped.append((f"L{level}/{name}:{t.class_name}",
+                                f"{type(exc).__name__}: {exc}"))
+                continue
+            if cls is None:
+                skipped.append((f"L{level}/{name}:{t.class_name}",
+                                "no nn.Module class found"))
+                continue
+            classes.append(cls)
+        if not classes:
             continue
 
-        level_dir = _CANDIDATE_DIR / f"L{t.level}"
+        level_dir = _CANDIDATE_DIR / f"L{level}"
         level_dir.mkdir(parents=True, exist_ok=True)
-        out_file = level_dir / f"{t.name}.py"
-        out_file.write_text(generate_stub(cls, t.level, t.name))
+        out_file = level_dir / f"{name}.py"
+        out_file.write_text(generate_stub(classes, level, name))
         written += 1
-        print(f"  L{t.level}/{t.name}.py  ({cls.__name__})")
+        print(f"  L{level}/{name}.py  ({', '.join(c.__name__ for c in classes)})")
 
     print(f"\nDone. {written} stub(s) written to {_CANDIDATE_DIR}")
     if skipped:
