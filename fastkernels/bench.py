@@ -514,6 +514,67 @@ def _sanitize_float_params(module: nn.Module) -> None:
                     p.normal_(0, 0.02)
 
 
+# --- DSA sparse indexer decode reconstruction --------------------------------
+# The indexer's meaningful path scores queries against a paged KV cache and
+# selects a top-k. To bench it standalone we synthesize a small, self-consistent
+# decode state: a valid FP8 indexer cache (populated by the real store kernel so
+# the packing/scale format is exact) plus decode metadata that all agree on the
+# same block geometry. The cached length is > topk_tokens so the top-k actually
+# selects (a real scoring test rather than "return everything").
+_INDEXER_BLOCK_SIZE = 64
+
+
+def _indexer_ctx_len(topk_tokens: int) -> int:
+    """Per-request cached KV length for the indexer decode bench: > topk (so the
+    top-k genuinely selects), rounded up to a whole number of blocks."""
+    ctx = 2 * max(1, int(topk_tokens))
+    return -(-ctx // _INDEXER_BLOCK_SIZE) * _INDEXER_BLOCK_SIZE
+
+
+def _prep_sparse_attn_indexer(module: nn.Module, init_args: dict, device: str) -> None:
+    """Populate ``SparseAttnIndexer`` module state its decode forward needs but
+    that is neither a constructor arg nor a captured weight: a valid FP8 indexer
+    K cache, plus flags that make the top-k comparison deterministic.
+
+    The cache is filled with the real ``IndexerKCacheStore`` kernel (so the fp8
+    key + UE8M0 scale packing is byte-exact) from a fixed seed, so baseline and
+    candidate get an identical cache (else their logits -- hence top-k -- would
+    differ). ``_sort_topk`` forces the canonical ascending index order (the
+    kernels are otherwise order-nondeterministic under real sparsity), and
+    ``max_model_len`` is shrunk to bound the decode logits buffer width."""
+    from fastkernels.tasks.baseline.L1.indexer_k_cache import IndexerKCacheStore
+
+    try:
+        topk = int(init_args["topk_tokens"])
+        head_dim = int(init_args["head_dim"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise _UnsupportedInput(f"SparseAttnIndexer prep: init dims ({exc!r})")
+
+    ctx_len = _indexer_ctx_len(topk)
+    max_blocks = ctx_len // _INDEXER_BLOCK_SIZE
+    total_slots = max_blocks * _INDEXER_BLOCK_SIZE
+    cache = torch.zeros(max_blocks, _INDEXER_BLOCK_SIZE, head_dim + 4,
+                        dtype=torch.uint8, device=device)
+    gen = torch.Generator(device=device).manual_seed(0)
+    keys = torch.randn(total_slots, head_dim, generator=gen, device=device,
+                       dtype=torch.float32).clamp_(-2, 2).to(torch.bfloat16)
+    slots = torch.arange(total_slots, device=device, dtype=torch.int64)
+    IndexerKCacheStore()(keys, cache, slots)
+
+    module.indexer_k_cache = cache
+    module._sort_topk = True
+    module.max_model_len = ctx_len
+
+
+# qualname -> prep(module, init_args, device): set up op-specific module state
+# (caches / flags) a valid forward depends on but that isn't a constructor arg
+# or a captured weight. Applied to baseline AND candidate before timing.
+_MODULE_PREP = {
+    "fastkernels.tasks.baseline.L2.sparse_attn_indexer:SparseAttnIndexer":
+        _prep_sparse_attn_indexer,
+}
+
+
 def _case_dtype(fwd_args: dict) -> torch.dtype:
     """The dominant floating compute dtype of a case (first fp16/bf16/fp32
     tensor input); defaults to bfloat16."""
@@ -916,6 +977,26 @@ def _build_moe_grouped_gemm_inputs(fwd_args, device, init_args):
     return [], kw
 
 
+def _set_mla_prefill_context(n: int, device: str, ctx_summary: dict | None) -> None:
+    """Publish a prefill inference ``Context`` for the MLA family: split the N
+    tokens into varlen segments (across the captured bucketed prefill seq count
+    when available, else one) and set ``cu_seqlens``. ``block_tables`` /
+    ``slot_mapping`` are left unset so the sparse/decode branches -- and the
+    indexer's paged-cache gather -- are skipped: the reconstructable dense-prefill
+    path (``MLAAttention._forward_mha``)."""
+    import itertools
+    from fastkernels.infra.context import set_context
+    ctx = ctx_summary or {}
+    s = int(ctx.get("pf_seqs") or 0) if ctx.get("prefill") else 0
+    s = max(1, min(s or 1, n))
+    base, rem = divmod(n, s)
+    sizes = [base + (1 if i < rem else 0) for i in range(s)]
+    cu = torch.tensor([0, *itertools.accumulate(sizes)], device=device,
+                      dtype=torch.int32)
+    set_context(is_prefill=True, cu_seqlens_q=cu, cu_seqlens_k=cu,
+                max_seqlen_q=max(sizes), max_seqlen_k=max(sizes))
+
+
 def _build_mla_attention_inputs(fwd_args, device, init_args):
     """Inputs for ``MLAAttention.forward`` driving its reconstructable *prefill*
     path (``_forward_mha``).
@@ -927,11 +1008,9 @@ def _build_mla_attention_inputs(fwd_args, device, init_args):
     branches (guarded by ``kv_cache.ndim >= 2``) are skipped and forward runs the
     ``kv_b_proj`` up-projection + varlen attention over the new tokens. We wire a
     fresh bf16 ``kv_b_proj`` (the projection the parent ``DeepSeekMLAAttention``
-    shares into ``_kv_b_proj``) and synthesize ``cu_seqlens`` by splitting the N
-    tokens across the captured (bucketed) prefill sequence count (``_ctx``)."""
-    import itertools
+    shares into ``_kv_b_proj``); ``cu_seqlens`` come from the shared prefill-ctx
+    helper (split across the captured bucketed prefill seq count in ``_ctx``)."""
     from fastkernels.tasks.baseline.L2.parallel_linear import ColumnParallelLinear
-    from fastkernels.infra.context import set_context
 
     kw = _materialize_all(fwd_args, device, init_args,
                           skip=("kv_b_proj", "topk_indices", "output_shape", "_ctx"))
@@ -953,18 +1032,70 @@ def _build_mla_attention_inputs(fwd_args, device, init_args):
         kvbp.weight.normal_(0, 0.02)
     kw["kv_b_proj"] = kvbp.to(device=device, dtype=kv_c.dtype)
 
-    # Prefill Context: split the N tokens across the captured (bucketed) prefill
-    # sequence count; each becomes one varlen segment.
-    n = int(q.shape[0])
-    ctx = fwd_args.get("_ctx") or {}
-    s = int(ctx.get("pf_seqs") or 0) if ctx.get("prefill") else 0
-    s = max(1, min(s or 1, n))
-    base, rem = divmod(n, s)
-    sizes = [base + (1 if i < rem else 0) for i in range(s)]
-    cu = torch.tensor([0, *itertools.accumulate(sizes)], device=device,
-                      dtype=torch.int32)
-    set_context(is_prefill=True, cu_seqlens_q=cu, cu_seqlens_k=cu,
-                max_seqlen_q=max(sizes), max_seqlen_k=max(sizes))
+    _set_mla_prefill_context(int(q.shape[0]), device, fwd_args.get("_ctx"))
+    return [], kw
+
+
+def _build_sparse_attn_indexer_inputs(fwd_args, device, init_args):
+    """Inputs for ``SparseAttnIndexer.forward`` driving its decode path
+    (``_decode_topk``) against the cache built by ``_prep_sparse_attn_indexer``.
+
+    Wires a fresh ``rope_emb`` (indexer RoPE; ``_wk_wp_fused`` stays ``None`` so
+    the separate ``wk``/``weights_proj`` run -- no ``compute_absorbed_weights``
+    needed), and sets a decode ``Context`` whose ``block_tables`` /
+    ``context_lens`` match the prep cache's block geometry: every request shares
+    blocks ``[0, max_blocks)`` and reads ``ctx_len`` cached tokens. ``positions``
+    are re-drawn within the RoPE cache."""
+    from fastkernels.tasks.baseline.L1.yarn_rotary_emb import YarnRotaryEmbedding
+    from fastkernels.infra.context import set_context
+
+    kw = _materialize_all(fwd_args, device, init_args, skip=("rope_emb", "positions"))
+    hs = kw.get("hidden_states")
+    if not isinstance(hs, torch.Tensor):
+        raise _UnsupportedInput("SparseAttnIndexer: missing hidden_states")
+    m = int(hs.shape[0])
+    try:
+        rope_dim = int(init_args["rope_dim"])
+        topk = int(init_args["topk_tokens"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise _UnsupportedInput(f"SparseAttnIndexer: init dims ({exc!r})")
+
+    max_pos = 8192
+    rope = YarnRotaryEmbedding(head_dim=rope_dim, max_position_embeddings=max_pos,
+                               rope_theta=10000.0, scaling_factor=1.0,
+                               is_plain=True, cache_dtype=hs.dtype).to(device)
+    kw["rope_emb"] = rope
+    kw["positions"] = torch.randint(0, max_pos, (m,), device=device, dtype=torch.int64)
+
+    # Decode Context consistent with _prep_sparse_attn_indexer's cache geometry.
+    ctx_len = _indexer_ctx_len(topk)
+    max_blocks = ctx_len // _INDEXER_BLOCK_SIZE
+    block_tables = torch.arange(max_blocks, device=device, dtype=torch.int32) \
+        .view(1, max_blocks).expand(m, max_blocks).contiguous()
+    context_lens = torch.full((m,), ctx_len, device=device, dtype=torch.int32)
+    set_context(is_prefill=False, context_lens=context_lens,
+                block_tables=block_tables, max_context_len=ctx_len)
+    return [], kw
+
+
+def _build_deepseek_mla_composite_inputs(fwd_args, device, init_args):
+    """Inputs for the DeepSeek MLA composites -- ``DeepSeekMLAAttention`` and the
+    ``DeepSeekDecoderLayer`` wrapping it -- driving the reconstructable prefill
+    path end to end.
+
+    Construction already wires the submodules (the parent ``__init__`` sets
+    ``self.attn._kv_b_proj`` and ``self.indexer._rope_emb``), so the only missing
+    piece is a prefill ``Context``. With one, ``self.attn`` runs ``_forward_mha``
+    over the new tokens (no absorbed weights or paged cache) and the indexer runs
+    its projection+RoPE+quant front half then early-returns (``block_tables``
+    unset), while ``o_proj``/``down_proj`` skip their allreduce at ``tp=1``. All
+    args (incl. ``positions``, ``residual``) come from the generic materializer;
+    weights are filled by the module-level bf16/fp8/nvfp4 sanitizers."""
+    kw = _materialize_all(fwd_args, device, init_args)
+    hs = kw.get("hidden_states")
+    if not isinstance(hs, torch.Tensor):
+        raise _UnsupportedInput("DeepSeek MLA composite: missing hidden_states")
+    _set_mla_prefill_context(int(hs.shape[0]), device, fwd_args.get("_ctx"))
     return [], kw
 
 
@@ -990,6 +1121,17 @@ _INPUT_BUILDERS = {
     # wiring kv_b_proj and synthesizing cu_seqlens from the captured composition.
     "fastkernels.tasks.baseline.L2.mla_attention_impl:MLAAttention":
         _build_mla_attention_inputs,
+    # DSA sparse indexer: drive the decode path (top-k over a synthesized paged
+    # cache); pairs with _prep_sparse_attn_indexer, which fills that cache.
+    "fastkernels.tasks.baseline.L2.sparse_attn_indexer:SparseAttnIndexer":
+        _build_sparse_attn_indexer_inputs,
+    # DeepSeek MLA composites: same prefill-Context trick as MLAAttention above,
+    # but end to end (submodules already wired in __init__). One builder serves
+    # the attention module and the decoder layer that wraps it.
+    "fastkernels.tasks.baseline.L2.deepseek_mla_attention:DeepSeekMLAAttention":
+        _build_deepseek_mla_composite_inputs,
+    "fastkernels.tasks.baseline.L3.deepseek_decoder:DeepSeekDecoderLayer":
+        _build_deepseek_mla_composite_inputs,
     # Grouped-GEMM (Fp8GroupedGemmContiguous / fused_experts) and MLA fp8 ops
     # slot in here with the same reference-quantize approach; deferred until
     # there are captures for those models (DeepSeek / Kimi) to validate against.
@@ -1384,6 +1526,21 @@ def _bench_one_case(op: Operator, baseline_cls, candidate_cls, case: dict,
     except Exception:
         pass  # best-effort weight sharing (old runner does the same)
 
+    # Op-specific module state (e.g. a valid paged cache) the forward reads from
+    # ``self`` rather than its args. Seeded so both modules match; run after
+    # weight sharing so it is not clobbered.
+    prep = _MODULE_PREP.get(op.qualname)
+    if prep is not None:
+        try:
+            prep(baseline, init_args, device)
+            prep(candidate, init_args, device)
+        except _UnsupportedInput as exc:
+            res.detail = f"skip: {exc}"
+            return res
+        except Exception as exc:  # noqa: BLE001 - prep needs a kernel not present here
+            res.detail = f"skip: module prep failed ({exc!r})"
+            return res
+
     # 2) Correctness over N rounds of fresh inputs.
     worst = None
     for r in range(rounds):
@@ -1699,6 +1856,146 @@ def _run_parallel(ops: list[Operator], args, gpu_ids: list[str], mode: str) -> B
 
 
 # ---------------------------------------------------------------------------
+# Distributed (TP) ops: auto-spawn a world_size=TP NCCL group, no torchrun.
+#
+# A few ops only make sense across ranks: ``AllReduce`` issues a collective, and
+# ``RowParallelLinear`` row-shards its input (captured activation width =
+# input_size // TP) then all-reduces. A tp=1 rebuild mismatches the shard width
+# and has no group to reduce over, so those cases skip. Instead we grab the whole
+# GPU set and run the op in a real world_size=TP group. Every rank runs the same
+# seeded cases in lockstep so the in-forward collectives stay matched; rank 0
+# records the results. TP comes from the capture (its sharding is baked into the
+# captured shapes), so replaying at the same world size is what makes it valid.
+# ---------------------------------------------------------------------------
+_DISTRIBUTED_OPS = {
+    "fastkernels.tasks.baseline.L1.allreduce:AllReduce",
+    "fastkernels.tasks.baseline.L2.parallel_linear:RowParallelLinear",
+}
+
+
+def _capture_tp(captures_dir: Path) -> int:
+    """TP degree the capture ran at, parsed from report filenames (``..._tp8_``).
+    RowParallelLinear's activation width is ``input_size // tp``, so a faithful
+    replay must use the same world size. 0 if no filename encodes it."""
+    best = 0
+    for p in captures_dir.glob("*.json"):
+        m = re.search(r"_tp(\d+)", p.name)
+        if m:
+            best = max(best, int(m.group(1)))
+    return best
+
+
+def _free_port() -> int:
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def _dist_worker_entry(rank, world_size, port, op_qualname, wargs, out_path, gpu_ids):
+    """One rank of an auto-spawned NCCL group (run via ``mp.spawn``). Builds the
+    op sharded at ``world_size`` (``_tp_size()`` reads the live group) and runs
+    its cases; rank 0 appends result JSON to ``out_path``. All ranks do identical
+    seeded work so the collectives inside each forward stay in lockstep."""
+    import torch.distributed as dist
+    from datetime import timedelta
+    # Pin this rank to its GPU before any CUDA init (spawn children start clean).
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_ids)
+    torch.cuda.set_device(rank)
+    device = f"cuda:{rank}"
+    dist.init_process_group("nccl", init_method=f"tcp://127.0.0.1:{port}",
+                            world_size=world_size, rank=rank,
+                            device_id=torch.device(device),
+                            timeout=timedelta(minutes=5))
+    try:
+        op = _parse_operator(op_qualname)
+        baseline_cls = _import_symbol(op_qualname)
+        candidate_cls = (baseline_cls if wargs["self_test"]
+                         else _load_candidate_class(op))
+        if candidate_cls is None:
+            return
+        integrity = _snapshot_integrity()
+        reports = _load_reports(Path(wargs["captures"]))
+        cases = _collect_cases(op, reports, wargs["max_shapes"])
+        sink = open(out_path, "a") if rank == 0 else None
+        try:
+            for case in cases:
+                torch.manual_seed(DEFAULT_SEED)  # identical weights across ranks
+                try:
+                    res = _bench_one_case(op, baseline_cls, candidate_cls, case,
+                                          device, wargs["warmup"], wargs["iters"],
+                                          wargs["rounds"], DEFAULT_SEED, integrity)
+                    d = res.to_dict()
+                except Exception as exc:  # noqa: BLE001 - keep the group alive
+                    traceback.print_exc()
+                    d = ScenarioResult(
+                        op=op.qualname, level=op.level,
+                        shape=_shape_repr(case["fwd_args"]), dtype="-",
+                        status=RUNTIME_ERROR, detail=f"{exc!r}").to_dict()
+                if sink is not None:
+                    sink.write(json.dumps(_json_safe(d)) + "\n")
+                    sink.flush()
+                dist.barrier()  # realign ranks before the next case
+        finally:
+            if sink is not None:
+                sink.close()
+    finally:
+        dist.destroy_process_group()
+
+
+def _run_distributed(ops: list[Operator], args, gpu_ids: list[str]) -> list[ScenarioResult]:
+    """Run each distributed op in its own world_size=TP group (sequentially --
+    each grabs every GPU). Falls back to a clear SKIP when fewer GPUs than TP are
+    available (the shard width can't be reproduced)."""
+    import torch.multiprocessing as mp
+
+    tp = _capture_tp(Path(args.captures))
+    world_size = tp or len(gpu_ids)
+    log_dir = RESULTS_DIR / "kernel_bench_logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    out: list[ScenarioResult] = []
+    for op in ops:
+        if len(gpu_ids) < world_size:
+            out.append(ScenarioResult(
+                op=op.qualname, level=op.level, shape="-", dtype="-",
+                status=SKIPPED,
+                detail=f"needs {world_size} GPUs (capture TP), have {len(gpu_ids)}"))
+            print(f"  -- {op.qualname} skipped (needs {world_size} GPUs)")
+            continue
+        ranks_gpus = gpu_ids[:world_size]
+        jsonl = log_dir / f"{op.level}_{op.stem}_{op.class_name}.dist.jsonl"
+        jsonl.write_text("")
+        wargs = {"captures": str(args.captures), "max_shapes": args.max_shapes,
+                 "warmup": args.warmup, "iters": args.iters,
+                 "rounds": args.rounds, "self_test": bool(args.self_test)}
+        print(f"  -> [GPUs {','.join(ranks_gpus)}] {op.qualname} "
+              f"(distributed, world_size={world_size}) started")
+        try:
+            mp.spawn(_dist_worker_entry,
+                     args=(world_size, _free_port(), op.qualname, wargs,
+                           str(jsonl), ranks_gpus),
+                     nprocs=world_size, join=True)
+        except Exception as exc:  # noqa: BLE001 - a dead rank surfaces here
+            out.append(ScenarioResult(
+                op=op.qualname, level=op.level, shape="-", dtype="-",
+                status=RUNTIME_ERROR, detail=f"distributed run failed: {exc!r}"))
+            print(f"  <- {op.qualname} FAILED ({exc!r})")
+            continue
+        scenarios = _read_scenarios(jsonl, op)
+        if not scenarios:
+            scenarios = [ScenarioResult(
+                op=op.qualname, level=op.level, shape="-", dtype="-",
+                status=RUNTIME_ERROR, detail="no results from rank 0")]
+        np = sum(1 for s in scenarios if s.status == PASSED)
+        nf = sum(1 for s in scenarios if s.status in _FAIL_STATUSES)
+        print(f"  <- {op.qualname} done ({np} passed, {nf} failed)")
+        out.extend(scenarios)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Optional GPU clock locking (best-effort; needs passwordless sudo nvidia-smi).
 # ---------------------------------------------------------------------------
 def _lock_clocks() -> bool:
@@ -1888,12 +2185,19 @@ def main(argv: list[str] | None = None) -> int:
     if not gpu_ids:
         print("No GPUs available.", file=sys.stderr)
         return 2
+    # Collective / TP-sharded ops need a real world_size=TP group (below); the
+    # rest run one-per-GPU in parallel.
+    dist_ops = [o for o in ops if o.qualname in _DISTRIBUTED_OPS]
+    normal_ops = [o for o in ops if o.qualname not in _DISTRIBUTED_OPS]
     print(f"Benchmarking {len(ops)} operator(s) in {mode} mode on GPU(s) "
-          f"{','.join(gpu_ids)} (one operator per GPU).")
+          f"{','.join(gpu_ids)} ({len(normal_ops)} one-per-GPU"
+          + (f", {len(dist_ops)} distributed" if dist_ops else "") + ").")
 
     locked = _lock_clocks() if args.lock_clocks else False
     try:
-        result = _run_parallel(ops, args, gpu_ids, mode)
+        result = _run_parallel(normal_ops, args, gpu_ids, mode)
+        if dist_ops:
+            result.scenarios.extend(_run_distributed(dist_ops, args, gpu_ids))
     finally:
         if locked:
             _unlock_clocks()
