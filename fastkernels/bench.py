@@ -272,7 +272,10 @@ def _load_candidate_class(op: Operator) -> type | None:
 # ---------------------------------------------------------------------------
 def _load_reports(captures_dir: Path) -> list[dict]:
     reports = []
-    for path in sorted(captures_dir.glob("*.json")):
+    # Recursive: capture writes each run into a per-run/per-scenario subfolder
+    # (``<run>/<NN_model_tpN_dtype>/report*.json``); flat top-level reports from
+    # older runs are still matched.
+    for path in sorted(captures_dir.rglob("*.json")):
         try:
             reports.append(json.loads(path.read_text()))
         except (OSError, ValueError):
@@ -1878,8 +1881,8 @@ def _capture_tp(captures_dir: Path) -> int:
     RowParallelLinear's activation width is ``input_size // tp``, so a faithful
     replay must use the same world size. 0 if no filename encodes it."""
     best = 0
-    for p in captures_dir.glob("*.json"):
-        m = re.search(r"_tp(\d+)", p.name)
+    for p in captures_dir.rglob("*.json"):
+        m = re.search(r"_tp(\d+)", str(p))
         if m:
             best = max(best, int(m.group(1)))
     return best

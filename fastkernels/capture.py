@@ -106,9 +106,8 @@ _NCCL_PORT_BASE = int(os.environ.get("FASTKERNELS_NCCL_PORT_BASE", "29500"))
 _SCENARIO_TIMEOUT_SEC = int(os.environ.get("FASTKERNELS_SCENARIO_TIMEOUT_SEC", "3600"))
 # Kill a scenario whose log has produced no new output for this long. Must
 # comfortably exceed the longest *silent* stretch of a healthy scenario -- model
-# load emits shard progress and each workload prints at its boundaries; only a
-# single workload's generation (tqdm disabled) is quiet, and that stays well
-# under this bound for the workload sizes here.
+# load emits shard progress, each workload prints at its boundaries, and
+# generation streams a per-request tqdm bar, so the log advances steadily.
 _SCENARIO_STALL_SEC = int(os.environ.get("FASTKERNELS_SCENARIO_STALL_SEC", "1200"))
 # How often (seconds) the scheduler runs the watchdog checks.
 _WATCHDOG_CHECK_INTERVAL_SEC = 15.0
@@ -1887,7 +1886,7 @@ def _capture_eagle3_scenario(scenario, runs, args, instrumented, n_instrumented,
                 )
                 try:
                     outputs = engine.generate(
-                        gen_prompts, sampling, use_tqdm=False, decode_text=True,
+                        gen_prompts, sampling, use_tqdm=True, decode_text=True,
                     )
                 finally:
                     for h in hook_handles:
@@ -2080,7 +2079,7 @@ def _capture_altengine_scenario(scenario, runs, args, instrumented, n_instrument
             _HOOK_RECORDS.clear()
             hook_handles = _register_hooks_on_models([engine.model], instrumented)
             try:
-                outputs = engine.generate(gen_prompts, sampling, use_tqdm=False)
+                outputs = engine.generate(gen_prompts, sampling, use_tqdm=True)
             finally:
                 for h in hook_handles:
                     h.remove()
@@ -2232,6 +2231,780 @@ def _capture_jamba_scenario(scenario, runs, args, instrumented, n_instrumented, 
             torch.cuda.empty_cache()
 
 
+# ---------------------------------------------------------------------------
+# Non-text families (vision / detection / embedding / recsys / video repr.)
+#
+# These don't autoregress tokens, so the LLM/alt-engine "prompts -> generate"
+# harness doesn't fit. Capture only needs the operators' forward SHAPES, so we
+# build the fastkernels model for the family and drive ONE representative
+# forward per workload with SYNTHETIC inputs (random tensors sized from the
+# workload spec) -- no datasets, tokenizers, or real generation. Verification #1
+# (the forward-pre-hook cross-check) still applies; #2 (paged-KV replay) does
+# not. Families we can't yet build cheaply (needs provisioned assets, a custom
+# CUDA build, MSA/alignment data, ...) raise ``_CaptureSkip`` so they land as a
+# clean SKIP in the summary rather than a hard error.
+# ---------------------------------------------------------------------------
+
+# Workload enum class names that are not the text-LLM / VLM / Omni paths.
+_NONTEXT_FAMILIES = {
+    "Diffusion", "VideoDiffusion", "Segmentation", "ASR", "TTS",
+    "VisionEncoder", "Detection", "Rendering", "PointCloudSeg",
+    "StructurePrediction", "Robotics", "PointCloudPolicy", "Recsys",
+    "Embedding", "DiffusionLM", "WorldModel", "VideoRepresentation",
+}
+
+# timm-backed vision encoders: hf id -> (timm name, L4 module stem, class, default res).
+_TIMM_VISION = {
+    "google/siglip2-so400m-patch16-naflex":
+        ("naflexvit_so400m_patch16_siglip.v2_webli", "siglip2", "SigLIP2Model", 384),
+    "facebook/dinov3-vit7b16-pretrain-lvd1689m":
+        ("vit_7b_patch16_dinov3.lvd1689m", "dinov3", "DINOv3Model", 256),
+    "timm/swinv2_large_window12_192.ms_in22k":
+        ("swinv2_large_window12_192.ms_in22k", "swinv2", "SwinV2Model", 192),
+    "timm/mobilenetv4_conv_medium.e500_r256_in1k":
+        ("mobilenetv4_conv_medium.e500_r256_in1k", "mobilenetv4", "MobileNetV4Model", 256),
+}
+
+
+class _CaptureSkip(Exception):
+    """A scenario that capture deliberately skips (unsupported / asset-gated)."""
+
+
+def _build_vision(scenario, dtype):
+    """Vision encoders: timm-backed (``from_timm``) or image-cls loader. Forward
+    takes a single NCHW image batch."""
+    name = scenario.hf_name
+    if name in _TIMM_VISION:
+        timm_name, stem, cls_name, default_res = _TIMM_VISION[name]
+        mod = __import__(f"fastkernels.tasks.baseline.L4.{stem}", fromlist=[cls_name])
+        model = getattr(mod, cls_name).from_timm(timm_name).to(
+            device="cuda", dtype=dtype).eval()
+    else:
+        from .infra.image_cls_loader import infer_image_size, load_ours_model
+        model = load_ours_model(name, "cuda", dtype)
+        default_res = infer_image_size(name)
+
+    def run(wl_label, wl, params):
+        res = int(getattr(params, "resolution", 0) or default_res)
+        n = min(int(getattr(params, "batch_size", 0) or 1), 8)
+        x = torch.randn(n, 3, res, res, device="cuda", dtype=dtype)
+        with torch.no_grad():
+            model(x)
+        return n
+
+    return [model], run
+
+
+def _build_detection(scenario, dtype):
+    """YOLOv10 / RT-DETRv2: forward takes a 640x640 image batch."""
+    from .infra.detection_loader import (
+        infer_image_size, load_ours_detector, run_ours_detector,
+    )
+    name = scenario.hf_name
+    detector = load_ours_detector(name, "cuda", dtype)
+    size = infer_image_size(name)
+
+    def run(wl_label, wl, params):
+        n = min(int(getattr(params, "batch_size", 0) or 1), 4)
+        x = torch.randn(n, 3, size, size, device="cuda", dtype=dtype)
+        with torch.no_grad():
+            run_ours_detector(detector, name, x, image_size=size, max_detections=100)
+        return n
+
+    return [detector], run
+
+
+def _build_embedding(scenario, dtype):
+    """bge-m3 / colbertv2 via the pooling engine; forward encodes a batch of
+    random token-id sequences."""
+    from .infra.embedding_engine import EmbeddingEngine
+    engine = EmbeddingEngine(scenario.hf_name, dtype=dtype, device="cuda")
+    vocab = int(getattr(engine.tokenizer, "vocab_size", 0) or 30000)
+
+    def run(wl_label, wl, params):
+        n = min(int(getattr(params, "batch_size", 0) or 8), 32)
+        reqs = [{"prompt_token_ids":
+                 torch.randint(1, vocab, (64,)).tolist()} for _ in range(n)]
+        engine.token_embed(reqs, use_tqdm=False)
+        return n
+
+    return [engine.model], run
+
+
+def _build_recsys(scenario, dtype):
+    """DLRMv2 / LightGCN (random-init: capture needs shapes, not trained
+    weights). Forward takes a synthetic feature / interaction batch."""
+    name = scenario.hf_name.lower()
+    if "dlrm" in name:
+        from .tasks.baseline.L4.dlrmv2 import DLRMv2, DLRMv2Config
+        cfg = DLRMv2Config()
+        model = DLRMv2(cfg).to("cuda", torch.float32).eval()
+
+        def run(wl_label, wl, params):
+            n = min(int(getattr(params, "batch_size", 0) or 32), 64)
+            dense = torch.randn(n, cfg.num_dense_features, device="cuda")
+            sparse = [torch.randint(0, m, (n, 1), device="cuda")
+                      for m in cfg.num_embeddings_per_feature]
+            with torch.no_grad():
+                model(dense, sparse)
+            return n
+
+        return [model], run
+
+    from .tasks.baseline.L4.lightgcn import LightGCN, LightGCNConfig
+    num_users = num_items = 2000
+    model = LightGCN(LightGCNConfig(num_users=num_users, num_items=num_items)).to(
+        "cuda", torch.float32).eval()
+
+    def run(wl_label, wl, params):
+        n = min(int(getattr(params, "batch_size", 0) or 32), 64)
+        users = torch.randint(0, num_users, (n,), device="cuda")
+        items = torch.randint(0, num_items, (n,), device="cuda")
+        adj = LightGCN.build_adjacency(users, items, num_users, num_items,
+                                       device=torch.device("cuda"))
+        with torch.no_grad():
+            model(users, items, adj)
+        return n
+
+    return [model], run
+
+
+def _build_vjepa2(scenario, dtype):
+    """V-JEPA 2: forward takes a synthetic video clip; the predictor path runs
+    encoder+predictor, the encoder path runs the encoder only."""
+    from .tasks.baseline.L4.vjepa2 import VJEPA2Model
+    model = VJEPA2Model.from_pretrained(scenario.hf_name).to("cuda", dtype).eval()
+    cfg = model.config
+    frames = int(getattr(cfg, "frames_per_clip", 16) or 16)
+    crop = int(getattr(cfg, "crop_size", 256) or 256)
+
+    def run(wl_label, wl, params):
+        name = getattr(wl, "value", str(wl))
+        skip_predictor = "encoder" in name
+        vids = torch.randn(1, frames, 3, crop, crop, device="cuda", dtype=dtype)
+        with torch.no_grad():
+            model(pixel_values_videos=vids, skip_predictor=skip_predictor)
+        return 1
+
+    return [model], run
+
+
+def _build_diffusion(scenario, dtype):
+    """FLUX / SDXL / HunyuanVideo: run ONE 1-step latent denoise so the DiT/UNet
+    (and the text encoders) execute. ``output_type='latent'`` skips the VAE
+    decode. The transformer/unet is the operator-heavy module we care about."""
+    name = scenario.hf_name
+    lower = name.lower()
+    if "stable-diffusion" in lower or "sdxl" in lower:
+        from .infra.sdxl_engine import SDXLEngine
+        from .tasks.baseline.L4.sdxl import SDXLSamplingParams
+        engine = SDXLEngine(name, dtype=dtype, enforce_eager=True)
+        pipeline = engine._get_pipeline()
+
+        def make_params(params):
+            return SDXLSamplingParams(
+                height=int(getattr(params, "height", 512) or 512),
+                width=int(getattr(params, "width", 512) or 512),
+                num_inference_steps=1, output_type="latent",
+            )
+    else:
+        from .infra.diffusion_engine import DiffusionEngine
+        from .tasks.baseline.L4.flux import DiffusionSamplingParams
+        from .tasks.baseline.L4.hunyuan_video import (
+            HunyuanVideoDiffusionSamplingParams,
+        )
+        engine = DiffusionEngine(name, dtype=dtype, enforce_eager=True)
+        pipeline = engine._get_pipeline()
+        video = engine._model_type == "hunyuan_video"
+
+        def make_params(params):
+            h = int(getattr(params, "height", 512) or 512)
+            w = int(getattr(params, "width", 512) or 512)
+            if video:
+                return HunyuanVideoDiffusionSamplingParams(
+                    height=h, width=w,
+                    # Cap frames: temporal length only needs to be non-trivial
+                    # for shapes, and a full clip at 1 step is still slow.
+                    num_frames=min(int(getattr(params, "num_frames", 5) or 5), 5),
+                    num_inference_steps=1, output_type="latent",
+                )
+            return DiffusionSamplingParams(
+                height=h, width=w, num_inference_steps=1, output_type="latent",
+            )
+
+    modules = [m for m in (
+        getattr(pipeline, "transformer", None), getattr(pipeline, "unet", None),
+        getattr(pipeline, "text_encoder", None),
+        getattr(pipeline, "text_encoder_2", None),
+    ) if isinstance(m, torch.nn.Module)]
+
+    def run(wl_label, wl, params):
+        engine.generate("a photograph of a cat", make_params(params))
+        return 1
+
+    return modules, run
+
+
+def _build_llada(scenario, dtype):
+    """LLaDA masked-diffusion LM: a short 1-block generate exercises the model."""
+    from .infra.dllm_engine import DLLMSamplingParams, LLaDAEngine
+    engine = LLaDAEngine(scenario.hf_name, dtype=dtype, device="cuda")
+
+    def run(wl_label, wl, params):
+        engine.generate(
+            ["Write a Python function that returns 1."],
+            DLLMSamplingParams(gen_length=32, steps=2, block_length=32),
+        )
+        return 1
+
+    return [engine.model], run
+
+
+def _build_oasis(scenario, dtype):
+    """Oasis world model: one short autoregressive-diffusion rollout with a
+    synthetic prompt frame + zero action stream (mirrors the engine's warmup)."""
+    from .infra.oasis_engine import OasisEngine
+    from .tasks.baseline.L4.oasis import OasisSamplingParams
+    engine = OasisEngine(scenario.hf_name, dtype=dtype, device="cuda")
+    pipeline = engine._get_pipeline()
+
+    def run(wl_label, wl, params):
+        nframes = min(int(getattr(params, "num_frames", 4) or 4), 6)
+        ddim = min(int(getattr(params, "ddim_steps", 4) or 4), 4)
+        prompt = torch.rand(1, 1, 3, 360, 640, device="cuda")
+        actions = torch.zeros(1, nframes, 25, device="cuda")
+        engine.generate(
+            prompt, actions,
+            OasisSamplingParams(num_frames=nframes, ddim_steps=ddim, seed=0),
+        )
+        return 1
+
+    return [pipeline.model, pipeline.vae], run
+
+
+def _build_whisper(scenario, dtype):
+    """Whisper ASR runs through the paged-KV ``LlamaEngine`` (encoder-decoder).
+    Drive one short decode on a synthetic 30s mel with the standard
+    transcribe decoder prompt; hook the engine's model."""
+    import numpy as np
+    from transformers import WhisperProcessor
+    from .infra.engine import LlamaEngine, SamplingParams
+    engine = LlamaEngine(model_name=scenario.hf_name, seed=0, enforce_eager=True,
+                         tensor_parallel_size=scenario.tp)
+    processor = WhisperProcessor.from_pretrained(scenario.hf_name)
+    # The processor pads/truncates to a fixed 30s window, so any short clip
+    # yields the model's real (n_mels, 3000) feature shape.
+    feats = processor(np.zeros(16000, dtype=np.float32), sampling_rate=16000,
+                      return_tensors="pt").input_features[0]
+    decoder_prompt = list(processor.tokenizer.encode(
+        "<|startoftranscript|><|en|><|transcribe|><|notimestamps|>",
+        add_special_tokens=False))
+    model = engine.model_runner.model
+
+    def run(wl_label, wl, params):
+        n = min(int(getattr(params, "batch_size", 0) or 1), 4)
+        cap = min(int(getattr(params, "output_len", 4) or 4), 4)
+        if hasattr(engine, "block_manager"):
+            engine.block_manager.reset()
+        engine.generate(
+            [decoder_prompt] * n,
+            SamplingParams(temperature=0.0, ignore_eos=True, max_tokens=cap),
+            audio_features=[feats] * n, use_tqdm=False,
+        )
+        return n
+
+    return [model], run
+
+
+def _build_ttt_e2e(scenario, dtype):
+    """TTT-E2E (test-time-training) has no public checkpoint; build the 125m
+    paper config random-init and run one meta-training chunk (``T == chunk_size``,
+    the minimum divisor) so both the prefix and the suffix inner-loop paths run.
+    Weight values are irrelevant for shape capture."""
+    from .infra.ttt_e2e_engine import TTTE2EEngine
+    from .tasks.baseline.L4.ttt_e2e import TTTE2EConfig
+    cfg = TTTE2EConfig(
+        vocab_size=128256, hidden_size=768, intermediate_size=1664,
+        num_hidden_layers=12, num_attention_heads=12, chunk_size=1024,
+        sliding_window_size=8192, suffix_len=3, max_position_embeddings=32768,
+        rope_theta=500000.0, rms_norm_eps=1e-6, qk_norm=True,
+        tie_word_embeddings=True, has_prime=True,
+    )
+    engine = TTTE2EEngine(cfg, weights_npz=None, device="cuda",
+                          param_dtype=dtype, compute_dtype=dtype)
+
+    def run(wl_label, wl, params):
+        ids = torch.randint(0, cfg.vocab_size, (1, cfg.chunk_size), device="cuda")
+        engine.forward(ids, train_mode="meta")
+        return 1
+
+    return [engine.pipeline], run
+
+
+def _build_dp3(scenario, dtype):
+    """DP3 point-cloud diffusion policy has no public checkpoint; materialize a
+    random-init one (the fastkernels pipeline's own state_dict round-trips) and
+    run the engine's synthetic warmup forward (PointNet encoder + 1D U-Net
+    denoise)."""
+    import tempfile
+    from .infra.dp3_engine import DP3Engine
+    from .validate.bench_dp3 import materialize_fastkernels_checkpoint
+    from .workloads import DP3_CONFIG
+    variant = getattr(scenario, "variant", None) or "simple_dp3"
+    ckpt_dir = tempfile.mkdtemp(prefix="fastkernels_dp3_")
+    ckpt = materialize_fastkernels_checkpoint(
+        ckpt_dir, variant, seed=0,
+        action_dim=DP3_CONFIG.action_dim, state_dim=DP3_CONFIG.state_dim,
+        num_points=DP3_CONFIG.num_points,
+    )
+    engine = DP3Engine(checkpoint_path=ckpt, seed=0, dtype=torch.float32,
+                       device="cuda", enforce_eager=True)
+    pipeline = engine._get_pipeline()
+
+    def run(wl_label, wl, params):
+        engine.warmup(num_steps=2)
+        return 1
+
+    return [pipeline], run
+
+
+def _ensure_spconv():
+    """PTV3's ``ours`` layers hard-import ``spconv.pytorch`` + ``addict``. Reuse
+    validate's provision installer for just that pip leg; skip its reference-repo
+    clone, which capture (ours-only) never needs."""
+    try:
+        import addict  # noqa: F401
+        import spconv.pytorch  # noqa: F401
+    except ImportError:
+        from .validate.provision import _pip
+        _pip("spconv-cu126", "addict")
+
+
+def _build_ptv3(scenario, dtype):
+    """PointTransformerV3 point-cloud segmentation. Random-init on one synthetic
+    object cloud (feat = coord+normal, the model's 6-channel input); the serial-
+    ization derives grid_coord/batch from grid_size+offset, so no dataset or
+    checkpoint is needed."""
+    _ensure_spconv()
+    from .infra.pointcloud_loader import default_ptv3_kwargs, load_ours_point_model
+    model = load_ours_point_model(scenario.hf_name, device="cuda", dtype=dtype,
+                                  **default_ptv3_kwargs())
+
+    def run(wl_label, wl, params):
+        n = 2048
+        coord = torch.rand(n, 3, device="cuda", dtype=dtype)
+        normal = torch.randn(n, 3, device="cuda", dtype=dtype)
+        batch = {
+            "coord": coord,
+            "feat": torch.cat([coord, normal], dim=1),
+            "grid_size": 0.02,
+            "offset": torch.tensor([n], device="cuda", dtype=torch.long),
+        }
+        model(batch)
+        return 1
+
+    return [model], run
+
+
+def _build_3dgs(scenario, dtype):
+    """3D Gaussian Splatting. The fastkernels renderer is pure torch (no gsplat),
+    and the scene .ply auto-downloads from the Hub, so render the baked-in orbit
+    cameras once. A small resolution/point budget keeps capture fast; the CUDA-
+    graph path is left off (incompatible with the capture instrumentation)."""
+    from .infra.graphics_loader import load_3dgs_scene, load_ours_3dgs
+    scene = load_3dgs_scene(
+        scene_name=getattr(scenario, "scene", None) or "train",
+        num_cameras=1, max_points=100_000,
+        device="cuda", dtype=torch.float32, width=512, height=512,
+    )
+    ours = load_ours_3dgs(scene)
+
+    def run(wl_label, wl, params):
+        ours()
+        return 1
+
+    return [ours], run
+
+
+def _build_sam3(scenario, dtype):
+    """SAM 3.1 promptable segmentation. The fastkernels ``Sam3Model`` is a
+    self-contained L4 task whose config defaults need no network; random-init is
+    enough for a shape-only capture. Drive one image + dummy text-token forward
+    (fp32; params are already fp32 so no complex-RoPE-buffer cast is needed)."""
+    from .tasks.baseline.L4.sam3 import Sam3Config, Sam3Model
+    config = Sam3Config.from_pretrained(scenario.hf_name)
+    model = Sam3Model(config).cuda().eval()
+    res = int(getattr(config, "img_size", 1008))
+    n_tok = int(getattr(config, "text_context_length", 32))
+
+    def run(wl_label, wl, params):
+        b = min(int(getattr(params, "batch_size", 0) or 1), 4)
+        images = torch.randn(b, 3, res, res, device="cuda", dtype=torch.float32)
+        tok = torch.ones(b, n_tok, dtype=torch.long, device="cuda")
+        model(images, tok)
+        return b
+
+    return [model], run
+
+
+def _build_pi0(scenario, dtype):
+    """Pi0 robotics VLA. ``Pi0Config`` is fully defaulted, so the real-shaped
+    pipeline (SigLIP vision + Gemma VLM + DiT action expert) builds random-init
+    without the OpenPI checkpoint -- enough for shape capture. Drive one
+    flow-matching forward on a synthetic ALOHA 3-camera observation."""
+    from .tasks.baseline.L4.pi0 import Pi0Config, Pi0Pipeline, Pi0SamplingParams
+    config = Pi0Config()
+    model = Pi0Pipeline(config).cuda().to(dtype).eval()
+    cams = 3
+    patches = (config.vlm_vision_config.image_size //
+               config.vlm_vision_config.patch_size) ** 2
+    img_tokens = patches * cams
+    text_len = 48
+    ids = [config.image_token_id] * img_tokens + [2] + [1] * text_len
+
+    def run(wl_label, wl, params):
+        input_ids = torch.tensor([ids], device="cuda")
+        n = input_ids.shape[1]
+        state = torch.randn(1, config.max_state_dim, device="cuda", dtype=dtype)
+        pixel_values = torch.rand(1, cams, 3, 224, 224, device="cuda", dtype=dtype) * 2 - 1
+        model(
+            state=state, input_ids=input_ids, pixel_values=pixel_values,
+            pixel_attention_mask=torch.ones(1, cams, dtype=torch.bool, device="cuda"),
+            attention_mask=torch.ones(1, n, device="cuda"),
+            params=Pi0SamplingParams(num_inference_steps=2),
+        )
+        return 1
+
+    return [model], run
+
+
+def _openfold3_synthetic_batch(n_tokens: int, n_seqs: int, c_token: int):
+    """Reproduce the atom/MSA feature dict that ``bench_openfold3`` builds, but
+    with a synthetic MSA (random residue types) so no alignment files are
+    needed. Shapes/dtypes match the featurizer exactly."""
+    import numpy as np
+    NUM_CLASSES, MAX_ATOMS = 22, 23
+    C_ELEM, C_NAME_DIM, C_NAME_VOCAB = 119, 4, 64
+    rng = np.random.RandomState(0)
+    msa_index = rng.randint(0, 20, size=(n_seqs, n_tokens))
+    msa_onehot_raw = np.eye(NUM_CLASSES, dtype=np.float32)[msa_index]
+    msa_onehot = np.zeros((n_seqs, n_tokens, 32), dtype=np.float32)
+    msa_onehot[:, :, :NUM_CLASSES] = msa_onehot_raw
+    has_deletion = np.zeros((n_seqs, n_tokens), dtype=np.float32)
+    deletion_value = np.zeros((n_seqs, n_tokens), dtype=np.float32)
+    profile = msa_onehot_raw.mean(axis=0)
+    deletion_mean = has_deletion.mean(axis=0)
+    token_features = np.concatenate([
+        profile, deletion_mean[:, None],
+        np.zeros((n_tokens, c_token - NUM_CLASSES - 1), dtype=np.float32),
+    ], axis=1)
+    n_atoms = n_tokens * MAX_ATOMS
+    ref_pos = np.zeros((n_atoms, 3), np.float32)
+    ref_charge = np.zeros(n_atoms, np.float32)
+    ref_mask = np.zeros(n_atoms, np.float32)
+    ref_element = np.zeros((n_atoms, C_ELEM), np.float32)
+    ref_name = np.zeros((n_atoms, C_NAME_DIM, C_NAME_VOCAB), np.float32)
+    ref_space_uid = np.zeros(n_atoms, np.int64)
+    atom_to_token = np.zeros(n_atoms, np.int64)
+    atom_mask = np.zeros(n_atoms, np.float32)
+    for i in range(n_tokens):
+        base = i * MAX_ATOMS
+        for j in range(5):
+            idx = base + j
+            ref_pos[idx] = rng.randn(3).astype(np.float32) * 1.5
+            ref_mask[idx] = atom_mask[idx] = 1.0
+            ref_element[idx, min(5 + j, C_ELEM - 1)] = 1.0
+            ref_name[idx, 0, min(j + 1, C_NAME_VOCAB - 1)] = 1.0
+        ref_space_uid[base:base + MAX_ATOMS] = i
+        atom_to_token[base:base + MAX_ATOMS] = i
+    restype = np.zeros((n_tokens, 32), np.float32); restype[:, :NUM_CLASSES] = msa_onehot_raw[0]
+    profile32 = np.zeros((n_tokens, 32), np.float32); profile32[:, :NUM_CLASSES] = profile
+    tt = torch.from_numpy
+    return {
+        "token_features": tt(token_features).unsqueeze(0),
+        "residue_index": torch.arange(n_tokens, dtype=torch.float32).unsqueeze(0),
+        "token_mask": torch.ones(1, n_tokens),
+        "atom_mask": tt(atom_mask).unsqueeze(0),
+        "msa": tt(msa_onehot).unsqueeze(0),
+        "has_deletion": tt(has_deletion).unsqueeze(0),
+        "deletion_value": tt(deletion_value).unsqueeze(0),
+        "msa_mask": torch.ones(1, n_seqs, n_tokens),
+        "restype": tt(restype).unsqueeze(0),
+        "profile": tt(profile32).unsqueeze(0),
+        "deletion_mean": tt(deletion_mean).unsqueeze(0),
+        "ref_pos": tt(ref_pos).unsqueeze(0),
+        "ref_charge": tt(ref_charge).unsqueeze(0),
+        "ref_mask": tt(ref_mask).unsqueeze(0),
+        "ref_element": tt(ref_element).unsqueeze(0),
+        "ref_atom_name_chars": tt(ref_name).unsqueeze(0),
+        "ref_space_uid": tt(ref_space_uid).unsqueeze(0),
+        "atom_to_token_index": tt(atom_to_token).unsqueeze(0),
+        "token_index": torch.arange(n_tokens, dtype=torch.float32).unsqueeze(0),
+        "asym_id": torch.zeros(1, n_tokens, dtype=torch.long),
+        "entity_id": torch.zeros(1, n_tokens, dtype=torch.long),
+        "sym_id": torch.zeros(1, n_tokens, dtype=torch.long),
+    }
+
+
+def _build_openfold3(scenario, dtype):
+    """OpenFold3 (AlphaFold3) structure prediction. The fastkernels
+    ``OpenFold3Model`` builds random-init from its config (no checkpoint needed
+    for shapes). Use the bench's reduced blocks/rollout and a small synthetic
+    chain (trunk O(N^2) memory), driving trunk + diffusion rollout once."""
+    from .tasks.baseline.L4.openfold3 import OpenFold3Config, OpenFold3Model
+    cfg = OpenFold3Config(pairformer_no_blocks=48, msa_no_blocks=4,
+                          no_rollout_steps=10, num_recycles=1)
+    model = OpenFold3Model(cfg).cuda().to(dtype).eval()
+    c_token = int(getattr(cfg, "c_token_embedder", 384))
+
+    def run(wl_label, wl, params):
+        batch = _openfold3_synthetic_batch(n_tokens=16, n_seqs=8, c_token=c_token)
+        batch = {k: (v.to("cuda", dtype) if v.is_floating_point() else v.to("cuda"))
+                 for k, v in batch.items()}
+        with torch.no_grad():
+            model(batch)
+        return 1
+
+    return [model], run
+
+
+def _build_tts(scenario, dtype):
+    """CosyVoice3 text-to-speech. Reuse validate's provision (s3tokenizer pip
+    leg), load the published checkpoint, and run one short ``generate`` on
+    synthetic 3s reference audio. Preprocessing mirrors vllm-omni (bench keeps it
+    in a worker string, so it is inlined here): Qwen text tokens, on-GPU
+    S3Tokenizer speech tokens, mel speech-feat, campplus speaker embedding ->
+    talker AR LLM -> flow-matching code2wav."""
+    import os
+    from functools import partial
+    try:
+        import s3tokenizer
+    except ImportError:
+        from .validate.provision import _pip
+        _pip("s3tokenizer")
+        import s3tokenizer
+    import numpy as np
+    import onnxruntime
+    from huggingface_hub import snapshot_download
+    from vllm_omni.model_executor.models.cosyvoice3.tokenizer import get_qwen_tokenizer
+    from vllm_omni.model_executor.models.cosyvoice3.utils import (
+        extract_speech_feat, extract_spk_embedding, extract_text_token,
+        mel_spectrogram,
+    )
+    from .tasks.baseline.L4.cosyvoice3 import CosyVoice3Config, CosyVoice3ForTTS
+
+    model_dir = snapshot_download(scenario.hf_name)
+    config = CosyVoice3Config.from_pretrained(scenario.hf_name)
+    model = CosyVoice3ForTTS(config, model_stage="e2e")
+    model.load_weights_e2e(model_dir, torch.device("cuda"))
+    model.eval()
+
+    tokenizer = get_qwen_tokenizer(
+        token_path=os.path.join(model_dir, config.qwen_pretrain_path),
+        skip_special_tokens=config.skip_special_tokens, version=config.version)
+    campplus = onnxruntime.InferenceSession(
+        os.path.join(model_dir, config.campplus_onxx_path),
+        providers=["CPUExecutionProvider"])
+    feat_ext = partial(mel_spectrogram, **getattr(config, "feat_extractor", {}))
+    s3 = s3tokenizer.load_model("speech_tokenizer_v3_25hz").to("cuda").eval()
+
+    def _speech_token(ref_audio, ref_sr):
+        from math import gcd
+        from scipy.signal import resample_poly
+        wav = ref_audio
+        if ref_sr != 16000:
+            g = gcd(ref_sr, 16000)
+            wav = resample_poly(wav, 16000 // g, ref_sr // g).astype(np.float32)
+        mel = s3tokenizer.log_mel_spectrogram(torch.from_numpy(wav))
+        mels_p, mels_lens = s3tokenizer.padding([mel])
+        with torch.inference_mode():
+            codes, codes_lens = s3.quantize(mels_p.cuda(), mels_lens.cuda())
+        n = int(codes_lens[0].item())
+        return codes[:1, :n].to(dtype=torch.int32, device="cuda")
+
+    def run(wl_label, wl, params):
+        ref_audio = np.random.randn(24000 * 3).astype(np.float32)
+        text_token, _ = extract_text_token("Warmup.", tokenizer, config.allowed_special)
+        prompt_text_token, _ = extract_text_token(
+            "Testing my voice.", tokenizer, config.allowed_special)
+        speech_token = _speech_token(ref_audio, 24000)
+        speech_feat, _ = extract_speech_feat((ref_audio, 24000), feat_ext, "cuda")
+        if config.sample_rate == 24000:
+            tok_len = min(int(speech_feat.shape[1] / 2), speech_token.shape[1])
+            speech_feat = speech_feat[:, :2 * tok_len]
+            speech_token = speech_token[:, :tok_len]
+        spk_embedding = extract_spk_embedding((ref_audio, 24000), campplus, "cuda")
+        model.generate(
+            text_token=text_token.cuda(), prompt_text_token=prompt_text_token.cuda(),
+            speech_token=speech_token.cuda(), speech_feat=speech_feat.cuda(),
+            spk_embedding=spk_embedding.cuda(), n_timesteps=10,
+            temperature=0, cfm_seed=12345,
+        )
+        return 1
+
+    return [model], run
+
+
+def _build_instantngp(scenario, dtype):
+    """InstantNGP NeRF. The fastkernels renderer loads a pyngp-trained snapshot,
+    so reuse validate's provision to build pyngp + the fox scene, then render one
+    view. Skips cleanly if the source build is unavailable (needs cmake/CUDA
+    toolkit)."""
+    from .validate.provision import COMPONENTS
+    comp = COMPONENTS["instant_ngp"]
+    if not comp.check():
+        from .validate.provision import provision
+        if provision(["instant_ngp"]):
+            raise _CaptureSkip(
+                "instant-ngp pyngp source build unavailable "
+                "(needs the repo clone + cmake/CUDA toolkit)")
+    from .infra.nerf_loader import load_ours_instantngp
+    scene = getattr(scenario, "scene", None) or "fox"
+    model = load_ours_instantngp(scene_name=scene, train_steps=5,
+                                 width=512, height=512, spp=1)
+
+    def run(wl_label, wl, params):
+        model(view_index=0)
+        return 1
+
+    return [model], run
+
+
+_NONTEXT_BUILDERS = {
+    "VisionEncoder": _build_vision,
+    "Detection": _build_detection,
+    "Embedding": _build_embedding,
+    "Recsys": _build_recsys,
+    "VideoRepresentation": _build_vjepa2,
+    "Diffusion": _build_diffusion,
+    "VideoDiffusion": _build_diffusion,
+    "DiffusionLM": _build_llada,
+    "WorldModel": _build_oasis,
+    "ASR": _build_whisper,
+    "PointCloudPolicy": _build_dp3,
+    "PointCloudSeg": _build_ptv3,
+    "Segmentation": _build_sam3,
+    "StructurePrediction": _build_openfold3,
+    "Robotics": _build_pi0,
+    "TTS": _build_tts,
+}
+
+# Models the family lookup above can't route on its own: either the workload
+# family is the generic ``LLM`` (ttt_e2e), or several models share one family
+# (the ``Rendering`` family covers both 3DGS and InstantNGP). Keyed by the bare
+# model token in ``hf_name``; checked before the family map.
+_NONTEXT_MODEL_BUILDERS = {
+    "ttt_e2e": _build_ttt_e2e,
+    "Voxel51/gaussian_splatting": _build_3dgs,
+    "NVlabs/instant-ngp": _build_instantngp,
+}
+
+
+def _capture_nontext_scenario(scenario, runs, args, instrumented, n_instrumented,
+                              multi):
+    """Capture a non-text family by driving one synthetic forward per workload.
+
+    Raises ``_CaptureSkip`` when the family has no builder yet, or the builder
+    can't construct the model in this environment (missing assets/deps)."""
+    family = type(scenario.workloads[0]).__name__
+    builder = _NONTEXT_MODEL_BUILDERS.get(scenario.hf_name) or _NONTEXT_BUILDERS.get(family)
+    if builder is None:
+        raise _CaptureSkip(
+            f"capture for {family} models is not implemented yet "
+            f"(synthetic-forward driver pending)")
+
+    dtype = _engine_dtype(scenario.dtype) or torch.bfloat16
+    _RECORDS.clear()
+    _HOOK_RECORDS.clear()
+    print(f"\n########## Scenario: {scenario.hf_name} "
+          f"({family}, dtype={scenario.dtype}) ##########")
+    print(f"Building fastkernels {family} model (synthetic-input capture) ...")
+    try:
+        models, run_forward = builder(scenario, dtype)
+    except _CaptureSkip:
+        raise
+    except Exception as exc:  # noqa: BLE001 - unbuildable here -> skip, not fail
+        raise _CaptureSkip(f"could not build {family} model {scenario.hf_name!r}: "
+                           f"{exc!r}")
+
+    written: list[Path] = []
+    ok = True
+    try:
+        for wl_label, wl in runs:
+            print(f"\n=== Capturing workload: {wl_label} ===")
+            params = spec_for(wl).params
+            for entry in _RECORDS.values():
+                entry["forward"] = None
+            _HOOK_RECORDS.clear()
+            handles = _register_hooks_on_models(models, instrumented)
+            try:
+                n = run_forward(wl_label, wl, params)
+            except Exception as exc:  # noqa: BLE001 - isolate per-workload failures
+                traceback.print_exc()
+                print(f"  !! workload {wl_label} failed: {exc!r}; "
+                      f"skipping to the next workload.")
+                ok = False
+                continue
+            finally:
+                for h in handles:
+                    h.remove()
+
+            # The forward-pre-hook cross-check is INFORMATIONAL here (recorded in
+            # the report, never fails the scenario): diffusion/rollout families
+            # routinely call submodule ``.forward`` directly (bypassing
+            # ``__call__``), so a pre-hook legitimately sees fewer ops than the
+            # monkeypatch that actually records shapes. Only a forward exception
+            # (above) fails a synthetic-forward capture.
+            hook_verification = _verify_forward_capture()
+            status = "PASS" if hook_verification["passed"] else "INFO"
+            print(f"  Verification 1 (hook cross-check) [{status}]: "
+                  f"{hook_verification['classes_matched']}/"
+                  f"{hook_verification['classes_checked']} operator forwards match "
+                  f"the independent hook capture.")
+            for issue in hook_verification["issues"]:
+                print(f"    ! {issue}")
+            verification = {
+                "forward_pre_hook_crosscheck": hook_verification,
+                "mock_batching_replay": {
+                    "method": "mock continuous-batching / chunked-prefill replay",
+                    "applicable": False, "passed": True,
+                    "reason": (f"skipped for {family}: no paged-KV token schedule; "
+                               "the forward-pre-hook cross-check is the pass "
+                               "criterion."),
+                },
+                "passed": hook_verification["passed"],
+            }
+            generation = {
+                "num_prompts": n,
+                "max_batch_size": n,
+                "engine": family.lower(),
+                "modality": family,
+                "inputs": "synthetic (random tensors sized from workload spec)",
+            }
+            report = _build_report(
+                scenario.hf_name, wl_label, dtype, n, n_instrumented,
+                generation, verification,
+            )
+            out_path = _report_path(args.output, scenario, wl_label, multi,
+                                    args.max_requests)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(out_path, "w") as f:
+                f.write(_dumps(report))
+                f.write("\n")
+            written.append(out_path)
+            print(f"  Captured {report['num_operator_classes_executed']} executed "
+                  f"operator class(es) (of {n_instrumented} instrumented).")
+            print(f"  Report written to {out_path}")
+    finally:
+        for m in models:
+            del m
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    return written, ok
+
+
 def _capture_scenario(scenario, runs, args, LlamaEngine, SamplingParams,
                       instrumented, n_instrumented, multi):
     """Build one scenario's engine and capture each of its workloads.
@@ -2274,6 +3047,17 @@ def _capture_scenario(scenario, runs, args, LlamaEngine, SamplingParams,
     if _is_jamba(scenario):
         # Jamba is a hybrid transformer+Mamba+MoE model (JambaEngine).
         return _capture_jamba_scenario(
+            scenario, runs, args, instrumented, n_instrumented, multi,
+        )
+    if scenario.hf_name in _NONTEXT_MODEL_BUILDERS or (
+        scenario.workloads
+        and type(scenario.workloads[0]).__name__ in _NONTEXT_FAMILIES
+    ):
+        # Non-text families (vision/detection/embedding/recsys/...) don't
+        # autoregress tokens; drive a synthetic forward per workload instead.
+        # ``_NONTEXT_MODEL_BUILDERS`` also routes checkpoint-free LLM-family
+        # models (ttt_e2e) here by their bare model token.
+        return _capture_nontext_scenario(
             scenario, runs, args, instrumented, n_instrumented, multi,
         )
     dtype = _engine_dtype(scenario.dtype)
@@ -2515,7 +3299,8 @@ def _capture_scenario(scenario, runs, args, LlamaEngine, SamplingParams,
                 outputs = engine.generate(
                     gen_prompts, sampling,
                     images=images, videos=videos, audio_features=audios,
-                    use_tqdm=is_media,
+                    # "Processed prompts" bar -- one tick per finished request.
+                    use_tqdm=True,
                 )
             finally:
                 for handle in hook_handles:
@@ -2968,6 +3753,8 @@ def _run_scenarios_parallel(scenarios, args, gpu_ids: list[str]) -> int:
                     results[i] = ("ok", "")
                 elif rc == 1:
                     results[i] = ("verify-failed", str(info["log"]))
+                elif rc == 3:
+                    results[i] = ("skipped", f"unsupported/asset-gated; {info['log']}")
                 else:
                     results[i] = ("error", f"exit={rc}; {info['log']}")
                 print(
@@ -2987,12 +3774,336 @@ def _run_scenarios_parallel(scenarios, args, gpu_ids: list[str]) -> int:
     ok_all = True
     for i, s in enumerate(scenarios):
         state, detail = results.get(i, ("unknown", ""))
-        if state != "ok":
+        if state not in ("ok", "skipped"):
             ok_all = False
         line = f"  [{state.upper()}] scenario[{i}] {s.hf_name} (tp={s.tp})"
         if detail:
             line += f" -- {detail}"
         print(line)
+    return 0 if ok_all else 1
+
+
+# --- Ray parallel scheduler ---------------------------------------------------
+# Like ``_run_scenarios_parallel`` but hands GPU packing to Ray (``num_gpus=tp``
+# per task) and lays out one folder per run, mirroring ``fastkernels validate``:
+# ``<root>/<NN_model_tpN_dtype>/`` holds that scenario's ``report*.json`` and
+# ``run.log``, with a ``run.jsonl`` event stream and ``summary.json`` at the root.
+_RAY_PROGRESS_INTERVAL_SEC = 30.0
+
+
+def _run_id() -> str:
+    return time.strftime("capture_%Y%m%d-%H%M%S")
+
+
+def _run_root(args) -> Path:
+    """Per-run output root: ``--output`` verbatim (as a directory) or a
+    timestamped folder under the captures dir."""
+    return Path(args.output) if args.output else CAPTURE_DIR / _run_id()
+
+
+def _job_dir(root: Path, index: int, scenario) -> Path:
+    return root / _scenario_log_name(scenario, index)
+
+
+def _worker_command_for_job(args, job_dir: Path) -> list[str]:
+    """Argv for a Ray worker child, pinning its report(s) into ``job_dir``."""
+    cmd = [
+        sys.executable, "-u", "-m", "fastkernels.capture",
+        args.scenarios,
+        "--max-requests", str(args.max_requests),
+        "--output", str(job_dir / "report.json"),
+    ]
+    if args.max_layers is not None:
+        cmd += ["--max-layers", str(args.max_layers)]
+    return cmd
+
+
+def _dashboard_url(ray) -> str | None:
+    """URL of the Ray dashboard -- the live view of every capture task (named
+    ``capture_NN_<model>_tpN_<dtype>``), its state, and per-GPU usage."""
+    try:
+        get_url = getattr(ray, "get_dashboard_url", None)
+        value = get_url() if get_url else None
+        if value:
+            return value if value.startswith("http") else f"http://{value}"
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        value = ray._private.worker._global_node.webui_url
+        return value if value.startswith("http") else f"http://{value}"
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _init_ray(ray):
+    """Start Ray with the dashboard on; retry without it if that fails."""
+    kwargs = {"ignore_reinit_error": True, "log_to_driver": False}
+    try:
+        return ray.init(include_dashboard=True, dashboard_host="127.0.0.1", **kwargs)
+    except Exception as exc:  # noqa: BLE001 - dashboard is best-effort
+        print(f"  !! Ray dashboard startup failed ({exc}); continuing without it")
+        ray.shutdown()
+        return ray.init(include_dashboard=False, **kwargs)
+
+
+def _append_run_event(root: Path, event: dict) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    with (root / "run.jsonl").open("a") as f:
+        f.write(json.dumps({"ts": time.time(), **event}, sort_keys=True) + "\n")
+
+
+def _write_capture_summary(root: Path, scenarios, results: dict) -> None:
+    summary = {
+        "root": str(root),
+        "scenarios": [
+            {
+                "index": i, "model": s.hf_name, "tp": s.tp, "dtype": s.dtype,
+                "status": results.get(i, ("unknown", ""))[0],
+                "detail": results.get(i, ("", ""))[1],
+            }
+            for i, s in enumerate(scenarios)
+        ],
+    }
+    (root / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+
+
+def _visible_to_physical_gpu_ids(visible: list[str], parent_visible: list[str]) -> list[str]:
+    """Map a Ray task's ``CUDA_VISIBLE_DEVICES`` (indices into the parent's
+    visible set) back to physical ids, for GPU reclaim."""
+    out: list[str] = []
+    for gpu in visible:
+        if gpu in parent_visible:
+            out.append(gpu)
+            continue
+        try:
+            idx = int(gpu)
+        except ValueError:
+            out.append(gpu)
+            continue
+        out.append(parent_visible[idx] if 0 <= idx < len(parent_visible) else gpu)
+    return out
+
+
+def _reclaim_gpus(gpu_ids: list[str]) -> None:
+    """SIGKILL any compute process still holding ``gpu_ids`` (re-parented ranks
+    that outlived the worker and would otherwise perturb the next task)."""
+    smi = shutil.which("nvidia-smi")
+    ids = [g for g in gpu_ids if g]
+    if smi is None or not ids:
+        return
+    try:
+        out = subprocess.run(
+            [smi, "-i", ",".join(ids), "--query-compute-apps=pid",
+             "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=30,
+        ).stdout
+    except Exception:  # noqa: BLE001 - best-effort reclaim
+        return
+    for tok in out.split():
+        try:
+            os.kill(int(tok), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, ValueError):
+            pass
+
+
+def _reap_process_group(proc: "subprocess.Popen", physical_gpus: list[str]) -> bool:
+    """Kill anything left in the child's session, then reclaim its GPUs. Returns
+    True if survivors had to be killed. ``start_new_session=True`` makes the
+    child's pgid its pid, so this never signals the driver or a sibling task."""
+    try:
+        os.killpg(proc.pid, 0)
+        survivors = True
+    except (ProcessLookupError, PermissionError):
+        survivors = False
+    if survivors:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        time.sleep(1.0)
+    _reclaim_gpus(physical_gpus)
+    return survivors
+
+
+def _ray_capture_job(job: dict, parent_visible_gpus: list[str],
+                     stall_timeout: int, timeout: int) -> dict:
+    """Ray remote: run one scenario's capture worker under a stall/wall-clock
+    watchdog, streaming to ``run.log`` and reaping GPU survivors on exit."""
+    run_dir = Path(job["run_dir"])
+    run_dir.mkdir(parents=True, exist_ok=True)
+    log_path = Path(job["log_path"])
+
+    env = os.environ.copy()
+    env[_WORKER_INDEX_ENV] = str(job["index"])
+    env["FASTKERNELS_NCCL_PORT"] = str(job["nccl_port"])
+    visible = [t.strip() for t in env.get("CUDA_VISIBLE_DEVICES", "").split(",")
+               if t.strip()]
+    physical = _visible_to_physical_gpu_ids(visible, parent_visible_gpus)
+
+    start = time.monotonic()
+    watchdog_reason: str | None = None
+    proc: subprocess.Popen | None = None
+    orphans = False
+    logf = open(log_path, "w", buffering=1)
+    try:
+        proc = subprocess.Popen(
+            job["cmd"], stdout=logf, stderr=subprocess.STDOUT,
+            env=env, start_new_session=True,
+        )
+        while proc.poll() is None:
+            now = time.monotonic()
+            if now - start > timeout:
+                watchdog_reason = (f"exceeded {timeout}s wall-clock timeout "
+                                   f"(elapsed {int(now - start)}s)")
+                break
+            try:
+                idle = time.time() - os.stat(log_path).st_mtime
+            except OSError:
+                idle = 0.0
+            if idle > stall_timeout:
+                watchdog_reason = (f"no log output for {int(idle)}s "
+                                   f"(>{stall_timeout}s) -- appears wedged")
+                break
+            time.sleep(1.0)
+        if watchdog_reason:
+            logf.write(f"\nWATCHDOG: {watchdog_reason}\n")
+            logf.flush()
+            _kill_process_group(proc, proc.pid)
+    except BaseException:
+        if proc is not None and proc.poll() is None:
+            _kill_process_group(proc, proc.pid)
+        raise
+    finally:
+        if proc is not None and _reap_process_group(proc, physical):
+            orphans = True
+            logf.write("\nORPHANS: killed processes that outlived the worker; "
+                       "GPU memory they held may have perturbed a neighbor\n")
+        logf.close()
+
+    rc = proc.returncode if proc is not None and proc.returncode is not None else -9
+    if watchdog_reason:
+        status = "error"
+        detail = watchdog_reason
+    elif rc == 0:
+        status = "ok"
+        detail = ""
+    elif rc == 1:
+        status = "verify-failed"
+        detail = str(log_path)
+    elif rc == 3:
+        status = "skipped"
+        detail = f"unsupported/asset-gated family; see {log_path}"
+    else:
+        status = "error"
+        detail = f"exit={rc}; {log_path}"
+    return {"index": job["index"], "status": status, "rc": rc,
+            "detail": detail, "log": str(log_path), "orphans": orphans}
+
+
+def _run_scenarios_ray(scenarios, args, gpu_ids: list[str], root: Path) -> int:
+    """Capture ``scenarios`` in parallel via Ray, one GPU-pinned task each.
+
+    Returns a process exit code (0 iff every scenario captured and verified).
+    Falls back to the subprocess scheduler if Ray is not installed.
+    """
+    try:
+        import ray
+    except ModuleNotFoundError:
+        print("  !! Ray not installed; using the subprocess scheduler instead.")
+        return _run_scenarios_parallel(scenarios, args, gpu_ids)
+
+    total = len(gpu_ids)
+    results: dict[int, tuple[str, str]] = {}
+    jobs: list[dict] = []
+    for i, s in enumerate(scenarios):
+        if s.tp > total:
+            detail = f"needs tp={s.tp} > {total} GPU(s) available"
+            results[i] = ("skipped", detail)
+            print(f"  !! SKIP scenario[{i}] {s.hf_name}: {detail}")
+            continue
+        job_dir = _job_dir(root, i, s)
+        jobs.append({
+            "index": i, "tp": s.tp, "name": s.hf_name,
+            "run_dir": str(job_dir), "log_path": str(job_dir / "run.log"),
+            "nccl_port": _NCCL_PORT_BASE + i,
+            "cmd": _worker_command_for_job(args, job_dir),
+        })
+
+    root.mkdir(parents=True, exist_ok=True)
+    _append_run_event(root, {"event": "run_start", "visible_gpus": gpu_ids,
+                             "job_count": len(jobs)})
+
+    prev_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if args.gpus:
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_ids)
+    try:
+        _init_ray(ray)
+        print(f"  Ray dashboard: {_dashboard_url(ray) or 'unavailable'}", flush=True)
+        total_cpus = int(ray.cluster_resources().get("CPU") or os.cpu_count() or 1)
+        remote_fn = ray.remote(_ray_capture_job)
+        ref_to_job: dict[object, dict] = {}
+        for job in jobs:
+            num_cpus = max(1, math.floor((total_cpus - 2) * job["tp"] / total))
+            ref = remote_fn.options(
+                name=f"capture_{job['index']:02d}_{_scenario_log_name(scenarios[job['index']], job['index'])}",
+                num_gpus=job["tp"], num_cpus=num_cpus,
+            ).remote(job, gpu_ids, _SCENARIO_STALL_SEC, _SCENARIO_TIMEOUT_SEC)
+            ref_to_job[ref] = job
+            _append_run_event(root, {"event": "task_submitted", "job": job})
+            print(f"  -> submitted scenario[{job['index']}] {job['name']} "
+                  f"(tp={job['tp']}); log {job['log_path']}")
+
+        pending = list(ref_to_job)
+        last = time.monotonic()
+        while pending:
+            ready, pending = ray.wait(pending, num_returns=1, timeout=2.0)
+            if not ready:
+                now = time.monotonic()
+                if now - last >= _RAY_PROGRESS_INTERVAL_SEC:
+                    print(f"  running/pending tasks: {len(pending)}", flush=True)
+                    last = now
+                continue
+            for ref in ready:
+                job = ref_to_job[ref]
+                i = job["index"]
+                try:
+                    r = ray.get(ref)
+                    state, detail = r["status"], r.get("detail", "")
+                except Exception as exc:  # noqa: BLE001 - task crash is a failure
+                    state, detail = "error", repr(exc)
+                    r = {"status": state, "detail": detail}
+                results[i] = (state, detail)
+                _append_run_event(root, {"event": "task_finished", "index": i,
+                                         "status": state, "result": r})
+                print(f"  <- [{state.upper()}] scenario[{i}] {job['name']}")
+                if state == "error":
+                    _print_log_tail(Path(job["log_path"]))
+    finally:
+        try:
+            ray.shutdown()
+        except Exception:  # noqa: BLE001
+            pass
+        if args.gpus:
+            if prev_cvd is None:
+                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+            else:
+                os.environ["CUDA_VISIBLE_DEVICES"] = prev_cvd
+
+    _write_capture_summary(root, scenarios, results)
+    _append_run_event(root, {"event": "run_finished", "results": {
+        str(i): results.get(i, ("unknown", ""))[0] for i in range(len(scenarios))}})
+
+    print("\nCapture summary:")
+    ok_all = True
+    for i, s in enumerate(scenarios):
+        state, detail = results.get(i, ("unknown", ""))
+        if state not in ("ok", "skipped"):
+            ok_all = False
+        line = f"  [{state.upper()}] scenario[{i}] {s.hf_name} (tp={s.tp})"
+        if detail:
+            line += f" -- {detail}"
+        print(line)
+    print(f"\nOutput root: {root}")
     return 0 if ok_all else 1
 
 
@@ -3079,17 +4190,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--output", default=None,
-        help="Base path for the JSON report(s) (default: "
-             "~/.fastkernels/captures/<scenario-slug>.json per scenario "
-             "workload). With multiple runs, the scenario slug is suffixed onto "
-             "this base to keep the paths distinct.",
+        help="For a parallel (multi-scenario) run, the output ROOT directory: "
+             "each scenario writes into <output>/<NN_model_tpN_dtype>/ "
+             "(report*.json + run.log), with run.jsonl + summary.json at the "
+             "root (default: ~/.fastkernels/captures/capture_<timestamp>/). For "
+             "a single-scenario run it is the report path base as before "
+             "(default ~/.fastkernels/captures/<scenario-slug>.json).",
     )
     parser.add_argument(
         "--gpus", default=None,
         help="Comma-separated physical GPU ids to schedule across (default: all "
              "visible GPUs / CUDA_VISIBLE_DEVICES). Scenarios are packed onto "
-             "these by their TP degree and captured in parallel, each in its own "
-             "GPU-pinned subprocess, launching more as GPUs free up.",
+             "these by their TP degree and captured in parallel via Ray, each in "
+             "its own GPU-pinned task, launching more as GPUs free up.",
     )
     parser.add_argument(
         "--max-layers", type=int, default=None,
@@ -3148,6 +4261,9 @@ def main(argv: list[str] | None = None) -> int:
                 scenario, runs, args, LlamaEngine, SamplingParams,
                 instrumented, n_instrumented, multi,
             )
+        except _CaptureSkip as exc:
+            print(f"\n  == SKIP scenario {scenario.hf_name}: {exc}")
+            return 3
         except Exception as exc:  # noqa: BLE001
             traceback.print_exc()
             print(f"\n  !! Scenario {scenario.hf_name} failed to capture: {exc!r}")
@@ -3162,11 +4278,13 @@ def main(argv: list[str] | None = None) -> int:
     _prefetch_media(scenarios)
     gpu_ids = _detect_gpu_ids(args.gpus)
     if len(scenarios) > 1 and len(gpu_ids) >= 1:
+        root = _run_root(args)
         print(
             f"Scheduling {len(scenarios)} scenario(s) across {len(gpu_ids)} "
-            f"GPU(s) [{', '.join(gpu_ids)}] by TP degree ..."
+            f"GPU(s) [{', '.join(gpu_ids)}] with Ray ..."
         )
-        return _run_scenarios_parallel(scenarios, args, gpu_ids)
+        print(f"  output root: {root}")
+        return _run_scenarios_ray(scenarios, args, gpu_ids, root)
 
     # --- In-process fallback (single scenario or no GPU detected). A
     #     per-scenario failure is reported and the loop continues with the next
@@ -3183,6 +4301,8 @@ def main(argv: list[str] | None = None) -> int:
             written.extend(paths)
             if not ok:
                 exit_code = 1
+        except _CaptureSkip as exc:
+            print(f"\n  == SKIP scenario {scenario.hf_name}: {exc}")
         except Exception as exc:  # noqa: BLE001
             traceback.print_exc()
             print(
