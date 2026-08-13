@@ -93,6 +93,19 @@ class VisionAttention(nn.Module):
             max_seqlen, max_seqlen,
             softmax_scale=self.head_dim ** -0.5,
             causal=False,
+            # Disable split-KV. With ``num_splits=0`` (auto) FA4's CuTeDSL
+            # kernel runs ``num_splits_heuristic`` and, for the few m-blocks a
+            # TP-sharded encoder produces (num_heads // tp, e.g. 16 // 4 = 4)
+            # at moderate seqlens, picks ``num_splits > 1``. That enables the
+            # ``is_split_kv`` path in ``flash_fwd_sm100.py``, whose
+            # ``n_block_first`` is typed ``None`` on one branch and ``Int32``
+            # on another -- a TYPE_UNSTABLE_JOIN CuTe compile error on
+            # Blackwell (SM100).  Encoder self-attention is balanced
+            # (q_len == k_len) so split-KV never helps here; forcing 1 is
+            # numerically identical and sidesteps the kernel bug.  The paged
+            # LLM prefill path (block_table/seqused_k) keeps auto-splitting,
+            # where short-q-over-long-KV chunks do benefit.
+            num_splits=1,
         )
 
         out = out.view(seq_len, batch_size, -1)
