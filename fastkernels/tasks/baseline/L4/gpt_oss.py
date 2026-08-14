@@ -43,6 +43,9 @@ from ..L2.parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from ..L3.gpt_oss_decoder import GptOssDecoderLayer
 
 
+__targets__ = ["GptOssForCausalLM"]
+
+
 @dataclass
 class GptOssConfig:
     hidden_size: int = 2880

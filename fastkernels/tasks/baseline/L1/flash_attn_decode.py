@@ -10,7 +10,7 @@ size; upstream ``flash_attn`` requires page sizes divisible by 256.
 import torch
 import torch.nn as nn
 
-from .fa_utils import FA_VERSION, flash_attn_varlen_func
+from ....infra.fa_utils import FA_VERSION, flash_attn_varlen_func
 
 
 class FlashAttnDecode(nn.Module):

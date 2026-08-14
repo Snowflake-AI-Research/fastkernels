@@ -23,6 +23,9 @@ def _permute_final_dims(tensor: torch.Tensor, inds: tuple[int, ...]) -> torch.Te
     return tensor.permute(first_inds + [zero_index + i for i in inds])
 
 
+__targets__ = ["TriangleMultiplicationOutgoing", "TriangleMultiplicationIncoming"]
+
+
 class TriangleMultiplicativeUpdate(nn.Module):
     """AF3 Algorithms 12/13: Triangle multiplicative update.
 

@@ -23,6 +23,9 @@ from ..L3.llama_decoder import LlamaDecoderLayer
 from ..L3.vision_block import VisionBlock
 
 
+__targets__ = ["Qwen2VLForConditionalGeneration"]
+
+
 @dataclass
 class Qwen2VLVisionConfig:
     depth: int = 32

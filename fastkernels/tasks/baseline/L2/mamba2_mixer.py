@@ -113,6 +113,9 @@ def _replace_loader(param: nn.Parameter, loader) -> None:
 # ---------------------------------------------------------------------------
 # Gated RMSNorm (per-group, optional TP-aware reduction)
 # ---------------------------------------------------------------------------
+__targets__ = ["Mamba2Mixer"]
+
+
 class Mixer2RMSNormGated(nn.Module):
     """Per-group gated RMSNorm matching vLLM's ``Mixer2RMSNormGated``.
 

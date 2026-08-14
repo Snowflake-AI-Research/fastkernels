@@ -30,6 +30,9 @@ def _make_divisible(v: float, divisor: int = 8) -> int:
     return new_v
 
 
+__targets__ = ["UniversalInvertedResidual"]
+
+
 class ConvNormAct(nn.Module):
     """Conv2d + BatchNorm2d + optional activation.
 

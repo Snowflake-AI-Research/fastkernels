@@ -26,6 +26,9 @@ from ..L3.whisper_encoder_layer import WhisperEncoderLayer
 from ..L3.whisper_decoder_layer import WhisperDecoderLayer
 
 
+__targets__ = ["WhisperForConditionalGeneration"]
+
+
 @dataclass
 class WhisperConfig:
     d_model: int = 1280

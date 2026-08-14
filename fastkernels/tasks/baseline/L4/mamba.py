@@ -38,6 +38,9 @@ from ..L2.parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from ..L3.mamba_decoder import MambaDecoderLayer
 
 
+__targets__ = ["MambaForCausalLM"]
+
+
 @dataclass
 class MambaConfig:
     model_type: str = "mamba"

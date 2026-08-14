@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 from flashinfer.prefill import trtllm_batch_context_with_kv_cache
 
-from .fa_utils import FA_VERSION, flash_attn_varlen_func
+from ....infra.fa_utils import FA_VERSION, flash_attn_varlen_func
 from .flashinfer_decode import prime_trtllm_sinks, trtllm_sinks
 
 
@@ -84,5 +84,10 @@ class TRTLLMPrefill(nn.Module):
             softmax_scale=softmax_scale if softmax_scale is not None else self.sm_scale,
             causal=causal,
             fa_version=FA_VERSION,
+            # Compute-bound dense prefill gains nothing from KV-splitting, but the
+            # FA4 (SM100 CuTe) auto heuristic still picks the split-KV kernel for
+            # mid-size seqlens -- which fails to compile in this vLLM build
+            # (TYPE_UNSTABLE_JOIN on ``n_block_first``).  Pin the unsplit kernel.
+            num_splits=1,
             **fa_extra,
         )

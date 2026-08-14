@@ -21,6 +21,9 @@ from ..L1.rotary_emb import RotaryEmbedding
 from ..L3.mixtral_decoder import MixtralDecoderLayer
 
 
+__targets__ = ["MixtralForCausalLM"]
+
+
 @dataclass
 class MixtralConfig:
     hidden_size: int = 4096

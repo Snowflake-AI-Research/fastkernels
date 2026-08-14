@@ -16,6 +16,9 @@ from ..L1.t5_layer_norm import T5LayerNorm
 from ..L3.t5_block import T5Block
 
 
+__targets__ = ["T5EncoderModel"]
+
+
 class T5Stack(nn.Module):
     def __init__(self, config: T5Config, shared: nn.Embedding):
         super().__init__()

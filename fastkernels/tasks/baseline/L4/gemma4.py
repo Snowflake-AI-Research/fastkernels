@@ -30,6 +30,9 @@ def _read_config(model_name: str) -> dict:
         return json.load(f)
 
 
+__targets__ = ["Gemma4ForCausalLM"]
+
+
 @dataclass
 class Gemma4Config:
     model_type: str = "gemma4"

@@ -56,6 +56,9 @@ logger = logging.getLogger(__name__)
 # Config dataclass
 # ---------------------------------------------------------------------------
 
+__targets__ = ["HunyuanVideoPipeline"]
+
+
 @dataclass
 class HunyuanVideoConfig:
     """Configuration for the HunyuanVideo-1.5 transformer model."""

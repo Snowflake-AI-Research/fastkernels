@@ -17,6 +17,9 @@ from ..L2.clip_mlp import CLIPTextEmbeddings
 from ..L3.clip_encoder_layer import CLIPEncoderLayer
 
 
+__targets__ = ["CLIPTextModel"]
+
+
 @dataclass
 class CLIPTextModelOutput:
     last_hidden_state: torch.Tensor

@@ -17,7 +17,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..L1.sam3_rope_attention import Sam3Attention
+from .sam3_rope_attention import Sam3Attention
+
+
+__targets__ = ["Sam3MaskDecoder"]
 
 
 class MLPBlock(nn.Module):

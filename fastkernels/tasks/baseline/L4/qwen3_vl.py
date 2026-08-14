@@ -31,6 +31,9 @@ from ..L3.qwen3_moe_decoder import Qwen3MoEDecoderLayer
 from ..L3.vision_block import VisionBlock
 
 
+__targets__ = ["Qwen3VLForConditionalGeneration"]
+
+
 @dataclass
 class Qwen3VLVisionConfig:
     depth: int = 27

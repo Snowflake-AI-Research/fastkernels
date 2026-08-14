@@ -14,6 +14,9 @@ from ..L1.gate_linear import _router_gemm_bf16_fp32
 from .fused_experts import FusedExperts
 
 
+__targets__ = ["Gemma4Router", "Gemma4MoE"]
+
+
 class Gemma4GateLinear(nn.Module):
     """Replicated router projection with vLLM's bf16->fp32 router GEMM."""
 

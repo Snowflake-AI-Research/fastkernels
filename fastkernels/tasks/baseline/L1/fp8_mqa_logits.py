@@ -17,6 +17,9 @@ import torch.nn as nn
 import deep_gemm
 
 
+__targets__ = ["Fp8MQALogits"]
+
+
 class Fp8MQALogits(nn.Module):
     """FP8 MQA logits for the DSA indexer (vLLM's unified fp8/fp4 kernels).
 

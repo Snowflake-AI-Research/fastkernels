@@ -44,6 +44,7 @@ class ValidateScenario:
 _MODULE_TO_HARNESS: dict[str, str] = {
     "llama": "bench_vllm",
     "deepseek": "bench_vllm",
+    "glm": "bench_vllm",
     "mixtral": "bench_vllm",
     "gpt_oss": "bench_vllm",
     "gemma4": "bench_vllm",

@@ -304,9 +304,6 @@ OPS: list[Op] = [
         '  m.def("moe_align_block_size", &moe_align_block_size, "MoE align block size (CUDA)");')),
     Op("topk_softmax.cu", ["moe_topk_softmax.cu"], _mod(
         '  m.def("topk_softmax", &topk_softmax, "Top-K softmax for MoE (CUDA)");')),
-    Op("rmsnorm_quant.cu", ["rmsnorm_quant.cu"], _mod(
-        '  m.def("rmsnorm_fp8_quant", &rmsnorm_fp8_quant, "Fused RMSNorm + FP8 quant (CUDA)");\n'
-        '  m.def("fused_add_rmsnorm_fp8_quant", &fused_add_rmsnorm_fp8_quant, "Fused add + RMSNorm + FP8 quant (CUDA)");')),
     Op("eagle_tree_ops.cu", ["eagle_utils.cu"], _mod(
         '  m.def("build_tree_kernel_efficient", &build_tree_kernel_efficient, "EAGLE build tree kernel efficient (CUDA)");\n'
         '  m.def("build_tree_kernel_efficient_with_metadata", &build_tree_kernel_efficient_with_metadata, "EAGLE build tree and FA3 metadata kernel efficient (CUDA)");\n'

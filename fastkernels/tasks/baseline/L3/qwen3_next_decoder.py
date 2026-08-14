@@ -18,7 +18,7 @@ from __future__ import annotations
 import torch.nn as nn
 
 from ....infra.tp import _tp_size
-from ..L1.flashinfer_allreduce_fusion import fused_allreduce_add_gemma_rmsnorm
+from ..L2.flashinfer_allreduce_fusion import fused_allreduce_add_gemma_rmsnorm
 from ..L1.gemma_rms_norm import GemmaRMSNorm
 from ..L2.qwen3_next_gdn_attention import Qwen3NextGDNAttention
 from ..L2.qwen3_next_attention import Qwen3NextAttention

@@ -18,6 +18,9 @@ from ..L2.gemma_dense_attention import GemmaDenseAttention
 from ..L2.parallel_linear import MergedColumnParallelLinear, RowParallelLinear
 
 
+__targets__ = ["GemmaDenseDecoderLayer"]
+
+
 class GemmaMLP(nn.Module):
     """Gemma MLP with GELUTanh activation (not SiLU like Llama)."""
 

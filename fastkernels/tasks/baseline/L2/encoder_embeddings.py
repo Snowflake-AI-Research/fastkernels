@@ -35,6 +35,9 @@ def create_roberta_position_ids_from_input_ids(
     return incremental.long() + padding_idx
 
 
+__targets__ = ["BertEmbeddings", "XLMRobertaEmbeddings"]
+
+
 class EncoderEmbeddingsBase(nn.Module):
     def __init__(self, config):
         super().__init__()

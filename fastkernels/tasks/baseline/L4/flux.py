@@ -46,6 +46,9 @@ logger = logging.getLogger(__name__)
 # Config dataclass
 # ---------------------------------------------------------------------------
 
+__targets__ = ["FluxPipeline"]
+
+
 @dataclass
 class FluxConfig:
     """Configuration for the FLUX transformer model."""

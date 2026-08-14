@@ -6,6 +6,9 @@ import torch
 import torch.nn as nn
 
 
+__targets__ = ["ColBERTv2TokenMask", "ColBERTv2MaxSim"]
+
+
 class ColBERTv2TokenMask(nn.Module):
     def __init__(self, pad_token_id: int):
         super().__init__()

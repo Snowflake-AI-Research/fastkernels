@@ -68,9 +68,13 @@ def m_grouped_fp8_gemm_nt_contiguous(a_and_scale, b_and_scale, output, expert_id
         output: output buffer
         expert_ids: per-row expert assignment (int32, -1 = skip)
     """
+    # Match the SF format to the arch: B200 (e8m0) needs the UE8M0 cast, Hopper
+    # keeps float32. Hardcoding True asserts on B200 ("Unsupported architecture
+    # or scaling factor types"). Mirrors ``fp8_linear._fp8_gemm_nt_impl``.
+    from .fp8_linear import _is_deep_gemm_e8m0_used
     _dg.m_grouped_fp8_gemm_nt_contiguous(
         a_and_scale, b_and_scale, output, expert_ids,
-        disable_ue8m0_cast=True,
+        disable_ue8m0_cast=not _is_deep_gemm_e8m0_used(),
     )
 
 

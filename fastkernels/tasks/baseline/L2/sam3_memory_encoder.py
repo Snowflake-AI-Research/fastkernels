@@ -22,6 +22,9 @@ import torch.nn.functional as F
 from .sam3_prompt_encoder import LayerNorm2d
 
 
+__targets__ = ["Sam3MemoryEncoder"]
+
+
 class SimpleMaskDownSampler(nn.Module):
     """Progressively downsample a mask by total_stride using strided convs.
 

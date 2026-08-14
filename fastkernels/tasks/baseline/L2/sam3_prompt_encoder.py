@@ -16,6 +16,9 @@ import torch
 import torch.nn as nn
 
 
+__targets__ = ["Sam3PromptEncoder"]
+
+
 class LayerNorm2d(nn.Module):
     def __init__(self, num_channels: int, eps: float = 1e-6):
         super().__init__()

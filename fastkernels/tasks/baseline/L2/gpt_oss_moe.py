@@ -27,8 +27,8 @@ import torch.nn as nn
 from ....infra.tp import _tp_rank, _tp_size
 from ..L1.allreduce import AllReduce
 from ..L1.linear import Linear
-from ..L1.mxfp4_moe import Mxfp4MoE
-from ..L1.trtllm_mxfp4_moe import (
+from .mxfp4_moe import Mxfp4MoE
+from .trtllm_mxfp4_moe import (
     TRTLLM_MXFP4_ALIGN,
     TrtLlmMxfp4MoE,
     prepare_trtllm_mxfp4_weights,

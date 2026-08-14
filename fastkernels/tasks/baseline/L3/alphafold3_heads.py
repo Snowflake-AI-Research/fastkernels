@@ -17,6 +17,9 @@ from ..L1.layer_norm import LayerNorm
 from ..L1.linear import Linear
 
 
+__targets__ = ["AuxiliaryHeads"]
+
+
 class DistogramHead(nn.Module):
     """Predicts inter-residue distance distribution.
 

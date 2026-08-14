@@ -20,6 +20,9 @@ from .alphafold3_input_embedder import relpos_complex
 from .alphafold3_swiglu_transition import SwiGLUTransition
 
 
+__targets__ = ["DiffusionConditioning"]
+
+
 class FourierEmbedding(nn.Module):
     """Fourier time embedding for diffusion conditioning.
 

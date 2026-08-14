@@ -9,6 +9,14 @@ scenarios:
     tp: 1
     dtype: bfloat16
     workloads: [LLM.mixed, LLM.long_context]
+  - model: Qwen/Qwen3-Next-80B-A3B-Instruct
+    tp: 2
+    dtype: bfloat16
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+  - model: moonshotai/Kimi-Linear-48B-A3B-Instruct
+    tp: 2
+    dtype: bfloat16
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
   - model: openai/gpt-oss-120b
     tp: 2
     dtype: mxfp4

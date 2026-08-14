@@ -30,7 +30,10 @@ from ..L1.embedding import Embedding
 from ..L1.layer_norm import LayerNorm
 from ..L1.linear import Linear
 from ..L3.rwkv7_decoder import RWKV7Block
-from .recurrent_cache import CausalLMOutputWithPast, RecurrentCache
+from ....infra.recurrent_cache import CausalLMOutputWithPast, RecurrentCache
+
+
+__targets__ = ["RWKV7ForCausalLM"]
 
 
 @dataclass

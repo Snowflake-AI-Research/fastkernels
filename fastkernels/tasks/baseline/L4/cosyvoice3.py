@@ -25,6 +25,9 @@ from ..L2.cosyvoice3_hifigan import CausalHiFTGenerator, CausalConvRNNF0Predicto
 from ..L3.cosyvoice3_dit import DiT
 
 
+__targets__ = ["CosyVoice3ForTTS"]
+
+
 @dataclass
 class CosyVoice3Config:
     model_type: str = "cosyvoice3"

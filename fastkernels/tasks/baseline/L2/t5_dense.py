@@ -21,6 +21,9 @@ from .parallel_linear import (
 )
 
 
+__targets__ = ["T5DenseGatedActDense", "T5DenseActDense"]
+
+
 class NewGELUActivation(nn.Module):
     """GELU approximation matching HuggingFace's NewGELUActivation exactly."""
 

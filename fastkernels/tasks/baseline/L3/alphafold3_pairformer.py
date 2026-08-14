@@ -16,6 +16,9 @@ from ..L2.alphafold3_pair_block import PairBlock
 from ..L2.alphafold3_swiglu_transition import SwiGLUTransition
 
 
+__targets__ = ["PairFormerStack"]
+
+
 class PairFormerBlock(nn.Module):
     """Single block of AF3 Algorithm 17.
 

@@ -27,6 +27,9 @@ def _norm(num_features: int, frozen: bool) -> nn.Module:
     return BatchNorm2d(num_features)
 
 
+__targets__ = ["RTDetrV2ResNetEmbeddings", "RTDetrV2ResNetBasicLayer", "RTDetrV2ResNetBottleNeckLayer"]
+
+
 class RTDetrV2ResNetConvLayer(nn.Module):
     def __init__(
         self,

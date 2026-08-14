@@ -11,7 +11,7 @@ from ..L1.gate_linear import GateLinear
 from ..L1.grouped_topk import GroupedTopK
 from ..L1.moe_shared_gate_add import moe_shared_gate_add
 from ..L1.silu_and_mul import SiluAndMul
-from ..L1.trtllm_bf16_moe import (
+from .trtllm_bf16_moe import (
     TrtLlmBf16MoE,
     prepare_trtllm_bf16_moe_weights,
     trtllm_bf16_moe_supported,

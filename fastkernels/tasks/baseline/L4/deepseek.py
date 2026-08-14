@@ -20,6 +20,9 @@ from ..L1.yarn_rotary_emb import YarnRotaryEmbedding
 from ..L3.deepseek_decoder import DeepSeekDecoderLayer
 
 
+__targets__ = ["DeepSeekV3ForCausalLM"]
+
+
 @dataclass
 class DeepSeekV3Config:
     hidden_size: int = 7168

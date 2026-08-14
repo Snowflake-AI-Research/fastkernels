@@ -23,6 +23,9 @@ from ..L2.hunyuan_video_token_refiner import (
 from ..L2.timestep_embedding import CombinedTimestepTextProjEmbeddings
 
 
+__targets__ = ["HunyuanVideo15TokenRefiner"]
+
+
 class HunyuanVideo15IndividualTokenRefinerBlock(nn.Module):
     def __init__(
         self,

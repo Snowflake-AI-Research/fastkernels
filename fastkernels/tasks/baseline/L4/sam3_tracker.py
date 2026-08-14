@@ -24,7 +24,7 @@ from ..L2.sam3_prompt_encoder import Sam3PromptEncoder
 from ..L2.sam3_memory_encoder import Sam3MemoryEncoder, SimpleMaskDownSampler, CXBlock, SimpleFuser, PositionEmbeddingSine
 from ..L3.sam3_mask_decoder import Sam3MaskDecoder, TwoWayTransformer, MLP, LayerNorm2d
 from ..L3.sam3_memory_attention import Sam3MemoryAttention, Sam3MemoryAttentionLayer
-from ..L1.sam3_rope_attention import Sam3RoPEAttention
+from ..L3.sam3_rope_attention import Sam3RoPEAttention
 
 NO_OBJ_SCORE = -1024.0
 
@@ -73,6 +73,9 @@ def select_closest_cond_frames(frame_idx, cond_frame_outputs, max_cond_frame_num
 def fill_holes_in_mask_scores(mask, max_area=0):
     """Placeholder for post-processing fill holes. In fastkernels, we skip connected components."""
     return mask
+
+
+__targets__ = ["Sam3TrackerPredictor"]
 
 
 class Sam3TrackerBase(nn.Module):

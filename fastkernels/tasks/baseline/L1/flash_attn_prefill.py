@@ -8,7 +8,7 @@ FA2 otherwise) -- see :mod:`fa_utils`.
 import torch
 import torch.nn as nn
 
-from .fa_utils import FA_VERSION, flash_attn_varlen_func
+from ....infra.fa_utils import FA_VERSION, flash_attn_varlen_func
 
 
 class FlashAttnPrefill(nn.Module):
@@ -35,5 +35,11 @@ class FlashAttnPrefill(nn.Module):
             fa_kw["seqused_k"] = seqused_k
         else:
             fa_kw["cu_seqlens_k"] = cu_seqlens_k
+            # Dense prefill is compute-bound, so KV-splitting buys nothing, but
+            # the FA4 (SM100 CuTe) auto heuristic still picks the split-KV kernel
+            # for mid-size seqlens -- and that variant fails to compile in this
+            # vLLM build (TYPE_UNSTABLE_JOIN on ``n_block_first``).  Pin
+            # ``num_splits=1`` so the unsplit kernel is used.
+            fa_kw["num_splits"] = 1
         fa_kw.update(kwargs)
         return flash_attn_varlen_func(q, k, v, **fa_kw)

@@ -2135,7 +2135,7 @@ class ModelRunner:
         """
         if self.world_size <= 1:
             return
-        from ..tasks.baseline.L1.flashinfer_allreduce_fusion import (
+        from ..tasks.baseline.L2.flashinfer_allreduce_fusion import (
             get_fi_ar_workspace,
         )
 

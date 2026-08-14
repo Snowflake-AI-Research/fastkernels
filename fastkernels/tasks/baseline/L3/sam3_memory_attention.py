@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..L1.sam3_rope_attention import Sam3RoPEAttention
+from .sam3_rope_attention import Sam3RoPEAttention
 
 
 def _get_activation_fn(activation: str):
@@ -31,6 +31,9 @@ def _get_activation_fn(activation: str):
 def _get_clones(module: nn.Module, N: int) -> nn.ModuleList:
     from copy import deepcopy
     return nn.ModuleList([deepcopy(module) for _ in range(N)])
+
+
+__targets__ = ["Sam3MemoryAttention"]
 
 
 class Sam3MemoryAttentionLayer(nn.Module):

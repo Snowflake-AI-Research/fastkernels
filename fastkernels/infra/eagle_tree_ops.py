@@ -14,7 +14,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from ....infra.cuda_ext import lazy_op
+from .cuda_ext import lazy_op
 
 _C = lazy_op("eagle_tree_ops", "eagle_tree_ops.cu")
 

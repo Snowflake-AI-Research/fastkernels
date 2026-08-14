@@ -39,6 +39,9 @@ logger = logging.getLogger(__name__)
 # Config dataclasses
 # ---------------------------------------------------------------------------
 
+__targets__ = ["Pi0Pipeline"]
+
+
 @dataclass
 class SigLIPVisionConfig:
     hidden_size: int = 1152

@@ -13,6 +13,9 @@ from ..L2.rtdetrv2_csp_rep_layer import RTDetrV2CSPRepLayer
 from ..L2.rtdetrv2_encoder_layer import RTDetrV2EncoderLayer
 
 
+__targets__ = ["RTDetrV2HybridEncoder"]
+
+
 class RTDetrV2Encoder(nn.Module):
     def __init__(self, config):
         super().__init__()

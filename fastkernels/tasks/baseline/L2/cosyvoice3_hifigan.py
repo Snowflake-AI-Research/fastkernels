@@ -21,6 +21,9 @@ from torch.distributions.uniform import Uniform
 from torch.nn import Parameter
 
 
+__targets__ = ["CausalConvRNNF0Predictor", "CausalHiFTGenerator"]
+
+
 class Snake(nn.Module):
     def __init__(self, in_features, alpha=1.0, alpha_trainable=True, alpha_logscale=False):
         super().__init__()

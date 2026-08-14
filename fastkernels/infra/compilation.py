@@ -246,10 +246,10 @@ def _fused_ar_add_rmsnorm_impl(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """One FlashInfer kernel for all-reduce + residual-add + RMSNorm.
 
-    See ``L1.flashinfer_allreduce_fusion`` for why this is a single kernel and
+    See ``L2.flashinfer_allreduce_fusion`` for why this is a single kernel and
     what it falls back to when the batch outgrows the workspace.
     """
-    from ..tasks.baseline.L1.flashinfer_allreduce_fusion import (
+    from ..tasks.baseline.L2.flashinfer_allreduce_fusion import (
         fused_allreduce_add_rmsnorm,
     )
 
@@ -275,7 +275,7 @@ def _fused_ar_rmsnorm_impl(
     Returns ``(normed, all_reduced)``: layer 0 carries the un-normalised
     all-reduce result forward as the residual, so both outputs are live.
     """
-    from ..tasks.baseline.L1.flashinfer_allreduce_fusion import (
+    from ..tasks.baseline.L2.flashinfer_allreduce_fusion import (
         fused_allreduce_rmsnorm,
     )
 
@@ -963,7 +963,7 @@ def _maybe_allreduce_fusion_pass(
     """
     import torch.distributed as dist
 
-    from ..tasks.baseline.L1.flashinfer_allreduce_fusion import (
+    from ..tasks.baseline.L2.flashinfer_allreduce_fusion import (
         fi_ar_fusion_available,
     )
 

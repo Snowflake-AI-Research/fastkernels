@@ -35,6 +35,9 @@ from ..L3.sam3_text_encoder import Sam3TextEncoder
 from ..L3.sam3_vit import Sam3ViT
 
 
+__targets__ = ["Sam3Model"]
+
+
 @dataclass
 class Sam3Config:
     """Configuration for SAM3 image segmentation model."""

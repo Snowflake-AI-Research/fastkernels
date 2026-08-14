@@ -1218,6 +1218,7 @@ FAMILIES: dict[str, Family] = {f.keyword: f for f in _FAMILIES}
 _ARCHITECTURES = (
     Architecture("llama", "llm", "Llama-3.1+", "llama"),
     Architecture("deepseek", "llm", "DeepSeek-V3.2", "deepseek_v32"),
+    Architecture("glm", "llm", "GLM-5.2", "glm_moe_dsa"),
     Architecture("mixtral", "llm", "Mixtral", "mixtral"),
     Architecture("bitnet", "llm", "BitNet 1.58b", "llama"),
     Architecture("gpt_oss", "llm", "GPT-OSS (MXFP4)", "gpt_oss"),
@@ -1267,13 +1268,12 @@ FASTKERNELS_ARCHITECTURES: dict[str, Architecture] = {a.module: a for a in _ARCH
 
 
 # Several HuggingFace ``model_type`` strings map to a single fastkernels L4
-# module because they are the same architecture. GLM-5.2 (``glm_moe_dsa`` /
-# ``GlmMoeDsaForCausalLM``) is a pure config variant of DeepSeek-V3.2 -- in vLLM
-# it subclasses ``DeepseekV2ForCausalLM`` with an empty body -- so it is served
-# by the ``deepseek`` module (which the registry keys on ``deepseek_v32``). This
-# mirrors the ``glm_moe_dsa -> deepseek_v3`` remap in ``weight_loader``.
+# module because they are the same architecture. DeepSeek ships both the current
+# ``deepseek_v32`` and the older ``deepseek_v3`` spellings; both resolve to the
+# ``deepseek`` module. GLM-5.2 (``glm_moe_dsa``) is a config variant of
+# DeepSeek-V3.2 but is registered as its own ``glm`` architecture/module (which
+# reuses the DeepSeek implementation), so it is intentionally NOT aliased here.
 _MODEL_TYPE_ALIASES: dict[str, str] = {
-    "glm_moe_dsa": "deepseek_v32",
     "deepseek_v3": "deepseek_v32",
 }
 
