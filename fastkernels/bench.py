@@ -457,6 +457,7 @@ def _init_fp8_module_weights(module: nn.Module) -> None:
     (matching param shapes), then weights are shared via ``load_state_dict``.
     """
     from fastkernels.tasks.baseline.L1.fp8_linear import Fp8Linear
+    from fastkernels.infra.weight_loader import _postprocess_moe_fp8_weights
     for sub in module.modules():
         lin = getattr(sub, "linear_op", None)
         w = getattr(sub, "weight", None)
@@ -466,6 +467,32 @@ def _init_fp8_module_weights(module: nn.Module) -> None:
             weight_fp8, weight_scale_inv = _fp8_block_quant_weight(n, k, str(w.device))
             sub.weight = torch.nn.Parameter(weight_fp8, requires_grad=False)
             sub.weight_scale_inv = torch.nn.Parameter(weight_scale_inv, requires_grad=False)
+        # Block-scaled MoE experts (Qwen3MoE): raw 3D fp8 ``w13``/``w2`` params.
+        # torch.empty leaves NaN fp8 bytes, and the DeepGEMM MoE path needs the
+        # scale in its own layout (``w13_scale_dg``/``w2_scale_dg``) or it asserts
+        # on the raw scale. Fill valid fp8 and build the DeepGEMM-layout scales.
+        w13, w13s = getattr(sub, "w13", None), getattr(sub, "w13_scale", None)
+        if (isinstance(w13, torch.nn.Parameter) and w13.dim() == 3
+                and w13.dtype == torch.float8_e4m3fn
+                and isinstance(w13s, torch.nn.Parameter)):
+            with torch.no_grad():
+                for name in ("w13", "w2"):
+                    p = getattr(sub, name, None)
+                    if (isinstance(p, torch.nn.Parameter)
+                            and p.dtype == torch.float8_e4m3fn):
+                        ref = torch.randn(p.shape, device=p.device,
+                                          dtype=torch.float32).clamp_(-2, 2)
+                        p.data.copy_(ref.to(torch.float8_e4m3fn))
+                # ``_prepare_module`` downcast the float32 block scales to the run
+                # dtype (bf16); DeepGEMM requires them float32, so restore.
+                for name in ("w13_scale", "w2_scale"):
+                    sp = getattr(sub, name, None)
+                    if isinstance(sp, torch.nn.Parameter) and sp.dtype != torch.float32:
+                        sp.data = sp.data.float()
+            try:
+                _postprocess_moe_fp8_weights(sub)
+            except Exception:  # noqa: BLE001 - no DeepGEMM here; forward uses Triton
+                pass
 
 
 def _init_nvfp4_module_weights(module: nn.Module) -> None:
@@ -569,12 +596,156 @@ def _prep_sparse_attn_indexer(module: nn.Module, init_args: dict, device: str) -
     module.max_model_len = ctx_len
 
 
+def _prep_process_weights(module: nn.Module, init_args: dict, device: str) -> None:
+    """Run every submodule's ``process_weights_after_loading``. The trtllm-gen
+    BF16 MoE kernels (KimiMoE / SharedExpertMoE / GptOssMoE) read expert weights
+    in a 4D BlockMajorK layout this produces; without it they index a still-3D
+    weight ('Index 3 out of bounds for tensor with 3 dimensions'). The methods
+    guard themselves, so this is safe on modules that need no conversion."""
+    for sub in module.modules():
+        fn = getattr(sub, "process_weights_after_loading", None)
+        if callable(fn):
+            fn()
+
+
+def _prep_cast_buffers(module: nn.Module, init_args: dict, device: str) -> None:
+    """Cast floating buffers to the module's (single) param dtype. Real loading
+    casts the whole module to the run dtype; ``_prepare_module`` only casts
+    params, leaving e.g. AlphaFold3's ``FourierEmbedding`` float32 ``w``/``b``
+    buffers to clash with the bf16 Linear that consumes them (float != bf16)."""
+    dtypes = {p.dtype for p in module.parameters() if p.is_floating_point()}
+    if len(dtypes) != 1:
+        return
+    target = next(iter(dtypes))
+    high_prec = (torch.float16, torch.bfloat16, torch.float32)
+    for sub in module.modules():
+        for name, buf in list(sub._buffers.items()):
+            if (buf is not None and buf.is_floating_point()
+                    and buf.dtype in high_prec and buf.dtype != target):
+                sub._buffers[name] = buf.to(target)
+
+
+# --- Kimi-Linear / Qwen3-Next recurrent state (KDA / GDN) --------------------
+# The linear-attention layers read their conv + recurrent state from a
+# ``KimiLinearStateManager`` on the global Context (plus, for GDN, the same
+# object as a forward arg) rather than from their inputs. Rebuilding the real
+# manager needs the full model config (an opaque ``$dataclass`` we don't get in
+# a prep); instead a prep sizes just the per-layer buffers the forwards index
+# from the *module*, stashes them here, and the matching builder attaches them
+# to a fresh prefill Context with a single-sequence ``KimiLinearMetadata``.
+_KIMI_RECURRENT_SM: object | None = None
+_KIMI_STATE_SLOTS = 8
+
+
+class _KimiRecurrentState:
+    """Minimal duck-typed ``KimiLinearStateManager``: only the per-layer conv /
+    recurrent buffers the KDA and GDN forwards index (slot 0 reserved as null,
+    matching the real manager; our single sequence uses slot 1)."""
+
+    def __init__(self, n_layers: int):
+        self.q_conv_states = [None] * n_layers
+        self.k_conv_states = [None] * n_layers
+        self.v_conv_states = [None] * n_layers
+        self.recurrent_states = [None] * n_layers
+        self.gdn_conv = [None] * n_layers
+        self.recurrent = [None] * n_layers
+
+
+def _locate_recurrent_attn(module: nn.Module):
+    """Return ``("kda"|"gdn", attn_module)`` for the recurrent attention inside
+    ``module`` (the module itself for the L2 ops, a submodule for the decoders),
+    or ``(None, None)``."""
+    from fastkernels.tasks.baseline.L2.kimi_delta_attention import KimiDeltaAttention
+    from fastkernels.tasks.baseline.L2.qwen3_next_gdn_attention import (
+        Qwen3NextGDNAttention,
+    )
+    for sub in module.modules():
+        if isinstance(sub, KimiDeltaAttention):
+            return "kda", sub
+        if isinstance(sub, Qwen3NextGDNAttention):
+            return "gdn", sub
+    return None, None
+
+
+def _prep_kimi_recurrent(module: nn.Module, init_args: dict, device: str) -> None:
+    """Build the per-layer recurrent state buffers (sized from the module) and
+    stash them for the builder. Also run ``process_weights_after_loading`` so
+    GDN's aliased input projection and Qwen3-Next's trtllm-gen MoE get their
+    expected layouts."""
+    global _KIMI_RECURRENT_SM
+    kind, attn = _locate_recurrent_attn(module)
+    if attn is None:
+        raise _UnsupportedInput("no KDA/GDN submodule found")
+    for sub in module.modules():
+        fn = getattr(sub, "process_weights_after_loading", None)
+        if callable(fn):
+            fn()
+    dt = torch.bfloat16
+    for p in module.parameters():
+        if p.is_floating_point() and p.dtype in (torch.float16, torch.bfloat16):
+            dt = p.dtype
+            break
+    S = _KIMI_STATE_SLOTS
+    li = attn.layer_idx
+    sm = _KimiRecurrentState(li + 1)
+    if kind == "kda":
+        proj = attn.q_conv1d.weight.shape[0]
+        k = max(attn.conv_size - 1, 1)
+        for lst in (sm.q_conv_states, sm.k_conv_states, sm.v_conv_states):
+            lst[li] = torch.zeros(S, k, proj, device=device, dtype=dt)
+        sm.recurrent_states[li] = torch.zeros(
+            S, attn.local_num_heads, attn.head_dim, attn.head_dim,
+            device=device, dtype=torch.float32)
+    else:  # gdn
+        k = max(attn.conv_kernel_size - 1, 1)
+        conv_dim = (2 * attn.local_k_heads * attn.head_k_dim
+                    + attn.local_v_heads * attn.head_v_dim)
+        sm.gdn_conv[li] = torch.zeros(
+            S, k, conv_dim, device=device, dtype=dt).transpose(-1, -2)
+        sm.recurrent[li] = torch.zeros(
+            S, attn.local_v_heads, attn.head_k_dim, attn.head_v_dim,
+            device=device, dtype=dt)
+    _KIMI_RECURRENT_SM = sm
+
+
 # qualname -> prep(module, init_args, device): set up op-specific module state
 # (caches / flags) a valid forward depends on but that isn't a constructor arg
 # or a captured weight. Applied to baseline AND candidate before timing.
 _MODULE_PREP = {
     "fastkernels.tasks.baseline.L2.sparse_attn_indexer:SparseAttnIndexer":
         _prep_sparse_attn_indexer,
+    # trtllm-gen BF16 MoE expert weights need the 4D layout conversion first.
+    "fastkernels.tasks.baseline.L2.kimi_moe:KimiMoE": _prep_process_weights,
+    "fastkernels.tasks.baseline.L2.shared_expert_moe:SharedExpertMoE":
+        _prep_process_weights,
+    "fastkernels.tasks.baseline.L3.gpt_oss_decoder:GptOssDecoderLayer":
+        _prep_process_weights,
+    # AlphaFold3 diffusion: match FourierEmbedding's float32 buffers to bf16.
+    "fastkernels.tasks.baseline.L2.alphafold3_diffusion_conditioning:DiffusionConditioning":
+        _prep_cast_buffers,
+    "fastkernels.tasks.baseline.L3.alphafold3_diffusion_module:DiffusionModule":
+        _prep_cast_buffers,
+    "fastkernels.tasks.baseline.L3.alphafold3_diffusion_module:SampleDiffusion":
+        _prep_cast_buffers,
+    # Kimi-Linear / Qwen3-Next linear attention: build the recurrent conv/state
+    # buffers the forwards read off the Context (paired with the builder below).
+    "fastkernels.tasks.baseline.L2.kimi_delta_attention:KimiDeltaAttention":
+        _prep_kimi_recurrent,
+    "fastkernels.tasks.baseline.L2.qwen3_next_gdn_attention:Qwen3NextGDNAttention":
+        _prep_kimi_recurrent,
+    "fastkernels.tasks.baseline.L3.kimi_linear_decoder:KimiLinearDecoderLayer":
+        _prep_kimi_recurrent,
+    "fastkernels.tasks.baseline.L3.qwen3_next_decoder:Qwen3NextDecoderLayer":
+        _prep_kimi_recurrent,
+}
+
+
+# qualname -> dtype override for cases whose captured inputs mislead _case_dtype.
+_FORCE_DTYPE = {
+    # Ran in a float32 scenario, but its only input (t) is int64 so the heuristic
+    # defaults to bf16 -- clashing with the always-fp32 sinusoidal embedding.
+    "fastkernels.tasks.baseline.L2.oasis_timestep_embedder:OasisTimestepEmbedder":
+        torch.float32,
 }
 
 
@@ -1102,6 +1273,332 @@ def _build_deepseek_mla_composite_inputs(fwd_args, device, init_args):
     return [], kw
 
 
+def _fix_paged_decode(kw: dict, cache_keys: tuple[str, ...]) -> None:
+    """Make a paged-attention decode's inputs finite and in-range, in place.
+
+    Random cache bytes decode to NaN (fp8) and a random ``block_table`` /
+    ``cache_seqlens`` walk pages that don't exist -> NaN. Zero the cache(s) (a
+    valid empty cache), draw page ids within the cache's block count, and cap the
+    context lengths to what the page table can address (``max_pages *
+    page_size``). Geometry comes from the first cache: ``[num_blocks, ...,
+    page_size, head_dim]``."""
+    caches = [kw.get(k) for k in cache_keys]
+    bt, sl = kw.get("block_table"), kw.get("cache_seqlens")
+    if not (all(isinstance(c, torch.Tensor) for c in caches)
+            and isinstance(bt, torch.Tensor) and isinstance(sl, torch.Tensor)):
+        raise _UnsupportedInput("paged decode: missing cache/block_table/cache_seqlens")
+    for c in caches:
+        c.zero_()
+    c0 = caches[0]
+    num_blocks, page_size = int(c0.shape[0]), int(c0.shape[-2])
+    max_pages = int(bt.shape[-1])
+    kw["block_table"] = torch.randint(0, max(1, num_blocks), tuple(bt.shape),
+                                      device=c0.device, dtype=bt.dtype)
+    max_len = max(1, max_pages * page_size)
+    sl = torch.randint(1, max_len + 1, tuple(sl.shape), device=c0.device, dtype=sl.dtype)
+    kw["cache_seqlens"] = sl
+    if "max_seq_len" in kw:
+        kw["max_seq_len"] = int(sl.max().item())
+
+
+def _build_trtllm_decode_inputs(fwd_args, device, init_args):
+    """Inputs for ``TRTLLMDecode.forward`` with a valid (zeroed) paged K/V cache
+    and consistent block_table / cache_seqlens (see ``_fix_paged_decode``)."""
+    kw = _materialize_all(fwd_args, device, init_args)
+    _fix_paged_decode(kw, ("k_cache", "v_cache"))
+    return [], kw
+
+
+def _build_flashinfer_mla_decode_inputs(fwd_args, device, init_args):
+    """Inputs for ``FlashInferMLADecode.forward`` with a valid (zeroed) paged
+    latent cache and consistent block_table / cache_seqlens."""
+    kw = _materialize_all(fwd_args, device, init_args)
+    _fix_paged_decode(kw, ("kv_cache",))
+    return [], kw
+
+
+def _build_chunk_gla_inputs(fwd_args, device, init_args):
+    """Inputs for ``ChunkGLA.forward``. ``g`` is a log-space forget gate: a
+    random (possibly positive) gate makes the chunk scan's ``exp(cumsum(g))``
+    overflow to NaN, so squash it to <= 0 with logsigmoid."""
+    kw = _materialize_all(fwd_args, device, init_args)
+    g = kw.get("g")
+    if isinstance(g, torch.Tensor):
+        kw["g"] = torch.nn.functional.logsigmoid(g.float()).to(g.dtype)
+    return [], kw
+
+
+def _build_attention_prefill_inputs(fwd_args, device, init_args):
+    """Drive the reconstructable dense-prefill path for the attention family
+    (``Attention`` / ``LlamaAttention``) and the decoder layers wrapping it
+    (Llama / Qwen3-MoE / GPT-OSS).
+
+    Their forward reads paged KV-cache metadata from the global inference
+    ``Context``; with none set they deref ``None`` ('NoneType has no attribute
+    contiguous'). Publish a prefill ``Context`` (the module's default empty KV
+    cache -> the dense branch, block_tables None) so attention runs over the new
+    tokens. A rotary passed as a *forward* arg is an opaque captured module we
+    can't rebuild, so pass ``None``: the op then uses its own (``$op_ref``-
+    reconstructed) init rotary, or skips RoPE when the rotary is model-level
+    (GPT-OSS) -- fine for a self-consistent baseline-vs-baseline check."""
+    kw = _materialize_all(fwd_args, device, init_args, skip=("rotary_emb",))
+    n = None
+    for key in ("hidden_states", "query"):
+        t = kw.get(key)
+        if isinstance(t, torch.Tensor):
+            n = int(t.shape[0])
+            break
+    if n is None:
+        raise _UnsupportedInput("attention prefill: no hidden_states/query")
+    if "rotary_emb" in fwd_args:
+        kw["rotary_emb"] = None
+    _set_mla_prefill_context(n, device, fwd_args.get("_ctx"))
+    return [], kw
+
+
+def _build_recurrent_prefill_inputs(fwd_args, device, init_args):
+    """GLA / GLADecoderLayer (linear-attention recurrent state): drop the opaque
+    captured ``RecurrentCache`` so forward runs its cacheless prefill path
+    (``initial_state=None``, no cache write). The packed ``cu_seqlens`` lives
+    under the captured ``**kwargs`` catch-all, so ``module(**kw)`` re-nests it
+    out of reach -- the whole [1, T] row is treated as one dense sequence, which
+    is a valid GLA forward for a self-consistent baseline-vs-baseline check."""
+    kw = _materialize_all(fwd_args, device, init_args, skip=("past_key_values",))
+    return [], kw
+
+
+def _set_kimi_prefill_context(n: int, sm, device: str) -> None:
+    """Publish a single-sequence prefill Context for the Kimi-Linear / Qwen3-Next
+    recurrent layers: a fresh state manager (``sm``) plus a ``KimiLinearMetadata``
+    for one prompt of ``n`` tokens on slot 1. ``has_initial_state`` is all-False
+    so both the conv and the recurrent state start from zero on every call --
+    which keeps baseline and candidate deterministic even though they share the
+    (stateful) manager instance."""
+    from fastkernels.infra.context import (
+        KimiLinearMetadata, get_context, set_context,
+    )
+    from fastkernels.infra.mamba_state import compute_causal_conv1d_metadata
+    cu = torch.tensor([0, n], device=device, dtype=torch.int32)
+    state_idx = torch.tensor([1], device=device, dtype=torch.int32)
+    md = KimiLinearMetadata(
+        num_actual_tokens=n,
+        query_start_loc=cu, max_query_len=n,
+        seq_lens=torch.tensor([n], device=device, dtype=torch.int32), max_seq_len=n,
+        state_indices=state_idx,
+        num_prefills=1, num_prefill_tokens=n, num_decodes=0, num_decode_tokens=0,
+        has_initial_state=torch.zeros(1, dtype=torch.bool, device=device),
+        all_have_initial_state=False, any_have_initial_state=False,
+        query_start_loc_int32=cu, state_indices_long=state_idx.long(),
+    )
+    md.nums_dict, md.batch_ptr, md.token_chunk_offset_ptr = (
+        compute_causal_conv1d_metadata(cu)
+    )
+    set_context(is_prefill=True, cu_seqlens_q=cu, cu_seqlens_k=cu,
+                max_seqlen_q=n, max_seqlen_k=n)
+    ctx = get_context()
+    ctx.kda_state = sm
+    ctx.kda_metadata = md
+
+
+def _build_kimi_recurrent_inputs(fwd_args, device, init_args):
+    """Inputs for the Kimi-Linear KDA and Qwen3-Next GDN linear-attention ops (and
+    the decoder layers wrapping them). Drop the opaque captured state manager and
+    rotary module, then attach the prep-built recurrent state + a single-sequence
+    prefill Context. Captured ``positions`` is materialized but unused on the
+    linear path."""
+    sm = _KIMI_RECURRENT_SM
+    if sm is None:
+        raise _UnsupportedInput("kimi recurrent state not prepared")
+    kw = _materialize_all(fwd_args, device, init_args,
+                          skip=("state_manager", "rotary_emb"))
+    hs = kw.get("hidden_states")
+    if not isinstance(hs, torch.Tensor):
+        raise _UnsupportedInput("kimi recurrent: missing hidden_states")
+    _set_kimi_prefill_context(int(hs.shape[0]), sm, device)
+    if "rotary_emb" in fwd_args:
+        kw["rotary_emb"] = None
+    kw["state_manager"] = sm
+    return [], kw
+
+
+def _build_row_parallel_inputs(fwd_args, device, init_args):
+    """RowParallelLinear row-shards its input to ``input_size // tp``, but the
+    captured activation is the full (pre-shard) width. Regenerate ``x`` at the
+    runtime per-rank width so it matches the sharded weight the module built."""
+    from fastkernels.infra.tp import _tp_size
+    kw = _materialize_all(fwd_args, device, init_args)
+    x = kw.get("x")
+    isize = init_args.get("input_size")
+    if isinstance(x, torch.Tensor) and isize:
+        local = int(isize) // max(1, _tp_size())
+        if x.shape[-1] != local:
+            kw["x"] = torch.randn(*x.shape[:-1], local, device=device, dtype=x.dtype)
+    return [], kw
+
+
+def _build_gather_dequant_mla_inputs(fwd_args, device, init_args):
+    """Consistent chunked-context gather metadata for GatherAndDequantKVCacheMLA:
+    partition ``total_tokens`` across ``num_seqs`` (block_table rows) with a
+    monotone ``cu_seq_lens``, matching ``token_to_seq``/``workspace_starts``, and
+    an in-range ``block_table``. The captured random metadata walks unallocated
+    pages -> illegal memory access."""
+    import itertools
+    kw = _materialize_all(fwd_args, device, init_args)
+    kv, bt, tts = kw.get("kv_cache"), kw.get("block_table"), kw.get("token_to_seq")
+    if not (isinstance(kv, torch.Tensor) and isinstance(bt, torch.Tensor)
+            and isinstance(tts, torch.Tensor)):
+        raise _UnsupportedInput("gather-dequant MLA: missing cache/block_table/token_to_seq")
+    num_blocks, num_seqs, total = int(kv.shape[0]), int(bt.shape[0]), int(tts.shape[0])
+    base, rem = divmod(total, max(1, num_seqs))
+    lens = [base + (1 if i < rem else 0) for i in range(num_seqs)]
+    cu = [0, *itertools.accumulate(lens)]
+    kw["cu_seq_lens"] = torch.tensor(cu, device=device, dtype=torch.int32)
+    kw["token_to_seq"] = torch.repeat_interleave(
+        torch.arange(num_seqs, device=device),
+        torch.tensor(lens, device=device)).to(torch.int32)
+    kw["workspace_starts"] = torch.tensor(cu[:-1], device=device, dtype=torch.int32)
+    kw["block_table"] = torch.randint(0, num_blocks, tuple(bt.shape),
+                                      device=device, dtype=bt.dtype)
+    kw["total_tokens"] = total
+    return [], kw
+
+
+def _build_kimi_mla_inputs(fwd_args, device, init_args):
+    """KimiMLAAttention: its forward ignores ``positions``/``state_manager`` and
+    delegates to an ``MLAAttention`` (``self.attn``, ``_kv_b_proj`` already wired
+    in ``__init__``). With a prefill ``Context`` and the module's default empty
+    KV cache it runs the dense-prefill MHA path (no paged cache / absorbed
+    weights), exactly like the standalone ``MLAAttention`` builder."""
+    kw = _materialize_all(fwd_args, device, init_args,
+                          skip=("state_manager", "positions", "_ctx"))
+    hs = kw.get("hidden_states")
+    if not isinstance(hs, torch.Tensor):
+        raise _UnsupportedInput("KimiMLAAttention: missing hidden_states")
+    _set_mla_prefill_context(int(hs.shape[0]), device, fwd_args.get("_ctx"))
+    return [], kw
+
+
+class _Qwen3NextKV:
+    """Minimal state manager: paged HND K/V cache indexed by ``layer_idx``."""
+
+    def __init__(self, layer_idx: int, kc: torch.Tensor, vc: torch.Tensor):
+        self.k_cache = [None] * (layer_idx + 1)
+        self.v_cache = [None] * (layer_idx + 1)
+        self.k_cache[layer_idx] = kc
+        self.v_cache[layer_idx] = vc
+
+
+def _build_qwen3_next_attention_inputs(fwd_args, device, init_args):
+    """Qwen3-Next full attention: rebuild the paged-prefill harness the engine
+    normally supplies. One prefill sequence over an empty (then just-stored) HND
+    KV cache with contiguous slot_mapping/block_table, a fresh partial-NeoX RoPE
+    (the captured ref carries no init args), and a ``KimiLinearMetadata`` on the
+    Context + a duck-typed state manager the forward reads its cache from."""
+    from fastkernels.infra.tp import _tp_size
+    from fastkernels.infra.context import KimiLinearMetadata, get_context, set_context
+    from fastkernels.tasks.baseline.L1.rotary_emb import RotaryEmbedding
+
+    kw = _materialize_all(fwd_args, device, init_args,
+                          skip=("state_manager", "rotary_emb", "positions"))
+    hs = kw.get("hidden_states")
+    if not isinstance(hs, torch.Tensor):
+        raise _UnsupportedInput("Qwen3NextAttention: missing hidden_states")
+    try:
+        nkv = int(init_args["num_key_value_heads"])
+        head_dim = int(init_args["head_dim"])
+        layer_idx = int(init_args["layer_idx"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise _UnsupportedInput(f"Qwen3NextAttention: init dims ({exc!r})")
+
+    N = int(hs.shape[0])
+    tp = _tp_size()
+    num_kv_heads = nkv // tp if nkv % tp == 0 else nkv
+    block = 16  # B200 HND page size (ATTN_BACKEND_CONFIG.block_size)
+    nblocks = (N + block - 1) // block + 1
+    kc = torch.zeros(nblocks, num_kv_heads, block, head_dim,
+                     device=device, dtype=hs.dtype)
+    vc = torch.zeros_like(kc)
+
+    cu = torch.tensor([0, N], device=device, dtype=torch.int32)
+    md = KimiLinearMetadata(
+        num_actual_tokens=N,
+        query_start_loc=cu, max_query_len=N,
+        seq_lens=torch.tensor([N], device=device, dtype=torch.int32), max_seq_len=N,
+        num_prefills=1, num_prefill_tokens=N, num_decodes=0, num_decode_tokens=0,
+        slot_mapping=torch.arange(N, device=device, dtype=torch.int32),
+        block_tables=torch.arange(nblocks, device=device, dtype=torch.int32)
+        .view(1, nblocks),
+    )
+    set_context(is_prefill=True, cu_seqlens_q=cu, cu_seqlens_k=cu,
+                max_seqlen_q=N, max_seqlen_k=N)
+    get_context().kda_metadata = md
+
+    rope = RotaryEmbedding(head_dim=head_dim // 4, max_position_embeddings=N + 1,
+                           rope_theta=10000.0, is_neox_style=True).to(device)
+    kw["rotary_emb"] = rope
+    kw["positions"] = torch.arange(N, device=device, dtype=torch.int64)
+    kw["state_manager"] = _Qwen3NextKV(layer_idx, kc, vc)
+    return [], kw
+
+
+def _build_af3_inputs(fwd_args, device, init_args):
+    """AlphaFold3 ops take a ``batch`` feature dict, but the capture only recorded
+    the keys the outer model read -- the atom-attention / relpos paths inside
+    reach for many more (``ref_pos``, ``atom_to_token_index``, chain/entity ids,
+    ...), so forward hits ``KeyError``. Fill the missing keys with finite,
+    self-consistent features sized from the captured token/atom masks. Single
+    chain/entity; atoms are spread monotonically across tokens."""
+    kw = _materialize_all(fwd_args, device, init_args)
+    batch = kw.get("batch")
+    if not isinstance(batch, dict):
+        raise _UnsupportedInput("AF3: missing batch dict")
+    tm, am = batch.get("token_mask"), batch.get("atom_mask")
+    if not (isinstance(tm, torch.Tensor) and isinstance(am, torch.Tensor)):
+        raise _UnsupportedInput("AF3: missing token_mask/atom_mask")
+    B, T, A, dt = tm.shape[0], tm.shape[1], am.shape[-1], am.dtype
+    ar_t = torch.arange(T, device=device, dtype=dt).unsqueeze(0).expand(B, T)
+    a2t = ((torch.arange(A, device=device) * T) // max(A, 1)).clamp_(0, T - 1)
+    a2t = a2t.unsqueeze(0).expand(B, A)
+    c_elem = int(init_args.get("c_atom_ref_element") or 119)
+    c_name = int(init_args.get("c_atom_ref_name_chars") or 256)
+    defaults = {
+        "residue_index": ar_t, "token_index": ar_t,
+        "asym_id": torch.zeros(B, T, device=device, dtype=dt),
+        "entity_id": torch.zeros(B, T, device=device, dtype=dt),
+        "sym_id": torch.zeros(B, T, device=device, dtype=dt),
+        "token_bonds": torch.zeros(B, T, T, device=device, dtype=dt),
+        "atom_to_token_index": a2t.to(torch.int64),
+        "ref_pos": torch.randn(B, A, 3, device=device, dtype=dt),
+        "ref_charge": torch.randn(B, A, device=device, dtype=dt),
+        "ref_mask": torch.ones(B, A, device=device, dtype=dt),
+        "ref_element": torch.randn(B, A, c_elem, device=device, dtype=dt),
+        "ref_atom_name_chars": torch.randn(B, A, 1, c_name, device=device, dtype=dt),
+        "ref_space_uid": a2t.to(dt),
+    }
+    for k, v in defaults.items():
+        batch.setdefault(k, v.contiguous() if isinstance(v, torch.Tensor) else v)
+    # The diffusion ops embed the noise level as ``0.25 * log(t / sigma_data)``;
+    # a random (possibly <= 0) ``t`` / ``noise_schedule`` -> NaN. Force positive,
+    # and give the sampler a clean descending sigma schedule.
+    t = kw.get("t")
+    if isinstance(t, torch.Tensor) and t.is_floating_point():
+        kw["t"] = t.abs() + 1.0
+    ns = kw.get("noise_schedule")
+    if isinstance(ns, torch.Tensor) and ns.numel() > 0:
+        kw["noise_schedule"] = torch.linspace(
+            160.0, 1e-2, ns.numel(), device=device, dtype=ns.dtype)
+    return [], kw
+
+
+def _build_oasis_rollout_inputs(fwd_args, device, init_args):
+    """OasisRollout.forward takes two whole trained models (OasisDiT + the VAE)
+    and runs a full DDIM sampling rollout + VAE encode/decode -- a model-level
+    driver, not a kernel.  The captured ``model``/``vae`` args are opaque module
+    references we cannot rebuild, so mark it a clean, intentional skip."""
+    raise _UnsupportedInput(
+        "whole-model rollout driver (needs full DiT + VAE); not a kernel")
+
+
 # qualname -> builder(fwd_args, device, init_args) -> (args, kwargs).
 _INPUT_BUILDERS = {
     "fastkernels.tasks.baseline.L1.fp8_linear:Fp8Linear": _build_fp8_linear_inputs,
@@ -1113,6 +1610,34 @@ _INPUT_BUILDERS = {
         _build_store_kvcache_inputs("k_cache", lambda s: int(s[0]) * int(s[2])),
     "fastkernels.tasks.baseline.L1.store_kvcache_fp8_mla:StoreKVCacheFP8MLA":
         _build_store_kvcache_inputs("kv_cache", lambda s: int(s[0]) * int(s[1])),
+    # MLA chunked-context gather: synthesize consistent gather metadata.
+    "fastkernels.tasks.baseline.L1.store_kvcache_fp8_mla:GatherAndDequantKVCacheMLA":
+        _build_gather_dequant_mla_inputs,
+    # RowParallelLinear: shard the captured full-width activation to input_size//tp.
+    "fastkernels.tasks.baseline.L2.parallel_linear:RowParallelLinear":
+        _build_row_parallel_inputs,
+    # Kimi MLA full attention: drive the dense-prefill MLA path (empty cache).
+    "fastkernels.tasks.baseline.L2.kimi_mla_attention:KimiMLAAttention":
+        _build_kimi_mla_inputs,
+    # Qwen3-Next full attention: synthesize a single-sequence paged-prefill state.
+    "fastkernels.tasks.baseline.L2.qwen3_next_attention:Qwen3NextAttention":
+        _build_qwen3_next_attention_inputs,
+    # AlphaFold3: fill the missing batch feature-dict keys (ref_pos, ids, ...).
+    "fastkernels.tasks.baseline.L2.alphafold3_atom_attention:AtomAttentionEncoder":
+        _build_af3_inputs,
+    "fastkernels.tasks.baseline.L2.alphafold3_atom_attention:AtomAttentionDecoder":
+        _build_af3_inputs,
+    "fastkernels.tasks.baseline.L2.alphafold3_input_embedder:InputEmbedder":
+        _build_af3_inputs,
+    "fastkernels.tasks.baseline.L2.alphafold3_diffusion_conditioning:DiffusionConditioning":
+        _build_af3_inputs,
+    "fastkernels.tasks.baseline.L3.alphafold3_diffusion_module:DiffusionModule":
+        _build_af3_inputs,
+    "fastkernels.tasks.baseline.L3.alphafold3_diffusion_module:SampleDiffusion":
+        _build_af3_inputs,
+    # OasisRollout: whole-model rollout driver, not a benchmarkable kernel.
+    "fastkernels.tasks.baseline.L3.oasis_rollout:OasisRollout":
+        _build_oasis_rollout_inputs,
     # Indexer K-cache gather: zero the paged fp8 cache so gathered scales are
     # finite (random bytes decode to NaN), and bound block_table in range.
     "fastkernels.tasks.baseline.L1.indexer_k_cache:IndexerKCacheGather":
@@ -1135,9 +1660,63 @@ _INPUT_BUILDERS = {
         _build_deepseek_mla_composite_inputs,
     "fastkernels.tasks.baseline.L3.deepseek_decoder:DeepSeekDecoderLayer":
         _build_deepseek_mla_composite_inputs,
+    # Paged decode: zero the cache, bound block_table, cap cache_seqlens.
+    "fastkernels.tasks.baseline.L1.flashinfer_decode:TRTLLMDecode":
+        _build_trtllm_decode_inputs,
+    "fastkernels.tasks.baseline.L1.flashinfer_mla_decode:FlashInferMLADecode":
+        _build_flashinfer_mla_decode_inputs,
+    # Chunked GLA: keep the log-space forget gate <= 0 so it doesn't overflow.
+    "fastkernels.tasks.baseline.L1.chunk_gla:ChunkGLA":
+        _build_chunk_gla_inputs,
+    # GLA linear-attention: drop the opaque RecurrentCache -> cacheless prefill.
+    "fastkernels.tasks.baseline.L2.gla_attention:GatedLinearAttention":
+        _build_recurrent_prefill_inputs,
+    "fastkernels.tasks.baseline.L3.gla_decoder:GLADecoderLayer":
+        _build_recurrent_prefill_inputs,
+    # Kimi-Linear KDA / Qwen3-Next GDN: attach a prep-built recurrent state +
+    # single-sequence prefill Context (state manager comes off the Context).
+    "fastkernels.tasks.baseline.L2.kimi_delta_attention:KimiDeltaAttention":
+        _build_kimi_recurrent_inputs,
+    "fastkernels.tasks.baseline.L2.qwen3_next_gdn_attention:Qwen3NextGDNAttention":
+        _build_kimi_recurrent_inputs,
+    "fastkernels.tasks.baseline.L3.kimi_linear_decoder:KimiLinearDecoderLayer":
+        _build_kimi_recurrent_inputs,
+    "fastkernels.tasks.baseline.L3.qwen3_next_decoder:Qwen3NextDecoderLayer":
+        _build_kimi_recurrent_inputs,
+    # Attention family: publish a prefill Context so forward doesn't deref an
+    # unset one, and drop any forward-arg rotary module (use the init rotary).
+    "fastkernels.tasks.baseline.L2.attention_impl:Attention":
+        _build_attention_prefill_inputs,
+    "fastkernels.tasks.baseline.L2.attention:LlamaAttention":
+        _build_attention_prefill_inputs,
+    "fastkernels.tasks.baseline.L3.llama_decoder:LlamaDecoderLayer":
+        _build_attention_prefill_inputs,
+    "fastkernels.tasks.baseline.L3.qwen3_moe_decoder:Qwen3MoEDecoderLayer":
+        _build_attention_prefill_inputs,
+    "fastkernels.tasks.baseline.L3.gpt_oss_decoder:GptOssDecoderLayer":
+        _build_attention_prefill_inputs,
     # Grouped-GEMM (Fp8GroupedGemmContiguous / fused_experts) and MLA fp8 ops
     # slot in here with the same reference-quantize approach; deferred until
     # there are captures for those models (DeepSeek / Kimi) to validate against.
+}
+
+
+def _canon_moe_align(out):
+    """Canonicalize ``MoeAlign``'s (sorted_token_ids, expert_ids,
+    num_tokens_post_padded) output. The token order *within* each expert block
+    is assigned by atomics, so it is not deterministic run to run -- only the
+    multiset of ids is. Sort the ids so a valid-but-reordered alignment compares
+    equal; ``expert_ids`` (block->expert) and the padded length stay exact."""
+    sorted_ids, *rest = out
+    if isinstance(sorted_ids, torch.Tensor):
+        sorted_ids = torch.sort(sorted_ids.flatten()).values
+    return (sorted_ids, *rest)
+
+
+# qualname -> fn(output) -> canonical output, applied to BOTH baseline and
+# candidate before comparison (for outputs whose exact values aren't unique).
+_OUTPUT_CANON = {
+    "fastkernels.tasks.baseline.L1.moe_align:MoeAlign": _canon_moe_align,
 }
 
 
@@ -1491,7 +2070,7 @@ def _bench_one_case(op: Operator, baseline_cls, candidate_cls, case: dict,
     operators = case["operators"]
     vid = case["vid"]
     fwd_args = case["fwd_args"]
-    dtype = _case_dtype(fwd_args)
+    dtype = _FORCE_DTYPE.get(op.qualname) or _case_dtype(fwd_args)
     init_args = _scalar_init_args(operators, op.qualname, vid)
     res = ScenarioResult(op=op.qualname, level=op.level,
                          shape=_shape_repr(fwd_args), dtype=str(dtype).replace("torch.", ""),
@@ -1545,6 +2124,7 @@ def _bench_one_case(op: Operator, baseline_cls, candidate_cls, case: dict,
             return res
 
     # 2) Correctness over N rounds of fresh inputs.
+    canon = _OUTPUT_CANON.get(op.qualname)
     worst = None
     for r in range(rounds):
         torch.manual_seed(seed + r)
@@ -1554,12 +2134,17 @@ def _bench_one_case(op: Operator, baseline_cls, candidate_cls, case: dict,
             res.detail = f"skip: {exc}"
             return res
         args, kwargs = base_call
+        # Reseed identically before each forward so ops that draw from the
+        # global RNG inside forward (e.g. stochastic diffusion samplers) see the
+        # same noise on baseline and candidate; a no-op for deterministic ops.
         try:
+            torch.manual_seed(seed + r)
             ref = _run_forward(baseline, *(_clone_tree((args, kwargs))))
         except Exception as exc:  # noqa: BLE001 - baseline rejects generated inputs
             res.detail = f"skip: baseline failed on generated inputs ({exc!r})"
             return res
         try:
+            torch.manual_seed(seed + r)
             out = _run_forward(candidate, *(_clone_tree((args, kwargs))))
         except Exception as exc:  # noqa: BLE001
             res.status = RUNTIME_ERROR
@@ -1573,7 +2158,9 @@ def _bench_one_case(op: Operator, baseline_cls, candidate_cls, case: dict,
                 res.status = REWARD_HACK
                 res.detail = str(exc)
                 return res
-        status, max_abs, max_rel, matched, detail = _compare(out, ref, check_dtype=(r == 0))
+        out_c, ref_c = (canon(out), canon(ref)) if canon else (out, ref)
+        status, max_abs, max_rel, matched, detail = _compare(
+            out_c, ref_c, check_dtype=(r == 0))
         if worst is None or matched < worst[3]:
             worst = (status, max_abs, max_rel, matched, detail)
         res.max_abs_error = max(res.max_abs_error, max_abs)
