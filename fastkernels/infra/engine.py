@@ -631,6 +631,7 @@ class ModelRunner:
                     if rank == 0:
                         print("  [5/6] Preparing Kimi decode buffers...", flush=True)
                     self._init_kimi_decode_buffers()
+                    self._init_fa3_decode_buffers()
                     if rank == 0:
                         print("  [6/6] Capturing Kimi CUDA graphs...", flush=True)
                     self.capture_kimi_cudagraph()
@@ -647,6 +648,7 @@ class ModelRunner:
                     if rank == 0:
                         print("  [4/6] Preparing Qwen3-Next decode buffers...", flush=True)
                     self._init_kimi_decode_buffers()
+                    self._init_fa3_decode_buffers()
                     if rank == 0:
                         print("  [5/6] Capturing Qwen3-Next CUDA graphs...", flush=True)
                     self.capture_kimi_cudagraph()
@@ -1349,6 +1351,8 @@ class ModelRunner:
         """
         from .fa_utils import refresh_fa3_decode_schedule
 
+        if not self._fa_decode_groups:
+            self._init_fa3_decode_buffers()
         if max_seqlen_k is None:
             max_seqlen_k = self.max_model_len
         refresh_fa3_decode_schedule(
