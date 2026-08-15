@@ -530,6 +530,46 @@ class Fp8Linear(nn.Module):
         return output.view(*input_bf16.shape[:-1], N)
 
 
+def _align_up(x: int, y: int) -> int:
+    return ((x + y - 1) // y) * y
+
+
+def _ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:
+    return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
+
+
+def _per_block_cast_to_fp8(
+    x: torch.Tensor, use_ue8m0: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Re-quantize a 2D tensor to block-scaled FP8.
+
+    Newer DeepGEMM wheels dropped ``per_block_cast_to_fp8`` from the Python
+    package; fall back to the same helper vLLM vendors from DeepGEMM's
+    ``utils/math.py``.
+    """
+    fn = getattr(deep_gemm, "per_block_cast_to_fp8", None)
+    if fn is not None:
+        return fn(x, use_ue8m0=use_ue8m0)
+    assert x.dim() == 2
+    m, n = x.shape
+    gran = Fp8Linear.BLOCK_SIZE
+    x_padded = torch.zeros(
+        (_align_up(m, gran), _align_up(n, gran)),
+        dtype=x.dtype, device=x.device,
+    )
+    x_padded[:m, :n] = x
+    x_view = x_padded.view(-1, gran, x_padded.size(1) // gran, gran)
+    x_amax = x_view.abs().float().amax(dim=(1, 3), keepdim=True).clamp(1e-4)
+    sf = x_amax / 448.0
+    if use_ue8m0:
+        sf = _ceil_to_ue8m0(sf)
+    x_scaled = (x_view * (1.0 / sf)).to(torch.float8_e4m3fn)
+    return (
+        x_scaled.view_as(x_padded)[:m, :n].contiguous(),
+        sf.view(x_view.size(0), x_view.size(2)),
+    )
+
+
 def postprocess_fp8_weights(weight_fp8: torch.Tensor,
                             scale_inv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Re-quantize FP8 weights to UE8M0 scale format and transform scale layout
@@ -574,7 +614,7 @@ def postprocess_fp8_weights(weight_fp8: torch.Tensor,
     # SF layout transform agree. Keeps weights consistent with what the GEMM
     # kernel expects on this build/arch.
     use_ue8m0 = _is_deep_gemm_e8m0_used()
-    w_fp8_new, scale_ue8m0 = deep_gemm.per_block_cast_to_fp8(
+    w_fp8_new, scale_ue8m0 = _per_block_cast_to_fp8(
         w_f32_flat, use_ue8m0=use_ue8m0,
     )
 
@@ -615,7 +655,7 @@ def postprocess_fp8_weights_batched(weight_fp8: torch.Tensor,
         s_exp = torch.repeat_interleave(s_exp, block_size, dim=1)[:, :K]
         w_dq = w_q.to(torch.float32) * s_exp
 
-        w_requant, s_requant = deep_gemm.per_block_cast_to_fp8(
+        w_requant, s_requant = _per_block_cast_to_fp8(
             w_dq, use_ue8m0=use_ue8m0,
         )
         w_q.copy_(w_requant)

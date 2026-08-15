@@ -48,7 +48,9 @@ def _ensure_triton_kernels_on_path() -> None:
     override (``FASTKERNELS_TRITON_KERNELS_PATH``) or, as a last resort, vLLM's
     bundled ``third_party`` dir -- without requiring the vLLM package.
     """
-    if importlib.util.find_spec("triton_kernels") is not None:
+    # A site-packages ``triton_kernels`` without ``routing`` (newer
+    # stripped wheels) must not shadow vLLM's bundled third_party copy.
+    if importlib.util.find_spec("triton_kernels.routing") is not None:
         return
 
     candidates: list[str] = []
@@ -65,8 +67,15 @@ def _ensure_triton_kernels_on_path() -> None:
         )
 
     for path in candidates:
-        if os.path.isdir(path) and path not in sys.path:
+        routing = os.path.join(path, "triton_kernels", "routing.py")
+        if not os.path.isfile(routing):
+            continue
+        if path not in sys.path:
             sys.path.insert(0, path)
+        for name in list(sys.modules):
+            if name == "triton_kernels" or name.startswith("triton_kernels."):
+                del sys.modules[name]
+        return
 
 
 # ---------------------------------------------------------------------------
