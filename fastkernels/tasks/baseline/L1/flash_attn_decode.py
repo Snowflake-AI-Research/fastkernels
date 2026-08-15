@@ -58,8 +58,9 @@ class FlashAttnDecode(nn.Module):
             causal=True,
             block_table=block_table,
             fa_version=FA_VERSION,
+            num_splits=1,
         )
-        if cache_seqlens is not None:
+        if cache_seqlens is not None and not torch.cuda.is_current_stream_capturing():
             page_size = k_cache.shape[1] if k_cache.dim() >= 2 else None
             meta = fa3_scheduler_metadata(
                 batch_size=int(cache_seqlens.shape[0]),
@@ -74,6 +75,7 @@ class FlashAttnDecode(nn.Module):
                 page_size=page_size,
                 causal=True,
                 window_size=kwargs.get("window_size", (-1, -1)),
+                num_splits=1,
             )
             if meta is not None:
                 fa_kw["scheduler_metadata"] = meta
