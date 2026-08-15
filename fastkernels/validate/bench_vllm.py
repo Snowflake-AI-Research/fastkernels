@@ -808,7 +808,50 @@ def _configure_parallel_safe_flashinfer():
 
 _configure_parallel_safe_flashinfer()
 
+def _set_cfg_attr(cfg, name, value):
+    try:
+        setattr(cfg, name, value)
+        return
+    except Exception:
+        pass
+    try:
+        cfg.__dict__[name] = value
+    except Exception:
+        try:
+            object.__setattr__(cfg, name, value)
+        except Exception:
+            pass
+
+
 def _fastkernels_limit_layers(hf_config):
+    # Gemma-4: transformers 5.x hides per-layer attrs. Enable global reads
+    # and stash the full-attention head dim so vLLM does not build every
+    # layer at sliding-window 256 (checkpoint weights for full attn are 512).
+    # global_head_dim is consumed in Gemma4TextConfig.__post_init__ and is
+    # not kept as an attribute, so vLLM's getattr(..., "global_head_dim",
+    # config.head_dim) would otherwise fall back to 256.
+    candidates = [hf_config, getattr(hf_config, "text_config", None)]
+    try:
+        candidates.append(hf_config.get_text_config())
+    except Exception:
+        pass
+    max_head_dim = 0
+    for cfg in candidates:
+        if cfg is None:
+            continue
+        _set_cfg_attr(cfg, "allow_global_per_layer_attribute_access", True)
+        try:
+            for layer_cfg in cfg.per_layer_config:
+                hd = getattr(layer_cfg, "head_dim", 0) or 0
+                if hd > max_head_dim:
+                    max_head_dim = int(hd)
+        except Exception:
+            pass
+    if max_head_dim:
+        for cfg in candidates:
+            if cfg is None:
+                continue
+            _set_cfg_attr(cfg, "global_head_dim", max_head_dim)
     # --max-layers: build only the first N decoder layers. get_text_config()
     # returns the text sub-config for multimodal models and the config itself
     # for pure-text models, so this limits the transformer stack in both. N is
@@ -822,10 +865,48 @@ def _fastkernels_limit_layers(hf_config):
     return hf_config
 
 def _patch_gemma4_head_size():
-    # transformers 5.x raises on config.head_dim for Gemma-4. vLLM's
-    # get_head_size() needs max(sliding=256, global=512). Do not set
-    # allow_global_per_layer_attribute_access: that makes every layer
-    # allocate at 256 and then fail weight load on the 512-d layers.
+    # convert() runs hasattr() on per-layer attrs. AmbiguousGlobalPerLayerAttributeError
+    # subclasses RuntimeError, so hasattr does not swallow it. Also keep
+    # get_head_size / get_total_num_kv_heads on the max per-layer values.
+    try:
+        from transformers.integrations.heterogeneity.configuration_utils import (
+            AmbiguousGlobalPerLayerAttributeError,
+        )
+    except Exception:
+        AmbiguousGlobalPerLayerAttributeError = ()
+    try:
+        from vllm.config import utils as vllm_config_utils
+        orig_getattr_iter = vllm_config_utils.getattr_iter
+        if not getattr(orig_getattr_iter, "_fk_patched", False):
+            def getattr_iter(object, names, default=None, default_factory=None, warn=False):
+                for name in names:
+                    try:
+                        has = hasattr(object, name)
+                    except AmbiguousGlobalPerLayerAttributeError:
+                        has = True
+                    if not has:
+                        continue
+                    try:
+                        return getattr(object, name)
+                    except AmbiguousGlobalPerLayerAttributeError:
+                        getter = getattr(
+                            object, "_getattr_without_heterogeneous_validation", None
+                        )
+                        if getter is not None:
+                            try:
+                                return getter(name)
+                            except Exception:
+                                pass
+                return default_factory() if default_factory is not None else default
+            getattr_iter._fk_patched = True
+            vllm_config_utils.getattr_iter = getattr_iter
+            try:
+                import vllm.transformers_utils.model_arch_config_convertor as conv
+                conv.getattr_iter = getattr_iter
+            except Exception:
+                pass
+    except Exception:
+        pass
     try:
         from vllm.transformers_utils.model_arch_config_convertor import (
             Gemma4ModelArchConfigConvertor,
@@ -835,29 +916,42 @@ def _patch_gemma4_head_size():
     if getattr(Gemma4ModelArchConfigConvertor.get_head_size, "_fk_patched", False):
         return
 
-    def get_head_size(self):
-        tc = self.hf_text_config
-        dims = []
+    def _max_per_layer(tc, names, default):
+        values = []
         try:
             for layer_cfg in tc.per_layer_config:
-                hd = getattr(layer_cfg, "head_dim", 0) or 0
-                if hd:
-                    dims.append(int(hd))
+                for name in names:
+                    val = getattr(layer_cfg, name, 0) or 0
+                    if val:
+                        values.append(int(val))
         except Exception:
             pass
         getter = getattr(tc, "_getattr_without_heterogeneous_validation", None)
         if getter is not None:
-            for name in ("head_dim", "global_head_dim"):
+            for name in names:
                 try:
-                    hd = getter(name)
-                    if hd:
-                        dims.append(int(hd))
+                    val = getter(name)
+                    if val:
+                        values.append(int(val))
                 except Exception:
                     pass
-        return max(dims) if dims else 256
+        return max(values) if values else default
+
+    def get_head_size(self):
+        return _max_per_layer(
+            self.hf_text_config, ("head_dim", "global_head_dim"), 256
+        )
+
+    def get_total_num_kv_heads(self):
+        return _max_per_layer(
+            self.hf_text_config,
+            ("num_key_value_heads", "num_global_key_value_heads"),
+            1,
+        )
 
     get_head_size._fk_patched = True
     Gemma4ModelArchConfigConvertor.get_head_size = get_head_size
+    Gemma4ModelArchConfigConvertor.get_total_num_kv_heads = get_total_num_kv_heads
 
 def main():
     from vllm import LLM, SamplingParams
@@ -897,8 +991,7 @@ def main():
         llm_kwargs["kv_cache_dtype"] = cfg["kv_cache_dtype"]
     if cfg.get("max_num_seqs") is not None:
         llm_kwargs["max_num_seqs"] = cfg["max_num_seqs"]
-    if cfg.get("max_layers") is not None:
-        llm_kwargs["hf_overrides"] = _fastkernels_limit_layers
+    llm_kwargs["hf_overrides"] = _fastkernels_limit_layers
     # Reference-only backend overrides for models vLLM's default selection
     # cannot run on this hardware (see _REFERENCE_ENGINE_OVERRIDES).
     llm = LLM(**llm_kwargs)
@@ -1489,7 +1582,50 @@ def _configure_parallel_safe_flashinfer():
 _configure_parallel_safe_flashinfer()
 
 
+def _set_cfg_attr(cfg, name, value):
+    try:
+        setattr(cfg, name, value)
+        return
+    except Exception:
+        pass
+    try:
+        cfg.__dict__[name] = value
+    except Exception:
+        try:
+            object.__setattr__(cfg, name, value)
+        except Exception:
+            pass
+
+
 def _fastkernels_limit_layers(hf_config):
+    # Gemma-4: transformers 5.x hides per-layer attrs. Enable global reads
+    # and stash the full-attention head dim so vLLM does not build every
+    # layer at sliding-window 256 (checkpoint weights for full attn are 512).
+    # global_head_dim is consumed in Gemma4TextConfig.__post_init__ and is
+    # not kept as an attribute, so vLLM's getattr(..., "global_head_dim",
+    # config.head_dim) would otherwise fall back to 256.
+    candidates = [hf_config, getattr(hf_config, "text_config", None)]
+    try:
+        candidates.append(hf_config.get_text_config())
+    except Exception:
+        pass
+    max_head_dim = 0
+    for cfg in candidates:
+        if cfg is None:
+            continue
+        _set_cfg_attr(cfg, "allow_global_per_layer_attribute_access", True)
+        try:
+            for layer_cfg in cfg.per_layer_config:
+                hd = getattr(layer_cfg, "head_dim", 0) or 0
+                if hd > max_head_dim:
+                    max_head_dim = int(hd)
+        except Exception:
+            pass
+    if max_head_dim:
+        for cfg in candidates:
+            if cfg is None:
+                continue
+            _set_cfg_attr(cfg, "global_head_dim", max_head_dim)
     # --max-layers: limit only the language-model decoder stack to the first N
     # layers (get_text_config() returns the LM sub-config for multimodal
     # models); vision / audio encoders and embeddings are left intact. N is
@@ -1504,6 +1640,48 @@ def _fastkernels_limit_layers(hf_config):
 
 
 def _patch_gemma4_head_size():
+    # convert() runs hasattr() on per-layer attrs. AmbiguousGlobalPerLayerAttributeError
+    # subclasses RuntimeError, so hasattr does not swallow it. Also keep
+    # get_head_size / get_total_num_kv_heads on the max per-layer values.
+    try:
+        from transformers.integrations.heterogeneity.configuration_utils import (
+            AmbiguousGlobalPerLayerAttributeError,
+        )
+    except Exception:
+        AmbiguousGlobalPerLayerAttributeError = ()
+    try:
+        from vllm.config import utils as vllm_config_utils
+        orig_getattr_iter = vllm_config_utils.getattr_iter
+        if not getattr(orig_getattr_iter, "_fk_patched", False):
+            def getattr_iter(object, names, default=None, default_factory=None, warn=False):
+                for name in names:
+                    try:
+                        has = hasattr(object, name)
+                    except AmbiguousGlobalPerLayerAttributeError:
+                        has = True
+                    if not has:
+                        continue
+                    try:
+                        return getattr(object, name)
+                    except AmbiguousGlobalPerLayerAttributeError:
+                        getter = getattr(
+                            object, "_getattr_without_heterogeneous_validation", None
+                        )
+                        if getter is not None:
+                            try:
+                                return getter(name)
+                            except Exception:
+                                pass
+                return default_factory() if default_factory is not None else default
+            getattr_iter._fk_patched = True
+            vllm_config_utils.getattr_iter = getattr_iter
+            try:
+                import vllm.transformers_utils.model_arch_config_convertor as conv
+                conv.getattr_iter = getattr_iter
+            except Exception:
+                pass
+    except Exception:
+        pass
     try:
         from vllm.transformers_utils.model_arch_config_convertor import (
             Gemma4ModelArchConfigConvertor,
@@ -1513,29 +1691,42 @@ def _patch_gemma4_head_size():
     if getattr(Gemma4ModelArchConfigConvertor.get_head_size, "_fk_patched", False):
         return
 
-    def get_head_size(self):
-        tc = self.hf_text_config
-        dims = []
+    def _max_per_layer(tc, names, default):
+        values = []
         try:
             for layer_cfg in tc.per_layer_config:
-                hd = getattr(layer_cfg, "head_dim", 0) or 0
-                if hd:
-                    dims.append(int(hd))
+                for name in names:
+                    val = getattr(layer_cfg, name, 0) or 0
+                    if val:
+                        values.append(int(val))
         except Exception:
             pass
         getter = getattr(tc, "_getattr_without_heterogeneous_validation", None)
         if getter is not None:
-            for name in ("head_dim", "global_head_dim"):
+            for name in names:
                 try:
-                    hd = getter(name)
-                    if hd:
-                        dims.append(int(hd))
+                    val = getter(name)
+                    if val:
+                        values.append(int(val))
                 except Exception:
                     pass
-        return max(dims) if dims else 256
+        return max(values) if values else default
+
+    def get_head_size(self):
+        return _max_per_layer(
+            self.hf_text_config, ("head_dim", "global_head_dim"), 256
+        )
+
+    def get_total_num_kv_heads(self):
+        return _max_per_layer(
+            self.hf_text_config,
+            ("num_key_value_heads", "num_global_key_value_heads"),
+            1,
+        )
 
     get_head_size._fk_patched = True
     Gemma4ModelArchConfigConvertor.get_head_size = get_head_size
+    Gemma4ModelArchConfigConvertor.get_total_num_kv_heads = get_total_num_kv_heads
 
 
 def main():
@@ -1587,8 +1778,7 @@ def main():
         llm_kwargs["limit_mm_per_prompt"] = cfg["limit_mm_per_prompt"]
     if cfg.get("max_num_seqs") is not None:
         llm_kwargs["max_num_seqs"] = cfg["max_num_seqs"]
-    if cfg.get("max_layers") is not None:
-        llm_kwargs["hf_overrides"] = _fastkernels_limit_layers
+    llm_kwargs["hf_overrides"] = _fastkernels_limit_layers
     llm = LLM(**llm_kwargs)
 
     # Warmup -- ignore_eos so all 16 decode steps run (parity with the engines).
