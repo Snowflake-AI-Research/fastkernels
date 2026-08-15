@@ -466,6 +466,91 @@ class DraftChainGraphRunner:
         self.bufs = bufs
 
         self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self._fa_decode_groups: list | None = None
+        self._fa3_step_bufs: list[list[torch.Tensor]] | None = None
+        self._fa3_step_views: list[list[torch.Tensor | None]] | None = None
+
+    def _ensure_fa3_decode_ops(self) -> list:
+        if self._fa_decode_groups is not None:
+            return self._fa_decode_groups
+        from ..tasks.baseline.L1.flash_attn_decode import FlashAttnDecode
+        from .fa_utils import group_fa_decode_ops
+
+        ops = [
+            m for m in self.engine.draft.modules()
+            if isinstance(m, FlashAttnDecode)
+        ]
+        self._fa_decode_groups = group_fa_decode_ops(ops)
+        device = self.engine.device
+        for group in self._fa_decode_groups:
+            lead = group[0]
+            lead.preallocate(self.B_max * self.K, device)
+            for op in group[1:]:
+                op._cu_seqlens_q = lead._cu_seqlens_q
+                op._sched_buf = lead._sched_buf
+                op._sched_meta = lead._sched_meta
+        return self._fa_decode_groups
+
+    def _refresh_fa3_chain(self, B: int) -> None:
+        """Build per-step FA3 schedules from ``base_pos`` (outside the graph).
+
+        The chain graph runs ``S-1`` decodes with lengths
+        ``base_pos + f + 1``.  Each step gets its own persistent buffer
+        so capture records a stable pointer and replay only rewrites
+        the contents.
+        """
+        from .fa_utils import FA_VERSION, fa3_scheduler_metadata_size
+
+        groups = self._ensure_fa3_decode_ops()
+        if FA_VERSION != 3 or not groups:
+            return
+        n_steps = max(self.S - 1, 1)
+        if self._fa3_step_bufs is None:
+            cap = fa3_scheduler_metadata_size(max(self.B_max * self.K, 1024))
+            device = self.engine.device
+            self._fa3_step_bufs = [
+                [torch.zeros(cap, dtype=torch.int32, device=device)
+                 for _ in groups]
+                for _ in range(n_steps)
+            ]
+            self._fa3_step_views = [
+                [None for _ in groups] for _ in range(n_steps)
+            ]
+        dtype = self.engine.dtype
+        max_k = self.engine.max_model_len
+        K = self.K
+        for f in range(self.S - 1):
+            seqlens_bk = (
+                self.bufs.base_pos[:B] + (f + 1)
+            ).to(torch.int32).repeat_interleave(K)
+            for gi, group in enumerate(groups):
+                lead = group[0]
+                lead.update_scheduler_metadata(
+                    seqlens_bk, max_k,
+                    qkv_dtype=dtype,
+                    window_size=lead._window_size,
+                )
+                meta = lead._sched_meta
+                if meta is None:
+                    continue
+                n = int(meta.shape[0])
+                dest = self._fa3_step_bufs[f][gi]
+                dest[:n].copy_(meta)
+                dest[n:].zero_()
+                view = dest[:n]
+                self._fa3_step_views[f][gi] = view
+                for op in group:
+                    op._sched_meta = view
+
+    def _bind_fa3_chain_step(self, f: int) -> None:
+        views = self._fa3_step_views
+        groups = self._fa_decode_groups
+        if not views or not groups:
+            return
+        for gi, group in enumerate(groups):
+            view = views[f][gi]
+            for op in group:
+                op._graph_sched_meta = view
 
     # ------------------------------------------------------------------
     # Capture
@@ -494,6 +579,7 @@ class DraftChainGraphRunner:
         arange_offset_K = bufs.arange_offset_K[:BK]
 
         max_ctx_const = self.engine.max_model_len
+        self._refresh_fa3_chain(B)
 
         def _run_chain():
             input_ids_bk = cur_top_i_t
@@ -501,6 +587,7 @@ class DraftChainGraphRunner:
             scores = scores_in
             base_pos_bk = base_pos.repeat_interleave(K)
             for f in range(S - 1):
+                self._bind_fa3_chain_step(f)
                 positions_step = base_pos_bk + f                       # [BK]
                 offset_full = r_per_seq + f                            # [B]
                 block_idx_within_branch = (offset_full // bsz)         # [B]
@@ -648,6 +735,7 @@ class DraftChainGraphRunner:
             bufs.bt_branch[:BK_real, w_real:].fill_(scratch_block)
 
         # --- replay ------------------------------------------------------
+        self._refresh_fa3_chain(B_pad)
         self.graphs[B_pad].replay()
 
         # Sliced views (callers should clone if they need to retain them
@@ -777,6 +865,71 @@ class DraftExtendGraphRunner:
         self.SP1 = SP1
 
         self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self._fa_prefill_ops: list | None = None
+        self._fa3_prefill_bufs: list[torch.Tensor] | None = None
+        self._fa3_prefill_views: list[torch.Tensor | None] | None = None
+
+    def _ensure_fa3_prefill_ops(self) -> list:
+        if self._fa_prefill_ops is not None:
+            return self._fa_prefill_ops
+        from ..tasks.baseline.L1.flash_attn_prefill import FlashAttnPrefill
+
+        self._fa_prefill_ops = [
+            m for m in self.engine.draft.modules()
+            if isinstance(m, FlashAttnPrefill)
+        ]
+        return self._fa_prefill_ops
+
+    def _refresh_fa3_extend(self, B: int) -> None:
+        """Build FA3 paged-prefill schedules from ``cu_seqlens_k``."""
+        from .fa_utils import (
+            FA3_CUDA_GRAPH_MAX_NUM_SPLITS,
+            FA_VERSION,
+            fa3_scheduler_metadata,
+            fa3_scheduler_metadata_size,
+        )
+
+        ops = self._ensure_fa3_prefill_ops()
+        if FA_VERSION != 3 or not ops:
+            return
+        if self._fa3_prefill_bufs is None:
+            cap = fa3_scheduler_metadata_size(max(self.B_max, 1024))
+            device = self.engine.device
+            self._fa3_prefill_bufs = [
+                torch.zeros(cap, dtype=torch.int32, device=device) for _ in ops
+            ]
+            self._fa3_prefill_views = [None for _ in ops]
+        cu_q = self.bufs.cu_seqlens_q[:B + 1]
+        cu_k = self.bufs.cu_seqlens_k[:B + 1]
+        seqused_k = cu_k[1:] - cu_k[:-1]
+        max_k = self.engine.max_model_len
+        max_q = self.SP1
+        dtype = self.engine.dtype
+        for i, op in enumerate(ops):
+            meta = fa3_scheduler_metadata(
+                batch_size=B,
+                max_seqlen_q=max_q,
+                max_seqlen_k=max_k,
+                num_heads_q=op.num_heads,
+                num_heads_kv=op.num_kv_heads,
+                headdim=op.head_dim,
+                cache_seqlens=seqused_k,
+                qkv_dtype=dtype,
+                cu_seqlens_q=cu_q,
+                page_size=op.page_size,
+                causal=True,
+                window_size=(-1, -1),
+                num_splits=FA3_CUDA_GRAPH_MAX_NUM_SPLITS,
+            )
+            if meta is None:
+                continue
+            n = int(meta.shape[0])
+            dest = self._fa3_prefill_bufs[i]
+            dest[:n].copy_(meta)
+            dest[n:].zero_()
+            view = dest[:n]
+            self._fa3_prefill_views[i] = view
+            op._graph_sched_meta = view
 
     # ------------------------------------------------------------------
     # Capture
@@ -804,6 +957,7 @@ class DraftExtendGraphRunner:
         seq_arange_offsets = bufs.seq_arange_offsets[:B]
 
         max_sk = self.engine.max_model_len
+        self._refresh_fa3_extend(B)
 
         def _run_extend():
             with set_forward_context(
@@ -935,6 +1089,7 @@ class DraftExtendGraphRunner:
             bufs.block_table[raw_bs:B_pad].fill_(scratch_block)
 
         # --- replay ------------------------------------------------------
+        self._refresh_fa3_extend(B_pad)
         self.graphs[B_pad].replay()
 
         return (

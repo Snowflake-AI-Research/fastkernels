@@ -36,6 +36,10 @@ class FlashAttnDecode(nn.Module):
         # (same class of bug as the DSA indexer schedule).
         self._sched_buf: torch.Tensor | None = None
         self._sched_meta: torch.Tensor | None = None
+        # Optional per-step buffer for multi-decode CUDA graphs (EAGLE-3
+        # draft chain).  When set, capture records this pointer instead
+        # of ``_sched_meta``.
+        self._graph_sched_meta: torch.Tensor | None = None
         self._graph_num_splits = FA3_CUDA_GRAPH_MAX_NUM_SPLITS
         self._window_size = (-1, -1)
         self._qkv_dtype = torch.bfloat16
@@ -138,12 +142,12 @@ class FlashAttnDecode(nn.Module):
         # (and graph *replay* never re-enters this Python) builds a fresh
         # schedule with FA3's auto split heuristic, like vLLM's non-CG path.
         if capturing:
-            if FA_VERSION == 3 and self._sched_meta is None:
+            meta = self._graph_sched_meta if self._graph_sched_meta is not None else self._sched_meta
+            if FA_VERSION == 3 and meta is None:
                 raise RuntimeError(
                     "FA3 CUDA-graph capture requires "
                     "update_scheduler_metadata() outside the graph first"
                 )
-            meta = self._sched_meta
             num_splits = self._graph_num_splits
         else:
             page_size = self.page_size
