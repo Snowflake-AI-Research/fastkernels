@@ -908,6 +908,41 @@ def _patch_gemma4_head_size():
     except Exception:
         pass
     try:
+        from vllm.model_executor.models.gemma4 import Gemma4DecoderLayer
+        from vllm.model_executor.models.utils import extract_layer_index
+        orig_init = Gemma4DecoderLayer.__init__
+        if not getattr(orig_init, "_fk_patched", False):
+            def _gemma4_layer_init(
+                self, config, cache_config=None, quant_config=None, prefix="",
+            ):
+                # Full-attn layers are 512-d / 2 KV heads; sliding are 256-d / 8.
+                # Enabling global per-layer reads makes every layer see n_kv=8.
+                try:
+                    layer_idx = extract_layer_index(prefix)
+                    class _LayerCfg:
+                        def __init__(self, cfg, idx):
+                            object.__setattr__(self, "_cfg", cfg)
+                            object.__setattr__(self, "_idx", idx)
+                        def __getattr__(self, name):
+                            if name == "num_key_value_heads":
+                                return self._cfg.per_layer_config[
+                                    self._idx
+                                ].num_key_value_heads
+                            return getattr(self._cfg, name)
+                    config = _LayerCfg(config, layer_idx)
+                except Exception:
+                    pass
+                orig_init(
+                    self, config,
+                    cache_config=cache_config,
+                    quant_config=quant_config,
+                    prefix=prefix,
+                )
+            _gemma4_layer_init._fk_patched = True
+            Gemma4DecoderLayer.__init__ = _gemma4_layer_init
+    except Exception:
+        pass
+    try:
         from vllm.transformers_utils.model_arch_config_convertor import (
             Gemma4ModelArchConfigConvertor,
         )
@@ -1680,6 +1715,41 @@ def _patch_gemma4_head_size():
                 conv.getattr_iter = getattr_iter
             except Exception:
                 pass
+    except Exception:
+        pass
+    try:
+        from vllm.model_executor.models.gemma4 import Gemma4DecoderLayer
+        from vllm.model_executor.models.utils import extract_layer_index
+        orig_init = Gemma4DecoderLayer.__init__
+        if not getattr(orig_init, "_fk_patched", False):
+            def _gemma4_layer_init(
+                self, config, cache_config=None, quant_config=None, prefix="",
+            ):
+                # Full-attn layers are 512-d / 2 KV heads; sliding are 256-d / 8.
+                # Enabling global per-layer reads makes every layer see n_kv=8.
+                try:
+                    layer_idx = extract_layer_index(prefix)
+                    class _LayerCfg:
+                        def __init__(self, cfg, idx):
+                            object.__setattr__(self, "_cfg", cfg)
+                            object.__setattr__(self, "_idx", idx)
+                        def __getattr__(self, name):
+                            if name == "num_key_value_heads":
+                                return self._cfg.per_layer_config[
+                                    self._idx
+                                ].num_key_value_heads
+                            return getattr(self._cfg, name)
+                    config = _LayerCfg(config, layer_idx)
+                except Exception:
+                    pass
+                orig_init(
+                    self, config,
+                    cache_config=cache_config,
+                    quant_config=quant_config,
+                    prefix=prefix,
+                )
+            _gemma4_layer_init._fk_patched = True
+            Gemma4DecoderLayer.__init__ = _gemma4_layer_init
     except Exception:
         pass
     try:
