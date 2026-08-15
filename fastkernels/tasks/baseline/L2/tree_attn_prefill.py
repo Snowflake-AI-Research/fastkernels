@@ -47,16 +47,22 @@ from ....infra.fa_utils import (
     flash_attn_varlen_func as _VLLM_FA_VARLEN_FUNC,
 )
 
-# Hopper (SM90): sgl_kernel FA3 cascade. Elsewhere: vLLM's bundled FA.
+# Hopper (SM90): sgl_kernel FA3 cascade when installed. Elsewhere (or if
+# sgl_kernel is missing): vLLM's bundled FA. The import used to be
+# unconditional on SM90, which crashed every Attention-using model on
+# Hopper boxes that only have sglang in the isolated sglang-bench env.
 _SGL_FA3_AVAILABLE = False
 _SGL_FA3_WITH_KVCACHE = None
 _SGL_MERGE_STATE_V2 = None
 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9:
-    from sgl_kernel import merge_state_v2 as _SGL_MERGE_STATE_V2
-    from sgl_kernel.flash_attn import (
-        flash_attn_with_kvcache as _SGL_FA3_WITH_KVCACHE,
-    )
-    _SGL_FA3_AVAILABLE = True
+    try:
+        from sgl_kernel import merge_state_v2 as _SGL_MERGE_STATE_V2
+        from sgl_kernel.flash_attn import (
+            flash_attn_with_kvcache as _SGL_FA3_WITH_KVCACHE,
+        )
+        _SGL_FA3_AVAILABLE = True
+    except ImportError:
+        pass
 
 
 def _sgl_fa3_paged(q, k_cache, v_cache, cu_seqlens_q, cache_seqlens,

@@ -618,6 +618,12 @@ _PER_MODEL_DEFAULTS: dict[str, dict] = {
         # *full* max_num_batched_tokens encoder batch.
         "gpu_memory_utilization": 0.80,
     },
+    "mamba-codestral": {
+        # H200 (141 GiB) cannot fit vLLM's default 1024 Mamba cache slots
+        # at max_model_len=128000 / util=0.9; B200 can. Cap so CUDA-graph
+        # capture can start. fastkernels already self-caps Mamba slots.
+        "max_num_seqs": 512,
+    },
 }
 
 
@@ -656,6 +662,13 @@ def _apply_per_model_defaults(model_name: str, args) -> dict[str, str]:
         if utilization is not None and args.gpu_memory_utilization is None:
             args.gpu_memory_utilization = utilization
             applied["gpu_memory_utilization"] = str(utilization)
+        max_num_seqs = spec.get("max_num_seqs")
+        if max_num_seqs is not None and getattr(args, "max_num_seqs", None) is None:
+            # B200 (180 GiB) can fit vLLM's default 1024 Mamba slots; H200
+            # cannot. Only apply the cap on Hopper-class cards.
+            if _detect_gpu_name() in ("H200", "H100"):
+                args.max_num_seqs = max_num_seqs
+                applied["max_num_seqs"] = str(max_num_seqs)
     return applied
 
 
@@ -796,6 +809,20 @@ def _configure_parallel_safe_flashinfer():
 _configure_parallel_safe_flashinfer()
 
 def _fastkernels_limit_layers(hf_config):
+    # transformers 5.x treats some attrs (e.g. Gemma-4 head_dim) as
+    # per-layer and raises on getattr. vLLM still reads the global value.
+    candidates = [hf_config, getattr(hf_config, "text_config", None)]
+    try:
+        candidates.append(hf_config.get_text_config())
+    except Exception:
+        pass
+    for cfg in candidates:
+        if cfg is None:
+            continue
+        try:
+            cfg.allow_global_per_layer_attribute_access = True
+        except Exception:
+            pass
     # --max-layers: build only the first N decoder layers. get_text_config()
     # returns the text sub-config for multimodal models and the config itself
     # for pure-text models, so this limits the transformer stack in both. N is
@@ -843,8 +870,11 @@ def main():
         llm_kwargs["load_format"] = cfg["load_format"]
     if cfg.get("kv_cache_dtype"):
         llm_kwargs["kv_cache_dtype"] = cfg["kv_cache_dtype"]
-    if cfg.get("max_layers") is not None:
-        llm_kwargs["hf_overrides"] = _fastkernels_limit_layers
+    if cfg.get("max_num_seqs") is not None:
+        llm_kwargs["max_num_seqs"] = cfg["max_num_seqs"]
+    # Always apply: Gemma-4 needs the per-layer getattr flag even when
+    # --max-layers is unset. The hook is a no-op for other models.
+    llm_kwargs["hf_overrides"] = _fastkernels_limit_layers
     # Reference-only backend overrides for models vLLM's default selection
     # cannot run on this hardware (see _REFERENCE_ENGINE_OVERRIDES).
     llm = LLM(**llm_kwargs)
@@ -980,6 +1010,8 @@ def main():
         engine_kwargs["max_layers"] = cfg["max_layers"]
     if cfg.get("kv_cache_dtype"):
         engine_kwargs["kv_cache_dtype"] = cfg["kv_cache_dtype"]
+    if cfg.get("max_num_seqs") is not None:
+        engine_kwargs["max_num_seqs"] = cfg["max_num_seqs"]
     engine = LlamaEngine(**engine_kwargs)
 
     # Warmup -- same 16-token prompt as the vLLM worker, so both sides enter
@@ -1434,6 +1466,20 @@ _configure_parallel_safe_flashinfer()
 
 
 def _fastkernels_limit_layers(hf_config):
+    # transformers 5.x treats some attrs (e.g. Gemma-4 head_dim) as
+    # per-layer and raises on getattr. vLLM still reads the global value.
+    candidates = [hf_config, getattr(hf_config, "text_config", None)]
+    try:
+        candidates.append(hf_config.get_text_config())
+    except Exception:
+        pass
+    for cfg in candidates:
+        if cfg is None:
+            continue
+        try:
+            cfg.allow_global_per_layer_attribute_access = True
+        except Exception:
+            pass
     # --max-layers: limit only the language-model decoder stack to the first N
     # layers (get_text_config() returns the LM sub-config for multimodal
     # models); vision / audio encoders and embeddings are left intact. N is
@@ -1493,8 +1539,11 @@ def main():
         llm_kwargs["kv_cache_dtype"] = cfg["kv_cache_dtype"]
     if cfg.get("limit_mm_per_prompt"):
         llm_kwargs["limit_mm_per_prompt"] = cfg["limit_mm_per_prompt"]
-    if cfg.get("max_layers") is not None:
-        llm_kwargs["hf_overrides"] = _fastkernels_limit_layers
+    if cfg.get("max_num_seqs") is not None:
+        llm_kwargs["max_num_seqs"] = cfg["max_num_seqs"]
+    # Always apply: Gemma-4 needs the per-layer getattr flag even when
+    # --max-layers is unset. The hook is a no-op for other models.
+    llm_kwargs["hf_overrides"] = _fastkernels_limit_layers
     llm = LLM(**llm_kwargs)
 
     # Warmup -- ignore_eos so all 16 decode steps run (parity with the engines).
@@ -2925,6 +2974,8 @@ def main():
                 vllm_config["max_layers"] = args.max_layers
             if args.kv_cache_dtype:
                 vllm_config["kv_cache_dtype"] = args.kv_cache_dtype
+            if getattr(args, "max_num_seqs", None) is not None:
+                vllm_config["max_num_seqs"] = args.max_num_seqs
             if is_qwen_omni:
                 vllm_config["limit_mm_per_prompt"] = {
                     "image": 1,
@@ -2993,6 +3044,8 @@ def main():
             kb_config["max_layers"] = args.max_layers
         if args.kv_cache_dtype:
             kb_config["kv_cache_dtype"] = args.kv_cache_dtype
+        if getattr(args, "max_num_seqs", None) is not None:
+            kb_config["max_num_seqs"] = args.max_num_seqs
         short_name = args.model.split("/")[-1]
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = str(kb_nccl_port)

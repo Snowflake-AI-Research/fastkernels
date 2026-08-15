@@ -267,8 +267,15 @@ def amalgamate(op: "Op") -> str:
     parts: list[str] = []
     for src in op.sources:
         body = open(os.path.join(_CSRC, src), errors="ignore").read()
+        # NVFP4 kernels use e2m1x2, which ptxas rejects on sm_90a. Keep the
+        # body out of Hopper compiles; dispatch is already ifdef'd the same way.
+        wrap_nvfp4 = src.endswith("nvfp4_kv_cache_kernels.cu")
+        if wrap_nvfp4:
+            parts.append("#if defined(ENABLE_NVFP4_SM100) || defined(ENABLE_NVFP4_SM120)")
         parts.append(f"// ===== source: {src} =====")
         parts.append(_expand(body, src, expanded))
+        if wrap_nvfp4:
+            parts.append("#endif  // ENABLE_NVFP4_SM100 || ENABLE_NVFP4_SM120")
     merged = "\n".join(parts)
     if len(op.sources) > 1:
         merged = _dedup_top_level_defs(merged)

@@ -4430,6 +4430,7 @@ void concat_mla_q(
   });
 }
 
+#if defined(ENABLE_NVFP4_SM100) || defined(ENABLE_NVFP4_SM120)
 // ===== source: vllm_port/libtorch_stable/nvfp4_kv_cache_kernels.cu =====
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
@@ -5037,6 +5038,7 @@ void reshape_and_cache_nvfp4_dispatch(torch::Tensor& key,
                 scale_head_stride, scale_block_offset_stride);
       });
 }
+#endif  // ENABLE_NVFP4_SM100 || ENABLE_NVFP4_SM120
 
 // ===== pybind module (per-op) =====
 #include <torch/extension.h>

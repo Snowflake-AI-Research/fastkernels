@@ -88,6 +88,11 @@ dependencies = [
     "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.22/flash_attn-2.8.3+cu130torch2.11-cp312-cp312-linux_aarch64.whl ; python_version == '3.12' and platform_machine == 'aarch64'",
     "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.22/flash_attn-2.8.3+cu130torch2.11-cp313-cp313-linux_aarch64.whl ; python_version == '3.13' and platform_machine == 'aarch64'",
     "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.9.22/flash_attn-2.8.3+cu130torch2.11-cp314-cp314-linux_aarch64.whl ; python_version == '3.14' and platform_machine == 'aarch64'",
+    # Hopper (SM90) tree-attn cascade uses sgl_kernel FA3. On Blackwell the
+    # import is skipped. Pin sglang-kernel (the current package name; import
+    # path is still sgl_kernel). The older sgl-kernel 0.3.x wheel is built
+    # against pre-2.11 torch and fails to dlopen (c10_cuda_check ABI).
+    "sglang-kernel>=0.4.5",
 ]
 
 # ---------------------------------------------------------------------------
