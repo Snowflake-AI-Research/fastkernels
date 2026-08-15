@@ -37,29 +37,32 @@ class FlashAttnPrefill(nn.Module):
         if kwargs.get("block_table") is not None:
             seqused_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
             fa_kw["seqused_k"] = seqused_k
-            # Pin split-KV off. FA3's auto heuristic is not CUDA-graph
-            # compatible and has IMA'd on Hopper mixed/VL batches; vLLM
-            # uses the same pin for batch-invariant / graph replay.
-            fa_kw["num_splits"] = 1
-            page_size = k.shape[1] if k.dim() >= 2 else None
-            if not torch.cuda.is_current_stream_capturing():
-                meta = fa3_scheduler_metadata(
-                    batch_size=int(seqused_k.shape[0]),
-                    max_seqlen_q=max_seqlen_q,
-                    max_seqlen_k=max_seqlen_k,
-                    num_heads_q=self.num_heads,
-                    num_heads_kv=self.num_kv_heads,
-                    headdim=self.head_dim,
-                    cache_seqlens=seqused_k,
-                    qkv_dtype=q.dtype,
-                    cu_seqlens_q=cu_seqlens_q,
-                    page_size=page_size,
-                    causal=kwargs.get("causal", True),
-                    window_size=kwargs.get("window_size", (-1, -1)),
-                    num_splits=1,
-                )
-                if meta is not None:
-                    fa_kw["scheduler_metadata"] = meta
+            # Hopper FA3 paged prefill IMA's on long-context (16K+ KV)
+            # even with scheduler metadata and num_splits=1. vLLM's FA2
+            # build still accepts our page size (multiple of 16).
+            if FA_VERSION == 3:
+                fa_kw["fa_version"] = 2
+            else:
+                fa_kw["num_splits"] = 1
+                page_size = k.shape[1] if k.dim() >= 2 else None
+                if not torch.cuda.is_current_stream_capturing():
+                    meta = fa3_scheduler_metadata(
+                        batch_size=int(seqused_k.shape[0]),
+                        max_seqlen_q=max_seqlen_q,
+                        max_seqlen_k=max_seqlen_k,
+                        num_heads_q=self.num_heads,
+                        num_heads_kv=self.num_kv_heads,
+                        headdim=self.head_dim,
+                        cache_seqlens=seqused_k,
+                        qkv_dtype=q.dtype,
+                        cu_seqlens_q=cu_seqlens_q,
+                        page_size=page_size,
+                        causal=kwargs.get("causal", True),
+                        window_size=kwargs.get("window_size", (-1, -1)),
+                        num_splits=1,
+                    )
+                    if meta is not None:
+                        fa_kw["scheduler_metadata"] = meta
         else:
             fa_kw["cu_seqlens_k"] = cu_seqlens_k
             # Dense prefill is compute-bound, so KV-splitting buys nothing, but
