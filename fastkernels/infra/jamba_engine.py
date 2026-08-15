@@ -635,16 +635,16 @@ class JambaEngine:
         if env_buckets:
             buckets = sorted({int(x) for x in env_buckets.split(",") if x.strip()})
         else:
-            base = [1, 2, 4]
-            base += list(range(8, max_num_seqs + 1, 8))
-            buckets = sorted(set(b for b in base if b <= max_num_seqs))
+            # One CUDA-graph size.  FA3's process-wide split-KV workspace is
+            # whatever the last capture recorded; a later B=16 capture makes
+            # the B=256 graph IMA on replay (and largest-last just moves the
+            # fault to the small graph).  A single max-B graph passes mixed
+            # 1000.  Override with FASTKERNELS_JAMBA_BUCKETS only for experiments.
+            buckets = [max_num_seqs]
         if max_num_seqs not in buckets:
             buckets.append(max_num_seqs)
             buckets = sorted(set(buckets))
         self._decode_buckets = buckets
-        # Pre-create a shared CUDA-graph mempool so all bucket captures
-        # share one address space (avoids ``cudaErrorIllegalAddress``
-        # when smaller-bucket replays alias larger-bucket pool blocks).
         self._cuda_graph_mempool_id = (
             torch.cuda.graph_pool_handle() if self._use_cuda_graphs else None
         )
@@ -664,9 +664,7 @@ class JambaEngine:
                 f"token slots, {self._n_attn_layers} attn layers, "
                 f"{self._kv_layout} layout)"
             )
-            # Capture LARGEST bucket first so subsequent smaller-bucket
-            # captures see a memory layout consistent with what their
-            # tensors will be in at runtime (LlamaEngine pattern).
+            torch.cuda.empty_cache()
             for bucket in reversed(self._decode_buckets):
                 self._capture_decode_graph(bucket)
 
@@ -701,6 +699,8 @@ class JambaEngine:
 
     def _refresh_fa3_decode_schedule(self, context_lens: torch.Tensor) -> None:
         """Rewrite FA3 scheduler metadata outside CUDA graph capture/replay."""
+        if not getattr(self, "_fa_decode_groups", None):
+            self._init_fa3_decode_buffers()
         refresh_fa3_decode_schedule(
             getattr(self, "_fa_decode_groups", []),
             context_lens,
@@ -709,25 +709,41 @@ class JambaEngine:
         )
 
     def _alloc_decode_buffers(self, B: int) -> dict:
-        """Allocate the static-identity tensors a B-bucket decode graph
-        reads from.  Tensors are reused across replays; the host loop
-        mutates their values in-place between replays.
+        """Static-identity tensors a B-bucket decode graph reads from.
+
+        All buckets share one max-B allocation (LlamaEngine's pattern).
+        Separate per-bucket tensors plus ``empty_cache`` between captures
+        let a small-bucket replay clobber the large-bucket graph pool,
+        which IMAs on the next large replay (mixed 1000: B=16 then B=256).
         """
         if B in self._decode_static_buffers:
             return self._decode_static_buffers[B]
-        device = self.device
-        bps = self._max_blocks_per_seq
-        bufs = {
-            "step_input_ids": torch.zeros(B, dtype=torch.long, device=device),
-            "step_positions": torch.zeros(B, dtype=torch.long, device=device),
-            "slot_mapping": torch.zeros(B, dtype=torch.long, device=device),
-            "context_lens": torch.zeros(B, dtype=torch.int32, device=device),
-            "block_tables": torch.zeros(B, bps, dtype=torch.int32, device=device),
-            "cache_indices": torch.zeros(B, dtype=torch.int32, device=device),
-            "next_tokens": torch.zeros(B, dtype=torch.long, device=device),
+        max_B = self._decode_buckets[-1]
+        if max_B not in self._decode_static_buffers:
+            device = self.device
+            bps = self._max_blocks_per_seq
+            self._decode_static_buffers[max_B] = {
+                "step_input_ids": torch.zeros(max_B, dtype=torch.long, device=device),
+                "step_positions": torch.zeros(max_B, dtype=torch.long, device=device),
+                "slot_mapping": torch.zeros(max_B, dtype=torch.long, device=device),
+                "context_lens": torch.zeros(max_B, dtype=torch.int32, device=device),
+                "block_tables": torch.zeros(max_B, bps, dtype=torch.int32, device=device),
+                "cache_indices": torch.zeros(max_B, dtype=torch.int32, device=device),
+                "next_tokens": torch.zeros(max_B, dtype=torch.long, device=device),
+            }
+        if B == max_B:
+            return self._decode_static_buffers[max_B]
+        src = self._decode_static_buffers[max_B]
+        self._decode_static_buffers[B] = {
+            "step_input_ids": src["step_input_ids"][:B],
+            "step_positions": src["step_positions"][:B],
+            "slot_mapping": src["slot_mapping"][:B],
+            "context_lens": src["context_lens"][:B],
+            "block_tables": src["block_tables"][:B],
+            "cache_indices": src["cache_indices"][:B],
+            "next_tokens": src["next_tokens"][:B],
         }
-        self._decode_static_buffers[B] = bufs
-        return bufs
+        return self._decode_static_buffers[B]
 
     def _capture_decode_graph(self, B: int) -> _JambaDecodeGraph:
         if B in self._decode_graphs:
@@ -833,10 +849,12 @@ class JambaEngine:
                 _decode_step()
         torch.cuda.current_stream().wait_stream(s)
         torch.cuda.synchronize()
-        torch.cuda.empty_cache()
 
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=self._cuda_graph_mempool_id):
+        graph_kwargs = {}
+        if self._cuda_graph_mempool_id is not None:
+            graph_kwargs["pool"] = self._cuda_graph_mempool_id
+        with torch.cuda.graph(graph, **graph_kwargs):
             _decode_step()
 
         entry = _JambaDecodeGraph(
@@ -901,6 +919,11 @@ class JambaEngine:
         # Reset state pools for a fresh generate() call.
         self.block_manager.reset()
         self.mamba_pool.reset()
+        # Block tables / Mamba slots are per-generate; do not reuse the
+        # previous call's decode-graph invariant cache.
+        self._decode_meta_key = None
+        self._decode_meta_bt = None
+        self._decode_meta_cache_idx = None
 
         # Build sequences in input order.  Sequence carries
         # block_table, num_computed_tokens, generated_ids, state_slot,
@@ -1457,10 +1480,16 @@ class JambaEngine:
     def _run_decode_step(self, running: list[Sequence]) -> list[int]:
         n = len(running)
         if self._use_cuda_graphs:
-            B = self._pick_bucket(n)
-            graph = self._decode_graphs.get(B)
-            if graph is None:
-                graph = self._capture_decode_graph(B)
+            # Tiny batches stay eager so single-request latency is not a
+            # 256-wide MoE graph.  n>=8 pads into the one captured size.
+            if n < 8 and n not in self._decode_graphs:
+                graph = None
+                B = n
+            else:
+                B = self._pick_bucket(n)
+                graph = self._decode_graphs.get(B)
+                if graph is None:
+                    graph = self._capture_decode_graph(B)
         else:
             graph = None
             B = n
@@ -1540,8 +1569,9 @@ class JambaEngine:
             full_pos = np.zeros(B, dtype=np.int64)
             full_pos[:n] = pos_np
             # Paged-attn pad rows: slot=-1 (skip store), ctx_len=0
-            # (kernel attends to nothing), block_table all-(-1)
-            # (sentinel; never read because ctx_len=0).
+            # (kernel attends to nothing).  Pad block_tables with 0, not
+            # -1 -- LlamaEngine leaves graph pad rows at 0, and FA3 can
+            # still touch a page even when seqused_k is 0.
             full_slot = np.full(B, -1, dtype=np.int64)
             full_slot[:n] = slot_np
             full_ctx = np.zeros(B, dtype=np.int32)
@@ -1552,7 +1582,7 @@ class JambaEngine:
             bufs_slot_mapping.copy_(torch.from_numpy(full_slot))
             bufs_context_lens.copy_(torch.from_numpy(full_ctx))
             if not reuse_invariants:
-                full_bt = np.full((B, bps), -1, dtype=np.int32)
+                full_bt = np.zeros((B, bps), dtype=np.int32)
                 full_bt[:n] = bt_np
                 # Mamba pad rows: cache_indices=-1 -- the vendored
                 # causal_conv1d_update / selective_state_update kernels
