@@ -809,20 +809,6 @@ def _configure_parallel_safe_flashinfer():
 _configure_parallel_safe_flashinfer()
 
 def _fastkernels_limit_layers(hf_config):
-    # transformers 5.x treats some attrs (e.g. Gemma-4 head_dim) as
-    # per-layer and raises on getattr. vLLM still reads the global value.
-    candidates = [hf_config, getattr(hf_config, "text_config", None)]
-    try:
-        candidates.append(hf_config.get_text_config())
-    except Exception:
-        pass
-    for cfg in candidates:
-        if cfg is None:
-            continue
-        try:
-            cfg.allow_global_per_layer_attribute_access = True
-        except Exception:
-            pass
     # --max-layers: build only the first N decoder layers. get_text_config()
     # returns the text sub-config for multimodal models and the config itself
     # for pure-text models, so this limits the transformer stack in both. N is
@@ -835,8 +821,47 @@ def _fastkernels_limit_layers(hf_config):
             tc.num_hidden_layers = min(tc.num_hidden_layers, int(n))
     return hf_config
 
+def _patch_gemma4_head_size():
+    # transformers 5.x raises on config.head_dim for Gemma-4. vLLM's
+    # get_head_size() needs max(sliding=256, global=512). Do not set
+    # allow_global_per_layer_attribute_access: that makes every layer
+    # allocate at 256 and then fail weight load on the 512-d layers.
+    try:
+        from vllm.transformers_utils.model_arch_config_convertor import (
+            Gemma4ModelArchConfigConvertor,
+        )
+    except Exception:
+        return
+    if getattr(Gemma4ModelArchConfigConvertor.get_head_size, "_fk_patched", False):
+        return
+
+    def get_head_size(self):
+        tc = self.hf_text_config
+        dims = []
+        try:
+            for layer_cfg in tc.per_layer_config:
+                hd = getattr(layer_cfg, "head_dim", 0) or 0
+                if hd:
+                    dims.append(int(hd))
+        except Exception:
+            pass
+        getter = getattr(tc, "_getattr_without_heterogeneous_validation", None)
+        if getter is not None:
+            for name in ("head_dim", "global_head_dim"):
+                try:
+                    hd = getter(name)
+                    if hd:
+                        dims.append(int(hd))
+                except Exception:
+                    pass
+        return max(dims) if dims else 256
+
+    get_head_size._fk_patched = True
+    Gemma4ModelArchConfigConvertor.get_head_size = get_head_size
+
 def main():
     from vllm import LLM, SamplingParams
+    _patch_gemma4_head_size()
 
     with open(sys.argv[1]) as f:
         cfg = json.load(f)
@@ -872,9 +897,8 @@ def main():
         llm_kwargs["kv_cache_dtype"] = cfg["kv_cache_dtype"]
     if cfg.get("max_num_seqs") is not None:
         llm_kwargs["max_num_seqs"] = cfg["max_num_seqs"]
-    # Always apply: Gemma-4 needs the per-layer getattr flag even when
-    # --max-layers is unset. The hook is a no-op for other models.
-    llm_kwargs["hf_overrides"] = _fastkernels_limit_layers
+    if cfg.get("max_layers") is not None:
+        llm_kwargs["hf_overrides"] = _fastkernels_limit_layers
     # Reference-only backend overrides for models vLLM's default selection
     # cannot run on this hardware (see _REFERENCE_ENGINE_OVERRIDES).
     llm = LLM(**llm_kwargs)
@@ -1466,20 +1490,6 @@ _configure_parallel_safe_flashinfer()
 
 
 def _fastkernels_limit_layers(hf_config):
-    # transformers 5.x treats some attrs (e.g. Gemma-4 head_dim) as
-    # per-layer and raises on getattr. vLLM still reads the global value.
-    candidates = [hf_config, getattr(hf_config, "text_config", None)]
-    try:
-        candidates.append(hf_config.get_text_config())
-    except Exception:
-        pass
-    for cfg in candidates:
-        if cfg is None:
-            continue
-        try:
-            cfg.allow_global_per_layer_attribute_access = True
-        except Exception:
-            pass
     # --max-layers: limit only the language-model decoder stack to the first N
     # layers (get_text_config() returns the LM sub-config for multimodal
     # models); vision / audio encoders and embeddings are left intact. N is
@@ -1493,9 +1503,45 @@ def _fastkernels_limit_layers(hf_config):
     return hf_config
 
 
+def _patch_gemma4_head_size():
+    try:
+        from vllm.transformers_utils.model_arch_config_convertor import (
+            Gemma4ModelArchConfigConvertor,
+        )
+    except Exception:
+        return
+    if getattr(Gemma4ModelArchConfigConvertor.get_head_size, "_fk_patched", False):
+        return
+
+    def get_head_size(self):
+        tc = self.hf_text_config
+        dims = []
+        try:
+            for layer_cfg in tc.per_layer_config:
+                hd = getattr(layer_cfg, "head_dim", 0) or 0
+                if hd:
+                    dims.append(int(hd))
+        except Exception:
+            pass
+        getter = getattr(tc, "_getattr_without_heterogeneous_validation", None)
+        if getter is not None:
+            for name in ("head_dim", "global_head_dim"):
+                try:
+                    hd = getter(name)
+                    if hd:
+                        dims.append(int(hd))
+                except Exception:
+                    pass
+        return max(dims) if dims else 256
+
+    get_head_size._fk_patched = True
+    Gemma4ModelArchConfigConvertor.get_head_size = get_head_size
+
+
 def main():
     from vllm import LLM, SamplingParams
     from transformers import AutoProcessor
+    _patch_gemma4_head_size()
 
     with open(sys.argv[1]) as f:
         cfg = json.load(f)
@@ -1541,9 +1587,8 @@ def main():
         llm_kwargs["limit_mm_per_prompt"] = cfg["limit_mm_per_prompt"]
     if cfg.get("max_num_seqs") is not None:
         llm_kwargs["max_num_seqs"] = cfg["max_num_seqs"]
-    # Always apply: Gemma-4 needs the per-layer getattr flag even when
-    # --max-layers is unset. The hook is a no-op for other models.
-    llm_kwargs["hf_overrides"] = _fastkernels_limit_layers
+    if cfg.get("max_layers") is not None:
+        llm_kwargs["hf_overrides"] = _fastkernels_limit_layers
     llm = LLM(**llm_kwargs)
 
     # Warmup -- ignore_eos so all 16 decode steps run (parity with the engines).
