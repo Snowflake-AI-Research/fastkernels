@@ -18,13 +18,38 @@ DeepGEMM is supported on the current arch (Hopper / Blackwell) AND
 from __future__ import annotations
 
 import functools
+import importlib
 import os
 
 import torch
 import torch.nn as nn
 
+
+def _resolve_deep_gemm():
+    """Prefer a DeepGEMM build that actually exports kernels.
+
+    Some site-packages installs are a header-only namespace (no ``_C``,
+    no ``fp8_gemm_nt``). vLLM vendors a complete copy under
+    ``vllm.third_party.deep_gemm``; use that when the top-level package
+    is a stub.
+    """
+    try:
+        mod = importlib.import_module("deep_gemm")
+        if getattr(mod, "fp8_gemm_nt", None) is not None:
+            return mod
+    except ImportError:
+        mod = None
+    try:
+        vendored = importlib.import_module("vllm.third_party.deep_gemm")
+        if getattr(vendored, "fp8_gemm_nt", None) is not None:
+            return vendored
+    except Exception:
+        pass
+    return mod
+
+
 # DeepGEMM is required for the FP8 path on Hopper+.
-import deep_gemm
+deep_gemm = _resolve_deep_gemm()
 
 
 @functools.cache
@@ -50,7 +75,7 @@ def _is_deep_gemm_e8m0_used() -> bool:
     """
     if not _is_deep_gemm_supported():
         return False
-    if getattr(deep_gemm, "fp8_gemm_nt", None) is None:
+    if deep_gemm is None or getattr(deep_gemm, "fp8_gemm_nt", None) is None:
         return False
     return bool(int(os.environ.get("VLLM_USE_DEEP_GEMM_E8M0", "1")))
 

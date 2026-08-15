@@ -1025,11 +1025,13 @@ def _postprocess_moe_fp8_weights(module) -> int:
 
     Only runs when DeepGEMM is available on Hopper+ GPUs.
     """
-    import deep_gemm
+    from ..tasks.baseline.L1.fp8_grouped_gemm_contiguous import deep_gemm
 
     if not hasattr(module, 'w13') or not hasattr(module, 'w13_scale'):
         return 0
     if module.w13.dtype != torch.float8_e4m3fn:
+        return 0
+    if deep_gemm is None or not hasattr(deep_gemm, "transform_sf_into_required_layout"):
         return 0
 
     from ..tasks.baseline.L1.moe_grouped_gemm import _is_deep_gemm_supported

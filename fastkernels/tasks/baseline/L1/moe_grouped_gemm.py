@@ -19,7 +19,7 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 
-import deep_gemm as _dg
+from .fp8_grouped_gemm_contiguous import deep_gemm as _dg
 
 
 _BLOCK_ALIGNMENT = 128

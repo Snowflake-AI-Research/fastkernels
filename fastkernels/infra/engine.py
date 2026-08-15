@@ -1058,7 +1058,7 @@ class ModelRunner:
         if not fp8_modules:
             return
 
-        import deep_gemm
+        from ..tasks.baseline.L1.fp8_grouped_gemm_contiguous import deep_gemm
 
         max_decode = self.max_num_seqs
         max_prefill = self.max_num_batched_tokens
@@ -4147,7 +4147,7 @@ class ModelRunner:
         sched = self._indexer_sched
         if sched is None:
             return
-        import deep_gemm as _dg
+        from ..tasks.baseline.L1.fp8_grouped_gemm_contiguous import deep_gemm as _dg
 
         # ``inference_mode`` explicitly: some decode sites (notably the CUDA
         # graph capture warmup) reach here with grad enabled, and the schedule is
@@ -4348,7 +4348,7 @@ class ModelRunner:
         # its CONTENTS each step, outside the graph -- see Context.indexer_schedule.
         self._indexer_sched = None
         if num_indexer_layers > 0:
-            import deep_gemm as _dg
+            from ..tasks.baseline.L1.fp8_grouped_gemm_contiguous import deep_gemm as _dg
 
             self._indexer_block_size = _MLA_BLOCK_SIZE
             self._indexer_num_sms = torch.cuda.get_device_properties(

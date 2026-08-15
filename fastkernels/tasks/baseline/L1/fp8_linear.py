@@ -32,10 +32,7 @@ from ....infra.cuda_ext import lazy_op
 
 _C = lazy_op("fp8_linear", "fp8_linear.cu")
 
-# DeepGEMM provides the FP8 fast path on Hopper+.
-import deep_gemm
-
-from .fp8_grouped_gemm_contiguous import _is_deep_gemm_e8m0_used
+from .fp8_grouped_gemm_contiguous import _is_deep_gemm_e8m0_used, deep_gemm
 
 
 _FP8_INFO = torch.finfo(torch.float8_e4m3fn)
@@ -547,7 +544,7 @@ def _per_block_cast_to_fp8(
     package; fall back to the same helper vLLM vendors from DeepGEMM's
     ``utils/math.py``.
     """
-    fn = getattr(deep_gemm, "per_block_cast_to_fp8", None)
+    fn = getattr(deep_gemm, "per_block_cast_to_fp8", None) if deep_gemm is not None else None
     if fn is not None:
         return fn(x, use_ue8m0=use_ue8m0)
     assert x.dim() == 2
@@ -618,8 +615,12 @@ def postprocess_fp8_weights(weight_fp8: torch.Tensor,
         w_f32_flat, use_ue8m0=use_ue8m0,
     )
 
+    transform_sf = getattr(deep_gemm, "transform_sf_into_required_layout", None)
+    if transform_sf is None:
+        return w_fp8_new, scale_ue8m0
+
     recipe = (1, block_size, block_size)
-    scale_transformed = deep_gemm.transform_sf_into_required_layout(
+    scale_transformed = transform_sf(
         sf=scale_ue8m0.unsqueeze(0),
         mn=N,
         k=K,
@@ -671,9 +672,10 @@ def postprocess_fp8_weights_batched(weight_fp8: torch.Tensor,
     # it here corrupts the scale (and its old in-place ``copy_`` even crashed on the
     # shape change). Only run the transform on the non-UE8M0 (Hopper) path, where it
     # preserves shape, to keep that path bit-identical.
-    if not use_ue8m0:
+    transform_sf = getattr(deep_gemm, "transform_sf_into_required_layout", None)
+    if not use_ue8m0 and transform_sf is not None:
         recipe = (1, block_size, block_size)
-        scale_transformed = deep_gemm.transform_sf_into_required_layout(
+        scale_transformed = transform_sf(
             sf=scale_inv[:, :scale_rows, :scale_cols],
             mn=N,
             k=K,
