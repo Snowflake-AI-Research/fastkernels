@@ -43,6 +43,7 @@ __all__ = [
     "FA_VERSION",
     "flash_attn_varlen_func",
     "get_scheduler_metadata",
+    "fa3_scheduler_metadata",
     "fa_supports_head_size",
 ]
 
@@ -67,6 +68,20 @@ get_scheduler_metadata = _vllm_get_scheduler_metadata
 FA_VERSION: int | None = (
     _vllm_get_flash_attn_version() if VLLM_FA_AVAILABLE else None
 )
+
+
+def fa3_scheduler_metadata(**kwargs):
+    """Build FA3 tile-scheduler metadata, or None when FA3 is not in use.
+
+    Hopper FA3 illegal-memory-accesses on long / large-batch paged attention
+    unless this tensor is passed through to ``flash_attn_varlen_func``.
+    """
+    if FA_VERSION != 3:
+        return None
+    try:
+        return get_scheduler_metadata(**kwargs)
+    except Exception:
+        return None
 
 
 def fa_supports_head_size(head_size: int) -> bool:

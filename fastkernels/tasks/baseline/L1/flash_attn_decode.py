@@ -10,7 +10,11 @@ size; upstream ``flash_attn`` requires page sizes divisible by 256.
 import torch
 import torch.nn as nn
 
-from ....infra.fa_utils import FA_VERSION, flash_attn_varlen_func
+from ....infra.fa_utils import (
+    FA_VERSION,
+    fa3_scheduler_metadata,
+    flash_attn_varlen_func,
+)
 
 
 class FlashAttnDecode(nn.Module):
@@ -55,5 +59,23 @@ class FlashAttnDecode(nn.Module):
             block_table=block_table,
             fa_version=FA_VERSION,
         )
+        if cache_seqlens is not None:
+            page_size = k_cache.shape[1] if k_cache.dim() >= 2 else None
+            meta = fa3_scheduler_metadata(
+                batch_size=int(cache_seqlens.shape[0]),
+                max_seqlen_q=1,
+                max_seqlen_k=max_seqlen_k,
+                num_heads_q=self.num_heads,
+                num_heads_kv=self.num_kv_heads,
+                headdim=self.head_dim,
+                cache_seqlens=cache_seqlens,
+                qkv_dtype=q.dtype,
+                cu_seqlens_q=cu_seqlens_q,
+                page_size=page_size,
+                causal=True,
+                window_size=kwargs.get("window_size", (-1, -1)),
+            )
+            if meta is not None:
+                fa_kw["scheduler_metadata"] = meta
         fa_kw.update(kwargs)
         return flash_attn_varlen_func(**fa_kw)
