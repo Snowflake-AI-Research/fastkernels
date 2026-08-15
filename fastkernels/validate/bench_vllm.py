@@ -169,8 +169,7 @@ def _install_bench_sitecustomize() -> None:
     """Install a sitecustomize that patches vLLM/FlashInfer in every spawned
     Python process (the v1 EngineCore and TP worker ranks), driven by env vars.
 
-    Independent patches, each gated by its own env var so this is safe to
-    install unconditionally:
+    Patches, each gated so this is safe to install unconditionally:
 
     * ``FASTKERNELS_FLASHINFER_SOCKET_NAMESPACE`` -- namespaces FlashInfer IPC
       socket IDs so concurrent TP>1 runs do not collide.
@@ -181,10 +180,10 @@ def _install_bench_sitecustomize() -> None:
       ``layers.{i>=N}.*`` tensors from the full checkpoint, so they must be
       dropped from the weight iterator here. A monkeypatch in this process would
       not survive the spawn to EngineCore/TP ranks -- the sitecustomize does.
-
-    Also primes linecache with a same-line-count FA4 ``n_block_first`` hoist
-    so vLLM 0.26 split-KV compiles on SM100 (CuTeDSL reads source via
-    inspect/linecache). The installed vLLM tree is not modified.
+    * Always: if site-packages ``deep_gemm`` is a header-only namespace
+      (import succeeds, no kernels), alias it to ``vllm.third_party.deep_gemm``
+      so vLLM's ``_import_deep_gemm`` does not bind the stub and then raise
+      ``DeepGEMM backend is unavailable``.
     """
     site_dir = Path(os.environ.get(
         "FASTKERNELS_FLASHINFER_SITECUSTOMIZE_DIR",
@@ -192,7 +191,25 @@ def _install_bench_sitecustomize() -> None:
     ))
     site_dir.mkdir(parents=True, exist_ok=True)
     (site_dir / "sitecustomize.py").write_text(r'''
+import importlib
 import os
+import sys
+
+# Site-packages DeepGEMM is sometimes a namespace with only `_C.so` (no
+# `__init__.py`, no `fp8_gemm_nt`). `import deep_gemm` still succeeds, so
+# vLLM never falls back to its vendored copy and weight post-process
+# raises "DeepGEMM backend is unavailable".
+try:
+    _dg = importlib.import_module("deep_gemm")
+except ImportError:
+    _dg = None
+if _dg is None or getattr(_dg, "fp8_gemm_nt", None) is None:
+    try:
+        _vendored = importlib.import_module("vllm.third_party.deep_gemm")
+    except Exception:
+        _vendored = None
+    if _vendored is not None and getattr(_vendored, "fp8_gemm_nt", None) is not None:
+        sys.modules["deep_gemm"] = _vendored
 
 # vLLM 0.26 FA4 split-KV TYPE_UNSTABLE_JOIN: CuTeDSL JITs from
 # inspect.getsourcelines / linecache. Prime the cache with a same-line-count
