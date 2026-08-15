@@ -29,6 +29,26 @@ _RAY_PROGRESS_INTERVAL_SEC = 30.0
 _TASK_RESULT_FILE = "task_result.json"
 
 
+def _nvfp4_supported() -> bool:
+    """NVFP4 attention/quant kernels need Blackwell (SM100+)."""
+    smi = shutil.which("nvidia-smi")
+    if smi is None:
+        return False
+    try:
+        output = subprocess.check_output(
+            [smi, "--query-gpu=compute_cap", "--format=csv,noheader"],
+            text=True,
+            timeout=10,
+        )
+        return any(
+            float(line.strip()) >= 10.0
+            for line in output.splitlines()
+            if line.strip()
+        )
+    except Exception:
+        return False
+
+
 def _c(text: str, code: str) -> str:
     return f"\033[{code}m{text}\033[0m" if sys.stdout.isatty() else text
 
@@ -180,6 +200,13 @@ def _plan_jobs(
                 f"> {total_gpus} GPU(s)"
             )
             results[index] = "SKIP(tp>gpus)"
+            continue
+        if str(getattr(scenario, "dtype", "")).lower() == "nvfp4" and not _nvfp4_supported():
+            print(
+                f"  - skip {scenario.hf_name}: dtype=nvfp4 requires "
+                f"SM100+ (Blackwell); this GPU cannot run it"
+            )
+            results[index] = "SKIP(nvfp4)"
             continue
         job = _make_job(index, scenario, harness, args, root)
         cached_result = _load_cached_result(job) if args.resume else None
@@ -1559,7 +1586,11 @@ def _print_summary(scenarios, results: dict[int, str]) -> int:
         else:
             mark = _c("FAIL", "31")
         print(f"  {mark:16} {scenario.hf_name}  [{status}]")
-    return 0 if results and all(v.startswith("PASS") for v in results.values()) else 1
+    return (
+        0
+        if results and all(v.startswith(("PASS", "SKIP")) for v in results.values())
+        else 1
+    )
 
 
 def _cancel_refs(ray, refs: list) -> None:
