@@ -77,6 +77,7 @@ from .context import (
     reset_context,
     set_jamba_context,
 )
+from .fa_utils import FA_VERSION
 
 
 # ---------------------------------------------------------------------------
@@ -617,8 +618,13 @@ class JambaEngine:
         # :meth:`LlamaEngine.capture_cudagraph`'s shared-mempool
         # largest-first strategy.
         # ------------------------------------------------------------------
+        # Hopper FA2 paged decode IMAs on Jamba CUDA-graph replay even
+        # when capture uses a one-token dummy (LlamaEngine's recipe).
+        # Eager decode is correct; set FASTKERNELS_JAMBA_CUDA_GRAPHS=1 to retry.
+        _graphs_default = "0" if FA_VERSION == 3 else "1"
         self._use_cuda_graphs = (
-            os.environ.get("FASTKERNELS_JAMBA_CUDA_GRAPHS", "1") not in ("0", "false", "False")
+            os.environ.get("FASTKERNELS_JAMBA_CUDA_GRAPHS", _graphs_default)
+            not in ("0", "false", "False")
         )
         self._use_compile = (
             os.environ.get("FASTKERNELS_JAMBA_COMPILE", "0") not in ("0", "false", "False")
