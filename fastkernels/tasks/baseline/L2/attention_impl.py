@@ -271,10 +271,13 @@ class Attention(nn.Module):
             from ..L1.flash_attn_decode import FlashAttnDecode
             self.prefill_op = FlashAttnPrefill(
                 self.num_heads, self.num_kv_heads, head_size,
+                page_size=attn_cfg.block_size,
             )
             self.decode_op = FlashAttnDecode(
                 self.num_heads, self.num_kv_heads, head_size,
+                page_size=attn_cfg.block_size,
             )
+            self.decode_op._window_size = self._fa3_window_size
 
         from .tree_attn_prefill import TreeAttnPrefill
         self.tree_attn_op = TreeAttnPrefill(

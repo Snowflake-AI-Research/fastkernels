@@ -141,9 +141,11 @@ class Qwen3NextAttention(nn.Module):
             self.store_kvcache = StoreKVCache()
             self.flash_attn_prefill = FlashAttnPrefill(
                 self.num_heads, self.num_kv_heads, self.head_dim,
+                page_size=attn_cfg.block_size,
             )
             self.flash_attn_decode = FlashAttnDecode(
                 self.num_heads, self.num_kv_heads, self.head_dim,
+                page_size=attn_cfg.block_size,
             )
 
     def set_trtllm_workspace(self, workspace: torch.Tensor) -> None:

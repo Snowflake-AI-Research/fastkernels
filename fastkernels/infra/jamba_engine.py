@@ -77,7 +77,7 @@ from .context import (
     reset_context,
     set_jamba_context,
 )
-from .fa_utils import FA_VERSION
+from .fa_utils import group_fa_decode_ops, refresh_fa3_decode_schedule
 
 
 # ---------------------------------------------------------------------------
@@ -571,6 +571,8 @@ class JambaEngine:
                     attn.set_trtllm_workspace(shared_workspace)
             torch.cuda.empty_cache()
 
+        self._init_fa3_decode_buffers()
+
         # ------------------------------------------------------------------
         # Block manager (paged KV) + Mamba state slot pool.
         # ------------------------------------------------------------------
@@ -618,12 +620,8 @@ class JambaEngine:
         # :meth:`LlamaEngine.capture_cudagraph`'s shared-mempool
         # largest-first strategy.
         # ------------------------------------------------------------------
-        # Hopper FA2 paged decode IMAs on Jamba CUDA-graph replay even
-        # when capture uses a one-token dummy (LlamaEngine's recipe).
-        # Eager decode is correct; set FASTKERNELS_JAMBA_CUDA_GRAPHS=1 to retry.
-        _graphs_default = "0" if FA_VERSION == 3 else "1"
         self._use_cuda_graphs = (
-            os.environ.get("FASTKERNELS_JAMBA_CUDA_GRAPHS", _graphs_default)
+            os.environ.get("FASTKERNELS_JAMBA_CUDA_GRAPHS", "1")
             not in ("0", "false", "False")
         )
         self._use_compile = (
@@ -685,6 +683,31 @@ class JambaEngine:
     # ------------------------------------------------------------------
     # Decode-graph static buffers + capture.
     # ------------------------------------------------------------------
+    def _init_fa3_decode_buffers(self) -> None:
+        """Collect FlashAttnDecode modules and preallocate graph-stable buffers."""
+        from ..tasks.baseline.L1.flash_attn_decode import FlashAttnDecode
+
+        ops = [m for m in self.model.modules() if isinstance(m, FlashAttnDecode)]
+        self._fa_decode_groups = group_fa_decode_ops(ops)
+        if not ops:
+            return
+        for group in self._fa_decode_groups:
+            lead = group[0]
+            lead.preallocate(self.max_num_seqs, self.device)
+            for op in group[1:]:
+                op._cu_seqlens_q = lead._cu_seqlens_q
+                op._sched_buf = lead._sched_buf
+                op._sched_meta = lead._sched_meta
+
+    def _refresh_fa3_decode_schedule(self, context_lens: torch.Tensor) -> None:
+        """Rewrite FA3 scheduler metadata outside CUDA graph capture/replay."""
+        refresh_fa3_decode_schedule(
+            getattr(self, "_fa_decode_groups", []),
+            context_lens,
+            max_seqlen_k=self._max_blocks_per_seq * self._page_size,
+            qkv_dtype=self.dtype,
+        )
+
     def _alloc_decode_buffers(self, B: int) -> dict:
         """Allocate the static-identity tensors a B-bucket decode graph
         reads from.  Tensors are reused across replays; the host loop
@@ -730,12 +753,12 @@ class JambaEngine:
         max_context_len = self._max_blocks_per_seq * self._page_size
         # Match LlamaEngine.capture_cudagraph: a dummy decode must look like a
         # real step (one cached token, skip the KV store). Capturing against
-        # context_len=0 records a kernel shape no live decode ever uses, and
-        # Hopper FA2 then IMAs on the first replay with real lengths.
+        # context_len=0 records a kernel shape no live decode ever uses.
         bufs["context_lens"].fill_(1)
         bufs["slot_mapping"].fill_(-1)
         bufs["block_tables"].zero_()
         bufs["cache_indices"].zero_()
+        self._refresh_fa3_decode_schedule(bufs["context_lens"])
 
         mamba_meta = JambaMambaMetadata(
             conv_states=self.mamba_pool.conv_states,
@@ -1540,6 +1563,8 @@ class JambaEngine:
                 full_cache_idx[:n] = cache_idx_np
                 bufs_block_tables.copy_(torch.from_numpy(full_bt))
                 bufs_cache_indices.copy_(torch.from_numpy(full_cache_idx))
+
+            self._refresh_fa3_decode_schedule(bufs_context_lens)
 
             # Replay graph + async D2H of the sampled tokens.  Mirrors
             # the Mamba engine's ``run_mamba_decode_fast_async`` (see

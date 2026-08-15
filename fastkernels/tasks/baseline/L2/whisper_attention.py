@@ -184,9 +184,11 @@ class WhisperCrossAttention(nn.Module):
         self.store_kvcache = StoreKVCache()
         self.prefill_op = FlashAttnPrefill(
             self.num_heads, self.num_heads, self.head_dim,
+            page_size=attn_cfg.block_size,
         )
         self.decode_op = FlashAttnDecode(
             self.num_heads, self.num_heads, self.head_dim,
+            page_size=attn_cfg.block_size,
         )
 
     def forward(
