@@ -722,6 +722,14 @@ class JambaEngine:
     def _capture_decode_graph_inner(self, B: int) -> _JambaDecodeGraph:
         bufs = self._alloc_decode_buffers(B)
         max_context_len = self._max_blocks_per_seq * self._page_size
+        # Match LlamaEngine.capture_cudagraph: a dummy decode must look like a
+        # real step (one cached token, skip the KV store). Capturing against
+        # context_len=0 records a kernel shape no live decode ever uses, and
+        # Hopper FA2 then IMAs on the first replay with real lengths.
+        bufs["context_lens"].fill_(1)
+        bufs["slot_mapping"].fill_(-1)
+        bufs["block_tables"].zero_()
+        bufs["cache_indices"].zero_()
 
         mamba_meta = JambaMambaMetadata(
             conv_states=self.mamba_pool.conv_states,
