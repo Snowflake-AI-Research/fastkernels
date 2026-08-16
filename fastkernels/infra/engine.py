@@ -239,6 +239,10 @@ class Sequence:
         self.max_tokens = max_tokens
         self.ignore_eos = ignore_eos
         self.block_table: list[int] = []
+        # Hopper Gemma-4 sliding-window KV group (vLLM SlidingWindowManager).
+        # Same length as ``block_table``; prefix entries are 0 (null) after
+        # they fall out of the window.  Empty on every other model.
+        self.sliding_block_table: list[int] = []
         self.status = SeqStatus.WAITING
         self.num_computed_tokens: int = 0
         # Multimodal fields
@@ -306,6 +310,7 @@ class Sequence:
         self.token_ids = list(self.prompt_ids)
         self.generated_ids.clear()
         self.block_table.clear()
+        self.sliding_block_table.clear()
         self.cross_block_table.clear()
         self.num_computed_tokens = 0
         self.encoder_computed = False
@@ -325,12 +330,14 @@ class Sequence:
     def __getstate__(self):
         """Minimal pickling for shared memory transfer to non-rank-0 workers."""
         return (len(self), len(self.prompt_ids), self.block_table,
+                self.sliding_block_table,
                 self.num_computed_tokens,
                 self.state_slot,
                 self.token_ids if not self.generated_ids else self.last_token)
 
     def __setstate__(self, state):
         (self._num_tokens, num_prompt, self.block_table,
+         self.sliding_block_table,
          self.num_computed_tokens, self.state_slot) = state[:-1]
         if isinstance(state[-1], list):
             self.token_ids = state[-1]
@@ -351,40 +358,141 @@ class Sequence:
 # Block Manager
 # ---------------------------------------------------------------------------
 class BlockManager:
-    def __init__(self, num_blocks: int):
+    def __init__(
+        self,
+        num_blocks: int,
+        num_sliding_blocks: int | None = None,
+        sliding_window: int | None = None,
+        block_size: int | None = None,
+    ):
         self._num_blocks = num_blocks
-        self.free_block_ids: deque[int] = deque(range(num_blocks))
+        # Sliding-window groups reserve physical block 0 as the null
+        # block (vLLM ``BlockPool.null_block``).  Every other model
+        # keeps the historical 0-based pool so B200 is unchanged.
+        self._reserve_null = bool(num_sliding_blocks)
+        start = 1 if self._reserve_null else 0
+        self.free_block_ids: deque[int] = deque(range(start, num_blocks))
+        self.sliding_free_block_ids: deque[int] | None = None
+        self._num_sliding_blocks = 0
+        self.sliding_window = sliding_window
+        self._sliding_block_size = block_size or BLOCK_SIZE
+        if num_sliding_blocks:
+            self._num_sliding_blocks = num_sliding_blocks
+            self.sliding_free_block_ids = deque(range(1, num_sliding_blocks))
 
     def reset(self):
         """Return all blocks to the free pool."""
-        self.free_block_ids = deque(range(self._num_blocks))
+        start = 1 if self._reserve_null else 0
+        self.free_block_ids = deque(range(start, self._num_blocks))
+        if self.sliding_free_block_ids is not None:
+            self.sliding_free_block_ids = deque(
+                range(1, self._num_sliding_blocks)
+            )
         if hasattr(self, '_num_cross_blocks'):
             self.cross_free_block_ids = deque(range(self._num_cross_blocks))
 
+    def _sync_sliding_append(self, seq, n: int = 1):
+        pool = self.sliding_free_block_ids
+        if pool is None:
+            return
+        for _ in range(n):
+            seq.sliding_block_table.append(pool.popleft())
+        self.remove_skipped_sliding(seq)
+
+    def remove_skipped_sliding(self, seq) -> None:
+        """Free sliding-window blocks that fell out of the window.
+
+        Mirrors vLLM ``SlidingWindowManager.remove_skipped_blocks``:
+        ``num_skipped = max(0, num_computed - sliding_window + 1)``.
+        """
+        pool = self.sliding_free_block_ids
+        window = self.sliding_window
+        if pool is None or not window:
+            return
+        # Use settled tokens only (vLLM ``processed_computed_tokens``).
+        # During chunked prefill ``num_computed_tokens`` lags ``len(seq)``;
+        # after prefill it equals the prompt length, so decode uses ``len``.
+        if seq.num_computed_tokens and seq.num_computed_tokens < len(seq):
+            num_computed = seq.num_computed_tokens
+        else:
+            num_computed = len(seq)
+        num_skipped = max(0, num_computed - window + 1)
+        n_skip = min(num_skipped // self._sliding_block_size, len(seq.sliding_block_table))
+        freed = []
+        for i in range(n_skip):
+            bid = seq.sliding_block_table[i]
+            if bid > 0:
+                freed.append(bid)
+                seq.sliding_block_table[i] = 0
+        if freed:
+            pool.extend(freed)
+
     def can_allocate(self, seq):
-        return len(self.free_block_ids) >= seq.num_blocks
+        n = seq.num_blocks
+        ok = len(self.free_block_ids) >= n
+        if ok and self.sliding_free_block_ids is not None:
+            ok = len(self.sliding_free_block_ids) >= n
+        return ok
 
     def allocate(self, seq):
-        for _ in range(seq.num_blocks):
+        n = seq.num_blocks
+        for _ in range(n):
             seq.block_table.append(self.free_block_ids.popleft())
+        self._sync_sliding_append(seq, n)
 
     def can_allocate_n(self, n_blocks):
-        return len(self.free_block_ids) >= n_blocks
+        ok = len(self.free_block_ids) >= n_blocks
+        if ok and self.sliding_free_block_ids is not None:
+            ok = len(self.sliding_free_block_ids) >= n_blocks
+        return ok
 
     def allocate_n(self, seq, n_blocks):
         for _ in range(n_blocks):
             seq.block_table.append(self.free_block_ids.popleft())
+        self._sync_sliding_append(seq, n_blocks)
 
     def can_append(self, seq):
-        return len(self.free_block_ids) >= (len(seq) % BLOCK_SIZE == 1)
+        need = int(len(seq) % BLOCK_SIZE == 1)
+        if not need:
+            return True
+        ok = len(self.free_block_ids) >= 1
+        if ok and self.sliding_free_block_ids is not None:
+            ok = len(self.sliding_free_block_ids) >= 1
+        return ok
 
     def may_append(self, seq):
         if len(seq) % BLOCK_SIZE == 1:
             seq.block_table.append(self.free_block_ids.popleft())
+            self._sync_sliding_append(seq, 1)
 
     def deallocate(self, seq):
-        self.free_block_ids.extend(seq.block_table)
+        if self._reserve_null:
+            self.free_block_ids.extend(b for b in seq.block_table if b > 0)
+        else:
+            self.free_block_ids.extend(seq.block_table)
         seq.block_table.clear()
+        if self.sliding_free_block_ids is not None:
+            self.sliding_free_block_ids.extend(
+                b for b in seq.sliding_block_table if b > 0
+            )
+            seq.sliding_block_table.clear()
+
+    def append_block(self, seq):
+        """Allocate one new page on every active KV group."""
+        seq.block_table.append(self.free_block_ids.popleft())
+        self._sync_sliding_append(seq, 1)
+
+    def num_free_blocks(self) -> int:
+        n = len(self.free_block_ids)
+        if self.sliding_free_block_ids is not None:
+            n = min(n, len(self.sliding_free_block_ids))
+        return n
+
+    def recycle_sliding(self, seqs) -> None:
+        if self.sliding_free_block_ids is None:
+            return
+        for seq in seqs:
+            self.remove_skipped_sliding(seq)
 
     def free_tail_blocks(self, seq, n_blocks: int) -> int:
         """Release the last ``n_blocks`` blocks of ``seq`` back to the pool.
@@ -398,7 +506,15 @@ class BlockManager:
             return 0
         released = seq.block_table[-n_blocks:]
         del seq.block_table[-n_blocks:]
-        self.free_block_ids.extend(released)
+        if self._reserve_null:
+            self.free_block_ids.extend(b for b in released if b > 0)
+        else:
+            self.free_block_ids.extend(released)
+        if self.sliding_free_block_ids is not None and seq.sliding_block_table:
+            n_s = min(n_blocks, len(seq.sliding_block_table))
+            released_s = seq.sliding_block_table[-n_s:]
+            del seq.sliding_block_table[-n_s:]
+            self.sliding_free_block_ids.extend(b for b in released_s if b > 0)
         return n_blocks
 
     def deallocate_cross(self, seq):
@@ -599,6 +715,9 @@ class ModelRunner:
 
         self._compiled = False
         self.num_blocks = 0  # set by allocate_kv_cache (attention) only
+        self._sliding_kv_groups = False
+        self.sliding_num_blocks = 0
+        self._sliding_window = None
         self.mamba_state_manager: MambaStateManager | None = None
         if rank == 0:
             print(f"  [1/6] Model loaded in {_time.perf_counter()-_t0:.1f}s", flush=True)
@@ -1589,38 +1708,34 @@ class ModelRunner:
                   f"(block_size={cfg.block_size}, kv_layout={cfg.kv_layout})")
 
 
+    def _allocate_layer_kv(self, layer, num_blocks: int):
+        """Allocate one layer's paged K/V in the layout its backend indexes."""
+        layer_layout = getattr(
+            layer, "kv_layout", ATTN_BACKEND_CONFIG.kv_layout,
+        )
+        if layer_layout == "HND":
+            cache = torch.empty(
+                2, num_blocks, layer.num_kv_heads, BLOCK_SIZE,
+                layer.head_size,
+            )
+        else:
+            cache = torch.empty(
+                2, num_blocks, BLOCK_SIZE, layer.num_kv_heads,
+                layer.head_size,
+            )
+        layer.k_cache = cache[0]
+        layer.v_cache = cache[1]
+        return cache
+
     def _allocate_variable_kv_cache(self):
         """Allocate per-layer KV caches for models with non-uniform KV shape.
 
-        Every layer gets ``num_blocks`` blocks and every layer is indexed by the
-        same ``seq.block_table``, so a sequence of length L holds ceil(L/16)
-        blocks in *all* layers.
-
-        This is a known divergence from vLLM for Gemma4, whose 25 of 30 layers
-        are ``sliding_attention`` with a 1024-token window. vLLM puts those in a
-        ``SlidingWindowSpec`` group whose ``SlidingWindowManager`` frees blocks
-        that fall out of the window on every ``allocate_slots``, capping a
-        request at ``cdiv(sliding_window - 1 + max_in_flight_tokens,
-        block_size) + 1`` blocks in each sliding layer no matter how long the
-        sequence gets. Holding the full length there instead costs capacity:
-        498,272 token slots against vLLM's 1,862,998 on a B200 at
-        gpu_memory_utilization=0.9.
-
-        It costs *capacity only*, not correctness or compute:
-          - the per-layer mask is still right (``sliding_window`` is passed
-            through to ``window_size=(1023, 0)``), so the extra resident KV is
-            simply never attended to;
-          - vLLM's Triton unified-attention kernel bounds its tile loop by
-            ``SLIDING_WINDOW`` (``loop_lo``/``loop_hi``), so the out-of-window
-            blocks are not read either.
-
-        Closing it needs per-layer-group block tables (one for the sliding
-        group, one for the full group) threaded through the CUDA-graph capture,
-        which today assumes a single ``block_tables`` tensor. Measured on the
-        mixed scenario it would buy nothing (sequences average ~737 tokens, so
-        nothing ever leaves the 1024 window) and on long-context the phase is
-        89% prefill, so it only starts to pay at higher long-sequence
-        concurrency than either workload reaches.
+        On Hopper Gemma-4 this splits sliding-window and full-attention layers
+        into two vLLM-style KV groups with independent free lists.  Sliding
+        layers recycle out-of-window pages (``SlidingWindowManager``), so a
+        long request holds ~``cdiv(window, block_size)+2`` sliding pages
+        instead of ``cdiv(seq_len, block_size)``.  Blackwell keeps the
+        historical shared table -- B200 already matches vLLM via TRTLLM.
         """
         free, total = torch.cuda.mem_get_info()
         used = total - free
@@ -1630,41 +1745,97 @@ class ModelRunner:
         available_bytes = int(
             total * self.gpu_memory_utilization - used - peak + current
         )
-        per_block_bytes = 0
-        for layer in self._attn_layers:
-            per_block_bytes += (
+
+        def _layer_block_bytes(layer) -> int:
+            return (
                 2 * BLOCK_SIZE * layer.num_kv_heads * layer.head_size * elem_size
             )
-        num_blocks = available_bytes // per_block_bytes
-        assert num_blocks > 0, f"Not enough GPU memory for KV cache on rank {self.rank}"
-        self.num_blocks = num_blocks
-        self.kv_cache = []
-        for layer in self._attn_layers:
-            # Each layer allocates in the layout its own selected backend
-            # indexes: trtllm-gen reads HND, FlashAttention and the Triton
-            # unified kernel read NHD.  Gemma4 mixes both in one model.
-            layer_layout = getattr(
-                layer, "kv_layout", ATTN_BACKEND_CONFIG.kv_layout,
+
+        sliding_layers = [
+            layer for layer in self._attn_layers
+            if getattr(layer, "sliding_window", None)
+        ]
+        full_layers = [
+            layer for layer in self._attn_layers
+            if not getattr(layer, "sliding_window", None)
+        ]
+        enable_sliding_groups = (
+            self.is_gemma4
+            and not ATTN_BACKEND_CONFIG.use_trtllm
+            and bool(sliding_layers)
+            and bool(full_layers)
+        )
+
+        if not enable_sliding_groups:
+            per_block_bytes = sum(
+                _layer_block_bytes(layer) for layer in self._attn_layers
             )
-            if layer_layout == "HND":
-                cache = torch.empty(
-                    2, num_blocks, layer.num_kv_heads, BLOCK_SIZE,
-                    layer.head_size,
-                )
-            else:
-                cache = torch.empty(
-                    2, num_blocks, BLOCK_SIZE, layer.num_kv_heads,
-                    layer.head_size,
-                )
-            layer.k_cache = cache[0]
-            layer.v_cache = cache[1]
-            self.kv_cache.append(cache)
+            num_blocks = available_bytes // per_block_bytes
+            assert num_blocks > 0, (
+                f"Not enough GPU memory for KV cache on rank {self.rank}"
+            )
+            self.num_blocks = num_blocks
+            self._sliding_kv_groups = False
+            self.sliding_num_blocks = 0
+            self._sliding_window = None
+            self.kv_cache = [
+                self._allocate_layer_kv(layer, num_blocks)
+                for layer in self._attn_layers
+            ]
+        else:
+            window = int(sliding_layers[0].sliding_window)
+            sliding_per_block = sum(
+                _layer_block_bytes(layer) for layer in sliding_layers
+            )
+            full_per_block = sum(
+                _layer_block_bytes(layer) for layer in full_layers
+            )
+            # vLLM ``SlidingWindowSpec.max_admission_blocks_per_request``
+            # without inflating by ``max_num_seqs * max_num_batched_tokens``:
+            # each request plateaus at the window, plus one in-flight chunk
+            # shared across the batch (the current prefill step).
+            sw_per_seq = (window + BLOCK_SIZE - 1) // BLOCK_SIZE + 2
+            inflight_blocks = (
+                self.max_num_batched_tokens + BLOCK_SIZE - 1
+            ) // BLOCK_SIZE + 1
+            ideal_ns = self.max_num_seqs * sw_per_seq + inflight_blocks + 1
+            # Never let sliding starve full-attn: keep >=30% of the budget
+            # for the full group so long-context concurrency stays high.
+            max_ns = max(1, (available_bytes * 7 // 10) // sliding_per_block)
+            num_sliding = min(ideal_ns, max_ns)
+            num_full = (
+                available_bytes - num_sliding * sliding_per_block
+            ) // full_per_block
+            if num_full <= 0:
+                num_sliding = max(2, available_bytes // (sliding_per_block + full_per_block))
+                num_full = (
+                    available_bytes - num_sliding * sliding_per_block
+                ) // full_per_block
+            assert num_full > 0 and num_sliding > 1, (
+                f"Not enough GPU memory for Gemma-4 KV groups on rank {self.rank}"
+            )
+            self.num_blocks = num_full
+            self.sliding_num_blocks = num_sliding
+            self._sliding_kv_groups = True
+            self._sliding_window = window
+            self.kv_cache = []
+            for layer in self._attn_layers:
+                n = num_sliding if getattr(layer, "sliding_window", None) else num_full
+                self.kv_cache.append(self._allocate_layer_kv(layer, n))
 
         if self.rank == 0:
-            print(
-                f"  KV cache: {num_blocks} blocks x {BLOCK_SIZE} = "
-                f"{num_blocks * BLOCK_SIZE} token slots (per-layer shapes)",
-            )
+            if self._sliding_kv_groups:
+                print(
+                    f"  KV cache: full {self.num_blocks} + sliding "
+                    f"{self.sliding_num_blocks} blocks x {BLOCK_SIZE} "
+                    f"(window={self._sliding_window}, Hopper groups)",
+                )
+            else:
+                print(
+                    f"  KV cache: {self.num_blocks} blocks x {BLOCK_SIZE} = "
+                    f"{self.num_blocks * BLOCK_SIZE} token slots "
+                    f"(per-layer shapes)",
+                )
             cfg = ATTN_BACKEND_CONFIG
             layouts = sorted({
                 getattr(layer, "kv_layout", cfg.kv_layout)
@@ -4573,6 +4744,36 @@ class ModelRunner:
             if blen > max_bt:
                 max_bt = blen
 
+        sliding_slot_mapping = None
+        sliding_block_tables = None
+        if getattr(self, "_sliding_kv_groups", False):
+            sliding_slots = []
+            s_max_bt = 0
+            for seq in seqs:
+                if not seq.sliding_block_table:
+                    continue
+                for i in range(seq.num_blocks):
+                    bid = (seq.sliding_block_table[i]
+                           if i < len(seq.sliding_block_table) else 0)
+                    start = bid * BLOCK_SIZE
+                    end = start + (BLOCK_SIZE if i != seq.num_blocks - 1
+                                   else seq.last_block_num_tokens)
+                    sliding_slots.extend(range(start, end))
+                s_max_bt = max(s_max_bt, len(seq.sliding_block_table))
+            if sliding_slots:
+                sliding_slot_mapping = torch.tensor(
+                    sliding_slots, dtype=torch.int32, pin_memory=True,
+                ).cuda(non_blocking=True)
+            if s_max_bt > 0:
+                sbt = np.full((len(seqs), s_max_bt), -1, dtype=np.int32)
+                for i, seq in enumerate(seqs):
+                    b = seq.sliding_block_table
+                    if b:
+                        sbt[i, :len(b)] = b
+                sliding_block_tables = torch.from_numpy(sbt).pin_memory().cuda(
+                    non_blocking=True,
+                )
+
         block_tables = None
         if max_bt > 0:
             n = len(seqs)
@@ -4607,6 +4808,8 @@ class ModelRunner:
                          pin_memory=True).cuda(non_blocking=True),
             block_tables=block_tables,
             req_id_per_token=req_id_per_token,
+            sliding_slot_mapping=sliding_slot_mapping,
+            sliding_block_tables=sliding_block_tables,
         )
 
         input_ids_t = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -4660,6 +4863,26 @@ class ModelRunner:
             req_id_per_token = torch.arange(
                 n, dtype=torch.int32, device=f"cuda:{self.rank}",
             )
+        sliding_slot_mapping = None
+        sliding_block_tables = None
+        if getattr(self, "_sliding_kv_groups", False):
+            ssm = np.empty(n, dtype=np.int32)
+            s_max_bt = 0
+            for i, seq in enumerate(seqs):
+                st = seq.sliding_block_table
+                ssm[i] = ((st[-1] if st else 0) * BLOCK_SIZE
+                          + seq.last_block_num_tokens - 1)
+                s_max_bt = max(s_max_bt, len(st))
+            sbt = np.full((n, s_max_bt), -1, dtype=np.int32)
+            for i, seq in enumerate(seqs):
+                b = seq.sliding_block_table
+                sbt[i, :len(b)] = b
+            sliding_slot_mapping = torch.from_numpy(ssm).pin_memory().cuda(
+                non_blocking=True,
+            )
+            sliding_block_tables = torch.from_numpy(sbt).pin_memory().cuda(
+                non_blocking=True,
+            )
         set_context(
             False,
             slot_mapping=torch.from_numpy(sm).pin_memory().cuda(non_blocking=True),
@@ -4667,6 +4890,8 @@ class ModelRunner:
             block_tables=torch.from_numpy(bt).pin_memory().cuda(non_blocking=True),
             max_context_len=max_cl,
             req_id_per_token=req_id_per_token,
+            sliding_slot_mapping=sliding_slot_mapping,
+            sliding_block_tables=sliding_block_tables,
         )
         self._refresh_indexer_schedule(get_context().context_lens)
         self._refresh_fa3_decode_schedule(get_context().context_lens)
@@ -4689,6 +4914,8 @@ class ModelRunner:
         """
         input_ids, positions = [], []
         slot_mapping = []
+        sliding_slot_mapping_list = []
+        use_sliding = getattr(self, "_sliding_kv_groups", False)
         block_size = self.block_size
 
         use_mrope = self.is_qwen_vl
@@ -4723,6 +4950,13 @@ class ModelRunner:
                 slot_mapping.append(
                     seq.block_table[p // block_size] * block_size + (p % block_size)
                 )
+                if use_sliding:
+                    st = seq.sliding_block_table
+                    idx = p // block_size
+                    bid = st[idx] if idx < len(st) else 0
+                    sliding_slot_mapping_list.append(
+                        bid * block_size + (p % block_size)
+                    )
             blen = len(seq.block_table)
             if blen > pf_max_bt:
                 pf_max_bt = blen
@@ -4757,6 +4991,12 @@ class ModelRunner:
             slot_mapping.append(
                 seq.block_table[-1] * block_size + seq.last_block_num_tokens - 1
             )
+            if use_sliding:
+                st = seq.sliding_block_table
+                sliding_slot_mapping_list.append(
+                    (st[-1] if st else 0) * block_size
+                    + seq.last_block_num_tokens - 1
+                )
             blen = len(seq.block_table)
             if blen > dc_max_bt:
                 dc_max_bt = blen
@@ -4803,6 +5043,38 @@ class ModelRunner:
         else:
             req_id_per_token = None
 
+        sliding_slot_t = None
+        sliding_prefill_bt = None
+        sliding_decode_bt = None
+        if use_sliding:
+            if sliding_slot_mapping_list:
+                sliding_slot_t = torch.tensor(
+                    sliding_slot_mapping_list, dtype=torch.int32,
+                    pin_memory=True,
+                ).cuda(non_blocking=True)
+            if num_prefill_seqs > 0:
+                s_max = max((len(s.sliding_block_table) for s in prefill_seqs), default=0)
+                if s_max > 0:
+                    spbt = np.full((num_prefill_seqs, s_max), -1, dtype=np.int32)
+                    for i, seq in enumerate(prefill_seqs):
+                        b = seq.sliding_block_table
+                        if b:
+                            spbt[i, :len(b)] = b
+                    sliding_prefill_bt = torch.from_numpy(spbt).pin_memory().cuda(
+                        non_blocking=True,
+                    )
+            if nd > 0:
+                s_max = max((len(s.sliding_block_table) for s in decode_seqs), default=0)
+                if s_max > 0:
+                    sdbt = np.full((nd, s_max), -1, dtype=np.int32)
+                    for i, seq in enumerate(decode_seqs):
+                        b = seq.sliding_block_table
+                        if b:
+                            sdbt[i, :len(b)] = b
+                    sliding_decode_bt = torch.from_numpy(sdbt).pin_memory().cuda(
+                        non_blocking=True,
+                    )
+
         set_mixed_context(
             slot_mapping=torch.tensor(slot_mapping,
                                       dtype=(torch.int64 if self.is_deepseek_mla else torch.int32),
@@ -4821,6 +5093,9 @@ class ModelRunner:
             logit_indices=torch.tensor(logit_idx, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True),
             chunked_context=chunked_context,
             req_id_per_token=req_id_per_token,
+            sliding_slot_mapping=sliding_slot_t,
+            sliding_prefill_block_tables=sliding_prefill_bt,
+            sliding_decode_block_tables=sliding_decode_bt,
         )
 
         input_ids_t = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -4917,6 +5192,13 @@ class ModelRunner:
         gv["context_lens"][:bs] = ctx.context_lens
         bt = ctx.block_tables
         gv["block_tables"][:bs, :bt.size(1)] = bt
+        if ctx.sliding_slot_mapping is not None and "sliding_slot_mapping" in gv:
+            gv["sliding_slot_mapping"][:bs] = ctx.sliding_slot_mapping
+            if bs < graph_bs:
+                gv["sliding_slot_mapping"][bs:graph_bs].fill_(-1)
+            sbt = ctx.sliding_block_tables
+            if sbt is not None:
+                gv["sliding_block_tables"][:bs, :sbt.size(1)] = sbt
         self._refresh_fa3_decode_schedule(gv["context_lens"][:graph_bs])
         self.graphs[graph_bs].replay()
         return self.model.compute_logits(gv["outputs"][:bs])
@@ -4971,6 +5253,19 @@ class ModelRunner:
         gv["block_tables"][:n, :bt_np.shape[1]].copy_(
             torch.from_numpy(bt_np), non_blocking=True
         )
+        if getattr(self, "_sliding_kv_groups", False):
+            ssm = self._np_sliding_sm
+            sbt = self._np_sliding_bt
+            max_sbt = getattr(self, "_prev_max_sbt", sbt.shape[1])
+            gv["sliding_slot_mapping"][:n].copy_(
+                torch.from_numpy(ssm[:n]), non_blocking=True,
+            )
+            if n < graph_bs and n != prev_n:
+                gv["sliding_slot_mapping"][n:graph_bs].fill_(-1)
+            if max_sbt > 0:
+                gv["sliding_block_tables"][:n, :max_sbt].copy_(
+                    torch.from_numpy(sbt[:n, :max_sbt]), non_blocking=True,
+                )
         self._prev_decode_n = n
         # Outside the graph, and after context_lens for this step is in place.
         self._refresh_indexer_schedule(gv["context_lens"][:graph_bs])
@@ -5054,6 +5349,25 @@ class ModelRunner:
             req_id_per_token = torch.arange(
                 n, dtype=torch.int32, device=f"cuda:{self.rank}",
             )
+        sliding_slot_mapping = None
+        sliding_block_tables = None
+        if getattr(self, "_sliding_kv_groups", False):
+            ssm = self._np_sliding_sm
+            sbt = self._np_sliding_bt
+            max_sbt = getattr(self, "_prev_max_sbt", sbt.shape[1])
+            self._eager_sliding_slot_mapping[:n].copy_(
+                torch.from_numpy(ssm[:n]), non_blocking=True,
+            )
+            if max_sbt > 0:
+                self._eager_sliding_block_tables[:n, :max_sbt].copy_(
+                    torch.from_numpy(sbt[:n, :max_sbt]), non_blocking=True,
+                )
+            sliding_slot_mapping = self._eager_sliding_slot_mapping[:n]
+            sliding_block_tables = (
+                self._eager_sliding_block_tables[:n]
+                if ATTN_BACKEND_CONFIG.use_trtllm
+                else self._eager_sliding_block_tables[:n, :max_sbt]
+            )
         set_context(
             False,
             slot_mapping=slot_mapping,
@@ -5061,6 +5375,8 @@ class ModelRunner:
             block_tables=block_tables,
             max_context_len=int(cl_np.max()),
             req_id_per_token=req_id_per_token,
+            sliding_slot_mapping=sliding_slot_mapping,
+            sliding_block_tables=sliding_block_tables,
         )
         self._refresh_indexer_schedule(context_lens)
         self._refresh_fa3_decode_schedule(context_lens)
@@ -5150,6 +5466,19 @@ class ModelRunner:
         self._pin_cl, self._np_cl = _pinned(max_bs, torch.int32)
         self._pin_bt, self._np_bt = _pinned((max_bs, max_num_blocks), torch.int32)
         self._np_bt.fill(-1)
+        if getattr(self, "_sliding_kv_groups", False):
+            self._pin_sliding_sm, self._np_sliding_sm = _pinned(max_bs, sm_torch_dtype)
+            self._pin_sliding_bt, self._np_sliding_bt = _pinned(
+                (max_bs, max_num_blocks), torch.int32,
+            )
+            self._np_sliding_bt.fill(-1)
+            self._eager_sliding_slot_mapping = torch.zeros(
+                max_bs, dtype=sm_torch_dtype, device=dev,
+            )
+            self._eager_sliding_block_tables = torch.zeros(
+                max_bs, max_num_blocks, dtype=torch.int32, device=dev,
+            )
+            self._prev_max_sbt = 0
 
         self._eager_input_ids = torch.zeros(max_bs, dtype=torch.int64, device=dev)
         if self.is_qwen_vl:
@@ -5320,6 +5649,24 @@ class ModelRunner:
             if blen < max_bt:
                 bt_np[i, blen:max_bt] = -1
         self._prev_max_bt = max_bt
+        if getattr(self, "_sliding_kv_groups", False):
+            ssm = self._np_sliding_sm
+            sbt = self._np_sliding_bt
+            max_sbt = 0
+            for i, seq in enumerate(seqs):
+                st = seq.sliding_block_table
+                slen = int(cl_np[i])
+                r = slen % bs
+                ssm[i] = (st[-1] if st else 0) * bs + (r - 1 if r else bs - 1)
+                blen = len(st)
+                sbt[i, :blen] = st
+                if blen > max_sbt:
+                    max_sbt = blen
+            for i, seq in enumerate(seqs):
+                blen = len(seq.sliding_block_table)
+                if blen < max_sbt:
+                    sbt[i, blen:max_sbt] = -1
+            self._prev_max_sbt = max_sbt
         if self.is_qwen_vl:
             return (n, ids_np[:n], pos_np[:, :n], sm_np[:n], cl_np[:n], bt_np[:n, :max_bt])
         return (n, ids_np[:n], pos_np[:n], sm_np[:n], cl_np[:n], bt_np[:n, :max_bt])
@@ -5348,6 +5695,8 @@ class ModelRunner:
             pos_np[:n] += 1
         cl_np[:n] += 1
         sm_np[:n] += 1
+        if getattr(self, "_sliding_kv_groups", False):
+            self._np_sliding_sm[:n] += 1
 
         boundary_mask = cl_np[:n] % bs == 1
         if boundary_mask.any():
@@ -5370,6 +5719,23 @@ class ModelRunner:
                 self._prev_max_bt = max_bt
         else:
             max_bt = self._prev_max_bt
+        if getattr(self, "_sliding_kv_groups", False):
+            ssm = self._np_sliding_sm
+            sbt = self._np_sliding_bt
+            max_sbt = 0
+            for i, seq in enumerate(decode_seqs):
+                st = seq.sliding_block_table
+                blen = len(st)
+                if blen:
+                    ssm[i] = st[-1] * bs + ((int(cl_np[i]) - 1) % bs)
+                    sbt[i, :blen] = st
+                if blen > max_sbt:
+                    max_sbt = blen
+            for i, seq in enumerate(decode_seqs):
+                blen = len(seq.sliding_block_table)
+                if blen < max_sbt:
+                    sbt[i, blen:max_sbt] = -1
+            self._prev_max_sbt = max_sbt
         if self.is_qwen_vl:
             return (n, ids_np[:n], pos_np[:, :n], sm_np[:n], cl_np[:n],
                     bt_np[:n, :max_bt])
@@ -6187,6 +6553,13 @@ class ModelRunner:
         # warms a shape the kernels never see again.
         context_lens = torch.ones(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
+        sliding_slot_mapping = None
+        sliding_block_tables = None
+        if getattr(self, "_sliding_kv_groups", False):
+            sliding_slot_mapping = torch.full((max_bs,), -1, dtype=sm_torch_dtype)
+            sliding_block_tables = torch.zeros(
+                max_bs, max_num_blocks, dtype=torch.int32,
+            )
         # Persistent arange buffer for per-token request id mapping during
         # pure-decode (token i -> sequence i).  Captured into decode CUDA
         # graphs and reused by ``prepare_decode``; kept on-device so the
@@ -6282,6 +6655,14 @@ class ModelRunner:
             block_tables=block_tables[:largest_bs],
             max_context_len=self.max_model_len,
             req_id_per_token=decode_req_id[:largest_bs],
+            sliding_slot_mapping=(
+                sliding_slot_mapping[:largest_bs]
+                if sliding_slot_mapping is not None else None
+            ),
+            sliding_block_tables=(
+                sliding_block_tables[:largest_bs]
+                if sliding_block_tables is not None else None
+            ),
         )
         self._refresh_indexer_schedule(context_lens[:largest_bs])
         self._refresh_fa3_decode_schedule(context_lens[:largest_bs])
@@ -6355,6 +6736,14 @@ class ModelRunner:
                     context_lens=context_lens[:bs], block_tables=block_tables[:bs],
                     max_context_len=self.max_model_len,
                     req_id_per_token=decode_req_id[:bs],
+                    sliding_slot_mapping=(
+                        sliding_slot_mapping[:bs]
+                        if sliding_slot_mapping is not None else None
+                    ),
+                    sliding_block_tables=(
+                        sliding_block_tables[:bs]
+                        if sliding_block_tables is not None else None
+                    ),
                 )
                 self._refresh_indexer_schedule(context_lens[:bs])
                 self._refresh_fa3_decode_schedule(context_lens[:bs])
@@ -6428,6 +6817,9 @@ class ModelRunner:
             lm_logits=lm_logits, lm_max_vals=lm_max_vals,
             lm_max_idxs=lm_max_idxs,
         )
+        if sliding_slot_mapping is not None:
+            self.graph_vars["sliding_slot_mapping"] = sliding_slot_mapping
+            self.graph_vars["sliding_block_tables"] = sliding_block_tables
         # Pre-compute lookup table: _graph_bs_for_n[n] = smallest graph_bs >= n
         self._graph_bs_for_n = [0] * (max_bs + 1)
         for n in range(max_bs + 1):
@@ -6525,6 +6917,13 @@ class LlamaEngine:
         if self.is_mamba:
             # Mamba uses MambaStateManager (slot-based) not paged KV blocks.
             self.block_manager = BlockManager(0)
+        elif getattr(self.model_runner, "_sliding_kv_groups", False):
+            self.block_manager = BlockManager(
+                self.model_runner.num_blocks,
+                num_sliding_blocks=self.model_runner.sliding_num_blocks,
+                sliding_window=self.model_runner._sliding_window,
+                block_size=BLOCK_SIZE,
+            )
         else:
             self.block_manager = BlockManager(self.model_runner.num_blocks)
         if hasattr(self.model_runner, '_cross_free_block_ids_init'):
@@ -8632,7 +9031,7 @@ class LlamaEngine:
                 if i < decode_count and len(seq) % block_size == 1:
                     decode_need_blocks += 1
 
-            free_after_decode = len(bm.free_block_ids) - decode_need_blocks
+            free_after_decode = bm.num_free_blocks() - decode_need_blocks
             if free_after_decode < 0:
                 return False
 
@@ -8675,7 +9074,8 @@ class LlamaEngine:
             # as vLLM handles it.
             full_blocks = (min(prompt_len, self.max_model_len)
                            + block_size - 1) // block_size
-            if free_after_decode < full_blocks + watermark_blocks:
+            free_full_after = len(bm.free_block_ids) - decode_need_blocks
+            if free_full_after < full_blocks + watermark_blocks:
                 return True
 
             if decode_count + 1 > self.max_num_seqs:
@@ -8818,10 +9218,9 @@ class LlamaEngine:
                         and mr.world_size == 1
                         and not mr.enforce_eager
                     ):
-                        if len(seq) % block_size != 1 or bm.free_block_ids:
+                        if len(seq) % block_size != 1 or bm.num_free_blocks() > 0:
                             if len(seq) % block_size == 1:
-                                seq.block_table.append(
-                                    bm.free_block_ids.popleft())
+                                bm.append_block(seq)
                             decode_data = mr._prepare_decode_arrays([seq])
                             gpu_ids = mr._run_decode_greedy_eager(*decode_data)
                             if gpu_ids is not None:
@@ -8839,7 +9238,7 @@ class LlamaEngine:
                 for seq in running:
                     if len(seq) % block_size == 1:
                         need_blocks += 1
-                if need_blocks <= len(bm.free_block_ids):
+                if need_blocks <= bm.num_free_blocks():
                     if _step_profile_active:
                         _spt0 = time.perf_counter()
                         step_profile["fast_decode"] = step_profile.get("fast_decode", 0) + 1
@@ -8850,7 +9249,7 @@ class LlamaEngine:
                     decode_seqs = list(running)
                     for seq in decode_seqs:
                         if len(seq) % block_size == 1:
-                            seq.block_table.append(bm.free_block_ids.popleft())
+                            bm.append_block(seq)
 
                     mr = self.model_runner
                     n_dc = len(decode_seqs)
@@ -8950,7 +9349,7 @@ class LlamaEngine:
                             for seq in decode_seqs:
                                 if len(seq) % block_size == 1:
                                     need_blocks += 1
-                            if need_blocks > len(bm.free_block_ids):
+                            if need_blocks > bm.num_free_blocks():
                                 break
                             if _step_profile_active:
                                 step_profile["fast_decode"] = step_profile.get("fast_decode", 0) + 1
@@ -8958,8 +9357,7 @@ class LlamaEngine:
                                 _record_decode_batch(n_dc)
                             for seq in decode_seqs:
                                 if len(seq) % block_size == 1:
-                                    seq.block_table.append(
-                                        bm.free_block_ids.popleft())
+                                    bm.append_block(seq)
                             if _PROFILE:
                                 _fp_t0 = time.perf_counter()
                             if use_incr:
@@ -9066,10 +9464,10 @@ class LlamaEngine:
                 for seq in decode_seqs:
                     if len(seq) % block_size == 1:
                         need_blocks += 1
-                if need_blocks <= len(bm.free_block_ids):
+                if need_blocks <= bm.num_free_blocks():
                     for seq in decode_seqs:
                         if len(seq) % block_size == 1:
-                            seq.block_table.append(bm.free_block_ids.popleft())
+                            bm.append_block(seq)
                     if self.is_whisper:
                         self.model_runner._set_cross_attn_context_decode(decode_seqs)
                     result = self.model_runner.call("run", decode_seqs, False)
@@ -9150,10 +9548,10 @@ class LlamaEngine:
                         continue
                     needs_block = (len(seq) % block_size == 1)
                     if needs_block:
-                        while not bm.free_block_ids:
+                        while bm.num_free_blocks() < 1:
                             if not _preempt_newest(seq):
                                 break
-                        if not bm.free_block_ids:
+                        if bm.num_free_blocks() < 1:
                             # Nothing left to evict: this sequence is the only
                             # one in flight, so preempting it would livelock.
                             _record_preemption(seq)
@@ -9164,7 +9562,7 @@ class LlamaEngine:
                             seq.preempt()
                             waiting.appendleft(seq)
                             continue
-                        seq.block_table.append(bm.free_block_ids.popleft())
+                        bm.append_block(seq)
                     decode_seqs.append(seq)
                 running = new_running
                 token_budget -= len(decode_seqs)
@@ -9190,7 +9588,7 @@ class LlamaEngine:
                 chunk = min(remaining, token_budget)
                 blocks_needed = seq.blocks_needed_for(chunk)
                 if blocks_needed > 0:
-                    if len(bm.free_block_ids) < blocks_needed:
+                    if bm.num_free_blocks() < blocks_needed:
                         still_prefilling.append(seq)
                         continue
                     bm.allocate_n(seq, blocks_needed)
@@ -9252,8 +9650,7 @@ class LlamaEngine:
                     chunk = min(prompt_len, token_budget)
 
                 blocks_needed = (chunk + block_size - 1) // block_size
-                free = len(bm.free_block_ids)
-                if free < blocks_needed + watermark_blocks:
+                if bm.num_free_blocks() < blocks_needed + watermark_blocks:
                     _admit_stop = "kv_blocks"
                     break
                 # vLLM's ``full_sequence_must_fit`` gate: the request's
@@ -9261,9 +9658,10 @@ class LlamaEngine:
                 # prefill cannot admit a long prompt on the strength of its
                 # first chunk. Tokens not yet generated are not reserved --
                 # see the matching comment in ``_prefill_blocked_by_capacity``.
+                # Full-attn only: sliding pages recycle to a window cap.
                 full_blocks = (min(prompt_len, self.max_model_len)
                                + block_size - 1) // block_size
-                if free < full_blocks + watermark_blocks:
+                if len(bm.free_block_ids) < full_blocks + watermark_blocks:
                     _admit_stop = "kv_full_seq"
                     break
                 if (_committed[0]
@@ -9723,6 +10121,7 @@ class LlamaEngine:
         sample_logits = []
         for i, (seq, chunk) in enumerate(zip(prefill_seqs, prefill_chunk_sizes)):
             seq.num_computed_tokens += chunk
+            bm.recycle_sliding((seq,))
             if seq.num_remaining_prefill == 0:
                 # Prefill complete — sample first decode token
                 sample_seqs.append(seq)

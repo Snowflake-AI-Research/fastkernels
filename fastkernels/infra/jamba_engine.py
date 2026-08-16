@@ -124,7 +124,7 @@ class SeqStatus(Enum):
 
 # Block size for the paged KV cache.  Matches
 # ``infra.context.AttnBackendConfig.block_size`` for the auto-detected
-# backend (16 for TRTLLM-gen on Blackwell, 256 for FA3 elsewhere) --
+# backend (16 for TRTLLM-gen on Blackwell, 16 for FA3 on Hopper) --
 # we read it from the config inside ``__init__`` so the engine state
 # matches whatever ``L2.attention_impl.Attention`` will dispatch to.
 
@@ -635,12 +635,17 @@ class JambaEngine:
         if env_buckets:
             buckets = sorted({int(x) for x in env_buckets.split(",") if x.strip()})
         else:
-            # One CUDA-graph size.  FA3's process-wide split-KV workspace is
-            # whatever the last capture recorded; a later B=16 capture makes
-            # the B=256 graph IMA on replay (and largest-last just moves the
-            # fault to the small graph).  A single max-B graph passes mixed
-            # 1000.  Override with FASTKERNELS_JAMBA_BUCKETS only for experiments.
-            buckets = [max_num_seqs]
+            # Match vLLM's default ``cudagraph_capture_sizes`` decode
+            # schedule: [1, 2, 4, 8, 16, 24, ..., 256, ...].  Hopper FA3
+            # is CUDA-graph safe at multiple sizes when every capture
+            # uses ``num_splits=32`` and metadata is built outside the
+            # graph (same as LlamaEngine).  Blackwell TRTLLM already
+            # used this dense schedule.
+            buckets = [b for b in (1, 2, 4) if b <= max_num_seqs]
+            if max_num_seqs >= 8:
+                buckets.extend(range(8, min(max_num_seqs, 256) + 1, 8))
+            if max_num_seqs > 256:
+                buckets.extend(range(272, max_num_seqs + 1, 16))
         if max_num_seqs not in buckets:
             buckets.append(max_num_seqs)
             buckets = sorted(set(buckets))
@@ -1480,16 +1485,10 @@ class JambaEngine:
     def _run_decode_step(self, running: list[Sequence]) -> list[int]:
         n = len(running)
         if self._use_cuda_graphs:
-            # Tiny batches stay eager so single-request latency is not a
-            # 256-wide MoE graph.  n>=8 pads into the one captured size.
-            if n < 8 and n not in self._decode_graphs:
-                graph = None
-                B = n
-            else:
-                B = self._pick_bucket(n)
-                graph = self._decode_graphs.get(B)
-                if graph is None:
-                    graph = self._capture_decode_graph(B)
+            B = self._pick_bucket(n)
+            graph = self._decode_graphs.get(B)
+            if graph is None:
+                graph = self._capture_decode_graph(B)
         else:
             graph = None
             B = n

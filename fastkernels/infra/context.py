@@ -45,15 +45,10 @@ class AttnBackendConfig:
     pins NHD because it reads the cache through FlashAttention.  Each such
     layer exposes ``kv_layout`` so the engine allocates its cache to match.
 
-    TODO(tech-debt): the flash_attn ``block_size=256`` default is a leftover
-    from routing paged attention through the PyPI ``flash_attn`` package,
-    which rejects page sizes that are not a multiple of 256.  fastkernels now
-    calls vLLM's bundled FlashAttention build (see
-    ``tasks/baseline/L1/fa_utils.py``), which advertises ``MultipleOf(16)``
-    like vLLM's own ``FlashAttentionBackend``.  Lowering this to 16 would
-    match vLLM and cut KV fragmentation, but it changes block-manager and
-    watermark behaviour on non-Blackwell GPUs, which cannot be validated on
-    this host.
+    The class-level ``block_size=256`` default is only used when CUDA is
+    unavailable or the GPU is pre-Hopper.  Hopper ``auto_detect`` returns
+    16 to match vLLM ``CacheConfig.DEFAULT_BLOCK_SIZE``; Blackwell stays
+    on TRTLLM / 16 / HND.
     """
     backend: str = "flash_attn"
     block_size: int = 256
@@ -70,6 +65,13 @@ class AttnBackendConfig:
                 return cls(backend="trtllm", block_size=16, kv_layout="HND")
             except ImportError:
                 pass
+        # Hopper: match vLLM ``CacheConfig.DEFAULT_BLOCK_SIZE = 16`` and
+        # FlashAttentionBackend ``MultipleOf(16)``.  The previous 256 default
+        # was leftover from PyPI flash_attn rejecting non-256 pages; we now
+        # call vLLM's bundled FA, so 16 is legal and cuts KV fragmentation.
+        # Blackwell is unchanged (TRTLLM / block 16 / HND above).
+        if cc[0] == 9:
+            return cls(backend="flash_attn", block_size=16, kv_layout="NHD")
         return cls()
 
     @property
@@ -180,6 +182,14 @@ class Context:
     context_lens: torch.Tensor | None = None
     block_tables: torch.Tensor | None = None
     max_context_len: int = 0
+    # Hopper Gemma-4: vLLM SlidingWindowManager group.  Sliding layers
+    # read these instead of ``block_tables`` / ``slot_mapping`` so
+    # out-of-window blocks can be recycled without touching full-attn KV.
+    # None on every other model / on Blackwell.
+    sliding_slot_mapping: torch.Tensor | None = None
+    sliding_block_tables: torch.Tensor | None = None
+    sliding_prefill_block_tables: torch.Tensor | None = None
+    sliding_decode_block_tables: torch.Tensor | None = None
 
     # Chunked prefill: mixed batch with both prefill and decode tokens.
     # Token layout: [prefill_tokens... | decode_tokens...]
@@ -398,7 +408,9 @@ def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None,
                 max_context_len=0, chunked_context=None,
                 req_id_per_token=None,
                 mamba_state=None, mamba_metadata=None,
-                flat_to_grid=None):
+                flat_to_grid=None,
+                sliding_slot_mapping=None,
+                sliding_block_tables=None):
     global _CONTEXT
     # For pure-decode batches (``is_prefill=False`` with no mixed fields),
     # mirror the generic ``context_lens`` / ``block_tables`` / ``max_context_len``
@@ -421,7 +433,12 @@ def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None,
                        decode_max_context_len=dc_max,
                        mamba_state=mamba_state,
                        mamba_metadata=mamba_metadata,
-                       flat_to_grid=flat_to_grid)
+                       flat_to_grid=flat_to_grid,
+                       sliding_slot_mapping=sliding_slot_mapping,
+                       sliding_block_tables=sliding_block_tables,
+                       sliding_decode_block_tables=(
+                           sliding_block_tables if not is_prefill else None
+                       ))
 
 
 def set_mixed_context(
@@ -434,6 +451,9 @@ def set_mixed_context(
     logit_indices,
     chunked_context=None,
     req_id_per_token=None,
+    sliding_slot_mapping=None,
+    sliding_prefill_block_tables=None,
+    sliding_decode_block_tables=None,
 ):
     global _CONTEXT
     _CONTEXT = Context(
@@ -454,6 +474,9 @@ def set_mixed_context(
         chunked_context=chunked_context,
         req_id_per_token=req_id_per_token,
         no_compile_layers=_STATIC_NO_COMPILE_LAYERS,
+        sliding_slot_mapping=sliding_slot_mapping,
+        sliding_prefill_block_tables=sliding_prefill_block_tables,
+        sliding_decode_block_tables=sliding_decode_block_tables,
     )
 
 

@@ -320,7 +320,7 @@ class Attention(nn.Module):
 
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel():
-            self.store_kvcache(k, v, k_cache, v_cache, ctx.slot_mapping)
+            self.store_kvcache(k, v, k_cache, v_cache, self._group_slot_mapping(ctx))
 
         if getattr(ctx, "is_tree_verify", False):
             o = self.tree_attn_op(
@@ -340,8 +340,8 @@ class Attention(nn.Module):
         elif ctx.is_mixed:
             if self._triton_only:
                 can_use_triton = (
-                    self._can_use_triton_unified(k_cache, ctx.prefill_block_tables)
-                    and (ctx.num_decode_tokens == 0 or ctx.decode_block_tables is not None)
+                    self._can_use_triton_unified(k_cache, self._group_prefill_block_tables(ctx))
+                    and (ctx.num_decode_tokens == 0 or self._group_decode_block_tables(ctx) is not None)
                 )
                 if can_use_triton:
                     o = self._forward_mixed_triton(q, k_cache, v_cache, ctx)
@@ -351,7 +351,7 @@ class Attention(nn.Module):
             o = self._forward_mixed(q, k_cache, v_cache, ctx)
         else:
             if self._triton_only:
-                if self._can_use_triton_unified(k_cache, ctx.block_tables):
+                if self._can_use_triton_unified(k_cache, self._group_block_tables(ctx)):
                     o = self._forward_pure_triton(q, k_cache, v_cache, ctx)
                 else:
                     o = self._forward_pure_torch(q, k, v, k_cache, v_cache, ctx)
@@ -359,6 +359,26 @@ class Attention(nn.Module):
             o = self._forward_pure(q, k, v, k_cache, v_cache, ctx)
 
         return o.reshape(N, self.num_heads * self.head_size)
+
+    def _group_slot_mapping(self, ctx):
+        if self.sliding_window and ctx.sliding_slot_mapping is not None:
+            return ctx.sliding_slot_mapping
+        return ctx.slot_mapping
+
+    def _group_block_tables(self, ctx):
+        if self.sliding_window and ctx.sliding_block_tables is not None:
+            return ctx.sliding_block_tables
+        return ctx.block_tables
+
+    def _group_prefill_block_tables(self, ctx):
+        if self.sliding_window and ctx.sliding_prefill_block_tables is not None:
+            return ctx.sliding_prefill_block_tables
+        return ctx.prefill_block_tables
+
+    def _group_decode_block_tables(self, ctx):
+        if self.sliding_window and ctx.sliding_decode_block_tables is not None:
+            return ctx.sliding_decode_block_tables
+        return ctx.decode_block_tables
 
     def forward(self, query: torch.Tensor, key: torch.Tensor,
                 value: torch.Tensor) -> torch.Tensor:
@@ -380,7 +400,7 @@ class Attention(nn.Module):
             cu_k = ctx.cu_seqlens_k
             msq = ctx.max_seqlen_q
             msk = ctx.max_seqlen_k
-            bt = ctx.block_tables
+            bt = self._group_block_tables(ctx)
 
             if self.attention_chunk_size is not None:
                 cu_q, cu_k, msq, msk, bt = _chunked_prefill_remap(
@@ -404,7 +424,7 @@ class Attention(nn.Module):
             )
 
         cache_seqlens = ctx.context_lens
-        bt = ctx.block_tables
+        bt = self._group_block_tables(ctx)
         max_ctx = ctx.max_context_len
 
         if self.attention_chunk_size is not None:
@@ -544,7 +564,7 @@ class Attention(nn.Module):
                 seqused_k,
                 ctx.max_seqlen_q,
                 ctx.max_seqlen_k,
-                ctx.block_tables,
+                self._group_block_tables(ctx),
             )
 
         cu_q = self._get_decode_cu_seqlens_q(q.shape[0], q.device)
@@ -556,7 +576,7 @@ class Attention(nn.Module):
             ctx.context_lens,
             1,
             ctx.max_context_len,
-            ctx.block_tables,
+            self._group_block_tables(ctx),
         )
 
     def _repeat_kv_for_heads(self, x: torch.Tensor) -> torch.Tensor:
@@ -635,17 +655,18 @@ class Attention(nn.Module):
 
     def _forward_pure_torch(self, q, k, v, k_cache, v_cache, ctx):
         if ctx.is_prefill:
-            if ctx.block_tables is not None and k_cache.numel():
+            bt = self._group_block_tables(ctx)
+            if bt is not None and k_cache.numel():
                 return self._prefill_torch_from_cache(
                     q, k_cache, v_cache,
                     ctx.cu_seqlens_q, ctx.cu_seqlens_k,
-                    ctx.block_tables,
+                    bt,
                 )
             return self._prefill_torch_from_tensors(
                 q, k, v, ctx.cu_seqlens_q, ctx.cu_seqlens_k,
             )
         return self._decode_torch(
-            q, k_cache, v_cache, ctx.context_lens, ctx.block_tables,
+            q, k_cache, v_cache, ctx.context_lens, self._group_block_tables(ctx),
         )
 
     def _forward_mixed(self, q, k_cache, v_cache, ctx):
@@ -664,7 +685,7 @@ class Attention(nn.Module):
             cu_k = ctx.prefill_cu_seqlens_k
             msq = ctx.prefill_max_seqlen_q
             msk = ctx.prefill_max_seqlen_k
-            bt = ctx.prefill_block_tables
+            bt = self._group_prefill_block_tables(ctx)
 
             if self.attention_chunk_size is not None:
                 cu_q, cu_k, msq, msk, bt = _chunked_prefill_remap(
@@ -682,7 +703,7 @@ class Attention(nn.Module):
 
         if nd > 0:
             cache_seqlens = ctx.decode_context_lens
-            bt = ctx.decode_block_tables
+            bt = self._group_decode_block_tables(ctx)
             max_ctx = ctx.decode_max_context_len
 
             if self.attention_chunk_size is not None:
@@ -716,7 +737,7 @@ class Attention(nn.Module):
                 prefill_seqused_k,
                 ctx.prefill_max_seqlen_q,
                 ctx.prefill_max_seqlen_k,
-                ctx.prefill_block_tables,
+                self._group_prefill_block_tables(ctx),
             )
 
         if nd > 0:
@@ -729,7 +750,7 @@ class Attention(nn.Module):
                 ctx.decode_context_lens,
                 1,
                 ctx.decode_max_context_len,
-                ctx.decode_block_tables,
+                self._group_decode_block_tables(ctx),
             )
         return out
 
@@ -744,7 +765,7 @@ class Attention(nn.Module):
                 v_cache,
                 ctx.prefill_cu_seqlens_q,
                 ctx.prefill_cu_seqlens_k,
-                ctx.prefill_block_tables,
+                self._group_prefill_block_tables(ctx),
             )
         if nd > 0:
             out[np_:] = self._decode_torch(
@@ -752,6 +773,6 @@ class Attention(nn.Module):
                 k_cache,
                 v_cache,
                 ctx.decode_context_lens,
-                ctx.decode_block_tables,
+                self._group_decode_block_tables(ctx),
             )
         return out
