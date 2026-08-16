@@ -650,12 +650,14 @@ class JambaEngine:
             buckets.append(max_num_seqs)
             buckets = sorted(set(buckets))
         self._decode_buckets = buckets
-        self._cuda_graph_mempool_id = (
-            torch.cuda.graph_pool_handle() if self._use_cuda_graphs else None
-        )
+        # One mempool per bucket.  FA3's split-KV scratch is allocated
+        # during capture; a shared pool lets the last (smallest) capture
+        # reuse the large-bucket addresses and IMA on replay.
+        self._cuda_graph_mempool_ids: dict[int, object] = {}
         self._compiled_decode_step = None
         self._decode_graphs: dict[int, _JambaDecodeGraph] = {}
         self._decode_static_buffers: dict[int, dict] = {}
+        self._fa3_needs_pin = False
         # Last decode step's (bucket, running sequence ids) and the per-sequence
         # invariants uploaded for it. See ``_run_decode_step``.
         self._decode_meta_key: tuple | None = None
@@ -670,8 +672,23 @@ class JambaEngine:
                 f"{self._kv_layout} layout)"
             )
             torch.cuda.empty_cache()
-            for bucket in reversed(self._decode_buckets):
-                self._capture_decode_graph(bucket)
+            self._init_fa3_decode_buffers()
+            for group in getattr(self, "_fa_decode_groups", []):
+                for op in group:
+                    op._force_graph_splits = True
+            try:
+                # Largest-first, LlamaEngine-style: one warmup then capture
+                # each bucket on the current stream.  No side-stream warmups
+                # -- those ran FA3 with num_splits=0 and shrank the
+                # process-wide split-KV workspace.
+                for bucket in reversed(self._decode_buckets):
+                    self._capture_decode_graph(bucket)
+                self._pin_fa3_workspace()
+            finally:
+                # Keep num_splits=32 + persistent out= after capture so a
+                # later eager mixed decode cannot shrink FA3's workspace
+                # and IMA the large-bucket graph.
+                pass
 
     # ------------------------------------------------------------------
     # Random seeds
@@ -698,9 +715,11 @@ class JambaEngine:
             lead = group[0]
             lead.preallocate(self.max_num_seqs, self.device)
             for op in group[1:]:
+                op.preallocate(self.max_num_seqs, self.device)
                 op._cu_seqlens_q = lead._cu_seqlens_q
                 op._sched_buf = lead._sched_buf
                 op._sched_meta = lead._sched_meta
+                op._graph_out = lead._graph_out
 
     def _refresh_fa3_decode_schedule(self, context_lens: torch.Tensor) -> None:
         """Rewrite FA3 scheduler metadata outside CUDA graph capture/replay."""
@@ -712,6 +731,48 @@ class JambaEngine:
             max_seqlen_k=self._max_blocks_per_seq * self._page_size,
             qkv_dtype=self.dtype,
         )
+
+    def _pin_fa3_workspace(self) -> None:
+        """Re-allocate FA3's process-wide split-KV scratch at max batch.
+
+        Multi-bucket capture ends at B=1; a later B=256 replay IMAs if
+        that scratch was shrunk.  One dummy decode at max_num_seqs with
+        ``num_splits=32`` and persistent ``out=`` grows it back.
+        """
+        from ..tasks.baseline.L1.flash_attn_decode import FlashAttnDecode
+
+        B = self.max_num_seqs
+        seqlens = torch.ones(B, dtype=torch.int32, device=self.device)
+        bt = torch.zeros(B, 1, dtype=torch.int32, device=self.device)
+        self._refresh_fa3_decode_schedule(seqlens)
+        dummy_q: dict[tuple, torch.Tensor] = {}
+        for attn in self.model.modules():
+            op = getattr(attn, "decode_op", None)
+            k_cache = getattr(attn, "k_cache", None)
+            v_cache = getattr(attn, "v_cache", None)
+            if not isinstance(op, FlashAttnDecode):
+                continue
+            if k_cache is None or not k_cache.numel():
+                continue
+            key = (op.num_heads, op.head_dim)
+            q = dummy_q.get(key)
+            if q is None:
+                q = torch.zeros(
+                    B, op.num_heads, op.head_dim,
+                    dtype=self.dtype, device=self.device,
+                )
+                dummy_q[key] = q
+            was = op._force_graph_splits
+            op._force_graph_splits = True
+            try:
+                op(
+                    q, k_cache, v_cache,
+                    cache_seqlens=seqlens,
+                    block_table=bt,
+                    max_seq_len=1,
+                )
+            finally:
+                op._force_graph_splits = was
 
     def _alloc_decode_buffers(self, B: int) -> dict:
         """Static-identity tensors a B-bucket decode graph reads from.
@@ -845,21 +906,17 @@ class JambaEngine:
             finally:
                 reset_context()
 
-        # Warmup outside the graph stream so allocator state settles.
+        # One warmup on the capture stream (LlamaEngine.capture_cudagraph).
         torch.cuda.synchronize()
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            for _ in range(3):
-                _decode_step()
-        torch.cuda.current_stream().wait_stream(s)
+        _decode_step()
         torch.cuda.synchronize()
 
         graph = torch.cuda.CUDAGraph()
-        graph_kwargs = {}
-        if self._cuda_graph_mempool_id is not None:
-            graph_kwargs["pool"] = self._cuda_graph_mempool_id
-        with torch.cuda.graph(graph, **graph_kwargs):
+        pool = self._cuda_graph_mempool_ids.get(B)
+        if pool is None:
+            pool = torch.cuda.graph_pool_handle()
+            self._cuda_graph_mempool_ids[B] = pool
+        with torch.cuda.graph(graph, pool=pool):
             _decode_step()
 
         entry = _JambaDecodeGraph(
@@ -1473,6 +1530,7 @@ class JambaEngine:
             reset_context()
 
         decode_tokens = logits[n_p_seqs:].argmax(dim=-1).tolist()
+        self._fa3_needs_pin = True
         return logits[:n_p_seqs], completed_mask, decode_tokens
 
     # ------------------------------------------------------------------
@@ -1484,6 +1542,9 @@ class JambaEngine:
     # ------------------------------------------------------------------
     def _run_decode_step(self, running: list[Sequence]) -> list[int]:
         n = len(running)
+        if self._fa3_needs_pin:
+            self._pin_fa3_workspace()
+            self._fa3_needs_pin = False
         if self._use_cuda_graphs:
             B = self._pick_bucket(n)
             graph = self._decode_graphs.get(B)

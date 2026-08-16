@@ -41,8 +41,18 @@ class FlashAttnDecode(nn.Module):
         # of ``_sched_meta``.
         self._graph_sched_meta: torch.Tensor | None = None
         self._graph_num_splits = FA3_CUDA_GRAPH_MAX_NUM_SPLITS
+        # Persistent decode output.  vLLM passes ``out=`` into FA3 so the
+        # kernel does not allocate a process-wide workspace that the last
+        # CUDA-graph capture then shrinks (Jamba multi-bucket IMA).
+        self._graph_out: torch.Tensor | None = None
+        # Set for the duration of CUDA-graph capture/warmup so eager
+        # warmups use the same num_splits=32 workspace as the graph.
+        self._force_graph_splits: bool = False
         self._window_size = (-1, -1)
         self._qkv_dtype = torch.bfloat16
+        self._graph_q: torch.Tensor | None = None
+        self._graph_seqlens: torch.Tensor | None = None
+        self._graph_block_table: torch.Tensor | None = None
 
     def _get_cu_seqlens_q(self, n: int, device: torch.device) -> torch.Tensor:
         needed = n + 1
@@ -122,6 +132,14 @@ class FlashAttnDecode(nn.Module):
                     cap, dtype=torch.int32, device=device,
                 )
             self._sched_meta = self._sched_buf[:fa3_scheduler_metadata_size(1)]
+            if (
+                self._graph_out is None
+                or self._graph_out.shape[0] < max_batch_size
+            ):
+                self._graph_out = torch.empty(
+                    max_batch_size, self.num_heads, self.head_dim,
+                    dtype=self._qkv_dtype, device=device,
+                )
 
     def forward(self, q, k_cache, v_cache, cache_seqlens=None, **kwargs):
         max_seq_len = kwargs.pop("max_seq_len", None)
@@ -138,10 +156,11 @@ class FlashAttnDecode(nn.Module):
             max_seqlen_k = int(cache_seqlens.max().item()) if cache_seqlens.numel() > 0 else 0
 
         capturing = torch.cuda.is_current_stream_capturing()
-        # CUDA-graph capture records the persistent buffer pointer.  Eager
-        # (and graph *replay* never re-enters this Python) builds a fresh
-        # schedule with FA3's auto split heuristic, like vLLM's non-CG path.
-        if capturing:
+        # Capture and its warmup share num_splits=32 + persistent ``out=``.
+        # Eager mixed stays on the auto-split path unless the engine pinned
+        # graph splits, so a later smaller FA3 call cannot shrink the
+        # process-wide split-KV workspace the large graph captured.
+        if capturing or self._force_graph_splits:
             meta = self._graph_sched_meta if self._graph_sched_meta is not None else self._sched_meta
             if FA_VERSION == 3 and meta is None:
                 raise RuntimeError(
@@ -186,5 +205,7 @@ class FlashAttnDecode(nn.Module):
         )
         if meta is not None:
             fa_kw["scheduler_metadata"] = meta
+        if self._graph_out is not None and self._graph_out.shape[0] >= n:
+            fa_kw["out"] = self._graph_out[:n]
         fa_kw.update(kwargs)
         return flash_attn_varlen_func(**fa_kw)

@@ -360,24 +360,33 @@ class Attention(nn.Module):
 
         return o.reshape(N, self.num_heads * self.head_size)
 
+    def _sliding_group_tensor(self, tensor):
+        """Select this layer's vLLM sliding KV group from a stacked tensor."""
+        if tensor is None:
+            return None
+        gid = getattr(self, "_sliding_group_id", None)
+        if gid is None:
+            return tensor
+        return tensor[gid]
+
     def _group_slot_mapping(self, ctx):
         if self.sliding_window and ctx.sliding_slot_mapping is not None:
-            return ctx.sliding_slot_mapping
+            return self._sliding_group_tensor(ctx.sliding_slot_mapping)
         return ctx.slot_mapping
 
     def _group_block_tables(self, ctx):
         if self.sliding_window and ctx.sliding_block_tables is not None:
-            return ctx.sliding_block_tables
+            return self._sliding_group_tensor(ctx.sliding_block_tables)
         return ctx.block_tables
 
     def _group_prefill_block_tables(self, ctx):
         if self.sliding_window and ctx.sliding_prefill_block_tables is not None:
-            return ctx.sliding_prefill_block_tables
+            return self._sliding_group_tensor(ctx.sliding_prefill_block_tables)
         return ctx.prefill_block_tables
 
     def _group_decode_block_tables(self, ctx):
         if self.sliding_window and ctx.sliding_decode_block_tables is not None:
-            return ctx.sliding_decode_block_tables
+            return self._sliding_group_tensor(ctx.sliding_decode_block_tables)
         return ctx.decode_block_tables
 
     def forward(self, query: torch.Tensor, key: torch.Tensor,
