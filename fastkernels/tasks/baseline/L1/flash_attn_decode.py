@@ -203,9 +203,15 @@ class FlashAttnDecode(nn.Module):
         orig_n = q.shape[0]
         n = orig_n
         capturing = torch.cuda.is_current_stream_capturing()
+        # Pad only post-capture eager decode.  Capture warmup sets
+        # ``_force_graph_splits`` so every bucket records num_splits=32;
+        # padding that warmup to max-B rewrites ``_sched_meta_batch``
+        # while the graph still sees native B, and FA3 then rejects the
+        # metadata (or IMAs on replay).  B200 / FA4 never enters here.
         if (
             FA_VERSION == 3
             and not capturing
+            and not self._force_graph_splits
             and self._graph_out is not None
             and cache_seqlens is not None
             and n < int(self._graph_out.shape[0])
@@ -247,7 +253,10 @@ class FlashAttnDecode(nn.Module):
                 if capturing:
                     raise RuntimeError(
                         "FA3 CUDA-graph capture requires "
-                        "update_scheduler_metadata() outside the graph first"
+                        "update_scheduler_metadata() outside the graph first "
+                        f"(q_batch={n}, sched_batch="
+                        f"{getattr(self, '_sched_meta_batch', None)}, "
+                        f"meta={'None' if meta is None else tuple(meta.shape)})"
                     )
                 use_graph_splits = False
         if use_graph_splits:
@@ -255,7 +264,9 @@ class FlashAttnDecode(nn.Module):
             if FA_VERSION == 3 and meta is None:
                 raise RuntimeError(
                     "FA3 CUDA-graph capture requires "
-                    "update_scheduler_metadata() outside the graph first"
+                    "update_scheduler_metadata() outside the graph first "
+                    f"(q_batch={n}, sched_batch="
+                    f"{getattr(self, '_sched_meta_batch', None)})"
                 )
             num_splits = self._graph_num_splits
         else:

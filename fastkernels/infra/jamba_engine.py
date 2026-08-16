@@ -914,6 +914,12 @@ class JambaEngine:
         torch.cuda.synchronize()
         _decode_step()
         torch.cuda.synchronize()
+        # Rebuild FA3 tile-scheduler metadata for this bucket *after*
+        # warmup.  Warmup is eager (not capturing) and must not be
+        # allowed to leave a max-B schedule in the buffer the graph
+        # will record.  vLLM's FlashAttentionMetadataBuilder also
+        # writes this tensor outside the CUDA graph.
+        self._refresh_fa3_decode_schedule(bufs["context_lens"])
 
         graph = torch.cuda.CUDAGraph()
         pool = self._cuda_graph_mempool_ids.get(B)
