@@ -53,6 +53,7 @@ class FlashAttnDecode(nn.Module):
         self._graph_q: torch.Tensor | None = None
         self._graph_seqlens: torch.Tensor | None = None
         self._graph_block_table: torch.Tensor | None = None
+        self._sched_meta_batch: int = 0
         # Eager mixed decode pads to this max-B so FA3's process-wide
         # split-KV scratch cannot shrink below the largest captured graph.
         self._pad_q: torch.Tensor | None = None
@@ -122,6 +123,7 @@ class FlashAttnDecode(nn.Module):
         # For a fixed batch + num_splits this n is stable across capture
         # (dummy len=1) and replay (real lengths).
         self._sched_meta = self._sched_buf[:n]
+        self._sched_meta_batch = batch_size
 
     def preallocate(self, max_batch_size: int, device: torch.device) -> None:
         """Allocate graph-stable cu_seqlens + scheduler buffers."""
@@ -230,20 +232,26 @@ class FlashAttnDecode(nn.Module):
         # so FA3's process-wide split-KV scratch cannot shrink below the
         # largest captured graph.  B200 / FA4 never sets _force_graph_splits.
         use_graph_splits = capturing or self._force_graph_splits
-        if use_graph_splits and not capturing and FA_VERSION == 3:
-            # Prefer the metadata we just wrote for this padded batch.
-            # ``_graph_sched_meta`` is an EAGLE-3 capture view and may
-            # still be sized for B=1 after multi-bucket capture.
+        if use_graph_splits and FA_VERSION == 3:
             meta = self._sched_meta
-            if meta is None and self._graph_sched_meta is not None:
-                meta = self._graph_sched_meta
-            if meta is None or int(meta.shape[0]) != fa3_scheduler_metadata_size(n):
-                if self._force_graph_splits and self._sched_meta is not None:
+            if meta is None or int(getattr(self, "_sched_meta_batch", -1)) != n:
+                if cache_seqlens is not None and not capturing:
+                    self.update_scheduler_metadata(
+                        cache_seqlens,
+                        max_seqlen_k,
+                        qkv_dtype=q.dtype,
+                        window_size=window_size,
+                    )
                     meta = self._sched_meta
-                else:
-                    use_graph_splits = False
+            if meta is None or int(getattr(self, "_sched_meta_batch", -1)) != n:
+                if capturing:
+                    raise RuntimeError(
+                        "FA3 CUDA-graph capture requires "
+                        "update_scheduler_metadata() outside the graph first"
+                    )
+                use_graph_splits = False
         if use_graph_splits:
-            meta = self._sched_meta if self._sched_meta is not None else self._graph_sched_meta
+            meta = self._sched_meta
             if FA_VERSION == 3 and meta is None:
                 raise RuntimeError(
                     "FA3 CUDA-graph capture requires "

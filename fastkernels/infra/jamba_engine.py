@@ -722,6 +722,7 @@ class JambaEngine:
                 op._cu_seqlens_q = lead._cu_seqlens_q
                 op._sched_buf = lead._sched_buf
                 op._sched_meta = lead._sched_meta
+                op._sched_meta_batch = lead._sched_meta_batch
                 op._graph_out = lead._graph_out
 
     def _refresh_fa3_decode_schedule(self, context_lens: torch.Tensor) -> None:

@@ -150,6 +150,7 @@ def refresh_fa3_decode_schedule(
             for op in group[1:]:
                 op._sched_buf = lead._sched_buf
                 op._sched_meta = lead._sched_meta
+                op._sched_meta_batch = lead._sched_meta_batch
 
 
 def fa_supports_head_size(head_size: int) -> bool:

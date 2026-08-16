@@ -2078,7 +2078,7 @@ class ModelRunner:
         """Per-group decode slot mapping ``[G, batch]``."""
         G = self._sliding_group_count()
         sbs = getattr(self, "_sliding_block_size", BLOCK_SIZE)
-        out = np.zeros((G, len(seqs)), dtype=np.int32)
+        out = np.zeros((G, len(seqs)), dtype=np.int64)
         for i, seq in enumerate(seqs):
             slen = int(slens[i])
             r = slen % sbs
@@ -2103,7 +2103,7 @@ class ModelRunner:
                     table = tables[g] if g < len(tables) else []
                     bid = table[idx] if idx < len(table) else 0
                     per_g[g].append(bid * sbs + off)
-        return np.asarray(per_g, dtype=np.int32)
+        return np.asarray(per_g, dtype=np.int64)
 
     # ------------------------------------------------------------------
     # Mamba / SSM model support (slot-based recurrent state)
@@ -5043,7 +5043,10 @@ class ModelRunner:
             torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
             torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
             max_sq, max_sk,
-            torch.tensor(slot_mapping, dtype=(torch.int64 if self.is_deepseek_mla else torch.int32),
+            torch.tensor(slot_mapping, dtype=(torch.int64 if (
+                self.is_deepseek_mla
+                or getattr(self, "_sliding_kv_groups", False)
+            ) else torch.int32),
                          pin_memory=True).cuda(non_blocking=True),
             block_tables=block_tables,
             req_id_per_token=req_id_per_token,
@@ -5307,7 +5310,10 @@ class ModelRunner:
 
         set_mixed_context(
             slot_mapping=torch.tensor(slot_mapping,
-                                      dtype=(torch.int64 if self.is_deepseek_mla else torch.int32),
+                                      dtype=(torch.int64 if (
+                                          self.is_deepseek_mla
+                                          or getattr(self, "_sliding_kv_groups", False)
+                                      ) else torch.int32),
                                       pin_memory=True).cuda(non_blocking=True),
             num_prefill_tokens=num_prefill_tokens,
             num_decode_tokens=nd,
@@ -5692,8 +5698,13 @@ class ModelRunner:
             self._pin_pos, self._np_pos = _pinned(max_bs, torch.int64)
         # DeepSeek MLA FP8 KV cache stores require int64 slot_mapping;
         # the FA3 path only needs int32.
-        sm_np_dtype = np.int64 if self.is_deepseek_mla else np.int32
-        sm_torch_dtype = torch.int64 if self.is_deepseek_mla else torch.int32
+        # Hybrid Hopper pages are large enough that ``slot * D`` overflows
+        # int32 (bid >= 65536).  DeepSeek MLA already needed int64 slots.
+        use_i64_slots = self.is_deepseek_mla or getattr(
+            self, "_sliding_kv_groups", False,
+        )
+        sm_np_dtype = np.int64 if use_i64_slots else np.int32
+        sm_torch_dtype = torch.int64 if use_i64_slots else torch.int32
         self._pin_sm, self._np_sm = _pinned(max_bs, sm_torch_dtype)
         self._pin_cl, self._np_cl = _pinned(max_bs, torch.int32)
         self._pin_bt, self._np_bt = _pinned((max_bs, max_num_blocks), torch.int32)
@@ -6798,7 +6809,9 @@ class ModelRunner:
             positions = torch.zeros(3, max_bs + 1, dtype=torch.int64)
         else:
             positions = torch.zeros(max_bs, dtype=torch.int64)
-        sm_torch_dtype = torch.int64 if self.is_deepseek_mla else torch.int32
+        sm_torch_dtype = torch.int64 if (
+            self.is_deepseek_mla or getattr(self, "_sliding_kv_groups", False)
+        ) else torch.int32
         slot_mapping = torch.full((max_bs,), -1, dtype=sm_torch_dtype)
         # One cached token per dummy request, not zero: vLLM's uniform-decode
         # dummy run sets ``seq_lens = max_query_len`` (== 1) and only zeroes the
