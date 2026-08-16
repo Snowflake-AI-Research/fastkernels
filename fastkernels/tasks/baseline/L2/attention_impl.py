@@ -184,7 +184,8 @@ class Attention(nn.Module):
                  sliding_window: int | None = None,
                  sinks: torch.nn.Parameter | None = None,
                  attention_chunk_size: int | None = None,
-                 prefer_triton: bool = False):
+                 prefer_triton: bool = False,
+                 fa_version: int | None = None):
         super().__init__()
         self.num_heads = num_heads
         self.head_size = head_size
@@ -226,7 +227,11 @@ class Attention(nn.Module):
         # Note this does not depend on whether the Triton kernel imported: an
         # HND cache would silently transpose the head and block dims for
         # either consumer.
-        self._triton_only = prefer_triton or head_size > _TRTLLM_MAX_HEAD_SIZE
+        from ....infra.fa_utils import fa_supports_head_size
+        # FA4 supports 512-d (Gemma-4 full).  Triton remains the fallback
+        # when FA cannot take the head, and when a model sets prefer_triton
+        # (B200 Gemma / TRTLLM).  FA still indexes NHD; only TRTLLM is HND.
+        self._triton_only = prefer_triton or not fa_supports_head_size(head_size)
         self._use_trtllm = attn_cfg.use_trtllm and not self._triton_only
         self.kv_layout = "HND" if self._use_trtllm else "NHD"
 
@@ -272,10 +277,12 @@ class Attention(nn.Module):
             self.prefill_op = FlashAttnPrefill(
                 self.num_heads, self.num_kv_heads, head_size,
                 page_size=attn_cfg.block_size,
+                fa_version=fa_version,
             )
             self.decode_op = FlashAttnDecode(
                 self.num_heads, self.num_kv_heads, head_size,
                 page_size=attn_cfg.block_size,
+                fa_version=fa_version,
             )
             self.decode_op._window_size = self._fa3_window_size
 
@@ -423,6 +430,16 @@ class Attention(nn.Module):
     def forward(self, query: torch.Tensor, key: torch.Tensor,
                 value: torch.Tensor) -> torch.Tensor:
         if self._use_custom_op:
+            # Hopper Gemma piecewise graphs only.  vLLM writes attention
+            # into a buffer allocated in the previous compiled piece so
+            # replay keeps a stable address.  B200 / other models keep
+            # the returning op and are unaffected.
+            if getattr(self, "_piecewise_attn_output", False):
+                output = torch.empty_like(query)
+                torch.ops.fastkernels.unified_attention_with_output(
+                    query, key, value, output, self._layer_name,
+                )
+                return output
             return torch.ops.fastkernels.unified_attention(
                 query, key, value, self._layer_name,
             )

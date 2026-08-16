@@ -65,6 +65,7 @@ logger = logging.getLogger(__name__)
 
 SPLITTING_OPS: list[str] = [
     "fastkernels::unified_attention",
+    "fastkernels::unified_attention_with_output",
     "fastkernels::whisper_cross_attention",
     "fastkernels::mamba2_conv_ssm_forward",
     "fastkernels::unified_mla_attention",
@@ -122,6 +123,35 @@ def _unified_attention_fake(
     layer_name: str,
 ) -> torch.Tensor:
     return torch.empty_like(query)
+
+
+def _unified_attention_with_output_impl(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """vLLM ``unified_attention_with_output``: write into a caller buffer.
+
+    The empty lives in the previous compiled piece (CUDA-graph pool), so
+    replay keeps a stable address for the next piece.  Hopper Gemma
+    piecewise graphs require this; B200 never takes this op.
+    """
+    layer = get_no_compile_layers()[layer_name]
+    result = layer.forward_impl(query, key, value)
+    if result.data_ptr() != output.data_ptr():
+        output.copy_(result)
+
+
+def _unified_attention_with_output_fake(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return None
 
 
 def _whisper_cross_attention_impl(
@@ -359,6 +389,20 @@ def ensure_custom_ops_registered() -> None:
     lib.impl("unified_attention", _unified_attention_impl, "CPU")
     abstract_lib.impl("unified_attention", _unified_attention_fake)
 
+    # In-place variant.  ``Tensor(a!)`` marks mutation so Dynamo treats
+    # ``output`` as the same storage after the split, matching vLLM.
+    lib.define(
+        "unified_attention_with_output(Tensor query, Tensor key, "
+        "Tensor value, Tensor(a!) output, str layer_name) -> ()"
+    )
+    lib.impl("unified_attention_with_output",
+             _unified_attention_with_output_impl, "CUDA")
+    lib.impl("unified_attention_with_output",
+             _unified_attention_with_output_impl, "CPU")
+    abstract_lib.impl(
+        "unified_attention_with_output", _unified_attention_with_output_fake,
+    )
+
     lib.define(
         "whisper_cross_attention(Tensor query, str layer_name) -> Tensor"
     )
@@ -454,7 +498,21 @@ def ensure_custom_ops_registered() -> None:
 @dataclasses.dataclass
 class _CUDAGraphEntry:
     cudagraph: torch.cuda.CUDAGraph
-    output: torch.Tensor
+    output: Any
+
+
+# Shared pool so every piecewise subgraph / token-bucket reuses the same
+# CUDA-graph memory.  Mirrors vLLM's single ``graph_pool_handle``.
+# FULL decode graphs on Hopper Gemma join this pool so peak is max
+# (piecewise, decode), not the sum.
+_PIECEWISE_GRAPH_POOL = None
+
+
+def _piecewise_graph_pool():
+    global _PIECEWISE_GRAPH_POOL
+    if _PIECEWISE_GRAPH_POOL is None:
+        _PIECEWISE_GRAPH_POOL = torch.cuda.graph_pool_handle()
+    return _PIECEWISE_GRAPH_POOL
 
 
 class CUDAGraphWrapper(torch.nn.Module):
@@ -506,31 +564,35 @@ class CUDAGraphWrapper(torch.nn.Module):
         entry = self._cache.get(bs)
 
         if entry is None:
-            entry = self._capture(bs, *args, **kwargs)
-            return entry.output
+            return self._capture(bs, *args, **kwargs)
 
+        # vLLM CUDAGraphWrapper: replay uses the addresses recorded at
+        # capture.  The caller must feed the same persistent buffers
+        # (model inputs) / graph-pool intermediates (piece outputs).
         entry.cudagraph.replay()
         return entry.output
 
-    def _capture(self, bs: int, *args, **kwargs) -> _CUDAGraphEntry:
+    def _capture(self, bs: int, *args, **kwargs):
         logger.debug("Capturing %s CUDA graph for batch_size=%d",
                      self.runtime_mode.name, bs)
         cap_ctx = self.capture_context or nullcontext()
+        pool = self.graph_pool
+        if pool is None:
+            pool = _piecewise_graph_pool()
+            self.graph_pool = pool
 
         with cap_ctx:
+            # Warmup outside the graph (vLLM ``cudagraph_num_of_warmups``).
             self.runnable(*args, **kwargs)
 
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, pool=self.graph_pool):
+            with torch.cuda.graph(graph, pool=pool):
                 output = self.runnable(*args, **kwargs)
-
-            if self.graph_pool is None:
-                self.graph_pool = graph.pool()
 
         entry = _CUDAGraphEntry(cudagraph=graph, output=output)
         self._cache[bs] = entry
         torch.cuda.synchronize()
-        return entry
+        return output
 
 
 # ===================================================================

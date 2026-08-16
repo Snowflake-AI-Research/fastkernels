@@ -378,6 +378,7 @@ class BlockManager:
         shared_pool: bool = False,
         full_block_size: int | None = None,
         n_sliding_groups: int = 1,
+        max_in_flight_tokens: int | None = None,
     ):
         self._num_blocks = num_blocks
         # Sliding-window groups reserve physical block 0 as the null
@@ -396,6 +397,12 @@ class BlockManager:
         # sharing 5 physical tensors (6x oversubscribe).
         self._shared_pool = bool(shared_pool and num_sliding_blocks)
         self._n_sliding_groups = max(1, int(n_sliding_groups or 1))
+        # vLLM ``SlidingWindowSpec.max_admission_blocks_per_request``:
+        # hold the window plus one in-flight chunk (not the window alone).
+        # A 16k chunk of sliding attention must keep those 16k keys until
+        # the chunk finishes; capping at the 1024-token window over-admits
+        # and then stalls mid-prefill when the transient pages are charged.
+        self._max_in_flight_tokens = int(max_in_flight_tokens or 0)
         if num_sliding_blocks and not self._shared_pool:
             self._num_sliding_blocks = num_sliding_blocks
             self.sliding_free_block_ids = deque(range(1, num_sliding_blocks))
@@ -429,7 +436,9 @@ class BlockManager:
     def _n_sliding_capped(self, n_tokens: int) -> int:
         n = self._n_sliding(n_tokens)
         if self.sliding_window:
-            n = min(n, self._n_sliding(self.sliding_window) + 2)
+            inflight = self._max_in_flight_tokens or self.sliding_window
+            cap_tokens = min(n_tokens, self.sliding_window - 1 + inflight)
+            n = min(n, self._n_sliding(cap_tokens) + 1)
         return n
 
     def _ensure_sliding_tables(self, seq) -> list[list[int]]:
@@ -453,7 +462,12 @@ class BlockManager:
         # Use settled tokens only (vLLM ``processed_computed_tokens``).
         # During chunked prefill ``num_computed_tokens`` lags ``len(seq)``;
         # after prefill it equals the prompt length, so decode uses ``len``.
-        if seq.num_computed_tokens and seq.num_computed_tokens < len(seq):
+        # ``num_computed_tokens == 0`` is "nothing settled yet", not
+        # "treat the whole prompt as computed" -- the latter over-skips
+        # on the first chunk of a long sliding-window request.
+        if not seq.num_computed_tokens:
+            num_computed = 0
+        elif seq.num_computed_tokens < len(seq):
             num_computed = seq.num_computed_tokens
         else:
             num_computed = len(seq)
@@ -567,6 +581,13 @@ class BlockManager:
         self.maybe_append_pages(seq)
 
     def blocks_needed_for_chunk(self, seq, chunk: int) -> int:
+        """Net new physical pages ``allocate_for_chunk`` will take.
+
+        Mirrors vLLM ``allocate_slots``: recycle out-of-window sliding
+        pages first, then grow the logical table.  Charging the uncapped
+        table delta without the recycle credit over-reserves the shared
+        hybrid pool and serializes long Gemma prefills.
+        """
         after = seq.num_computed_tokens + chunk
         n_full = max(0, self._n_full(after) - len(seq.block_table))
         pool = self._sliding_pool()
@@ -574,10 +595,23 @@ class BlockManager:
             return n_full
         tables = self._ensure_sliding_tables(seq)
         have = len(tables[0]) if tables else 0
-        n_sw = max(0, self._n_sliding(after) - have)
+        n_sw_new = max(0, self._n_sliding(after) - have)
+        freed = 0
+        window = self.sliding_window
+        if window and tables:
+            if not seq.num_computed_tokens:
+                num_computed = 0
+            elif seq.num_computed_tokens < len(seq):
+                num_computed = seq.num_computed_tokens
+            else:
+                num_computed = len(seq)
+            n_skip = max(0, num_computed - window + 1) // self._sliding_block_size
+            for table in tables:
+                skip = min(n_skip, len(table))
+                freed += sum(1 for i in range(skip) if table[i] > 0)
         if self._shared_pool:
-            return n_full + n_sw * len(tables)
-        return max(n_full, n_sw)
+            return n_full + max(0, n_sw_new * len(tables) - freed)
+        return max(n_full, max(0, n_sw_new - freed))
 
     def num_free_blocks(self) -> int:
         n = len(self.free_block_ids)
@@ -1546,23 +1580,36 @@ class ModelRunner:
         ``FlashAttentionMetadataBuilder`` pattern).
         """
         from ..tasks.baseline.L1.flash_attn_decode import FlashAttnDecode
+        from ..tasks.baseline.L1.flash_attn_prefill import FlashAttnPrefill
         from .fa_utils import group_fa_decode_ops
 
         ops = [m for m in self.model.modules() if isinstance(m, FlashAttnDecode)]
         self._fa_decode_ops = ops
         self._fa_decode_groups = group_fa_decode_ops(ops)
-        if not ops:
-            return
         device = torch.device(f"cuda:{self.rank}")
-        for group in self._fa_decode_groups:
-            lead = group[0]
-            lead.preallocate(self.max_num_seqs, device)
-            for op in group[1:]:
-                op.preallocate(self.max_num_seqs, device)
-                op._cu_seqlens_q = lead._cu_seqlens_q
-                op._sched_buf = lead._sched_buf
-                op._sched_meta = lead._sched_meta
-                op._graph_out = lead._graph_out
+        if ops:
+            for group in self._fa_decode_groups:
+                lead = group[0]
+                lead.preallocate(self.max_num_seqs, device)
+                for op in group[1:]:
+                    op.preallocate(self.max_num_seqs, device)
+                    op._cu_seqlens_q = lead._cu_seqlens_q
+                    op._sched_buf = lead._sched_buf
+                    op._sched_meta = lead._sched_meta
+                    op._graph_out = lead._graph_out
+        # FA4 mixed prefill allocates ``out`` every call; with KV + graphs
+        # that 256 MiB empty can OOM.  Share one buffer per (H, D).
+        prefills = [
+            m for m in self.model.modules() if isinstance(m, FlashAttnPrefill)
+        ]
+        shared: dict[tuple[int, int], torch.Tensor] = {}
+        for op in prefills:
+            key = (op.num_heads, op.head_dim)
+            if key not in shared:
+                op.preallocate(self.max_num_batched_tokens, device)
+                shared[key] = op._graph_out
+            else:
+                op._graph_out = shared[key]
 
     def _refresh_fa3_decode_schedule(
         self,
@@ -1946,6 +1993,34 @@ class ModelRunner:
                 f"Gemma-4 page unify failed: full {page_bytes} vs sliding "
                 f"{_layer_block_bytes(sliding_layers[0], slide_bs)}"
             )
+            # Decode-graph capture workspace.  The 16k piecewise bucket
+            # needs ~8 GiB and drops mixed to 0.90x / 33 preempts; it
+            # is opt-in (FASTKERNELS_ENABLE_PIECEWISE=1).  2 GiB is
+            # enough for 83 FULL decode graphs (mixed 0.96x, 0 preempts).
+            if (
+                self.is_gemma4
+                and not self.enforce_eager
+                and not ATTN_BACKEND_CONFIG.use_trtllm
+                and torch.cuda.get_device_capability()[0] == 9
+            ):
+                pw = (
+                    os.environ.get("FASTKERNELS_ENABLE_PIECEWISE") == "1"
+                    and os.environ.get("FASTKERNELS_DISABLE_PIECEWISE") != "1"
+                )
+                default_reserve = (
+                    8 * 1024 * 1024 * 1024 if pw else 2 * 1024 * 1024 * 1024
+                )
+                reserve = int(os.environ.get(
+                    "FASTKERNELS_HOPPER_PIECEWISE_RESERVE_BYTES",
+                    str(default_reserve),
+                ))
+                available_bytes = max(0, available_bytes - reserve)
+                if self.rank == 0:
+                    print(
+                        f"  Reserved {reserve / (1 << 30):.1f} GiB for "
+                        f"Hopper PIECEWISE CUDA graphs",
+                        flush=True,
+                    )
             group_size = min(len(full_layers), len(sliding_layers))
             n_sliding_groups = len(sliding_layers) // group_size
             assert n_sliding_groups * group_size == len(sliding_layers), (
@@ -5341,6 +5416,228 @@ class ModelRunner:
             positions_t = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         return input_ids_t, positions_t
 
+    # Long-context prefill bucket only.  8k steps pad to 16k (the
+    # scheduler's token budget is 16384, so two 8k seqs fill it
+    # exactly).  A second bucket would pin another set of piece
+    # outputs in the caching allocator.
+    _PIECEWISE_SIZES = (16384,)
+
+    def _hopper_piecewise_enabled(self) -> bool:
+        # Off by default: 16k capture needs an 8 GiB KV reserve that
+        # costs ~0.06x mixed.  Opt in with FASTKERNELS_ENABLE_PIECEWISE=1.
+        if os.environ.get("FASTKERNELS_ENABLE_PIECEWISE") != "1":
+            return False
+        if os.environ.get("FASTKERNELS_DISABLE_PIECEWISE") == "1":
+            return False
+        return (
+            bool(self.is_gemma4)
+            and not self.enforce_eager
+            and bool(getattr(self, "_compiled", False))
+            and not ATTN_BACKEND_CONFIG.use_trtllm
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability()[0] == 9
+        )
+
+    def _piecewise_bucket(self, n: int) -> int | None:
+        cap = int(getattr(self, "max_num_batched_tokens", 16384) or 16384)
+        # Do not pad small mixed steps to 16k — that made the mixed
+        # workload several times slower than compiled-eager.
+        if n < 4096:
+            return None
+        for s in self._PIECEWISE_SIZES:
+            if s >= n and s <= cap:
+                return s
+        return None
+
+    def _pad_mixed_for_piecewise(self, input_ids, positions, pad: int):
+        ctx = get_context()
+        n_pf = int(getattr(ctx, "num_prefill_tokens", 0) or 0)
+        device = input_ids.device
+        input_ids = torch.cat([
+            input_ids[:n_pf],
+            torch.zeros(pad, dtype=input_ids.dtype, device=device),
+            input_ids[n_pf:],
+        ])
+        positions = torch.cat([
+            positions[:n_pf],
+            torch.zeros(pad, dtype=positions.dtype, device=device),
+            positions[n_pf:],
+        ])
+        sm = ctx.slot_mapping
+        if sm is not None:
+            ctx.slot_mapping = torch.cat([
+                sm[:n_pf],
+                torch.full((pad,), -1, dtype=sm.dtype, device=sm.device),
+                sm[n_pf:],
+            ])
+        ssm = getattr(ctx, "sliding_slot_mapping", None)
+        if ssm is not None:
+            ctx.sliding_slot_mapping = torch.cat([
+                ssm[:, :n_pf],
+                torch.full((ssm.size(0), pad), -1, dtype=ssm.dtype, device=ssm.device),
+                ssm[:, n_pf:],
+            ], dim=1)
+        q = ctx.prefill_cu_seqlens_q
+        if q is not None:
+            ctx.prefill_cu_seqlens_q = torch.cat([q, q[-1:] + pad])
+        k = ctx.prefill_cu_seqlens_k
+        if k is not None:
+            ctx.prefill_cu_seqlens_k = torch.cat([k, k[-1:] + 1])
+        ctx.prefill_max_seqlen_q = max(int(ctx.prefill_max_seqlen_q or 0), pad)
+        ctx.prefill_max_seqlen_k = max(int(ctx.prefill_max_seqlen_k or 0), 1)
+        pbt = ctx.prefill_block_tables
+        if pbt is not None:
+            ctx.prefill_block_tables = torch.cat([
+                pbt, torch.zeros(1, pbt.size(1), dtype=pbt.dtype, device=pbt.device),
+            ])
+        spbt = getattr(ctx, "sliding_prefill_block_tables", None)
+        if spbt is not None:
+            ctx.sliding_prefill_block_tables = torch.cat([
+                spbt,
+                torch.zeros(
+                    spbt.size(0), 1, spbt.size(2),
+                    dtype=spbt.dtype, device=spbt.device,
+                ),
+            ], dim=1)
+        li = ctx.logit_indices
+        if li is not None:
+            li = li.clone()
+            li[li >= n_pf] += pad
+            ctx.logit_indices = li
+        rid = ctx.req_id_per_token
+        if rid is not None:
+            dummy = int(ctx.num_prefill_seqs or 0) + int(ctx.num_decode_tokens or 0)
+            ctx.req_id_per_token = torch.cat([
+                rid[:n_pf],
+                torch.full((pad,), dummy, dtype=rid.dtype, device=rid.device),
+                rid[n_pf:],
+            ])
+        ctx.num_prefill_tokens = n_pf + pad
+        ctx.num_prefill_seqs = int(ctx.num_prefill_seqs or 0) + 1
+        return input_ids, positions
+
+    def _ensure_piecewise_buffers(self, n_max: int):
+        """Persistent input_ids/positions for piecewise replay.
+
+        vLLM's CUDAGraphWrapper does not copy inputs; it records the
+        addresses used at capture.  Every later replay must use these
+        same tensors.
+        """
+        device = torch.device(f"cuda:{self.rank}")
+        buf = getattr(self, "_pw_input_ids", None)
+        if buf is None or buf.numel() < n_max:
+            self._pw_input_ids = torch.zeros(
+                n_max, dtype=torch.int64, device=device,
+            )
+            self._pw_positions = torch.zeros(
+                n_max, dtype=torch.int64, device=device,
+            )
+
+    def _bind_piecewise_inputs(self, input_ids, positions, n: int):
+        self._pw_input_ids[:n].copy_(input_ids)
+        self._pw_positions[:n].copy_(positions)
+        return self._pw_input_ids[:n], self._pw_positions[:n]
+
+    def _activate_hopper_piecewise(self, input_ids, positions):
+        ctx = get_context()
+        prof = getattr(self, "_pw_profile", None)
+        if prof is None:
+            prof = {"hit": 0, "miss": 0, "pad_tokens": 0, "n_sum": 0}
+            self._pw_profile = prof
+        if not self._hopper_piecewise_enabled():
+            ctx.cudagraph_runtime_mode = CUDAGraphMode.NONE
+            prof["miss"] += 1
+            prof["n_sum"] += int(input_ids.size(0))
+            return input_ids, positions
+        n = int(input_ids.size(0))
+        bucket = self._piecewise_bucket(n)
+        if bucket is None or not ctx.is_mixed:
+            ctx.cudagraph_runtime_mode = CUDAGraphMode.NONE
+            prof["miss"] += 1
+            prof["n_sum"] += n
+            return input_ids, positions
+        if bucket > n:
+            input_ids, positions = self._pad_mixed_for_piecewise(
+                input_ids, positions, bucket - n,
+            )
+            prof["pad_tokens"] += bucket - n
+        self._ensure_piecewise_buffers(bucket)
+        input_ids, positions = self._bind_piecewise_inputs(
+            input_ids, positions, bucket,
+        )
+        ctx.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
+        ctx.batch_size_for_graph = bucket
+        prof["hit"] += 1
+        prof["n_sum"] += n
+        return input_ids, positions
+
+    def _capture_hopper_piecewise_graphs(self):
+        """Warm the 8k/16k piecewise pool (largest first, like vLLM)."""
+        if not self._hopper_piecewise_enabled():
+            return
+        from .compilation import _piecewise_graph_pool
+        sizes = [s for s in reversed(self._PIECEWISE_SIZES)
+                 if s <= int(self.max_num_batched_tokens)]
+        if not sizes:
+            return
+        self._ensure_piecewise_buffers(sizes[0])
+        if self.graph_pool is None:
+            self.graph_pool = _piecewise_graph_pool()
+        if self.rank == 0:
+            print(f"    PIECEWISE prefill graphs {sizes}", flush=True)
+        device = torch.device(f"cuda:{self.rank}")
+        for n in sizes:
+            input_ids, positions = self._bind_piecewise_inputs(
+                torch.zeros(n, dtype=torch.int64, device=device),
+                torch.zeros(n, dtype=torch.int64, device=device),
+                n,
+            )
+            slot = torch.full((n,), -1, dtype=torch.int64, device=device)
+            set_mixed_context(
+                slot_mapping=slot,
+                num_prefill_tokens=n,
+                num_decode_tokens=0,
+                num_prefill_seqs=1,
+                prefill_cu_seqlens_q=torch.tensor(
+                    [0, n], dtype=torch.int32, device=device,
+                ),
+                prefill_cu_seqlens_k=torch.tensor(
+                    [0, 1], dtype=torch.int32, device=device,
+                ),
+                prefill_max_seqlen_q=n,
+                prefill_max_seqlen_k=1,
+                prefill_block_tables=torch.zeros(
+                    1, 1, dtype=torch.int32, device=device,
+                ),
+                decode_context_lens=None,
+                decode_block_tables=None,
+                decode_max_context_len=0,
+                logit_indices=torch.tensor(
+                    [n - 1], dtype=torch.int64, device=device,
+                ),
+            )
+            ctx = get_context()
+            if getattr(self, "_sliding_kv_groups", False):
+                g = self._sliding_group_count()
+                ctx.sliding_slot_mapping = torch.full(
+                    (g, n), -1, dtype=torch.int64, device=device,
+                )
+                ctx.sliding_prefill_block_tables = torch.zeros(
+                    g, 1, 1, dtype=torch.int32, device=device,
+                )
+            ctx.cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
+            ctx.batch_size_for_graph = n
+            self.model(input_ids, positions)
+            reset_context()
+            torch.cuda.synchronize()
+            if self.rank == 0:
+                free, total = torch.cuda.mem_get_info()
+                print(
+                    f"    PIECEWISE n={n} done "
+                    f"(free={free / (1 << 30):.1f} GiB)",
+                    flush=True,
+                )
+
     @torch.inference_mode()
     def _compute_logits(self, hidden_states, skip_final_softcap=False):
         if skip_final_softcap:
@@ -5378,6 +5675,10 @@ class ModelRunner:
                 _n = input_ids.shape[0]
                 deepstack_embeds = [b[:_n] for b in _ds_bufs]
         if is_prefill or self.enforce_eager or input_ids.size(0) > self.graph_bs_list[-1]:
+            if is_prefill:
+                input_ids, positions = self._activate_hopper_piecewise(
+                    input_ids, positions,
+                )
             model = self.model
             if is_prefill and self.is_bitnet and self._compiled:
                 # BitNet's BitLinear switches between bf16 fake-quant prefill
@@ -5391,22 +5692,38 @@ class ModelRunner:
             # receive one.
             if self.is_qwen_vl and self._compiled and inputs_embeds is None:
                 inputs_embeds = self.model.get_input_embeddings()(input_ids)
+            _log_pw = (
+                is_prefill
+                and self.rank == 0
+                and os.environ.get("FASTKERNELS_PW_LOG") == "1"
+            )
+            if _log_pw:
+                ctx = get_context()
+                torch.cuda.synchronize()
+                _pw_t0 = time.perf_counter()
             if inputs_embeds is not None:
                 kwargs = {"inputs_embeds": inputs_embeds}
                 if deepstack_embeds is not None:
                     kwargs["deepstack_embeds"] = deepstack_embeds
-                return self._compute_logits(
-                    model(input_ids, positions, **kwargs),
-                    skip_final_softcap=skip_final_softcap,
+                hidden = model(input_ids, positions, **kwargs)
+            elif encoder_outputs is not None:
+                hidden = model(
+                    input_ids, positions, encoder_outputs=encoder_outputs,
                 )
-            if encoder_outputs is not None:
-                return self._compute_logits(
-                    model(input_ids, positions, encoder_outputs=encoder_outputs),
-                    skip_final_softcap=skip_final_softcap,
+            else:
+                hidden = model(input_ids, positions)
+            if _log_pw:
+                torch.cuda.synchronize()
+                dt = time.perf_counter() - _pw_t0
+                n = int(input_ids.size(0))
+                print(
+                    f"  prefill n={n} mode={ctx.cudagraph_runtime_mode.name} "
+                    f"graph_bs={ctx.batch_size_for_graph} "
+                    f"{dt:.3f}s {n / max(dt, 1e-6):.0f} tok/s",
+                    flush=True,
                 )
             return self._compute_logits(
-                model(input_ids, positions),
-                skip_final_softcap=skip_final_softcap,
+                hidden, skip_final_softcap=skip_final_softcap,
             )
         # Decode path: CUDA graph replay.
         # For VL models, embed_fn is recorded inside the graph — updating
@@ -6722,6 +7039,19 @@ class ModelRunner:
         """
         from .compilation import compile_model, configure_post_grad_passes
 
+        # Hopper Gemma only: allocate attention output in the previous
+        # compiled piece so PIECEWISE replay has stable addresses.
+        # B200 never sets this flag (TRTLLM / sm_10).
+        if (
+            self.is_gemma4
+            and not self.enforce_eager
+            and not ATTN_BACKEND_CONFIG.use_trtllm
+            and torch.cuda.get_device_capability()[0] == 9
+        ):
+            for m in self.model.modules():
+                if hasattr(m, "forward_impl") and hasattr(m, "k_cache"):
+                    m._piecewise_attn_output = True
+
         configure_post_grad_passes(model_dtype=self.dtype)
         # Mamba2 owns a dedicated decode-cudagraph path, so keep the
         # compile stack's generic cudagraph wrapper off for it.
@@ -6916,6 +7246,16 @@ class ModelRunner:
         ar_ctx = self.custom_ar.capture() if self.custom_ar is not None else nullcontext()
         _graph_list = list(reversed(self.graph_bs_list))
 
+        # Match Jamba: pin FA3 decode to num_splits=32 for the whole
+        # capture loop.  Otherwise the first smaller-bucket warmup pads
+        # Q to max-B, rewrites scheduler_metadata to that batch, and
+        # capture then sees native B (Gemma sliding is now FA3).
+        self._init_fa3_decode_buffers()
+        for group in getattr(self, "_fa_decode_groups", []):
+            for op in group:
+                if getattr(op, "fa_version", None) == 3:
+                    op._force_graph_splits = True
+
         # Single warmup at the largest batch size to trigger all Triton/CUDA
         # kernel JIT compilation. Subsequent captures reuse compiled kernels.
         largest_bs = _graph_list[0]
@@ -6993,6 +7333,15 @@ class ModelRunner:
         # Freeze GC during capture to avoid Python GC stalls (matches vllm).
         gc.collect()
         gc.freeze()
+
+        # vLLM captures PIECEWISE first (larger activations), then FULL
+        # decode graphs into the same pool so peak is the overlay.
+        # Hopper Gemma decode graphs stop at 512 so the first FULL
+        # warmup fits in the ~1 GiB left after the 16k bucket.
+        if self._hopper_piecewise_enabled():
+            from .compilation import _piecewise_graph_pool
+            self.graph_pool = _piecewise_graph_pool()
+            self._capture_hopper_piecewise_graphs()
 
         with ar_ctx:
             for _gi, bs in enumerate(_graph_list):
@@ -7202,6 +7551,7 @@ class LlamaEngine:
                 n_sliding_groups=getattr(
                     self.model_runner, "_n_sliding_groups", 1,
                 ),
+                max_in_flight_tokens=self.model_runner.max_num_batched_tokens,
             )
         else:
             self.block_manager = BlockManager(self.model_runner.num_blocks)
@@ -8976,9 +9326,12 @@ class LlamaEngine:
         step_profile = {
             "pure_decode": 0, "decode_tokens": 0, "decode_time": 0.0,
             "pure_mm_prefill": 0, "mm_prefill_tokens": 0, "mm_prefill_time": 0.0,
-            "pure_text_prefill": 0, "text_prefill_tokens": 0,
+            "pure_text_prefill": 0, "text_prefill_tokens": 0, "text_prefill_time": 0.0,
             "mixed_mm": 0, "mixed_mm_pf_tokens": 0, "mixed_mm_dc_tokens": 0, "mixed_mm_time": 0.0,
             "mixed_text": 0, "mixed_text_pf_tokens": 0, "mixed_text_dc_tokens": 0,
+            "mixed_text_time": 0.0, "mixed_text_gpu": 0.0,
+            "text_prefill_gpu": 0.0, "decode_gpu": 0.0,
+            "mixed_n_hist": [0] * 7, "mixed_n_max": 0, "mixed_n_sum": 0,
             "preempted": 0, "preempted_tokens": 0,
         }
         _step_profile_active = os.environ.get("FASTKERNELS_STEP_PROFILE") == "1"
@@ -9172,10 +9525,7 @@ class LlamaEngine:
             fbs = getattr(bm, "_full_block_size", block_size)
             n = (total + fbs - 1) // fbs
             if getattr(bm, "_shared_pool", False) and bm.sliding_window:
-                sbs = bm._sliding_block_size
-                n += getattr(bm, "_n_sliding_groups", 1) * (
-                    (min(total, bm.sliding_window) + sbs - 1) // sbs + 2
-                )
+                n += getattr(bm, "_n_sliding_groups", 1) * bm._n_sliding_capped(total)
             return n
 
         # Reserve final length at admission, but only when the batch cannot fit
@@ -9960,10 +10310,8 @@ class LlamaEngine:
                 fbs = getattr(bm, "_full_block_size", block_size)
                 full_blocks = (min(prompt_len, self.max_model_len) + fbs - 1) // fbs
                 if getattr(bm, "_shared_pool", False):
-                    sbs = bm._sliding_block_size
-                    window = bm.sliding_window or prompt_len
                     sw_cap = getattr(bm, "_n_sliding_groups", 1) * (
-                        (min(prompt_len, window) + sbs - 1) // sbs + 2
+                        bm._n_sliding_capped(min(prompt_len, self.max_model_len))
                     )
                     full_blocks += sw_cap
                 if len(bm.free_block_ids) < full_blocks + watermark_blocks:
@@ -10067,8 +10415,17 @@ class LlamaEngine:
                     _sp_cat = "mixed_mm_time"
                 else:
                     _sp["mixed_text"] += 1
-                    _sp["mixed_text_pf_tokens"] += sum(prefill_chunk_sizes)
+                    _pf_tok = sum(prefill_chunk_sizes)
+                    _sp["mixed_text_pf_tokens"] += _pf_tok
                     _sp["mixed_text_dc_tokens"] += n_dc
+                    _n_tok = _pf_tok + n_dc
+                    _sp["mixed_n_sum"] += _n_tok
+                    _sp["mixed_n_max"] = max(_sp["mixed_n_max"], _n_tok)
+                    _edges = (64, 256, 512, 1024, 4096, 8192, 16384)
+                    _b = 0
+                    while _b < len(_edges) - 1 and _n_tok > _edges[_b]:
+                        _b += 1
+                    _sp["mixed_n_hist"][_b] += 1
 
             # ----- Whisper: run encoder for new prefill seqs -----
             encoder_outputs = None
@@ -10302,6 +10659,13 @@ class LlamaEngine:
                 else:
                     running.extend(decode_seqs)
 
+            if _step_profile_active:
+                _dt = time.perf_counter() - _spt0
+                if n_pf > 0 and n_dc == 0 and not has_mm_step:
+                    step_profile["text_prefill_time"] += _dt
+                elif n_pf > 0 and n_dc > 0 and not has_mm_step:
+                    step_profile["mixed_text_time"] += _dt
+
         _loop_t0_elapsed = time.perf_counter() - _loop_t0
         if _producer is not None:
             _producer.join()
@@ -10323,10 +10687,24 @@ class LlamaEngine:
             print(f"\n[Step Profile] total_steps={total} (fast_decode={fd}, scheduled={slow})")
             print(f"  fast_decode:       {fd:6d} steps, {fdt:10d} tokens, {sp['decode_time']:.3f}s")
             print(f"  pure_decode:       {sp['pure_decode']:6d} steps, {sp['decode_tokens']:10d} tokens")
-            print(f"  pure_text_prefill: {sp['pure_text_prefill']:6d} steps, {sp['text_prefill_tokens']:10d} tokens")
+            print(f"  pure_text_prefill: {sp['pure_text_prefill']:6d} steps, {sp['text_prefill_tokens']:10d} tokens, {sp.get('text_prefill_time', 0):.3f}s")
             print(f"  pure_mm_prefill:   {sp['pure_mm_prefill']:6d} steps, {sp['mm_prefill_tokens']:10d} tokens, {sp['mm_prefill_time']:.3f}s")
-            print(f"  mixed_text:        {sp['mixed_text']:6d} steps, pf={sp['mixed_text_pf_tokens']:10d} dc={sp['mixed_text_dc_tokens']:10d}")
+            print(f"  mixed_text:        {sp['mixed_text']:6d} steps, pf={sp['mixed_text_pf_tokens']:10d} dc={sp['mixed_text_dc_tokens']:10d}, {sp.get('mixed_text_time', 0):.3f}s")
             print(f"  mixed_mm:          {sp['mixed_mm']:6d} steps, pf={sp['mixed_mm_pf_tokens']:10d} dc={sp['mixed_mm_dc_tokens']:10d}, {sp['mixed_mm_time']:.3f}s")
+            if sp.get("mixed_n_hist") and sp["mixed_text"]:
+                labels = ("<=64", "<=256", "<=512", "<=1k", "<=4k", "<=8k", "<=16k")
+                bands = " ".join(
+                    f"{lab}:{c}" for lab, c in zip(labels, sp["mixed_n_hist"]) if c
+                )
+                avg_n = sp["mixed_n_sum"] / max(1, sp["mixed_text"])
+                print(f"  mixed_tokens:      avg={avg_n:.0f} max={sp['mixed_n_max']} "
+                      f"({bands})")
+            pw = getattr(self.model_runner, "_pw_profile", None)
+            if pw:
+                tot = pw["hit"] + pw["miss"]
+                print(f"  piecewise:         hit={pw['hit']} miss={pw['miss']} "
+                      f"({pw['hit'] / max(1, tot):.0%} replay) "
+                      f"pad_tokens={pw['pad_tokens']}")
             print(f"  preemptions:       {sp['preempted']:6d} seqs, "
                   f"{sp['preempted_tokens']:10d} decode tokens discarded")
             if sp.get("kv_peak_blocks"):

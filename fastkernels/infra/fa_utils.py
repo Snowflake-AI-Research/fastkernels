@@ -47,6 +47,8 @@ __all__ = [
     "fa3_scheduler_metadata",
     "fa3_scheduler_metadata_size",
     "fa_supports_head_size",
+    "flash_attn_version_for_head",
+    "gemma4_flash_attn_version",
     "group_fa_decode_ops",
     "refresh_fa3_decode_schedule",
 ]
@@ -117,6 +119,7 @@ def group_fa_decode_ops(ops):
             op.head_dim,
             tuple(getattr(op, "_window_size", (-1, -1))),
             getattr(op, "page_size", None),
+            getattr(op, "fa_version", FA_VERSION),
         )
         groups.setdefault(key, []).append(op)
     return list(groups.values())
@@ -141,6 +144,8 @@ def refresh_fa3_decode_schedule(
     with torch.inference_mode():
         for group in groups:
             lead = group[0]
+            if getattr(lead, "fa_version", FA_VERSION) != 3:
+                continue
             lead.update_scheduler_metadata(
                 context_lens,
                 max_seqlen_k,
@@ -162,3 +167,28 @@ def fa_supports_head_size(head_size: int) -> bool:
     if _is_fa_version_supported(4):
         return head_size <= 512
     return False
+
+
+def flash_attn_version_for_head(head_size: int) -> int | None:
+    """Per-layer FA version, matching vLLM ``get_flash_attn_version``.
+
+    Hopper defaults to FA3, then upgrades to FA4 when ``head_size > 256``
+    (Gemma-4 full-attn is 512).  B200 still prefers FA4 via the same
+    helper, but Gemma-4 on B200 stays on Triton (``prefer_triton``).
+    """
+    if not VLLM_FA_AVAILABLE:
+        return None
+    return _vllm_get_flash_attn_version(head_size=head_size)
+
+
+def gemma4_flash_attn_version() -> int | None:
+    """vLLM ``Gemma4Config.verify_and_update_config``.
+
+    Heterogeneous 256/512 heads would otherwise mix FA3+FA4.  vLLM
+    forces FA4 on every Gemma-4 layer when it is available.
+    """
+    if not VLLM_FA_AVAILABLE:
+        return None
+    if _is_fa_version_supported(4):
+        return 4
+    return flash_attn_version_for_head(256)

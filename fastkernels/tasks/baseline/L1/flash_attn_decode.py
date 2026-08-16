@@ -16,17 +16,23 @@ from ....infra.fa_utils import (
     fa3_scheduler_metadata,
     fa3_scheduler_metadata_size,
     flash_attn_varlen_func,
+    flash_attn_version_for_head,
 )
 
 
 class FlashAttnDecode(nn.Module):
     def __init__(self, num_heads: int, num_kv_heads: int, head_dim: int,
-                 page_size: int | None = None):
+                 page_size: int | None = None, fa_version: int | None = None):
         super().__init__()
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.page_size = page_size
+        self.fa_version = (
+            fa_version
+            or flash_attn_version_for_head(head_dim)
+            or FA_VERSION
+        )
         self._cu_seqlens_q = None
         # Persistent FA3 scheduler metadata.  vLLM builds this in
         # ``FlashAttentionMetadataBuilder`` *outside* the CUDA graph and
@@ -82,7 +88,7 @@ class FlashAttnDecode(nn.Module):
         metadata builder.  ``cache_seqlens`` is the [B] decode lengths
         including the padded tail the captured graph covers.
         """
-        if FA_VERSION != 3:
+        if self.fa_version != 3:
             self._sched_meta = None
             return
         if qkv_dtype is not None:
@@ -132,21 +138,21 @@ class FlashAttnDecode(nn.Module):
             self._cu_seqlens_q = torch.arange(
                 needed, dtype=torch.int32, device=device,
             )
-        if FA_VERSION == 3:
+        if self.fa_version == 3:
             cap = fa3_scheduler_metadata_size(max(max_batch_size, 1024))
             if self._sched_buf is None or self._sched_buf.numel() < cap:
                 self._sched_buf = torch.zeros(
                     cap, dtype=torch.int32, device=device,
                 )
             self._sched_meta = self._sched_buf[:fa3_scheduler_metadata_size(1)]
-            if (
-                self._graph_out is None
-                or self._graph_out.shape[0] < max_batch_size
-            ):
-                self._graph_out = torch.empty(
-                    max_batch_size, self.num_heads, self.head_dim,
-                    dtype=self._qkv_dtype, device=device,
-                )
+        if (
+            self._graph_out is None
+            or self._graph_out.shape[0] < max_batch_size
+        ):
+            self._graph_out = torch.empty(
+                max_batch_size, self.num_heads, self.head_dim,
+                dtype=self._qkv_dtype, device=device,
+            )
 
     def _pad_eager_to_graph_batch(self, q, cache_seqlens, block_table):
         """Pad an eager FA3 decode to the captured max batch.
@@ -203,30 +209,10 @@ class FlashAttnDecode(nn.Module):
         orig_n = q.shape[0]
         n = orig_n
         capturing = torch.cuda.is_current_stream_capturing()
-        # Pad only post-capture eager decode.  Capture warmup sets
-        # ``_force_graph_splits`` so every bucket records num_splits=32;
-        # padding that warmup to max-B rewrites ``_sched_meta_batch``
-        # while the graph still sees native B, and FA3 then rejects the
-        # metadata (or IMAs on replay).  B200 / FA4 never enters here.
-        if (
-            FA_VERSION == 3
-            and not capturing
-            and not self._force_graph_splits
-            and self._graph_out is not None
-            and cache_seqlens is not None
-            and n < int(self._graph_out.shape[0])
-        ):
-            q, cache_seqlens, block_table = self._pad_eager_to_graph_batch(
-                q, cache_seqlens, block_table,
-            )
-            n = q.shape[0]
-            self.update_scheduler_metadata(
-                cache_seqlens,
-                max_seq_len if max_seq_len is not None else int(cache_seqlens.max().item() or 0),
-                qkv_dtype=q.dtype,
-                window_size=window_size,
-            )
-            self._force_graph_splits = True
+        # Do not pad enforce_eager decode to max_num_seqs.  Compiled
+        # capture leaves ``_force_graph_splits`` True, so this block
+        # never ran on the graph path; on eager it padded Q to 1024
+        # and FA3 rejected ``scheduler_metadata`` shape.
         cu_seqlens_q = self._get_cu_seqlens_q(n, q.device)
         if max_seq_len is not None:
             max_seqlen_k = max_seq_len
@@ -234,61 +220,73 @@ class FlashAttnDecode(nn.Module):
             max_seqlen_k = int(cache_seqlens.max().item()) if cache_seqlens.numel() > 0 else 0
 
         capturing = torch.cuda.is_current_stream_capturing()
-        # Capture, pin, and padded eager decode all stay on num_splits=32
-        # so FA3's process-wide split-KV scratch cannot shrink below the
-        # largest captured graph.  B200 / FA4 never sets _force_graph_splits.
-        use_graph_splits = capturing or self._force_graph_splits
-        if use_graph_splits and FA_VERSION == 3:
-            meta = self._sched_meta
-            if meta is None or int(getattr(self, "_sched_meta_batch", -1)) != n:
-                if cache_seqlens is not None and not capturing:
-                    self.update_scheduler_metadata(
-                        cache_seqlens,
-                        max_seqlen_k,
-                        qkv_dtype=q.dtype,
-                        window_size=window_size,
-                    )
-                    meta = self._sched_meta
-            if meta is None or int(getattr(self, "_sched_meta_batch", -1)) != n:
-                if capturing:
+        # FA4 (CuTeDSL): never inherit FA3's graph ``num_splits=32``.
+        # ``capturing`` is true for every decode op inside a FULL graph,
+        # so treating "capturing" as FA3 graph-splits sent FA4 through
+        # 32-way split-KV (huge partial-O alloc + a different compile
+        # key).  That is why forcing FA4 on all Gemma-4 layers made
+        # decode ~5x slower.  vLLM pins unsplit FA4 (``num_splits=1``).
+        if self.fa_version == 4:
+            num_splits = 1
+            meta = None
+        else:
+            # Capture, pin, and padded eager decode all stay on
+            # num_splits=32 so FA3's process-wide split-KV scratch
+            # cannot shrink below the largest captured graph.
+            use_graph_splits = capturing or self._force_graph_splits
+            if use_graph_splits:
+                meta = self._sched_meta
+                if meta is None or int(getattr(self, "_sched_meta_batch", -1)) != n:
+                    if cache_seqlens is not None and not capturing:
+                        self.update_scheduler_metadata(
+                            cache_seqlens,
+                            max_seqlen_k,
+                            qkv_dtype=q.dtype,
+                            window_size=window_size,
+                        )
+                        meta = self._sched_meta
+                if meta is None or int(getattr(self, "_sched_meta_batch", -1)) != n:
+                    if capturing:
+                        raise RuntimeError(
+                            "FA3 CUDA-graph capture requires "
+                            "update_scheduler_metadata() outside the graph first "
+                            f"(q_batch={n}, sched_batch="
+                            f"{getattr(self, '_sched_meta_batch', None)}, "
+                            f"meta={'None' if meta is None else tuple(meta.shape)})"
+                        )
+                    use_graph_splits = False
+            if use_graph_splits:
+                meta = self._sched_meta
+                if meta is None:
                     raise RuntimeError(
                         "FA3 CUDA-graph capture requires "
                         "update_scheduler_metadata() outside the graph first "
                         f"(q_batch={n}, sched_batch="
-                        f"{getattr(self, '_sched_meta_batch', None)}, "
-                        f"meta={'None' if meta is None else tuple(meta.shape)})"
+                        f"{getattr(self, '_sched_meta_batch', None)})"
                     )
-                use_graph_splits = False
-        if use_graph_splits:
-            meta = self._sched_meta
-            if FA_VERSION == 3 and meta is None:
-                raise RuntimeError(
-                    "FA3 CUDA-graph capture requires "
-                    "update_scheduler_metadata() outside the graph first "
-                    f"(q_batch={n}, sched_batch="
-                    f"{getattr(self, '_sched_meta_batch', None)})"
-                )
-            num_splits = self._graph_num_splits
-        else:
-            page_size = self.page_size
-            if page_size is None and k_cache.dim() >= 2:
-                page_size = k_cache.shape[1]
-            meta = fa3_scheduler_metadata(
-                batch_size=int(cache_seqlens.shape[0]) if cache_seqlens is not None else n,
-                max_seqlen_q=1,
-                max_seqlen_k=max_seqlen_k,
-                num_heads_q=self.num_heads,
-                num_heads_kv=self.num_kv_heads,
-                headdim=self.head_dim,
-                cache_seqlens=cache_seqlens,
-                qkv_dtype=q.dtype,
-                cu_seqlens_q=cu_seqlens_q,
-                page_size=page_size,
-                causal=True,
-                window_size=window_size,
-                num_splits=0,
-            ) if cache_seqlens is not None else None
-            num_splits = 0
+                num_splits = self._graph_num_splits
+            else:
+                page_size = self.page_size
+                if page_size is None and k_cache.dim() >= 2:
+                    page_size = k_cache.shape[1]
+                meta = None
+                if cache_seqlens is not None:
+                    meta = fa3_scheduler_metadata(
+                        batch_size=int(cache_seqlens.shape[0]),
+                        max_seqlen_q=1,
+                        max_seqlen_k=max_seqlen_k,
+                        num_heads_q=self.num_heads,
+                        num_heads_kv=self.num_kv_heads,
+                        headdim=self.head_dim,
+                        cache_seqlens=cache_seqlens,
+                        qkv_dtype=q.dtype,
+                        cu_seqlens_q=cu_seqlens_q,
+                        page_size=page_size,
+                        causal=True,
+                        window_size=window_size,
+                        num_splits=0,
+                    )
+                num_splits = 0
 
         fa_kw = dict(
             q=q,
@@ -301,7 +299,7 @@ class FlashAttnDecode(nn.Module):
             softmax_scale=softmax_scale,
             causal=True,
             block_table=block_table,
-            fa_version=FA_VERSION,
+            fa_version=self.fa_version,
             num_splits=num_splits,
         )
         if meta is not None:

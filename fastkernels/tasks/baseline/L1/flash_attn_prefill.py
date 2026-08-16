@@ -9,23 +9,40 @@ import torch
 import torch.nn as nn
 
 from ....infra.fa_utils import (
-    FA3_CUDA_GRAPH_MAX_NUM_SPLITS,
     FA_VERSION,
     fa3_scheduler_metadata,
     flash_attn_varlen_func,
+    flash_attn_version_for_head,
 )
 
 
 class FlashAttnPrefill(nn.Module):
     def __init__(self, num_heads: int, num_kv_heads: int, head_dim: int,
-                 page_size: int | None = None):
+                 page_size: int | None = None, fa_version: int | None = None):
         super().__init__()
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.page_size = page_size
         self.sm_scale = head_dim ** -0.5
+        self.fa_version = (
+            fa_version
+            or flash_attn_version_for_head(head_dim)
+            or FA_VERSION
+        )
         self._graph_sched_meta: torch.Tensor | None = None
+        self._graph_out: torch.Tensor | None = None
+
+    def preallocate(self, max_tokens: int, device: torch.device) -> None:
+        """Persistent FA4/FA3 ``out=`` so mixed prefill does not alloc."""
+        if (
+            self._graph_out is None
+            or self._graph_out.shape[0] < max_tokens
+        ):
+            self._graph_out = torch.empty(
+                max_tokens, self.num_heads, self.head_dim,
+                dtype=torch.bfloat16, device=device,
+            )
 
     def forward(self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs):
         # vLLM's wrapper takes keyword args in a different order than the
@@ -36,7 +53,7 @@ class FlashAttnPrefill(nn.Module):
             max_seqlen_q=max_seqlen_q,
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_k=max_seqlen_k,
-            fa_version=FA_VERSION,
+            fa_version=self.fa_version,
         )
         if kwargs.get("block_table") is not None:
             seqused_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
@@ -45,42 +62,35 @@ class FlashAttnPrefill(nn.Module):
             # in a CUDA graph, so the schedule must come from a persistent
             # buffer filled outside capture (vLLM metadata-builder pattern).
             capturing = torch.cuda.is_current_stream_capturing()
+            # vLLM pins num_splits=32 only for FULL decode CUDA graphs.
+            # Prefill is compute-bound; 32 splits on 16k Q allocates ~8 GiB
+            # of FA3 scratch and OOMs Hopper Gemma piecewise capture.
+            # num_splits=1 matches vLLM's unsplit prefill / FA4 dense pin.
+            num_splits = 1
+            fa_kw["num_splits"] = num_splits
             if capturing:
                 meta = self._graph_sched_meta
-                if FA_VERSION == 3 and meta is None:
-                    raise RuntimeError(
-                        "FA3 CUDA-graph capture requires scheduler "
-                        "metadata to be built outside the graph first"
-                    )
-                fa_kw["num_splits"] = FA3_CUDA_GRAPH_MAX_NUM_SPLITS
             else:
-                page_size = self.page_size
-                if page_size is None and k.dim() >= 2:
-                    page_size = k.shape[1]
-                # Hopper FA3: auto ``num_splits=0`` shrinks the process-wide
-                # split-KV scratch after CUDA-graph capture; the next decode
-                # graph replay IMAs.  Keep the captured workspace.  FA4 /
-                # B200 is unchanged (this branch is FA3-only below).
-                num_splits = (
-                    FA3_CUDA_GRAPH_MAX_NUM_SPLITS if FA_VERSION == 3 else 0
-                )
-                meta = fa3_scheduler_metadata(
-                    batch_size=int(seqused_k.shape[0]),
-                    max_seqlen_q=max_seqlen_q,
-                    max_seqlen_k=max_seqlen_k,
-                    num_heads_q=self.num_heads,
-                    num_heads_kv=self.num_kv_heads,
-                    headdim=self.head_dim,
-                    cache_seqlens=seqused_k,
-                    qkv_dtype=q.dtype,
-                    cu_seqlens_q=cu_seqlens_q,
-                    page_size=page_size,
-                    causal=kwargs.get("causal", True),
-                    window_size=kwargs.get("window_size", (-1, -1)),
-                    num_splits=num_splits,
-                )
-                if FA_VERSION == 3:
-                    fa_kw["num_splits"] = num_splits
+                meta = None
+                if self.fa_version == 3:
+                    page_size = self.page_size
+                    if page_size is None and k.dim() >= 2:
+                        page_size = k.shape[1]
+                    meta = fa3_scheduler_metadata(
+                        batch_size=int(seqused_k.shape[0]),
+                        max_seqlen_q=max_seqlen_q,
+                        max_seqlen_k=max_seqlen_k,
+                        num_heads_q=self.num_heads,
+                        num_heads_kv=self.num_kv_heads,
+                        headdim=self.head_dim,
+                        cache_seqlens=seqused_k,
+                        qkv_dtype=q.dtype,
+                        cu_seqlens_q=cu_seqlens_q,
+                        page_size=page_size,
+                        causal=kwargs.get("causal", True),
+                        window_size=kwargs.get("window_size", (-1, -1)),
+                        num_splits=num_splits,
+                    )
             if meta is not None:
                 fa_kw["scheduler_metadata"] = meta
         else:
@@ -92,4 +102,11 @@ class FlashAttnPrefill(nn.Module):
             # ``num_splits=1`` so the unsplit kernel is used.
             fa_kw["num_splits"] = 1
         fa_kw.update(kwargs)
+        nq = q.shape[0]
+        if (
+            "out" not in fa_kw
+            and self._graph_out is not None
+            and self._graph_out.shape[0] >= nq
+        ):
+            fa_kw["out"] = self._graph_out[:nq]
         return flash_attn_varlen_func(q, k, v, **fa_kw)

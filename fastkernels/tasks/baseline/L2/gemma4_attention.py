@@ -5,6 +5,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from ....infra.context import get_attn_backend_config
+from ....infra.fa_utils import fa_supports_head_size
 from ....infra.tp import _tp_size
 from .attention_impl import Attention
 from .parallel_linear import QKVParallelLinear, RowParallelLinear
@@ -64,14 +66,15 @@ class Gemma4Attention(nn.Module):
             1.0,
             num_kv_heads=self.num_kv_heads,
             sliding_window=config.sliding_window if self.is_sliding else None,
-            # Gemma4 is a PrefixLM: image tokens attend bidirectionally
-            # ("mm_prefix").  vLLM's selector rejects FlashInfer for it
-            # ("partial multimodal token full attention not supported") and
-            # FlashAttention too ("mm_prefix requires FlashAttention v4,
-            # which does not resolve for this head_size"), leaving
-            # TRITON_ATTN for *every* Gemma4 layer -- not just the 512-wide
-            # ones.  Match that so the benchmark compares the same kernel.
-            prefer_triton=True,
+            # Gemma4 is a PrefixLM (mm_prefix).  FlashInfer still rejects
+            # that.  Hopper: FA3 on 256-d sliding, FA4 on 512-d full.
+            # FA4 decode must stay on ``num_splits=1`` (see FlashAttnDecode)
+            # or FULL-graph capture inherits FA3's 32-way split-KV.
+            # B200 already matches vLLM on Triton/TRTLLM -- do not switch.
+            prefer_triton=(
+                get_attn_backend_config().use_trtllm
+                or not fa_supports_head_size(512)
+            ),
         )
 
     def _apply_rope(self, positions, q, k):
