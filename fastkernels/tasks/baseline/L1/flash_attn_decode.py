@@ -53,6 +53,11 @@ class FlashAttnDecode(nn.Module):
         self._graph_q: torch.Tensor | None = None
         self._graph_seqlens: torch.Tensor | None = None
         self._graph_block_table: torch.Tensor | None = None
+        # Eager mixed decode pads to this max-B so FA3's process-wide
+        # split-KV scratch cannot shrink below the largest captured graph.
+        self._pad_q: torch.Tensor | None = None
+        self._pad_seqlens: torch.Tensor | None = None
+        self._pad_bt: torch.Tensor | None = None
 
     def _get_cu_seqlens_q(self, n: int, device: torch.device) -> torch.Tensor:
         needed = n + 1
@@ -141,6 +146,51 @@ class FlashAttnDecode(nn.Module):
                     dtype=self._qkv_dtype, device=device,
                 )
 
+    def _pad_eager_to_graph_batch(self, q, cache_seqlens, block_table):
+        """Pad an eager FA3 decode to the captured max batch.
+
+        Multi-bucket capture ends at B=1; a later smaller ``num_splits=0``
+        call shrinks FA3's process-wide scratch and the large graph IMAs.
+        Running every eager decode at ``_graph_out``'s batch keeps that
+        scratch at the size capture recorded.  B200 / FA4 is unchanged
+        (this is only reached for FA3).
+        """
+        target = int(self._graph_out.shape[0])
+        n = q.shape[0]
+        if (
+            self._pad_q is None
+            or self._pad_q.shape[0] < target
+            or self._pad_q.shape[1:] != q.shape[1:]
+            or self._pad_q.dtype != q.dtype
+            or self._pad_q.device != q.device
+        ):
+            self._pad_q = torch.zeros(
+                target, *q.shape[1:], dtype=q.dtype, device=q.device,
+            )
+            self._pad_seqlens = torch.zeros(
+                target, dtype=torch.int32, device=q.device,
+            )
+        self._pad_q[:n].copy_(q)
+        self._pad_q[n:target].zero_()
+        self._pad_seqlens[:n].copy_(cache_seqlens)
+        self._pad_seqlens[n:target].zero_()
+        bt = block_table
+        if bt is not None:
+            width = int(bt.shape[1])
+            if (
+                self._pad_bt is None
+                or self._pad_bt.shape[0] < target
+                or self._pad_bt.shape[1] < width
+                or self._pad_bt.device != bt.device
+            ):
+                self._pad_bt = torch.zeros(
+                    target, width, dtype=bt.dtype, device=bt.device,
+                )
+            self._pad_bt[:n, :width].copy_(bt)
+            self._pad_bt[n:target].zero_()
+            bt = self._pad_bt[:target, :width]
+        return self._pad_q[:target], self._pad_seqlens[:target], bt
+
     def forward(self, q, k_cache, v_cache, cache_seqlens=None, **kwargs):
         max_seq_len = kwargs.pop("max_seq_len", None)
         block_table = kwargs.pop("block_table", None)
@@ -148,7 +198,27 @@ class FlashAttnDecode(nn.Module):
         kwargs.pop("causal", None)
         window_size = kwargs.get("window_size", self._window_size)
 
-        n = q.shape[0]
+        orig_n = q.shape[0]
+        n = orig_n
+        capturing = torch.cuda.is_current_stream_capturing()
+        if (
+            FA_VERSION == 3
+            and not capturing
+            and self._graph_out is not None
+            and cache_seqlens is not None
+            and n < int(self._graph_out.shape[0])
+        ):
+            q, cache_seqlens, block_table = self._pad_eager_to_graph_batch(
+                q, cache_seqlens, block_table,
+            )
+            n = q.shape[0]
+            self.update_scheduler_metadata(
+                cache_seqlens,
+                max_seq_len if max_seq_len is not None else int(cache_seqlens.max().item() or 0),
+                qkv_dtype=q.dtype,
+                window_size=window_size,
+            )
+            self._force_graph_splits = True
         cu_seqlens_q = self._get_cu_seqlens_q(n, q.device)
         if max_seq_len is not None:
             max_seqlen_k = max_seq_len
@@ -215,4 +285,5 @@ class FlashAttnDecode(nn.Module):
         if self._graph_out is not None and self._graph_out.shape[0] >= n:
             fa_kw["out"] = self._graph_out[:n]
         fa_kw.update(kwargs)
-        return flash_attn_varlen_func(**fa_kw)
+        out = flash_attn_varlen_func(**fa_kw)
+        return out[:orig_n]
