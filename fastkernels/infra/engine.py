@@ -499,6 +499,9 @@ class BlockManager:
 
     def allocate_for_chunk(self, seq, chunk: int) -> None:
         """Allocate full + per-group sliding pages for ``computed + chunk``."""
+        # vLLM ``allocate_slots`` recycles out-of-window sliding pages
+        # before charging the new chunk against the shared pool.
+        self.remove_skipped_sliding(seq)
         after = seq.num_computed_tokens + chunk
         for _ in range(max(0, self._n_full(after) - len(seq.block_table))):
             seq.block_table.append(self.free_block_ids.popleft())
@@ -2042,7 +2045,7 @@ class ModelRunner:
         table = getattr(seq, "sliding_block_table", None)
         return [table] if table else []
 
-    def _pack_sliding_block_tables(self, seqs) -> np.ndarray:
+    def _pack_sliding_block_tables(self, seqs, max_kv_len: int | None = None) -> np.ndarray:
         """Stack per-group block tables as ``[G, batch, max_bt]``."""
         G = self._sliding_group_count()
         n = len(seqs)
@@ -2052,6 +2055,13 @@ class ModelRunner:
             for table in tables:
                 if table:
                     max_bt = max(max_bt, len(table))
+        # Triton indexes ``seq_offset // sliding_bs`` with no width check.
+        # Pad to the pages the longest KV length needs so a short table
+        # cannot IMA; extra columns are the null page.
+        sbs = int(getattr(self, "_sliding_block_size", BLOCK_SIZE) or BLOCK_SIZE)
+        if max_kv_len is None:
+            max_kv_len = max((len(seq) for seq in seqs), default=0)
+        max_bt = max(max_bt, (int(max_kv_len) + sbs - 1) // sbs)
         # Never return a 0-width table: ``ndarray.size == 0`` used to
         # drop sliding metadata and sliding layers then read the
         # full-attn table (page 32 vs 16) and IMA.
@@ -5181,6 +5191,9 @@ class ModelRunner:
 
         # Build prefill block table
         prefill_block_tables = None
+        if num_prefill_seqs > 0:
+            fbs = int(block_size)
+            pf_max_bt = max(pf_max_bt, (pf_max_sk + fbs - 1) // fbs, 1)
         if pf_max_bt > 0 and num_prefill_seqs > 0:
             pbt = np.full(
                 (num_prefill_seqs, pf_max_bt), self._block_table_pad(),
@@ -5215,13 +5228,16 @@ class ModelRunner:
             if blen > dc_max_bt:
                 dc_max_bt = blen
 
+        dc_max_cl = int(dc_cl[:nd].max()) if nd > 0 else 0
+        if nd > 0:
+            fbs = int(block_size)
+            dc_max_bt = max(dc_max_bt, (dc_max_cl + fbs - 1) // fbs, 1)
         dc_bt = np.full(
             (nd, dc_max_bt), self._block_table_pad(), dtype=np.int32,
         ) if nd > 0 else np.empty((0, 0), dtype=np.int32)
         for i, seq in enumerate(decode_seqs):
             b = seq.block_table
             dc_bt[i, :len(b)] = b
-        dc_max_cl = int(dc_cl[:nd].max()) if nd > 0 else 0
 
         logit_idx = []
         for i in range(num_prefill_seqs):
@@ -5270,13 +5286,17 @@ class ModelRunner:
                     [s.num_computed_tokens for s in prefill_seqs],
                     prefill_chunk_sizes,
                 ))
-                spbt = self._pack_sliding_block_tables(prefill_seqs)
+                spbt = self._pack_sliding_block_tables(
+                    prefill_seqs, max_kv_len=pf_max_sk,
+                )
                 sliding_prefill_bt = torch.from_numpy(spbt).pin_memory().cuda(
                     non_blocking=True,
                 )
             if nd > 0:
                 slot_parts.append(self._sliding_decode_slots(decode_seqs, dc_cl))
-                sdbt = self._pack_sliding_block_tables(decode_seqs)
+                sdbt = self._pack_sliding_block_tables(
+                    decode_seqs, max_kv_len=dc_max_cl,
+                )
                 sliding_decode_bt = torch.from_numpy(sdbt).pin_memory().cuda(
                     non_blocking=True,
                 )

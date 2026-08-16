@@ -57,6 +57,13 @@ class FlashAttnPrefill(nn.Module):
                 page_size = self.page_size
                 if page_size is None and k.dim() >= 2:
                     page_size = k.shape[1]
+                # Hopper FA3: auto ``num_splits=0`` shrinks the process-wide
+                # split-KV scratch after CUDA-graph capture; the next decode
+                # graph replay IMAs.  Keep the captured workspace.  FA4 /
+                # B200 is unchanged (this branch is FA3-only below).
+                num_splits = (
+                    FA3_CUDA_GRAPH_MAX_NUM_SPLITS if FA_VERSION == 3 else 0
+                )
                 meta = fa3_scheduler_metadata(
                     batch_size=int(seqused_k.shape[0]),
                     max_seqlen_q=max_seqlen_q,
@@ -70,8 +77,10 @@ class FlashAttnPrefill(nn.Module):
                     page_size=page_size,
                     causal=kwargs.get("causal", True),
                     window_size=kwargs.get("window_size", (-1, -1)),
-                    num_splits=0,
+                    num_splits=num_splits,
                 )
+                if FA_VERSION == 3:
+                    fa_kw["num_splits"] = num_splits
             if meta is not None:
                 fa_kw["scheduler_metadata"] = meta
         else:

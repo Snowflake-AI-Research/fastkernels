@@ -226,19 +226,24 @@ class FlashAttnDecode(nn.Module):
             max_seqlen_k = int(cache_seqlens.max().item()) if cache_seqlens.numel() > 0 else 0
 
         capturing = torch.cuda.is_current_stream_capturing()
-        # Capture and its warmup share num_splits=32 + persistent ``out=``.
-        # Eager mixed stays on the auto-split path unless the engine pinned
-        # graph splits, so a later smaller FA3 call cannot shrink the
-        # process-wide split-KV workspace the large graph captured.
+        # Capture, pin, and padded eager decode all stay on num_splits=32
+        # so FA3's process-wide split-KV scratch cannot shrink below the
+        # largest captured graph.  B200 / FA4 never sets _force_graph_splits.
         use_graph_splits = capturing or self._force_graph_splits
         if use_graph_splits and not capturing and FA_VERSION == 3:
-            meta = self._graph_sched_meta if self._graph_sched_meta is not None else self._sched_meta
+            # Prefer the metadata we just wrote for this padded batch.
+            # ``_graph_sched_meta`` is an EAGLE-3 capture view and may
+            # still be sized for B=1 after multi-bucket capture.
+            meta = self._sched_meta
+            if meta is None and self._graph_sched_meta is not None:
+                meta = self._graph_sched_meta
             if meta is None or int(meta.shape[0]) != fa3_scheduler_metadata_size(n):
-                # Stale metadata from another batch (last capture was B=1,
-                # this eager mixed decode is B=N).  FA3 rejects the shape.
-                use_graph_splits = False
+                if self._force_graph_splits and self._sched_meta is not None:
+                    meta = self._sched_meta
+                else:
+                    use_graph_splits = False
         if use_graph_splits:
-            meta = self._graph_sched_meta if self._graph_sched_meta is not None else self._sched_meta
+            meta = self._sched_meta if self._sched_meta is not None else self._graph_sched_meta
             if FA_VERSION == 3 and meta is None:
                 raise RuntimeError(
                     "FA3 CUDA-graph capture requires "
