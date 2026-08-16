@@ -367,26 +367,57 @@ class Attention(nn.Module):
         gid = getattr(self, "_sliding_group_id", None)
         if gid is None:
             return tensor
-        return tensor[gid]
+        # ``[G, ...]`` slot maps and block tables.  A non-contiguous
+        # ``tensor[gid]`` view makes Triton's ``stride(0)`` wrong and
+        # turns a long prefill into an IMA.
+        return tensor[gid].contiguous()
+
+    def _hybrid_sliding(self) -> bool:
+        """True after Hopper Gemma hybrid KV assign (per-layer group id)."""
+        return getattr(self, "_sliding_group_id", None) is not None
 
     def _group_slot_mapping(self, ctx):
         if self.sliding_window and ctx.sliding_slot_mapping is not None:
             return self._sliding_group_tensor(ctx.sliding_slot_mapping)
+        if self.sliding_window and self._hybrid_sliding():
+            raise RuntimeError(
+                "sliding layer missing sliding_slot_mapping; "
+                "refusing full-attn slots (different page size)"
+            )
         return ctx.slot_mapping
 
     def _group_block_tables(self, ctx):
         if self.sliding_window and ctx.sliding_block_tables is not None:
             return self._sliding_group_tensor(ctx.sliding_block_tables)
+        if self.sliding_window and self._hybrid_sliding():
+            raise RuntimeError(
+                "sliding layer missing sliding_block_tables; "
+                "refusing full-attn tables (different page size)"
+            )
         return ctx.block_tables
 
     def _group_prefill_block_tables(self, ctx):
         if self.sliding_window and ctx.sliding_prefill_block_tables is not None:
             return self._sliding_group_tensor(ctx.sliding_prefill_block_tables)
+        if self.sliding_window and self._hybrid_sliding():
+            if getattr(ctx, "num_prefill_tokens", 0) == 0:
+                return None
+            raise RuntimeError(
+                "sliding layer missing sliding_prefill_block_tables; "
+                "refusing full-attn tables (different page size)"
+            )
         return ctx.prefill_block_tables
 
     def _group_decode_block_tables(self, ctx):
         if self.sliding_window and ctx.sliding_decode_block_tables is not None:
             return self._sliding_group_tensor(ctx.sliding_decode_block_tables)
+        if self.sliding_window and self._hybrid_sliding():
+            if getattr(ctx, "num_decode_tokens", 0) == 0:
+                return None
+            raise RuntimeError(
+                "sliding layer missing sliding_decode_block_tables; "
+                "refusing full-attn tables (different page size)"
+            )
         return ctx.decode_block_tables
 
     def forward(self, query: torch.Tensor, key: torch.Tensor,

@@ -683,12 +683,15 @@ class JambaEngine:
                 # process-wide split-KV workspace.
                 for bucket in reversed(self._decode_buckets):
                     self._capture_decode_graph(bucket)
-                self._pin_fa3_workspace()
             finally:
-                # Keep num_splits=32 + persistent out= after capture so a
-                # later eager mixed decode cannot shrink FA3's workspace
-                # and IMA the large-bucket graph.
-                pass
+                for group in getattr(self, "_fa_decode_groups", []):
+                    for op in group:
+                        op._force_graph_splits = False
+                # Grow FA3's process-wide scratch back to max-B after the
+                # last (smallest) capture.  Mixed eager decode stays on
+                # num_splits=0; ``_run_decode_step`` re-pins before the
+                # next graph replay.
+                self._pin_fa3_workspace()
 
     # ------------------------------------------------------------------
     # Random seeds

@@ -1971,6 +1971,7 @@ class ModelRunner:
                 views[id(layer)] = self._view_layer_kv(
                     raws[j // n_sliding_groups], layer, num_blocks, slide_bs,
                 )
+                assert getattr(layer, "_sliding_group_id", None) is not None
             self.kv_cache = [views[id(layer)] for layer in self._attn_layers]
             self.num_blocks = num_blocks
             self.sliding_num_blocks = num_blocks
@@ -2021,6 +2022,19 @@ class ModelRunner:
     def _sliding_group_count(self) -> int:
         return int(getattr(self, "_n_sliding_groups", 1) or 1)
 
+    def _hybrid_page_size(self) -> int:
+        """Smallest page used by any KV group (graph table width)."""
+        return min(
+            int(getattr(self, "_full_block_size", BLOCK_SIZE) or BLOCK_SIZE),
+            int(getattr(self, "_sliding_block_size", BLOCK_SIZE) or BLOCK_SIZE),
+            int(BLOCK_SIZE),
+        )
+
+    def _block_table_pad(self) -> int:
+        # Hybrid reserves physical block 0 as the null page.  Padding
+        # with -1 lets Triton treat the pad as a real index and IMA.
+        return 0 if getattr(self, "_sliding_kv_groups", False) else -1
+
     def _seq_sliding_tables(self, seq) -> list[list[int]]:
         tables = getattr(seq, "sliding_block_tables", None)
         if tables:
@@ -2038,7 +2052,11 @@ class ModelRunner:
             for table in tables:
                 if table:
                     max_bt = max(max_bt, len(table))
-        out = np.full((G, n, max_bt), -1, dtype=np.int32)
+        # Never return a 0-width table: ``ndarray.size == 0`` used to
+        # drop sliding metadata and sliding layers then read the
+        # full-attn table (page 32 vs 16) and IMA.
+        max_bt = max(max_bt, 1)
+        out = np.full((G, n, max_bt), self._block_table_pad(), dtype=np.int32)
         for i, tables in enumerate(tables_per_seq):
             for g in range(min(G, len(tables))):
                 table = tables[g]
@@ -4978,19 +4996,17 @@ class ModelRunner:
             lengths = [len(seq) for seq in seqs]
             ssm = self._sliding_token_slots(seqs, starts, lengths)
             sbt = self._pack_sliding_block_tables(seqs)
-            if ssm.size:
-                sliding_slot_mapping = torch.from_numpy(ssm).pin_memory().cuda(
-                    non_blocking=True,
-                )
-            if sbt.size:
-                sliding_block_tables = torch.from_numpy(sbt).pin_memory().cuda(
-                    non_blocking=True,
-                )
+            sliding_slot_mapping = torch.from_numpy(ssm).pin_memory().cuda(
+                non_blocking=True,
+            )
+            sliding_block_tables = torch.from_numpy(sbt).pin_memory().cuda(
+                non_blocking=True,
+            )
 
         block_tables = None
         if max_bt > 0:
             n = len(seqs)
-            bt = np.full((n, max_bt), -1, dtype=np.int32)
+            bt = np.full((n, max_bt), self._block_table_pad(), dtype=np.int32)
             for i, seq in enumerate(seqs):
                 if seq.block_table:
                     b = seq.block_table
@@ -5062,7 +5078,7 @@ class ModelRunner:
             if blen > max_bt:
                 max_bt = blen
 
-        bt = np.full((n, max_bt), -1, dtype=np.int32)
+        bt = np.full((n, max_bt), self._block_table_pad(), dtype=np.int32)
         for i, seq in enumerate(seqs):
             b = seq.block_table
             bt[i, :len(b)] = b
@@ -5087,10 +5103,9 @@ class ModelRunner:
             sliding_slot_mapping = torch.from_numpy(ssm).pin_memory().cuda(
                 non_blocking=True,
             )
-            if sbt.size:
-                sliding_block_tables = torch.from_numpy(sbt).pin_memory().cuda(
-                    non_blocking=True,
-                )
+            sliding_block_tables = torch.from_numpy(sbt).pin_memory().cuda(
+                non_blocking=True,
+            )
         set_context(
             False,
             slot_mapping=torch.from_numpy(sm).pin_memory().cuda(non_blocking=True),
@@ -5167,7 +5182,10 @@ class ModelRunner:
         # Build prefill block table
         prefill_block_tables = None
         if pf_max_bt > 0 and num_prefill_seqs > 0:
-            pbt = np.full((num_prefill_seqs, pf_max_bt), -1, dtype=np.int32)
+            pbt = np.full(
+                (num_prefill_seqs, pf_max_bt), self._block_table_pad(),
+                dtype=np.int32,
+            )
             for i, seq in enumerate(prefill_seqs):
                 b = seq.block_table
                 pbt[i, :len(b)] = b
@@ -5197,7 +5215,9 @@ class ModelRunner:
             if blen > dc_max_bt:
                 dc_max_bt = blen
 
-        dc_bt = np.full((nd, dc_max_bt), -1, dtype=np.int32) if nd > 0 else np.empty((0, 0), dtype=np.int32)
+        dc_bt = np.full(
+            (nd, dc_max_bt), self._block_table_pad(), dtype=np.int32,
+        ) if nd > 0 else np.empty((0, 0), dtype=np.int32)
         for i, seq in enumerate(decode_seqs):
             b = seq.block_table
             dc_bt[i, :len(b)] = b
@@ -5251,17 +5271,15 @@ class ModelRunner:
                     prefill_chunk_sizes,
                 ))
                 spbt = self._pack_sliding_block_tables(prefill_seqs)
-                if spbt.size:
-                    sliding_prefill_bt = torch.from_numpy(spbt).pin_memory().cuda(
-                        non_blocking=True,
-                    )
+                sliding_prefill_bt = torch.from_numpy(spbt).pin_memory().cuda(
+                    non_blocking=True,
+                )
             if nd > 0:
                 slot_parts.append(self._sliding_decode_slots(decode_seqs, dc_cl))
                 sdbt = self._pack_sliding_block_tables(decode_seqs)
-                if sdbt.size:
-                    sliding_decode_bt = torch.from_numpy(sdbt).pin_memory().cuda(
-                        non_blocking=True,
-                    )
+                sliding_decode_bt = torch.from_numpy(sdbt).pin_memory().cuda(
+                    non_blocking=True,
+                )
             if slot_parts:
                 sliding_slot_t = torch.from_numpy(
                     np.concatenate(slot_parts, axis=1),
@@ -5625,7 +5643,9 @@ class ModelRunner:
         self._greedy_all_info = torch.zeros(self.world_size, max_bs, 2, dtype=torch.float32, device=dev)
         self._greedy_arange = torch.arange(max_bs, device=dev)
 
-        max_num_blocks = (self.max_model_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+        max_num_blocks = (
+            self.max_model_len + self._hybrid_page_size() - 1
+        ) // self._hybrid_page_size()
         # Back the per-step decode staging arrays with *pinned* host memory.
         #
         # These are written as numpy and then handed to
@@ -5657,7 +5677,7 @@ class ModelRunner:
         self._pin_sm, self._np_sm = _pinned(max_bs, sm_torch_dtype)
         self._pin_cl, self._np_cl = _pinned(max_bs, torch.int32)
         self._pin_bt, self._np_bt = _pinned((max_bs, max_num_blocks), torch.int32)
-        self._np_bt.fill(-1)
+        self._np_bt.fill(self._block_table_pad())
         if getattr(self, "_sliding_kv_groups", False):
             n_g = self._sliding_group_count()
             self._pin_sliding_sm, self._np_sliding_sm = _pinned(
@@ -5666,7 +5686,7 @@ class ModelRunner:
             self._pin_sliding_bt, self._np_sliding_bt = _pinned(
                 (n_g, max_bs, max_num_blocks), torch.int32,
             )
-            self._np_sliding_bt.fill(-1)
+            self._np_sliding_bt.fill(self._block_table_pad())
             self._eager_sliding_slot_mapping = torch.zeros(
                 n_g, max_bs, dtype=sm_torch_dtype, device=dev,
             )
@@ -5842,7 +5862,7 @@ class ModelRunner:
             blen = len(b)
             bt_np[i, :blen] = b
             if blen < max_bt:
-                bt_np[i, blen:max_bt] = -1
+                bt_np[i, blen:max_bt] = self._block_table_pad()
         self._prev_max_bt = max_bt
         if getattr(self, "_sliding_kv_groups", False):
             sbs = getattr(self, "_sliding_block_size", BLOCK_SIZE)
@@ -5869,7 +5889,7 @@ class ModelRunner:
                     for g in range(G):
                         blen = len(tables[g]) if g < len(tables) else 0
                         if blen < max_sbt:
-                            sbt[g, i, blen:max_sbt] = -1
+                            sbt[g, i, blen:max_sbt] = self._block_table_pad()
             self._prev_max_sbt = max_sbt
         if self.is_qwen_vl:
             return (n, ids_np[:n], pos_np[:, :n], sm_np[:n], cl_np[:n], bt_np[:n, :max_bt])
@@ -5946,7 +5966,7 @@ class ModelRunner:
                     for g in range(G):
                         blen = len(tables[g]) if g < len(tables) else 0
                         if blen < max_sbt:
-                            sbt[g, i, blen:max_sbt] = -1
+                            sbt[g, i, blen:max_sbt] = self._block_table_pad()
             self._prev_max_sbt = max_sbt
         if self.is_qwen_vl:
             return (n, ids_np[:n], pos_np[:, :n], sm_np[:n], cl_np[:n],
@@ -6750,7 +6770,9 @@ class ModelRunner:
         import gc
         from contextlib import nullcontext
         max_bs = self.max_num_seqs
-        max_num_blocks = (self.max_model_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+        max_num_blocks = (
+            self.max_model_len + self._hybrid_page_size() - 1
+        ) // self._hybrid_page_size()
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         if self.is_qwen_vl:
             positions = torch.zeros(3, max_bs + 1, dtype=torch.int64)

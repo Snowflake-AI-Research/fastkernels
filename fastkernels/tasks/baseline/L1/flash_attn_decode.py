@@ -160,7 +160,14 @@ class FlashAttnDecode(nn.Module):
         # Eager mixed stays on the auto-split path unless the engine pinned
         # graph splits, so a later smaller FA3 call cannot shrink the
         # process-wide split-KV workspace the large graph captured.
-        if capturing or self._force_graph_splits:
+        use_graph_splits = capturing or self._force_graph_splits
+        if use_graph_splits and not capturing and FA_VERSION == 3:
+            meta = self._graph_sched_meta if self._graph_sched_meta is not None else self._sched_meta
+            if meta is None or int(meta.shape[0]) != fa3_scheduler_metadata_size(n):
+                # Stale metadata from another batch (last capture was B=1,
+                # this eager mixed decode is B=N).  FA3 rejects the shape.
+                use_graph_splits = False
+        if use_graph_splits:
             meta = self._graph_sched_meta if self._graph_sched_meta is not None else self._sched_meta
             if FA_VERSION == 3 and meta is None:
                 raise RuntimeError(
