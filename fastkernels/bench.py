@@ -50,7 +50,8 @@ Known limitations (honest by design):
 * Inputs are materialized from shape+dtype plus name heuristics. Operators whose
   ``forward`` args include live module handles, opaque runtime objects or
   deeply-nested/collapsed values are reported ``SKIPPED``, not benchmarked. A
-  case whose generated inputs the baseline itself rejects is also ``SKIPPED``.
+  case whose generated inputs the baseline itself rejects, or whose baseline
+  output is all-zeros (untestable — a stub would match), is also ``SKIPPED``.
 * One GPU per operator (tp=1) -- matches the L1/L2 kernel scope; multi-GPU
   operators would need the tp-packing logic from ``capture.py``.
 
@@ -1092,22 +1093,50 @@ def _build_store_kvcache_inputs(cache_key: str, num_slots_fn):
     return _builder
 
 
+def _fill_indexer_k_cache(cache: torch.Tensor, block_table: torch.Tensor) -> None:
+    """Pack finite fp8 keys + UE8M0 scales into pages *block_table* walks.
+
+    Random uint8 bytes decode to NaN/Inf scales; a zeroed cache makes gather
+    return zeros and a stub candidate pass. Use the store kernel so the
+    layout matches what gather reads.
+    """
+    if cache.ndim < 2 or int(cache.shape[-1]) <= 4:
+        raise _UnsupportedInput("indexer cache: unexpected layout")
+    try:
+        from fastkernels.tasks.baseline.L1.indexer_k_cache import IndexerKCacheStore
+    except Exception as exc:  # noqa: BLE001
+        raise _UnsupportedInput(f"indexer cache fill: {exc!r}")
+    block_size = int(cache.shape[1])
+    head_dim = int(cache.shape[-1]) - 4
+    pages = torch.unique(block_table.reshape(-1).to(torch.int64))
+    n = int(pages.numel()) * block_size
+    keys = (torch.randn(n, head_dim, device=cache.device, dtype=torch.float32)
+            .clamp_(-2, 2).to(torch.bfloat16))
+    slots = (pages.unsqueeze(1) * block_size
+             + torch.arange(block_size, device=cache.device, dtype=torch.int64)
+             ).reshape(-1)
+    try:
+        IndexerKCacheStore()(keys, cache, slots)
+    except Exception as exc:  # noqa: BLE001
+        raise _UnsupportedInput(f"indexer cache fill: {exc!r}")
+
+
 def _build_indexer_k_cache_gather_inputs(fwd_args, device, init_args):
     """Inputs for ``IndexerKCacheGather.forward(kv_cache, block_table,
     cu_seq_lens, ...)``. The paged cache is uint8 ``[num_blocks, block_size,
     132]`` holding fp8 keys plus a float32 scale per token; random bytes decode
-    to NaN/Inf (a random 4-byte scale is almost never finite), so the gather
-    returns NaN. Zero the cache (a valid empty cache), bound ``block_table`` to
-    the cache's block count, and drop the captured output workspace /
-    ``total_tokens`` so they stay consistent with the generated cu_seq_lens."""
+    to NaN/Inf. Pack referenced pages via the store kernel, bound
+    ``block_table`` to the cache's block count, and drop the captured output
+    workspace / ``total_tokens`` so they stay consistent with the generated
+    cu_seq_lens."""
     kw = _materialize_all(fwd_args, device, init_args,
                           skip=("total_tokens", "out_k_fp8", "out_k_scale"))
     cache = kw.get("kv_cache")
     bt = kw.get("block_table")
     if not (isinstance(cache, torch.Tensor) and isinstance(bt, torch.Tensor)):
         raise _UnsupportedInput("IndexerKCacheGather: missing kv_cache/block_table")
-    cache.zero_()
     kw["block_table"] = _valid_slot_mapping(cache, int(cache.shape[0]), bt)
+    _fill_indexer_k_cache(cache, kw["block_table"])
     return [], kw
 
 
@@ -1276,19 +1305,18 @@ def _build_deepseek_mla_composite_inputs(fwd_args, device, init_args):
 def _fix_paged_decode(kw: dict, cache_keys: tuple[str, ...]) -> None:
     """Make a paged-attention decode's inputs finite and in-range, in place.
 
-    Random cache bytes decode to NaN (fp8) and a random ``block_table`` /
-    ``cache_seqlens`` walk pages that don't exist -> NaN. Zero the cache(s) (a
-    valid empty cache), draw page ids within the cache's block count, and cap the
-    context lengths to what the page table can address (``max_pages *
-    page_size``). Geometry comes from the first cache: ``[num_blocks, ...,
-    page_size, head_dim]``."""
+    A random ``block_table`` / ``cache_seqlens`` walks pages that don't exist
+    -> NaN. Draw page ids within the cache's block count and cap context
+    lengths to what the page table can address (``max_pages * page_size``).
+    Leave the cache values from the generic materializer (randn / clamped
+    fp8) — zeroing them made the baseline output zeros, so a stub passed.
+    Geometry comes from the first cache: ``[num_blocks, ..., page_size,
+    head_dim]``."""
     caches = [kw.get(k) for k in cache_keys]
     bt, sl = kw.get("block_table"), kw.get("cache_seqlens")
     if not (all(isinstance(c, torch.Tensor) for c in caches)
             and isinstance(bt, torch.Tensor) and isinstance(sl, torch.Tensor)):
         raise _UnsupportedInput("paged decode: missing cache/block_table/cache_seqlens")
-    for c in caches:
-        c.zero_()
     c0 = caches[0]
     num_blocks, page_size = int(c0.shape[0]), int(c0.shape[-2])
     max_pages = int(bt.shape[-1])
@@ -1302,7 +1330,7 @@ def _fix_paged_decode(kw: dict, cache_keys: tuple[str, ...]) -> None:
 
 
 def _build_trtllm_decode_inputs(fwd_args, device, init_args):
-    """Inputs for ``TRTLLMDecode.forward`` with a valid (zeroed) paged K/V cache
+    """Inputs for ``TRTLLMDecode.forward`` with a finite paged K/V cache
     and consistent block_table / cache_seqlens (see ``_fix_paged_decode``)."""
     kw = _materialize_all(fwd_args, device, init_args)
     _fix_paged_decode(kw, ("k_cache", "v_cache"))
@@ -1310,7 +1338,7 @@ def _build_trtllm_decode_inputs(fwd_args, device, init_args):
 
 
 def _build_flashinfer_mla_decode_inputs(fwd_args, device, init_args):
-    """Inputs for ``FlashInferMLADecode.forward`` with a valid (zeroed) paged
+    """Inputs for ``FlashInferMLADecode.forward`` with a finite paged
     latent cache and consistent block_table / cache_seqlens."""
     kw = _materialize_all(fwd_args, device, init_args)
     _fix_paged_decode(kw, ("kv_cache",))
@@ -1638,8 +1666,8 @@ _INPUT_BUILDERS = {
     # OasisRollout: whole-model rollout driver, not a benchmarkable kernel.
     "fastkernels.tasks.baseline.L3.oasis_rollout:OasisRollout":
         _build_oasis_rollout_inputs,
-    # Indexer K-cache gather: zero the paged fp8 cache so gathered scales are
-    # finite (random bytes decode to NaN), and bound block_table in range.
+    # Indexer K-cache gather: pack finite fp8 keys into referenced pages
+    # (random uint8 scales decode to NaN; an empty cache is untestable).
     "fastkernels.tasks.baseline.L1.indexer_k_cache:IndexerKCacheGather":
         _build_indexer_k_cache_gather_inputs,
     # Fused MoE grouped GEMM: regenerate valid routing metadata.
@@ -1660,7 +1688,7 @@ _INPUT_BUILDERS = {
         _build_deepseek_mla_composite_inputs,
     "fastkernels.tasks.baseline.L3.deepseek_decoder:DeepSeekDecoderLayer":
         _build_deepseek_mla_composite_inputs,
-    # Paged decode: zero the cache, bound block_table, cap cache_seqlens.
+    # Paged decode: finite-fill the cache, bound block_table, cap cache_seqlens.
     "fastkernels.tasks.baseline.L1.flashinfer_decode:TRTLLMDecode":
         _build_trtllm_decode_inputs,
     "fastkernels.tasks.baseline.L1.flashinfer_mla_decode:FlashInferMLADecode":
@@ -1805,6 +1833,11 @@ def _compare(out, ref, check_dtype: bool):
     if len(out_leaves) != len(ref_leaves):
         return (INCORRECT_SHAPE, float("inf"), float("inf"), 0.0,
                 f"output tensor count {len(out_leaves)} != {len(ref_leaves)}")
+    nonempty_refs = [r for r in ref_leaves if r.numel() > 0]
+    if nonempty_refs and all(
+            torch.linalg.vector_norm(r.detach().to(torch.float32)).item() == 0
+            for r in nonempty_refs):
+        return (SKIPPED, 0.0, 0.0, 0.0, "skip: reference output is all-zeros")
     worst_matched = 1.0
     max_abs = max_rel = 0.0
     for o, r in zip(out_leaves, ref_leaves):

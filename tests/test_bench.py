@@ -264,6 +264,59 @@ def test_section_6():
 
 
 # ===========================================================================
+# Section 7: Bench correctness helpers (unit, CPU)
+# ===========================================================================
+def test_section_7():
+    print(f"\n{'=' * 60}")
+    print("  SECTION 7: Bench correctness helpers")
+    print(f"{'=' * 60}")
+
+    # test_bench.py puts the repo parent on sys.path; the installable package
+    # lives at PACKAGE_DIR/fastkernels.
+    sys.path.insert(0, PACKAGE_DIR)
+    from fastkernels.bench import (
+        INCORRECT_NUMERICAL,
+        PASSED,
+        SKIPPED,
+        _compare,
+        _fix_paged_decode,
+    )
+
+    with _Timeout(30):
+        zeros = torch.zeros(8)
+        noise = torch.randn(8)
+        check(_compare(zeros, zeros, True)[0] == SKIPPED,
+              "7a. all-zero reference is SKIPPED, not PASSED")
+        check(_compare(noise, noise, True)[0] == PASSED,
+              "7a. matching nonzero tensors PASS")
+        check(_compare(zeros, noise, True)[0] == INCORRECT_NUMERICAL,
+              "7a. zeros candidate vs nonzero ref is INCORRECT")
+        # Aux zeros next to a live tensor must not skip the case.
+        check(_compare((noise, zeros), (noise, zeros), True)[0] == PASSED,
+              "7a. mixed live + zero aux still compares")
+
+    with _Timeout(30):
+        k = torch.randn(4, 1, 16, 8)
+        v = torch.randn(4, 1, 16, 8)
+        k_before, v_before = k.clone(), v.clone()
+        kw = {
+            "k_cache": k, "v_cache": v,
+            "block_table": torch.zeros(2, 3, dtype=torch.int32),
+            "cache_seqlens": torch.zeros(2, dtype=torch.int32),
+            "max_seq_len": 0,
+        }
+        _fix_paged_decode(kw, ("k_cache", "v_cache"))
+        check(torch.equal(kw["k_cache"], k_before) and torch.equal(kw["v_cache"], v_before),
+              "7b. paged-decode fix does not zero the cache")
+        check(int(kw["block_table"].min()) >= 0
+              and int(kw["block_table"].max()) < 4,
+              "7b. block_table stays in cache range")
+        check(int(kw["cache_seqlens"].min()) >= 1
+              and int(kw["max_seq_len"]) == int(kw["cache_seqlens"].max()),
+              "7b. cache_seqlens and max_seq_len are consistent")
+
+
+# ===========================================================================
 # Section 9: Eval integration (GPU required, single GPU)
 # ===========================================================================
 def test_section_9():
@@ -333,7 +386,7 @@ def main():
     )
     parser.add_argument(
         "--section", type=int, default=None,
-        help="Run only a specific section (4, 5, 6, 9)",
+        help="Run only a specific section (4, 5, 6, 7, 9)",
     )
     args = parser.parse_args()
 
@@ -345,6 +398,7 @@ def main():
         4: ("Standardized workloads", test_section_4),
         5: ("Conflict resolution", test_section_5),
         6: ("CLI argument parsing", test_section_6),
+        7: ("Bench correctness helpers", test_section_7),
         9: ("Eval integration", test_section_9),
     }
 
