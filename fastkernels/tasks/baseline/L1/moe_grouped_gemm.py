@@ -22,7 +22,6 @@ import triton.language as tl
 import deep_gemm as _dg
 
 
-
 _BLOCK_ALIGNMENT = 128
 
 

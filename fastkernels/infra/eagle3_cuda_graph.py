@@ -883,7 +883,6 @@ class DraftExtendGraphRunner:
     def _refresh_fa3_extend(self, B: int) -> None:
         """Build FA3 paged-prefill schedules from ``cu_seqlens_k``."""
         from .fa_utils import (
-            FA3_CUDA_GRAPH_MAX_NUM_SPLITS,
             FA_VERSION,
             fa3_scheduler_metadata,
             fa3_scheduler_metadata_size,
@@ -919,7 +918,11 @@ class DraftExtendGraphRunner:
                 page_size=op.page_size,
                 causal=True,
                 window_size=(-1, -1),
-                num_splits=FA3_CUDA_GRAPH_MAX_NUM_SPLITS,
+                # Must match ``FlashAttnPrefill``: prefill graphs pin
+                # ``num_splits=1`` (32-split metadata is a different size and
+                # FA3 rejects it with ``scheduler_metadata must have shape
+                # (metadata_size)``). Decode graphs keep 32; this is prefill.
+                num_splits=1,
             )
             if meta is None:
                 continue
