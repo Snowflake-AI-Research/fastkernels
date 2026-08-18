@@ -1329,6 +1329,41 @@ def _fix_paged_decode(kw: dict, cache_keys: tuple[str, ...]) -> None:
         kw["max_seq_len"] = int(sl.max().item())
 
 
+def _build_trtllm_prefill_inputs(fwd_args, device, init_args):
+    """Paged TRTLLM prefill: keep cu_seqlens_k as token lengths, not block count.
+
+    Generic rewrite pairs ``cu_seqlens_k`` with the ``k`` cache, whose dim0 is
+    ``num_blocks``. That makes seqused_k huge vs the page table and OOMs / IMA.
+    """
+    kw = _materialize_all(fwd_args, device, init_args)
+    q, k = kw.get("q"), kw.get("k")
+    cu_q, bt = kw.get("cu_seqlens_q"), kw.get("block_table")
+    if not isinstance(q, torch.Tensor):
+        raise _UnsupportedInput("TRTLLMPrefill: missing q")
+    nseg = (int(cu_q.numel()) - 1) if isinstance(cu_q, torch.Tensor) and cu_q.numel() >= 2 else 1
+    kw["cu_seqlens_q"] = _partition_cu(int(q.shape[0]), nseg, q.device, torch.int32)
+    q_lens = kw["cu_seqlens_q"][1:] - kw["cu_seqlens_q"][:-1]
+    if isinstance(bt, torch.Tensor) and isinstance(k, torch.Tensor) and k.dim() == 4:
+        num_blocks = int(k.shape[0])
+        page_size = int(k.shape[-2])
+        kw["block_table"] = torch.randint(
+            0, max(1, num_blocks), tuple(bt.shape), device=k.device, dtype=bt.dtype)
+        max_len = max(1, int(bt.shape[-1]) * page_size)
+        extra = max(0, int(fwd_args.get("max_seqlen_k") or 0) - int(fwd_args.get("max_seqlen_q") or 0))
+        k_lens = torch.clamp(q_lens + extra, min=1, max=max_len)
+        cu = torch.zeros(nseg + 1, device=q.device, dtype=torch.int32)
+        cu[1:] = torch.cumsum(k_lens.to(torch.int32), 0)
+        kw["cu_seqlens_k"] = cu
+        kw["max_seqlen_q"] = int(q_lens.max().item()) if nseg else 0
+        kw["max_seqlen_k"] = int(k_lens.max().item()) if nseg else 0
+    elif isinstance(k, torch.Tensor) and k.dim() == 3:
+        nseg_k = (int(kw["cu_seqlens_k"].numel()) - 1
+                  if isinstance(kw.get("cu_seqlens_k"), torch.Tensor) and kw["cu_seqlens_k"].numel() >= 2
+                  else nseg)
+        kw["cu_seqlens_k"] = _partition_cu(int(k.shape[0]), nseg_k, k.device, torch.int32)
+    return [], kw
+
+
 def _build_trtllm_decode_inputs(fwd_args, device, init_args):
     """Inputs for ``TRTLLMDecode.forward`` with a finite paged K/V cache
     and consistent block_table / cache_seqlens (see ``_fix_paged_decode``)."""
@@ -1689,6 +1724,8 @@ _INPUT_BUILDERS = {
     "fastkernels.tasks.baseline.L3.deepseek_decoder:DeepSeekDecoderLayer":
         _build_deepseek_mla_composite_inputs,
     # Paged decode: finite-fill the cache, bound block_table, cap cache_seqlens.
+    "fastkernels.tasks.baseline.L1.flashinfer_prefill:TRTLLMPrefill":
+        _build_trtllm_prefill_inputs,
     "fastkernels.tasks.baseline.L1.flashinfer_decode:TRTLLMDecode":
         _build_trtllm_decode_inputs,
     "fastkernels.tasks.baseline.L1.flashinfer_mla_decode:FlashInferMLADecode":
