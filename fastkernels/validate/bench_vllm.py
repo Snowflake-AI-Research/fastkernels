@@ -165,49 +165,6 @@ def _load_raw(path: str, fingerprint: str) -> dict | None:
     return blob.get("raw")
 
 
-_FA4_N_BLOCK_FIRST_OLD = (
-    "                if const_expr(not self.is_split_kv) or n_block_min < n_block_max:\n"
-    "                    n_block_first = n_block_max - 1 if n_block_max > 0 else 0\n"
-)
-_FA4_N_BLOCK_FIRST_NEW = (
-    "                n_block_first = n_block_max - 1 if n_block_max > 0 else Int32(0)\n"
-    "                if const_expr(not self.is_split_kv) or n_block_min < n_block_max:\n"
-)
-
-
-def _patch_vllm_fa4_n_block_first() -> None:
-    """Hoist FA4 ``n_block_first`` in linecache so split-KV compiles on SM100.
-
-    CuTeDSL re-parses kernel source via ``inspect.getsourcelines`` (linecache),
-    not the on-disk file at JIT time. Prime the cache with a same-line-count
-    hoist (``else Int32(0)``) so both join paths are ``Int32``. Does not write
-    site-packages. Drop once upstream ships this.
-    """
-    try:
-        import linecache
-        import vllm
-        path = str(
-            Path(vllm.__file__).resolve().parent
-            / "vllm_flash_attn" / "cute" / "flash_fwd_sm100.py"
-        )
-        src = Path(path).read_text()
-    except Exception:
-        return
-    if _FA4_N_BLOCK_FIRST_OLD not in src:
-        return
-    patched = src.replace(_FA4_N_BLOCK_FIRST_OLD, _FA4_N_BLOCK_FIRST_NEW, 1)
-    try:
-        st = os.stat(path)
-    except OSError:
-        return
-    lines = patched.splitlines(True)
-    entry = (st.st_size, st.st_mtime, lines, path)
-    linecache.cache[path] = entry
-    real = os.path.realpath(path)
-    if real != path:
-        linecache.cache[real] = (st.st_size, st.st_mtime, lines, real)
-
-
 def _install_bench_sitecustomize() -> None:
     """Install a sitecustomize that patches vLLM/FlashInfer in every spawned
     Python process (the v1 EngineCore and TP worker ranks), driven by env vars.
@@ -227,10 +184,8 @@ def _install_bench_sitecustomize() -> None:
 
     Also primes linecache with a same-line-count FA4 ``n_block_first`` hoist
     so vLLM 0.26 split-KV compiles on SM100 (CuTeDSL reads source via
-    inspect/linecache). Applied here and in sitecustomize so EngineCore/TP
-    workers see it; the installed vLLM tree is not modified.
+    inspect/linecache). The installed vLLM tree is not modified.
     """
-    _patch_vllm_fa4_n_block_first()
     site_dir = Path(os.environ.get(
         "FASTKERNELS_FLASHINFER_SITECUSTOMIZE_DIR",
         "/tmp/fastkernels_flashinfer_sitecustomize",
@@ -2641,29 +2596,24 @@ def main():
         )
         _HELD_PORT_LOCKS.append(vllm_port_lock)
         os.environ["VLLM_PORT"] = str(vllm_port)
-        need_sitecustomize = False
         if args.tp > 1:
             flashinfer_namespace = (
                 os.environ.get("FASTKERNELS_FLASHINFER_SOCKET_NAMESPACE")
                 or f"bench-vllm-{os.getpid()}-{vllm_port}"
             )
             os.environ["FASTKERNELS_FLASHINFER_SOCKET_NAMESPACE"] = flashinfer_namespace
-            need_sitecustomize = True
         if args.max_layers is not None:
             # Filter pruned-layer weights inside every spawned vLLM rank so its
             # per-model loaders don't KeyError on the full checkpoint's extra
             # ``layers.{i>=N}`` tensors (hf_overrides only shrinks the model).
             os.environ["FASTKERNELS_MAX_LAYERS"] = str(args.max_layers)
-            need_sitecustomize = True
         # Align the throwaway CUDA-graph-profiling KV cache's block count so
         # vLLM's own default MLA decode backend can start (upstream bug; see
         # the sitecustomize body). Always on: it is a no-op for every model
         # whose page size already yields alignment == 1, and it never changes a
         # measured config -- so it does not need to be model-gated.
         os.environ["FASTKERNELS_ALIGN_PROFILING_KV_BLOCKS"] = "1"
-        need_sitecustomize = True
-        if need_sitecustomize:
-            _install_bench_sitecustomize()
+        _install_bench_sitecustomize()
 
     if is_whisper:
         throughput_scenarios = WHISPER_SCENARIOS

@@ -49,6 +49,9 @@ from fastkernels.workloads import (  # noqa: E402
     load_real_prompt_workload,
 )
 from fastkernels.validate.worker import run_worker  # noqa: E402
+from fastkernels.validate.bench_vllm import (  # noqa: E402
+    _install_bench_sitecustomize,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -708,6 +711,10 @@ def main():
             "scenarios": scenarios,
             "latency_scenarios": latency_scenarios,
         }
+        # FA4 split-KV TYPE_UNSTABLE_JOIN: same sitecustomize linecache hoist
+        # bench_vllm uses. EAGLE-3 tree-verify JITs flash_fwd_sm100 in this
+        # worker, which never loads bench_vllm.
+        _install_bench_sitecustomize()
         kb_raw = run_worker(
             FASTKERNELS_EAGLE3_WORKER, kb_cfg,
             f"fastkernels [EAGLE-3] {args.model.split('/')[-1]}",
