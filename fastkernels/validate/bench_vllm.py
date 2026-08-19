@@ -169,7 +169,7 @@ def _install_bench_sitecustomize() -> None:
     """Install a sitecustomize that patches vLLM/FlashInfer in every spawned
     Python process (the v1 EngineCore and TP worker ranks), driven by env vars.
 
-    Two independent patches, each gated by its own env var so this is safe to
+    Independent patches, each gated by its own env var so this is safe to
     install unconditionally:
 
     * ``FASTKERNELS_FLASHINFER_SOCKET_NAMESPACE`` -- namespaces FlashInfer IPC
@@ -181,6 +181,8 @@ def _install_bench_sitecustomize() -> None:
       ``layers.{i>=N}.*`` tensors from the full checkpoint, so they must be
       dropped from the weight iterator here. A monkeypatch in this process would
       not survive the spawn to EngineCore/TP ranks -- the sitecustomize does.
+    * ``FASTKERNELS_PIN_FA4_DENSE_NUM_SPLITS`` -- pin dense FA4 ``num_splits=1``
+      so vLLM's ViT encoder does not JIT the broken SM100 split-KV kernel.
     """
     site_dir = Path(os.environ.get(
         "FASTKERNELS_FLASHINFER_SITECUSTOMIZE_DIR",
@@ -384,6 +386,42 @@ if os.environ.get("FASTKERNELS_DSA_DETERMINISTIC_TOPK", "0") != "0":
                   "override installed", file=_sys.stderr, flush=True)
         except Exception:
             pass
+# FASTKERNELS_PIN_FA4_DENSE_NUM_SPLITS -- work around an upstream vLLM 0.26
+# FA4 CuTeDSL compile bug on Blackwell (SM100).
+#
+# vLLM's ViT wrapper calls flash_attn_varlen_func with the default
+# ``num_splits=0`` (auto). FA4 then runs num_splits_heuristic and, for the
+# few m-blocks a TP-sharded encoder produces (e.g. Qwen3-VL 16 heads / tp=4
+# = 4) at moderate image seqlens, picks num_splits > 1. That compiles
+# flash_fwd_sm100.py with is_split_kv=True, where ``n_block_first`` is None
+# on one branch and Int32 on the other -- TYPE_UNSTABLE_JOIN under
+# nvidia-cutlass-dsl 4.6.0 (the version vLLM 0.26.0 pins).
+#
+# Encoder self-attention is balanced (q_len == k_len), so split-KV does not
+# help; forcing 1 is numerically identical and is the same pin our own
+# vision_attention / flash_attn_prefill kernels already use. Paged LLM
+# prefill (block_table set) keeps auto-splitting. Default on: no-op when
+# the heuristic would have chosen 1 anyway, and FA3/FA2 ignore or reject
+# split-KV. Set the env to 0 to restore stock vLLM.
+if os.environ.get("FASTKERNELS_PIN_FA4_DENSE_NUM_SPLITS", "1") != "0":
+    try:
+        import vllm.vllm_flash_attn as _fa_pkg
+        from vllm.vllm_flash_attn import flash_attn_interface as _fa_iface
+    except Exception:
+        pass
+    else:
+        if not getattr(_fa_iface, "_fastkernels_pin_dense_num_splits", False):
+            _orig_fa_varlen = _fa_iface.flash_attn_varlen_func
+
+            def _fa_varlen_pin_dense(*args, _orig=_orig_fa_varlen, **kwargs):
+                if (kwargs.get("block_table") is None
+                        and kwargs.get("num_splits", 0) == 0):
+                    kwargs["num_splits"] = 1
+                return _orig(*args, **kwargs)
+
+            _fa_iface.flash_attn_varlen_func = _fa_varlen_pin_dense
+            _fa_pkg.flash_attn_varlen_func = _fa_varlen_pin_dense
+            _fa_iface._fastkernels_pin_dense_num_splits = True
 ''')
 
     current = os.environ.get("PYTHONPATH", "")
