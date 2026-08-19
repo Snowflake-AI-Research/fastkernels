@@ -123,7 +123,19 @@ def _load_coco_images(
 
     stacked = torch.stack(all_tensors).half()
     print(f"  Preprocessed {len(all_tensors)} images -> {stacked.shape}")
-    torch.save(stacked, tensor_path)
+    # Atomic publish so a parallel detection job (YOLO + RT-DETR share this
+    # path) cannot load a half-written zip. os.replace is atomic; readers
+    # see either a complete file or nothing.
+    tmp_path = f"{tensor_path}.{os.getpid()}.tmp"
+    try:
+        torch.save(stacked, tmp_path)
+        os.replace(tmp_path, tensor_path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
     print(f"  Saved to {tensor_path}")
     return tensor_path
 

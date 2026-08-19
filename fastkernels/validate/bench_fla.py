@@ -423,8 +423,25 @@ def _continuous_generate(model, tokenizer, prompts, output_lens, eos, device,
                 active_cache = _concat_cache_batches([active_cache, new_cache])
                 active.extend(new_active)
 
+    # The validate sweep kills a task whose log has not moved for 900s.
+    # Mixed RetNet can sit in this loop that long with no other prints.
+    last_beat = time.perf_counter()
+
+    def _maybe_beat():
+        nonlocal last_beat
+        if time.perf_counter() - last_beat < 30.0:
+            return
+        ntok = sum(len(g) for g in generated)
+        print(
+            f"  [FLA reference] {wait_pos}/{n} admitted, "
+            f"{len(active)} active, {ntok} tok",
+            flush=True,
+        )
+        last_beat = time.perf_counter()
+
     with torch.inference_mode():
         _admit()
+        _maybe_beat()
         while active:
             input_ids = torch.tensor(
                 [[generated[i][-1]] for i in active],
@@ -457,6 +474,7 @@ def _continuous_generate(model, tokenizer, prompts, output_lens, eos, device,
                 active_cache = None
             active = survivors
             _admit()
+            _maybe_beat()
 
     return generated
 

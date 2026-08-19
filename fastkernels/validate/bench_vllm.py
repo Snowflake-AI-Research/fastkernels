@@ -165,6 +165,49 @@ def _load_raw(path: str, fingerprint: str) -> dict | None:
     return blob.get("raw")
 
 
+_FA4_N_BLOCK_FIRST_OLD = (
+    "                if const_expr(not self.is_split_kv) or n_block_min < n_block_max:\n"
+    "                    n_block_first = n_block_max - 1 if n_block_max > 0 else 0\n"
+)
+_FA4_N_BLOCK_FIRST_NEW = (
+    "                n_block_first = n_block_max - 1 if n_block_max > 0 else Int32(0)\n"
+    "                if const_expr(not self.is_split_kv) or n_block_min < n_block_max:\n"
+)
+
+
+def _patch_vllm_fa4_n_block_first() -> None:
+    """Hoist FA4 ``n_block_first`` in linecache so split-KV compiles on SM100.
+
+    CuTeDSL re-parses kernel source via ``inspect.getsourcelines`` (linecache),
+    not the on-disk file at JIT time. Prime the cache with a same-line-count
+    hoist (``else Int32(0)``) so both join paths are ``Int32``. Does not write
+    site-packages. Drop once upstream ships this.
+    """
+    try:
+        import linecache
+        import vllm
+        path = str(
+            Path(vllm.__file__).resolve().parent
+            / "vllm_flash_attn" / "cute" / "flash_fwd_sm100.py"
+        )
+        src = Path(path).read_text()
+    except Exception:
+        return
+    if _FA4_N_BLOCK_FIRST_OLD not in src:
+        return
+    patched = src.replace(_FA4_N_BLOCK_FIRST_OLD, _FA4_N_BLOCK_FIRST_NEW, 1)
+    try:
+        st = os.stat(path)
+    except OSError:
+        return
+    lines = patched.splitlines(True)
+    entry = (st.st_size, st.st_mtime, lines, path)
+    linecache.cache[path] = entry
+    real = os.path.realpath(path)
+    if real != path:
+        linecache.cache[real] = (st.st_size, st.st_mtime, lines, real)
+
+
 def _install_bench_sitecustomize() -> None:
     """Install a sitecustomize that patches vLLM/FlashInfer in every spawned
     Python process (the v1 EngineCore and TP worker ranks), driven by env vars.
@@ -181,9 +224,13 @@ def _install_bench_sitecustomize() -> None:
       ``layers.{i>=N}.*`` tensors from the full checkpoint, so they must be
       dropped from the weight iterator here. A monkeypatch in this process would
       not survive the spawn to EngineCore/TP ranks -- the sitecustomize does.
-    * ``FASTKERNELS_PIN_FA4_DENSE_NUM_SPLITS`` -- pin dense FA4 ``num_splits=1``
-      so vLLM's ViT encoder does not JIT the broken SM100 split-KV kernel.
+
+    Also primes linecache with a same-line-count FA4 ``n_block_first`` hoist
+    so vLLM 0.26 split-KV compiles on SM100 (CuTeDSL reads source via
+    inspect/linecache). Applied here and in sitecustomize so EngineCore/TP
+    workers see it; the installed vLLM tree is not modified.
     """
+    _patch_vllm_fa4_n_block_first()
     site_dir = Path(os.environ.get(
         "FASTKERNELS_FLASHINFER_SITECUSTOMIZE_DIR",
         "/tmp/fastkernels_flashinfer_sitecustomize",
@@ -191,6 +238,34 @@ def _install_bench_sitecustomize() -> None:
     site_dir.mkdir(parents=True, exist_ok=True)
     (site_dir / "sitecustomize.py").write_text(r'''
 import os
+
+# vLLM 0.26 FA4 split-KV TYPE_UNSTABLE_JOIN: CuTeDSL JITs from
+# inspect.getsourcelines / linecache. Prime the cache with a same-line-count
+# hoist so both join paths are Int32. Does not write site-packages.
+try:
+    import linecache as _lc
+    from pathlib import Path as _P
+    import vllm as _vllm
+    _fa4 = str(_P(_vllm.__file__).resolve().parent
+               / "vllm_flash_attn" / "cute" / "flash_fwd_sm100.py")
+    _src = _P(_fa4).read_text()
+    _old = (
+        "                if const_expr(not self.is_split_kv) or n_block_min < n_block_max:\n"
+        "                    n_block_first = n_block_max - 1 if n_block_max > 0 else 0\n"
+    )
+    _new = (
+        "                n_block_first = n_block_max - 1 if n_block_max > 0 else Int32(0)\n"
+        "                if const_expr(not self.is_split_kv) or n_block_min < n_block_max:\n"
+    )
+    if _old in _src:
+        _st = os.stat(_fa4)
+        _lines = _src.replace(_old, _new, 1).splitlines(True)
+        _lc.cache[_fa4] = (_st.st_size, _st.st_mtime, _lines, _fa4)
+        _real = os.path.realpath(_fa4)
+        if _real != _fa4:
+            _lc.cache[_real] = (_st.st_size, _st.st_mtime, _lines, _real)
+except Exception:
+    pass
 
 namespace = os.environ.get("FASTKERNELS_FLASHINFER_SOCKET_NAMESPACE")
 if namespace:
@@ -386,42 +461,6 @@ if os.environ.get("FASTKERNELS_DSA_DETERMINISTIC_TOPK", "0") != "0":
                   "override installed", file=_sys.stderr, flush=True)
         except Exception:
             pass
-# FASTKERNELS_PIN_FA4_DENSE_NUM_SPLITS -- work around an upstream vLLM 0.26
-# FA4 CuTeDSL compile bug on Blackwell (SM100).
-#
-# vLLM's ViT wrapper calls flash_attn_varlen_func with the default
-# ``num_splits=0`` (auto). FA4 then runs num_splits_heuristic and, for the
-# few m-blocks a TP-sharded encoder produces (e.g. Qwen3-VL 16 heads / tp=4
-# = 4) at moderate image seqlens, picks num_splits > 1. That compiles
-# flash_fwd_sm100.py with is_split_kv=True, where ``n_block_first`` is None
-# on one branch and Int32 on the other -- TYPE_UNSTABLE_JOIN under
-# nvidia-cutlass-dsl 4.6.0 (the version vLLM 0.26.0 pins).
-#
-# Encoder self-attention is balanced (q_len == k_len), so split-KV does not
-# help; forcing 1 is numerically identical and is the same pin our own
-# vision_attention / flash_attn_prefill kernels already use. Paged LLM
-# prefill (block_table set) keeps auto-splitting. Default on: no-op when
-# the heuristic would have chosen 1 anyway, and FA3/FA2 ignore or reject
-# split-KV. Set the env to 0 to restore stock vLLM.
-if os.environ.get("FASTKERNELS_PIN_FA4_DENSE_NUM_SPLITS", "1") != "0":
-    try:
-        import vllm.vllm_flash_attn as _fa_pkg
-        from vllm.vllm_flash_attn import flash_attn_interface as _fa_iface
-    except Exception:
-        pass
-    else:
-        if not getattr(_fa_iface, "_fastkernels_pin_dense_num_splits", False):
-            _orig_fa_varlen = _fa_iface.flash_attn_varlen_func
-
-            def _fa_varlen_pin_dense(*args, _orig=_orig_fa_varlen, **kwargs):
-                if (kwargs.get("block_table") is None
-                        and kwargs.get("num_splits", 0) == 0):
-                    kwargs["num_splits"] = 1
-                return _orig(*args, **kwargs)
-
-            _fa_iface.flash_attn_varlen_func = _fa_varlen_pin_dense
-            _fa_pkg.flash_attn_varlen_func = _fa_varlen_pin_dense
-            _fa_iface._fastkernels_pin_dense_num_splits = True
 ''')
 
     current = os.environ.get("PYTHONPATH", "")

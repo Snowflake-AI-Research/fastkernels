@@ -411,8 +411,7 @@ def _prov_recsys() -> None:
 
 
 def _check_recsys() -> bool:
-    # Minimum bar is LightGCN; DLRMv2 (torchrec) is best-effort on top.
-    return _importable("torch_geometric")
+    return _importable("torch_geometric") and _importable("torchrec")
 
 
 def _build_fbgemm() -> None:
