@@ -154,6 +154,16 @@ def _torch_cc() -> tuple[int, int]:
         return (10, 0)
 
 
+def _cuda_arch_list() -> str:
+    """``TORCH_CUDA_ARCH_LIST`` for GPU 0 (``9.0a`` on H200, ``10.0a`` on B200)."""
+    major, minor = _torch_cc()
+    arch = f"{major}.{minor}"
+    # Hopper+ need the architecture-specific ('a') variant.
+    if major >= 9:
+        arch += "a"
+    return arch
+
+
 # --- Per-component provisioning steps --------------------------------------
 def _prov_ttt() -> None:
     _pip("jax[cuda12]", "equinox>=0.11.12", "optax>=0.2.4", "jaxtyping>=0.2.36", "hydra-core>=1.3")
@@ -420,14 +430,18 @@ def _build_fbgemm() -> None:
         return
     _git_clone("https://github.com/pytorch/FBGEMM", FBGEMM_DIR, recursive=True)
     fbdir = FBGEMM_DIR / "fbgemm_gpu"
-    cc = _torch_cc()
-    env = {**os.environ, "TORCH_CUDA_ARCH_LIST": f"{cc[0]}.{cc[1]}"}
+    arch = _cuda_arch_list()
+    env = {**os.environ, "TORCH_CUDA_ARCH_LIST": arch}
     reqs = fbdir / "requirements.txt"
     if reqs.is_file():
         _run([sys.executable, "-m", "pip", "install", "-r", str(reqs)])
-    # FBGEMM's setup.py takes --build-target (default = the fbgemm_gpu package
-    # torchrec's DLRM needs) and --build-variant (cuda), consuming them before
-    # delegating the rest to setuptools' install command.
+    # A previous failed configure can leave CMAKE_CUDA_ARCHITECTURES=75 in
+    # _skbuild; drop it so this install actually uses ``arch``.
+    skbuild = fbdir / "_skbuild"
+    if skbuild.is_dir():
+        shutil.rmtree(skbuild)
+    # FBGEMM's setup.py only forwards arch if it is a ``-D`` setup.py arg
+    # (the env var alone does not reach CMake).
     _run(
         [
             sys.executable,
@@ -437,6 +451,7 @@ def _build_fbgemm() -> None:
             "default",
             "--build-variant",
             "cuda",
+            f"-DTORCH_CUDA_ARCH_LIST={arch}",
         ],
         cwd=fbdir,
         env=env,
