@@ -161,6 +161,36 @@ def test_ray_task_name_contains_scenario_model_tp_and_workloads(tmp_path):
     assert "_tp2_mixed" in name
 
 
+def test_plan_jobs_skips_nvfp4_on_hopper(tmp_path):
+    scenario = ValidateScenario(
+        hf_name="nvidia/GLM-5.2-NVFP4",
+        tp=8,
+        dtype="nvfp4",
+        legacy_workloads=("mixed",),
+    )
+    jobs, results, cached = _plan_jobs(
+        [scenario], _args(), 8, tmp_path, hopper=True
+    )
+    assert jobs == []
+    assert cached == []
+    assert results == {0: "SKIP(nvfp4-hopper)"}
+
+
+def test_plan_jobs_keeps_nvfp4_off_hopper(tmp_path):
+    scenario = ValidateScenario(
+        hf_name="nvidia/GLM-5.2-NVFP4",
+        tp=8,
+        dtype="nvfp4",
+        legacy_workloads=("mixed",),
+    )
+    jobs, results, cached = _plan_jobs(
+        [scenario], _args(), 8, tmp_path, hopper=False
+    )
+    assert len(jobs) == 1
+    assert results == {}
+    assert cached == []
+
+
 def test_resume_marks_existing_results_as_cached(tmp_path):
     scenario = _scenario("ttt_e2e", workloads=("125m_e2e",))
     initial_jobs, _, _ = _plan_jobs([scenario], _args(), 1, tmp_path)

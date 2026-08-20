@@ -157,15 +157,48 @@ def _load_cached_result(job: dict) -> dict | None:
     return None
 
 
+def _cuda_cc_major() -> int | None:
+    """Compute-capability major of GPU 0, or None if undetectable."""
+    smi = shutil.which("nvidia-smi")
+    if smi is None:
+        return None
+    try:
+        output = subprocess.run(
+            [smi, "--query-gpu=compute_cap", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        ).stdout
+    except Exception:
+        return None
+    for line in output.splitlines():
+        token = line.strip().split(".", 1)[0]
+        if token.isdigit():
+            return int(token)
+    return None
+
+
+def _is_nvfp4_scenario(scenario) -> bool:
+    if str(getattr(scenario, "dtype", "")).lower() == "nvfp4":
+        return True
+    kv = getattr(scenario, "kv_cache_dtype", None)
+    return kv is not None and str(kv).lower() == "nvfp4"
+
+
 def _plan_jobs(
     scenarios,
     args,
     total_gpus: int,
     root: Path,
+    *,
+    hopper: bool | None = None,
 ) -> tuple[list[dict], dict[int, str], list[dict]]:
     jobs: list[dict] = []
     cached: list[dict] = []
     results: dict[int, str] = {}
+    if hopper is None:
+        hopper = _cuda_cc_major() == 9
     for index, scenario in enumerate(scenarios):
         harness = _harness_for(
             scenario.hf_name, getattr(scenario, "draft_model", None)
@@ -173,6 +206,10 @@ def _plan_jobs(
         if harness is None:
             print(f"  - skip {scenario.hf_name}: no harness mapped")
             results[index] = "SKIP(no-harness)"
+            continue
+        if hopper and _is_nvfp4_scenario(scenario):
+            print(f"  - skip {scenario.hf_name}: NVFP4 is Blackwell-only")
+            results[index] = "SKIP(nvfp4-hopper)"
             continue
         if scenario.tp > total_gpus:
             print(
@@ -1440,6 +1477,7 @@ def _build_summary(root: Path, scenarios, results: dict[int, str]) -> dict:
                     {"index": index, "model": model, "harness": harness, **coverage}
                 )
     passed = sum(model["status"].startswith("PASS") for model in models)
+    skipped = sum(model["status"].startswith("SKIP") for model in models)
     # A declared workload with no value is a failure even when every job exits 0:
     # that is exactly how a sweep can look green while the table is full of holes.
     incomplete = [
@@ -1449,7 +1487,7 @@ def _build_summary(root: Path, scenarios, results: dict[int, str]) -> dict:
         "run": {
             "status": (
                 "PASS"
-                if models and passed == len(models) and not incomplete
+                if models and passed + skipped == len(models) and not incomplete
                 else "FAIL"
             ),
             "root": str(root),
@@ -1559,7 +1597,12 @@ def _print_summary(scenarios, results: dict[int, str]) -> int:
         else:
             mark = _c("FAIL", "31")
         print(f"  {mark:16} {scenario.hf_name}  [{status}]")
-    return 0 if results and all(v.startswith("PASS") for v in results.values()) else 1
+    return (
+        0
+        if results
+        and all(v.startswith(("PASS", "SKIP")) for v in results.values())
+        else 1
+    )
 
 
 def _cancel_refs(ray, refs: list) -> None:
