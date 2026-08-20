@@ -1,4 +1,4 @@
-"""FA3 cascade attention for the EAGLE-3 verify step.
+"""Cascade attention for the EAGLE-3 verify step.
 
 Direct port of sglang's two-stage strategy
 (`flashattention_backend.py`, ``use_cascade_attn=True``):
@@ -13,21 +13,19 @@ Direct port of sglang's two-stage strategy
 
 2. **Expand pass** -- a single batched FlashAttention call where each draft
    query is its own length-1 "sequence" attending only to its tree-ancestor
-   draft tokens (per the verify tree mask).
-
-   With FA3, this is paged at ``page_size = 1`` (each "page" is a single
-   token); ``page_table_expand`` is sorted so the first
+   draft tokens (per the verify tree mask). The cache is viewed as
+   ``page_size = 1`` pages; ``page_table_expand`` is sorted so the first
    ``cache_seqlens_expand[i]`` entries are the live attended slots.
-
-   With FA2 (which requires page_size divisible by 256 for paged KV) we
-   instead gather the relevant draft K/V into a small contiguous buffer
-   (size <= B*N*N tokens, e.g. <=2048) and use the non-paged FA2 varlen
-   path. This is mathematically identical and a tiny one-time cost
-   relative to the prefix pass.
 
 3. **LSE merge** -- combine the two outputs exactly using the standard
    log-sum-exp merge, since the two key sets (prefix tokens and draft tokens)
    are disjoint.
+
+Both passes go through vLLM's bundled FlashAttention (FA3 on Hopper, FA4 on
+Blackwell) plus the vendored ``merge_state`` Triton kernel -- the same path
+on every GPU. This replaces a previous Hopper-only ``sgl_kernel`` FA3
+fast path that pulled a second, ABI-fragile kernel library into every
+Attention import.
 
 This replaces the previous per-sequence Python SDPA loop, which was ~92%
 of ``_target_verify`` time. With the cascade we do at most two batched
@@ -46,34 +44,6 @@ from ....infra.fa_utils import (
     FA_VERSION as _FA_VERSION,
     flash_attn_varlen_func as _VLLM_FA_VARLEN_FUNC,
 )
-
-# Hopper (SM90): sgl_kernel FA3 cascade. Elsewhere: vLLM's bundled FA.
-_SGL_FA3_AVAILABLE = False
-_SGL_FA3_WITH_KVCACHE = None
-_SGL_MERGE_STATE_V2 = None
-if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9:
-    from sgl_kernel import merge_state_v2 as _SGL_MERGE_STATE_V2
-    from sgl_kernel.flash_attn import (
-        flash_attn_with_kvcache as _SGL_FA3_WITH_KVCACHE,
-    )
-    _SGL_FA3_AVAILABLE = True
-
-
-def _sgl_fa3_paged(q, k_cache, v_cache, cu_seqlens_q, cache_seqlens,
-                   max_seqlen_q, max_seqlen_k, page_table, softmax_scale):
-    out, lse, *_ = _SGL_FA3_WITH_KVCACHE(
-        q=q.contiguous(),
-        k_cache=k_cache,
-        v_cache=v_cache,
-        page_table=page_table,
-        cache_seqlens=cache_seqlens,
-        cu_seqlens_q=cu_seqlens_q,
-        max_seqlen_q=max_seqlen_q,
-        softmax_scale=softmax_scale,
-        causal=False,
-        return_softmax_lse=True,
-    )
-    return out, lse
 
 
 def _vllm_fa_paged(q, k_cache, v_cache, cu_seqlens_q, seqused_k,
@@ -151,36 +121,6 @@ class TreeAttnPrefill(nn.Module):
 
         kc_blk = k_cache.view(-1, block_size, H_kv, D)
         vc_blk = v_cache.view(-1, block_size, H_kv, D)
-
-        if _SGL_FA3_AVAILABLE:
-            o_prefix, lse_prefix = _sgl_fa3_paged(
-                q, kc_blk, vc_blk,
-                cu_seqlens_q=cu_seqlens_q_prefix,
-                cache_seqlens=cache_seqlens_prefix,
-                max_seqlen_q=max_seqlen_q_prefix,
-                max_seqlen_k=max_seqlen_k_prefix,
-                page_table=block_table_prefix,
-                softmax_scale=scale,
-            )
-
-            kc_tok = k_cache.view(-1, 1, H_kv, D)
-            vc_tok = v_cache.view(-1, 1, H_kv, D)
-            o_expand, lse_expand = _sgl_fa3_paged(
-                q, kc_tok, vc_tok,
-                cu_seqlens_q=cu_seqlens_q_expand,
-                cache_seqlens=cache_seqlens_expand,
-                max_seqlen_q=1,
-                max_seqlen_k=max_seqlen_k_expand,
-                page_table=page_table_expand,
-                softmax_scale=scale,
-            )
-            out, _ = _SGL_MERGE_STATE_V2(
-                o_prefix,
-                lse_prefix.T.contiguous(),
-                o_expand,
-                lse_expand.T.contiguous(),
-            )
-            return out
 
         o_prefix, lse_prefix = _vllm_fa_paged(
             q, kc_blk, vc_blk,

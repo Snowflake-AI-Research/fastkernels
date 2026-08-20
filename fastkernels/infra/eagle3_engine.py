@@ -357,8 +357,7 @@ class LlamaEagle3Engine:
             return
 
         # Tree-verify CUDA graphs need vLLM's bundled FA (paged cascade on
-        # non-Hopper; sgl_kernel FA3 on SM90). Gate on fa_utils, not the
-        # Hopper-only `_SGL_FA3_AVAILABLE` flag in tree_attn_prefill.
+        # every GPU). Gate on fa_utils.
         from .fa_utils import VLLM_FA_AVAILABLE
 
         if not VLLM_FA_AVAILABLE:
