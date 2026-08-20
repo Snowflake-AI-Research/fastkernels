@@ -21,15 +21,18 @@ def _store_kvcache_kernel(
     D_PAD: tl.constexpr,
 ):
     idx = tl.program_id(0)
-    slot = tl.load(slot_mapping_ptr + idx)
-    if slot == -1:
+    # int64: Hopper hybrid pages are large.  ``slot * D`` in int32
+    # overflows at slot >= 2^31/D (bid >= 65536 when D=2048).
+    slot = tl.load(slot_mapping_ptr + idx).to(tl.int64)
+    if slot < 0:
         return
     offsets = tl.arange(0, D_PAD)
     mask = offsets < D
     key = tl.load(key_ptr + idx * key_stride + offsets, mask=mask)
     value = tl.load(value_ptr + idx * value_stride + offsets, mask=mask)
-    tl.store(k_cache_ptr + slot * D + offsets, key, mask=mask)
-    tl.store(v_cache_ptr + slot * D + offsets, value, mask=mask)
+    dst = slot * D + offsets
+    tl.store(k_cache_ptr + dst, key, mask=mask)
+    tl.store(v_cache_ptr + dst, value, mask=mask)
 
 
 @triton.jit
@@ -66,6 +69,8 @@ class StoreKVCache(nn.Module):
         N, num_heads, head_dim = key.shape
         D = num_heads * head_dim
         D_PAD = triton.next_power_of_2(D)
+        if slot_mapping.dtype != torch.int64:
+            slot_mapping = slot_mapping.to(torch.int64)
         _store_kvcache_kernel[(N,)](
             key, key.stride(0), value, value.stride(0),
             k_cache, v_cache, slot_mapping, D, D_PAD,
