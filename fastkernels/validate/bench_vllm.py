@@ -182,8 +182,9 @@ def _install_bench_sitecustomize() -> None:
       dropped from the weight iterator here. A monkeypatch in this process would
       not survive the spawn to EngineCore/TP ranks -- the sitecustomize does.
 
-    Also primes linecache with a same-line-count FA4 ``n_block_first`` hoist
-    so vLLM 0.26 split-KV compiles on SM100 (CuTeDSL reads source via
+    Also primes linecache with same-line-count FA4 hoists (``n_block_first``,
+    ``n_block_min_causal_local_mask``, ``n_block_min_before_local_mask``) so
+    vLLM 0.26 split-KV compiles on SM100 (CuTeDSL reads source via
     inspect/linecache). The installed vLLM tree is not modified.
     """
     site_dir = Path(os.environ.get(
@@ -195,8 +196,8 @@ def _install_bench_sitecustomize() -> None:
 import os
 
 # vLLM 0.26 FA4 split-KV TYPE_UNSTABLE_JOIN: CuTeDSL JITs from
-# inspect.getsourcelines / linecache. Prime the cache with a same-line-count
-# hoist so both join paths are Int32. Does not write site-packages.
+# inspect.getsourcelines / linecache. Prime the cache with same-line-count
+# hoists so both join paths are Int32. Does not write site-packages.
 try:
     import linecache as _lc
     from pathlib import Path as _P
@@ -204,17 +205,39 @@ try:
     _fa4 = str(_P(_vllm.__file__).resolve().parent
                / "vllm_flash_attn" / "cute" / "flash_fwd_sm100.py")
     _src = _P(_fa4).read_text()
-    _old = (
-        "                if const_expr(not self.is_split_kv) or n_block_min < n_block_max:\n"
-        "                    n_block_first = n_block_max - 1 if n_block_max > 0 else 0\n"
-    )
-    _new = (
-        "                n_block_first = n_block_max - 1 if n_block_max > 0 else Int32(0)\n"
-        "                if const_expr(not self.is_split_kv) or n_block_min < n_block_max:\n"
-    )
-    if _old in _src:
+    _patched = False
+    for _old, _new in (
+        (
+            "                if const_expr(not self.is_split_kv) or n_block_min < n_block_max:\n"
+            "                    n_block_first = n_block_max - 1 if n_block_max > 0 else 0\n",
+            "                n_block_first = n_block_max - 1 if n_block_max > 0 else Int32(0)\n"
+            "                if const_expr(not self.is_split_kv) or n_block_min < n_block_max:\n",
+        ),
+        (
+            "            else:\n"
+            "                if const_expr(not self.is_split_kv) or tile_block_count > Int32(0):\n",
+            "            else:\n"
+            "                n_block_min_causal_local_mask = n_block_min\n"
+            "                n_block_min_before_local_mask = n_block_min\n"
+            "                if const_expr(not self.is_split_kv) or tile_block_count > Int32(0):\n",
+        ),
+        (
+            "                    # Next couple of iterations with causal masking\n"
+            "                    if const_expr(self.is_causal or self.is_local):\n",
+            "                    if const_expr(self.is_causal or self.is_local):\n",
+        ),
+        (
+            "                    # The remaining iterations have no masking (but may still need mask_mod)\n"
+            "                    n_block_min_before_local_mask = block_info.get_n_block_min_before_local_mask(\n",
+            "                    n_block_min_before_local_mask = block_info.get_n_block_min_before_local_mask(\n",
+        ),
+    ):
+        if _old in _src:
+            _src = _src.replace(_old, _new, 1)
+            _patched = True
+    if _patched:
         _st = os.stat(_fa4)
-        _lines = _src.replace(_old, _new, 1).splitlines(True)
+        _lines = _src.splitlines(True)
         _lc.cache[_fa4] = (_st.st_size, _st.st_mtime, _lines, _fa4)
         _real = os.path.realpath(_fa4)
         if _real != _fa4:

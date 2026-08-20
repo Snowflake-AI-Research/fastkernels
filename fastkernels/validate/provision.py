@@ -45,7 +45,6 @@ DP3_DIR = THIRD_PARTY_DIR / "3D-Diffusion-Policy"
 # bench_dp3 imports from the inner package directory of the nested repo.
 DP3_INNER = DP3_DIR / "3D-Diffusion-Policy"
 NGP_DIR = THIRD_PARTY_DIR / "instant-ngp"
-FBGEMM_DIR = THIRD_PARTY_DIR / "FBGEMM"
 PTV3_DIR = THIRD_PARTY_DIR / "PointTransformerV3"
 FASTDLLM_DIR = THIRD_PARTY_DIR / "Fast-dLLM"
 # The Microsoft BitNet GPU reference is a source checkout plus a hand-built CUDA
@@ -152,16 +151,6 @@ def _torch_cc() -> tuple[int, int]:
         return int(major), int(minor)
     except ValueError:
         return (10, 0)
-
-
-def _cuda_arch_list() -> str:
-    """``TORCH_CUDA_ARCH_LIST`` for GPU 0 (``9.0a`` on H200, ``10.0a`` on B200)."""
-    major, minor = _torch_cc()
-    arch = f"{major}.{minor}"
-    # Hopper+ need the architecture-specific ('a') variant.
-    if major >= 9:
-        arch += "a"
-    return arch
 
 
 # --- Per-component provisioning steps --------------------------------------
@@ -403,18 +392,25 @@ def _check_pointcloud() -> bool:
 def _prov_recsys() -> None:
     # LightGCN reference — pure-Python, reliable.
     _pip("torch-geometric")
-    # DLRMv2 reference (torchrec) needs fbgemm_gpu matched to the installed
-    # torch. No prebuilt wheel exists for recent torch, so build from source.
+    # DLRMv2 needs torchrec + fbgemm-gpu. fbgemm 1.6.0+cu130 loads on
+    # torch 2.11; 1.7.0 does not (undefined libtorch symbol). torchrec
+    # 1.7 imports fbgemm_gpu.tbe.monitoring which 1.6 lacks, so pin
+    # torchrec 1.5.0 from PyPI (py312 wheel). --no-deps keeps torch.
     # Best-effort: LightGCN already works if this leg fails.
     try:
-        _build_fbgemm()
-        # Install torchrec without deps so it cannot pull a mismatched fbgemm
-        # wheel over the source build; add its remaining pure deps explicitly.
+        if not _importable("fbgemm_gpu"):
+            _pip(
+                "--index-url",
+                "https://download.pytorch.org/whl/cu130",
+                "--no-deps",
+                "fbgemm-gpu==1.6.0",
+            )
         _pip("tensordict", "torchmetrics", "pyre-extensions")
-        _pip("--no-deps", "torchrec")
+        if not _importable("torchrec"):
+            _pip("--no-deps", "torchrec==1.5.0")
     except subprocess.CalledProcessError as exc:
         print(
-            f"    WARNING: torchrec/fbgemm_gpu source build failed ({exc}); "
+            f"    WARNING: torchrec/fbgemm-gpu wheel install failed ({exc}); "
             "DLRMv2 reference unavailable, LightGCN reference still works.",
             flush=True,
         )
@@ -422,40 +418,6 @@ def _prov_recsys() -> None:
 
 def _check_recsys() -> bool:
     return _importable("torch_geometric") and _importable("torchrec")
-
-
-def _build_fbgemm() -> None:
-    if _importable("fbgemm_gpu"):
-        print("    [skip] fbgemm_gpu already importable", flush=True)
-        return
-    _git_clone("https://github.com/pytorch/FBGEMM", FBGEMM_DIR, recursive=True)
-    fbdir = FBGEMM_DIR / "fbgemm_gpu"
-    arch = _cuda_arch_list()
-    env = {**os.environ, "TORCH_CUDA_ARCH_LIST": arch}
-    reqs = fbdir / "requirements.txt"
-    if reqs.is_file():
-        _run([sys.executable, "-m", "pip", "install", "-r", str(reqs)])
-    # A previous failed configure can leave CMAKE_CUDA_ARCHITECTURES=75 in
-    # _skbuild; drop it so this install actually uses ``arch``.
-    skbuild = fbdir / "_skbuild"
-    if skbuild.is_dir():
-        shutil.rmtree(skbuild)
-    # FBGEMM's setup.py only forwards arch if it is a ``-D`` setup.py arg
-    # (the env var alone does not reach CMake).
-    _run(
-        [
-            sys.executable,
-            "setup.py",
-            "install",
-            "--build-target",
-            "default",
-            "--build-variant",
-            "cuda",
-            f"-DTORCH_CUDA_ARCH_LIST={arch}",
-        ],
-        cwd=fbdir,
-        env=env,
-    )
 
 
 def _prov_dllm() -> None:

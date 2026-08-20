@@ -135,7 +135,7 @@ ref-dp3 = [
     # recent torch/CUDA, so the provisioner builds pytorch3d from source.
 ]
 # RecSys references (bench_recsys): torch-geometric backs the LightGCN
-# reference. DLRMv2 also needs torchrec + a source-built fbgemm_gpu (provisioner).
+# reference. DLRMv2 also needs torchrec + fbgemm-gpu (cu130 wheels via provisioner).
 ref-recsys = [
     "torch-geometric",
 ]
