@@ -51,7 +51,16 @@ _CUDNN_MAX_HEAD_DIM = 128
 
 
 def _resolve_flash_attn_func():
-    """Return the flash-attention callable for Ampere/Hopper."""
+    """Return the flash-attention callable for Ampere/Hopper.
+
+    Same order as vllm-omni's CUDA FA resolver: FA3 (fa3-fwd) >
+    FA3 (source-built flash_attn_interface) > FA2.
+    """
+    for mod in ("fa3_fwd_interface", "flash_attn_interface"):
+        try:
+            return __import__(mod, fromlist=["flash_attn_func"]).flash_attn_func
+        except (ImportError, ModuleNotFoundError):
+            pass
     from flash_attn import flash_attn_func
     return flash_attn_func
 
