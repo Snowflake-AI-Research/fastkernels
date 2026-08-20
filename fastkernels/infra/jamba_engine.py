@@ -356,6 +356,8 @@ class JambaEngine:
         self.seed = seed
         self.max_num_seqs = max_num_seqs
         self.max_model_len = max_model_len
+        self._fa_decode_ops: list = []
+        self._fa_decode_groups: list = []
         # Per-step token budget for chunked prefill.  Mirrors vLLM's
         # ``max_num_batched_tokens`` (default 16384) and the chunked-
         # prefill scheduler in ``infra.engine`` /
@@ -570,6 +572,8 @@ class JambaEngine:
                     attn.set_trtllm_workspace(shared_workspace)
             torch.cuda.empty_cache()
 
+        self._init_fa3_decode_buffers()
+
         # ------------------------------------------------------------------
         # Block manager (paged KV) + Mamba state slot pool.
         # ------------------------------------------------------------------
@@ -700,6 +704,37 @@ class JambaEngine:
         self._decode_static_buffers[B] = bufs
         return bufs
 
+    def _init_fa3_decode_buffers(self) -> None:
+        """Collect FlashAttnDecode ops and preallocate graph-stable FA3 buffers."""
+        from ..tasks.baseline.L1.flash_attn_decode import FlashAttnDecode
+        from .fa_utils import group_fa_decode_ops
+
+        ops = [m for m in self.model.modules() if isinstance(m, FlashAttnDecode)]
+        self._fa_decode_ops = ops
+        self._fa_decode_groups = group_fa_decode_ops(ops)
+        if not ops:
+            return
+        for group in self._fa_decode_groups:
+            lead = group[0]
+            if not lead.page_size:
+                lead.page_size = self._page_size
+            lead.preallocate(self.max_num_seqs, self.device)
+            for op in group[1:]:
+                op.page_size = lead.page_size
+                op._cu_seqlens_q = lead._cu_seqlens_q
+                op._sched_buf = lead._sched_buf
+                op._sched_meta = lead._sched_meta
+
+    def _refresh_fa3_decode_schedule(self, context_lens) -> None:
+        from .fa_utils import refresh_fa3_decode_schedule
+
+        refresh_fa3_decode_schedule(
+            self._fa_decode_groups,
+            context_lens,
+            self.max_model_len,
+            qkv_dtype=self.dtype,
+        )
+
     def _capture_decode_graph(self, B: int) -> _JambaDecodeGraph:
         if B in self._decode_graphs:
             return self._decode_graphs[B]
@@ -787,6 +822,12 @@ class JambaEngine:
             finally:
                 reset_context()
 
+        # Dummy capture lengths are 1, not 0: a zero context length is not a
+        # state any real decode step reaches (matches LlamaEngine).
+        if int(bufs["context_lens"].max().item() or 0) == 0:
+            bufs["context_lens"].fill_(1)
+        self._refresh_fa3_decode_schedule(bufs["context_lens"])
+
         # Warmup outside the graph stream so allocator state settles.
         torch.cuda.synchronize()
         s = torch.cuda.Stream()
@@ -798,6 +839,7 @@ class JambaEngine:
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
 
+        self._refresh_fa3_decode_schedule(bufs["context_lens"])
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, pool=self._cuda_graph_mempool_id):
             _decode_step()
@@ -1527,6 +1569,7 @@ class JambaEngine:
                 bufs_block_tables.copy_(torch.from_numpy(full_bt))
                 bufs_cache_indices.copy_(torch.from_numpy(full_cache_idx))
 
+            self._refresh_fa3_decode_schedule(bufs_context_lens)
             # Replay graph + async D2H of the sampled tokens.  Mirrors
             # the Mamba engine's ``run_mamba_decode_fast_async`` (see
             # ``infra.engine``): copy on a separate stream, record an

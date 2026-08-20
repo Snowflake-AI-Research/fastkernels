@@ -457,6 +457,11 @@ class ModelRunner:
         # None. Default it here so non-MLA models (Llama, Mixtral, BitNet, ...)
         # reach that early return instead of an AttributeError.
         self._indexer_sched = None
+        # FA3 paged-decode scheduler metadata.  Collected in
+        # ``_init_fa3_decode_buffers``; ``_refresh_fa3_decode_schedule``
+        # returns early when empty (TRTLLM / MLA / no FlashAttn layers).
+        self._fa_decode_ops: list = []
+        self._fa_decode_groups: list = []
 
         torch.cuda.set_device(rank)
         self._dist_initialized = False
@@ -1307,21 +1312,54 @@ class ModelRunner:
         del inputs, messages, text
 
     def _init_fa3_decode_buffers(self):
-        """Pre-allocate cu_seqlens_q buffers for the FlashAttention decode
-        path to avoid allocations during CUDA graph capture."""
-        try:
-            from ..tasks.baseline.L1.flash_attn_decode import VLLM_FA_AVAILABLE
-        except ImportError:
+        """Collect FlashAttnDecode modules and preallocate graph-stable buffers.
+
+        FA3's ``scheduler_metadata`` must live in a persistent allocation:
+        CUDA graphs record the pointer, and ``_refresh_fa3_decode_schedule``
+        rewrites the contents before every capture and replay (vLLM's
+        ``FlashAttentionMetadataBuilder`` pattern).
+        """
+        from ..tasks.baseline.L1.flash_attn_decode import FlashAttnDecode
+        from .fa_utils import group_fa_decode_ops
+
+        ops = [m for m in self.model.modules() if isinstance(m, FlashAttnDecode)]
+        self._fa_decode_ops = ops
+        self._fa_decode_groups = group_fa_decode_ops(ops)
+        if not ops:
             return
-        if not VLLM_FA_AVAILABLE:
-            return
-        max_bs = self.max_num_seqs
-        for module in self.model.modules():
-            if hasattr(module, '_cu_seqlens_q'):
-                module._cu_seqlens_q = torch.arange(
-                    max_bs + 1, dtype=torch.int32,
-                    device=f"cuda:{self.rank}",
-                )
+        device = torch.device(f"cuda:{self.rank}")
+        for group in self._fa_decode_groups:
+            lead = group[0]
+            if not lead.page_size:
+                lead.page_size = BLOCK_SIZE
+            lead.preallocate(self.max_num_seqs, device)
+            for op in group[1:]:
+                op.page_size = lead.page_size
+                op._cu_seqlens_q = lead._cu_seqlens_q
+                op._sched_buf = lead._sched_buf
+                op._sched_meta = lead._sched_meta
+
+    def _refresh_fa3_decode_schedule(
+        self,
+        context_lens: torch.Tensor,
+        max_seqlen_k: int | None = None,
+    ) -> None:
+        """Recompute FA3 tile-scheduler metadata for this decode step.
+
+        Must run OUTSIDE CUDA graph capture/replay.  ``context_lens`` is
+        the [B] decode lengths *including* the padded tail the captured
+        graph covers, matching ``_refresh_indexer_schedule``.
+        """
+        from .fa_utils import refresh_fa3_decode_schedule
+
+        if max_seqlen_k is None:
+            max_seqlen_k = self.max_model_len
+        refresh_fa3_decode_schedule(
+            self._fa_decode_groups,
+            context_lens,
+            max_seqlen_k,
+            qkv_dtype=getattr(self, "dtype", torch.bfloat16),
+        )
 
     def allocate_kv_cache(self):
         if not hasattr(self, '_attn_layers') or not self._attn_layers:
@@ -2585,6 +2623,7 @@ class ModelRunner:
                 ctx = get_context()
                 ctx.kda_state = sm_
                 ctx.kda_metadata = md
+                self._refresh_fa3_decode_schedule(seq_lens_v)
 
                 # Mark the batch dim dynamic BEFORE the first
                 # compile-triggering forward. ``compile_model`` traces under
@@ -2711,6 +2750,7 @@ class ModelRunner:
     ):
         """Replay already-staged hybrid decode graph and return greedy token ids."""
         bucket = self._kimi_graph_bs_for_n[n]
+        self._refresh_fa3_decode_schedule(self._kd_seq_lens[:bucket])
         self._kimi_graphs[bucket].replay()
 
         if self.world_size == 1:
@@ -4628,6 +4668,7 @@ class ModelRunner:
             req_id_per_token=req_id_per_token,
         )
         self._refresh_indexer_schedule(get_context().context_lens)
+        self._refresh_fa3_decode_schedule(get_context().context_lens)
         self._apply_pending_cross_ctx()
         if use_mrope:
             positions_t = torch.from_numpy(mrope_pos).pin_memory().cuda(non_blocking=True)
@@ -4875,6 +4916,7 @@ class ModelRunner:
         gv["context_lens"][:bs] = ctx.context_lens
         bt = ctx.block_tables
         gv["block_tables"][:bs, :bt.size(1)] = bt
+        self._refresh_fa3_decode_schedule(gv["context_lens"][:graph_bs])
         self.graphs[graph_bs].replay()
         return self.model.compute_logits(gv["outputs"][:bs])
 
@@ -4931,6 +4973,7 @@ class ModelRunner:
         self._prev_decode_n = n
         # Outside the graph, and after context_lens for this step is in place.
         self._refresh_indexer_schedule(gv["context_lens"][:graph_bs])
+        self._refresh_fa3_decode_schedule(gv["context_lens"][:graph_bs])
         self.graphs[graph_bs].replay()
 
     @torch.inference_mode()
@@ -5019,6 +5062,7 @@ class ModelRunner:
             req_id_per_token=req_id_per_token,
         )
         self._refresh_indexer_schedule(context_lens)
+        self._refresh_fa3_decode_schedule(context_lens)
         self._apply_pending_cross_ctx()
         use_bitnet_eager_model = self.is_bitnet and self._compiled
         model = getattr(self, "_eager_model", self.model) if use_bitnet_eager_model else self.model
@@ -6239,6 +6283,7 @@ class ModelRunner:
             req_id_per_token=decode_req_id[:largest_bs],
         )
         self._refresh_indexer_schedule(context_lens[:largest_bs])
+        self._refresh_fa3_decode_schedule(context_lens[:largest_bs])
         self._set_cross_attn_context_for_capture(largest_bs)
         # Mark batch dim as dynamic BEFORE the first compile-triggering forward
         # so Dynamo / Inductor produce a single symbolic-shape compiled graph
@@ -6305,6 +6350,7 @@ class ModelRunner:
                 req_id_per_token=decode_req_id[:bs],
             )
             self._refresh_indexer_schedule(context_lens[:bs])
+            self._refresh_fa3_decode_schedule(context_lens[:bs])
             self._set_cross_attn_context_for_capture(bs)
             ids_slice = input_ids[:bs]
             pos_slice = (positions[:, :bs] if self.is_qwen_vl

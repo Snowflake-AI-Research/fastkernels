@@ -41,9 +41,14 @@ from vllm.v1.attention.backends.fa_utils import (
 __all__ = [
     "VLLM_FA_AVAILABLE",
     "FA_VERSION",
+    "FA3_CUDA_GRAPH_MAX_NUM_SPLITS",
     "flash_attn_varlen_func",
     "get_scheduler_metadata",
+    "fa3_scheduler_metadata",
+    "fa3_scheduler_metadata_size",
     "fa_supports_head_size",
+    "group_fa_decode_ops",
+    "refresh_fa3_decode_schedule",
 ]
 
 VLLM_FA_AVAILABLE = torch.cuda.is_available()
@@ -67,6 +72,58 @@ get_scheduler_metadata = _vllm_get_scheduler_metadata
 FA_VERSION: int | None = (
     _vllm_get_flash_attn_version() if VLLM_FA_AVAILABLE else None
 )
+
+# vLLM ``AttentionConfig.flash_attn_max_num_splits_for_cuda_graph``.
+FA3_CUDA_GRAPH_MAX_NUM_SPLITS = 32
+
+
+def fa3_scheduler_metadata_size(batch_size: int) -> int:
+    """FA3 ``scheduler_metadata`` length: ``1 + round_up(batch, 4) * 4``."""
+    return 1 + ((batch_size + 3) // 4 * 4) * 4
+
+
+def fa3_scheduler_metadata(**kwargs):
+    """vLLM ``get_scheduler_metadata`` when Hopper FA3 is in use, else None."""
+    if FA_VERSION != 3:
+        return None
+    return get_scheduler_metadata(**kwargs)
+
+
+def group_fa_decode_ops(ops):
+    """Group FlashAttnDecode modules that can share one FA3 schedule."""
+    groups: dict[tuple, list] = {}
+    for op in ops:
+        key = (
+            op.num_heads,
+            op.num_kv_heads,
+            op.head_dim,
+            tuple(getattr(op, "_window_size", (-1, -1))),
+        )
+        groups.setdefault(key, []).append(op)
+    return list(groups.values())
+
+
+def refresh_fa3_decode_schedule(
+    groups,
+    context_lens: torch.Tensor,
+    max_seqlen_k: int,
+    qkv_dtype: torch.dtype,
+) -> None:
+    """Rewrite FA3 tile-scheduler metadata outside CUDA graph capture/replay."""
+    if FA_VERSION != 3 or not groups:
+        return
+    with torch.inference_mode():
+        for group in groups:
+            lead = group[0]
+            lead.update_scheduler_metadata(
+                context_lens,
+                max_seqlen_k,
+                qkv_dtype=qkv_dtype,
+                window_size=getattr(lead, "_window_size", (-1, -1)),
+            )
+            for op in group[1:]:
+                op._sched_buf = lead._sched_buf
+                op._sched_meta = lead._sched_meta
 
 
 def fa_supports_head_size(head_size: int) -> bool:

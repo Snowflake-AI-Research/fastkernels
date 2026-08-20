@@ -8,7 +8,7 @@ FA2 otherwise) -- see :mod:`fa_utils`.
 import torch
 import torch.nn as nn
 
-from ....infra.fa_utils import FA_VERSION, flash_attn_varlen_func
+from ....infra.fa_utils import FA_VERSION, fa3_scheduler_metadata, flash_attn_varlen_func
 
 
 class FlashAttnPrefill(nn.Module):
@@ -33,6 +33,29 @@ class FlashAttnPrefill(nn.Module):
         if kwargs.get("block_table") is not None:
             seqused_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
             fa_kw["seqused_k"] = seqused_k
+            if (
+                FA_VERSION == 3
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                page_size = k.shape[1] if k.dim() >= 2 else None
+                meta = fa3_scheduler_metadata(
+                    batch_size=int(seqused_k.shape[0]),
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
+                    num_heads_q=self.num_heads,
+                    num_heads_kv=self.num_kv_heads,
+                    headdim=self.head_dim,
+                    cache_seqlens=seqused_k,
+                    qkv_dtype=q.dtype,
+                    cu_seqlens_q=cu_seqlens_q,
+                    page_size=page_size,
+                    causal=kwargs.get("causal", True),
+                    window_size=kwargs.get("window_size", (-1, -1)),
+                    num_splits=0,
+                )
+                if meta is not None:
+                    fa_kw["scheduler_metadata"] = meta
+                fa_kw["num_splits"] = 0
         else:
             fa_kw["cu_seqlens_k"] = cu_seqlens_k
             # Dense prefill is compute-bound, so KV-splitting buys nothing, but
