@@ -6293,37 +6293,67 @@ class ModelRunner:
         reset_context()
         torch.cuda.synchronize()
 
+        def _eager_decode(bs: int) -> tuple:
+            """One decode-shaped forward at ``bs``. Used to prime cubins /
+            workspaces outside CUDA-graph capture, and as the per-size warmup
+            immediately before ``torch.cuda.graph``.
+            """
+            set_context(
+                False, slot_mapping=slot_mapping[:bs],
+                context_lens=context_lens[:bs], block_tables=block_tables[:bs],
+                max_context_len=self.max_model_len,
+                req_id_per_token=decode_req_id[:bs],
+            )
+            self._refresh_indexer_schedule(context_lens[:bs])
+            self._set_cross_attn_context_for_capture(bs)
+            ids_slice = input_ids[:bs]
+            pos_slice = (positions[:, :bs] if self.is_qwen_vl
+                         else positions[:bs])
+            ie_slice = (vl_inputs_embeds[:bs]
+                        if vl_inputs_embeds is not None else None)
+            if ie_slice is not None:
+                ie_slice.copy_(vl_embed_fn(ids_slice))
+                outputs[:bs] = self.model(
+                    ids_slice, pos_slice,
+                    inputs_embeds=ie_slice,
+                    **({"deepstack_embeds": _ds(bs)} if _ds_all else {}),
+                )
+            else:
+                outputs[:bs] = self.model(ids_slice, pos_slice)
+            lm_logits[:bs] = lm_head.linear_op(
+                outputs[:bs], lm_head.embedding_op.emb.weight)
+            lm_max_vals[:bs], lm_max_idxs[:bs] = lm_logits[:bs].max(dim=-1)
+            return ids_slice, pos_slice, ie_slice
+
+        # GLM-5.2 only: prime remaining capture sizes *before* custom-AR /
+        # CUDA-graph so FlashInfer cubins and workspaces for smaller CTA tiles
+        # (bs=128 PerCta128, etc.) are not first-touched inside the graph pool
+        # -- that path has hung with no traceback on a cold cubin cache.
+        _is_glm = getattr(self.config, "model_type", "") == "glm_moe_dsa"
+        if _is_glm:
+            if self.rank == 0 and len(_graph_list) > 1:
+                print(f"    Eager-priming {len(_graph_list) - 1} remaining "
+                      f"capture sizes (outside CUDA graph)", flush=True)
+            for bs in _graph_list[1:]:
+                _eager_decode(bs)
+                torch.cuda.synchronize()
+            reset_context()
+
         # Freeze GC during capture to avoid Python GC stalls (matches vllm).
         gc.collect()
         gc.freeze()
 
         with ar_ctx:
             for _gi, bs in enumerate(_graph_list):
-                if self.rank == 0 and (_gi % max(1, len(_graph_list) // 5) == 0
-                                       or _gi == len(_graph_list) - 1):
+                if self.rank == 0 and (
+                    _is_glm
+                    or _gi % max(1, len(_graph_list) // 5) == 0
+                    or _gi == len(_graph_list) - 1
+                ):
                     print(f"    CUDA graph {_gi+1}/{len(_graph_list)} (bs={bs})",
                           flush=True)
                 graph = torch.cuda.CUDAGraph()
-                set_context(
-                    False, slot_mapping=slot_mapping[:bs],
-                    context_lens=context_lens[:bs], block_tables=block_tables[:bs],
-                    max_context_len=self.max_model_len,
-                    req_id_per_token=decode_req_id[:bs],
-                )
-                self._refresh_indexer_schedule(context_lens[:bs])
-                self._set_cross_attn_context_for_capture(bs)
-
-                ids_slice = input_ids[:bs]
-                if self.is_qwen_vl:
-                    pos_slice = positions[:, :bs]
-                else:
-                    pos_slice = positions[:bs]
-
-                # For VL: create a slice reference ONCE and reuse for both
-                # mark_dynamic and the warmup call so the dynamic metadata
-                # stays on the exact tensor object Dynamo will trace.
-                ie_slice = (vl_inputs_embeds[:bs]
-                            if vl_inputs_embeds is not None else None)
+                ids_slice, pos_slice, ie_slice = _eager_decode(bs)
 
                 if self._compiled and not self._mark_dynamic_done:
                     torch._dynamo.mark_dynamic(ids_slice, 0)
@@ -6334,22 +6364,6 @@ class ModelRunner:
                     if ie_slice is not None:
                         torch._dynamo.mark_dynamic(ie_slice, 0)
                     self._mark_dynamic_done = True
-
-                # Warmup forward: for VL, compute inputs_embeds outside and
-                # pass it so the compiled inner model traces the
-                # inputs_embeds branch (never embed_tokens).
-                if ie_slice is not None:
-                    ie_slice.copy_(vl_embed_fn(ids_slice))
-                    outputs[:bs] = self.model(
-                        ids_slice, pos_slice,
-                        inputs_embeds=ie_slice,
-                        **({"deepstack_embeds": _ds(bs)} if _ds_all else {}),
-                    )
-                else:
-                    outputs[:bs] = self.model(ids_slice, pos_slice)
-                lm_logits[:bs] = lm_head.linear_op(
-                    outputs[:bs], lm_head.embedding_op.emb.weight)
-                lm_max_vals[:bs], lm_max_idxs[:bs] = lm_logits[:bs].max(dim=-1)
 
                 with torch.cuda.graph(graph, self.graph_pool):
                     if ie_slice is not None:
