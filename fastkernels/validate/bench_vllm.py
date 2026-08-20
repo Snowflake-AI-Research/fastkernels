@@ -58,6 +58,27 @@ def _detect_gpu_name() -> str:
         return "unknown"
 
 
+def _cuda_cc_major() -> int | None:
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+            text=True,
+        ).strip().splitlines()[0]
+        return int(out.split(".")[0])
+    except Exception:
+        return None
+
+
+def _is_pure_mamba_model(model_name: str) -> bool:
+    lower = model_name.lower()
+    return "mamba" in lower and "jamba" not in lower
+
+
+# vLLM hopper CUDA-graph cap (``min(max_num_seqs * 2, 512)``). On H200 the
+# default max_num_seqs=1024 exceeds Mamba cache blocks (~849 at 0.9 / 128k).
+_HOPPER_MAMBA_MAX_NUM_SEQS = 512
+
+
 def _parse_port_env(name: str) -> int | None:
     value = os.environ.get(name)
     if value is None or value == "":
@@ -866,6 +887,8 @@ def main():
         llm_kwargs["load_format"] = cfg["load_format"]
     if cfg.get("kv_cache_dtype"):
         llm_kwargs["kv_cache_dtype"] = cfg["kv_cache_dtype"]
+    if cfg.get("max_num_seqs") is not None:
+        llm_kwargs["max_num_seqs"] = cfg["max_num_seqs"]
     if cfg.get("max_layers") is not None:
         llm_kwargs["hf_overrides"] = _fastkernels_limit_layers
     # Reference-only backend overrides for models vLLM's default selection
@@ -1003,6 +1026,8 @@ def main():
         engine_kwargs["max_layers"] = cfg["max_layers"]
     if cfg.get("kv_cache_dtype"):
         engine_kwargs["kv_cache_dtype"] = cfg["kv_cache_dtype"]
+    if "max_num_seqs" in cfg:
+        engine_kwargs["max_num_seqs"] = cfg["max_num_seqs"]
     engine = LlamaEngine(**engine_kwargs)
 
     # Warmup -- same 16-token prompt as the vLLM worker, so both sides enter
@@ -2584,6 +2609,17 @@ def main():
     is_qwen_omni = _is_qwen_omni_model(args.model)
     is_whisper = _is_whisper_model(args.model)
     engine_env = _apply_per_model_defaults(args.model, args)
+    hopper_mamba_max_num_seqs = (
+        _HOPPER_MAMBA_MAX_NUM_SEQS
+        if (
+            not is_vlm
+            and not is_qwen_omni
+            and not is_whisper
+            and _is_pure_mamba_model(args.model)
+            and _cuda_cc_major() == 9
+        )
+        else None
+    )
 
     if args.max_layers is not None:
         if args.max_layers < 1:
@@ -2867,6 +2903,11 @@ def main():
     print(f"  Seed           : {args.seed}")
     print(f"  Trust RC       : {args.trust_remote_code}")
     print(f"  Max seq len    : {global_max_seq_len}")
+    if hopper_mamba_max_num_seqs is not None:
+        print(
+            f"  max_num_seqs   : {hopper_mamba_max_num_seqs} "
+            "(Hopper Mamba; vLLM CUDA-graph cap)"
+        )
     if engine_env:
         print(
             "  Engine env     : "
@@ -2908,6 +2949,7 @@ def main():
         max_layers=args.max_layers, max_model_len=global_max_seq_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
         kv_cache_dtype=args.kv_cache_dtype,
+        max_num_seqs=hopper_mamba_max_num_seqs,
         engine_env=engine_env,
         scenarios=scenario_data, latency=latency_data,
     )
@@ -2936,6 +2978,11 @@ def main():
                 **(
                     {"gpu_memory_utilization": args.gpu_memory_utilization}
                     if args.gpu_memory_utilization is not None
+                    else {}
+                ),
+                **(
+                    {"max_num_seqs": hopper_mamba_max_num_seqs}
+                    if hopper_mamba_max_num_seqs is not None
                     else {}
                 ),
                 "scenarios": scenario_data,
@@ -3005,6 +3052,11 @@ def main():
             **(
                 {"gpu_memory_utilization": args.gpu_memory_utilization}
                 if args.gpu_memory_utilization is not None
+                else {}
+            ),
+            **(
+                {"max_num_seqs": hopper_mamba_max_num_seqs}
+                if hopper_mamba_max_num_seqs is not None
                 else {}
             ),
             "project_root": kb_root,

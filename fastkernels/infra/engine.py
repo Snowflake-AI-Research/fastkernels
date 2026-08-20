@@ -178,6 +178,27 @@ def _detect_scheduling_defaults() -> tuple[int, int]:
     return 8192, 256
 
 
+def _is_hopper_gpu() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9
+
+
+# vLLM ``VllmConfig._set_cudagraph_sizes``: min(max_num_seqs * 2, 512).
+# Hopper Mamba-Codestral only has ~849 cache blocks at 0.9 util / 128k, so
+# vLLM's default max_num_seqs=1024 fails CUDA-graph capture. Matching this
+# cap keeps Hopper under the block count without changing Blackwell.
+_VLLM_DEFAULT_MAX_CUDAGRAPH_CAPTURE_SIZE = 512
+
+
+def _vllm_default_cudagraph_capture_sizes(max_capture: int) -> list[int]:
+    """Match vLLM ``VllmConfig._set_cudagraph_sizes`` (non-interactivity)."""
+    sizes = [i for i in (1, 2, 4) if i <= max_capture]
+    if max_capture >= 8:
+        sizes += list(range(8, min(max_capture + 1, 256), 8))
+    if max_capture >= 256:
+        sizes += list(range(256, max_capture + 1, 16))
+    return sorted(set(sizes))
+
+
 _DEFAULT_MAX_NUM_BATCHED_TOKENS, _DEFAULT_MAX_NUM_SEQS = (
     _detect_scheduling_defaults()
 )
@@ -562,6 +583,15 @@ class ModelRunner:
             or self.is_kimi_linear
             or self.is_qwen3_next
         )
+        # Hopper-only: vLLM's 1024-seq default exceeds Mamba cache blocks on
+        # H200 (~849 at 0.9 util / 128k). Cap at vLLM's hopper CUDA-graph
+        # size (512). Blackwell has more HBM and keeps 1024.
+        if (
+            model_type in ("mamba", "mamba2")
+            and _is_hopper_gpu()
+            and self.max_num_seqs > _VLLM_DEFAULT_MAX_CUDAGRAPH_CAPTURE_SIZE
+        ):
+            self.max_num_seqs = _VLLM_DEFAULT_MAX_CUDAGRAPH_CAPTURE_SIZE
         self.model_family = "mamba" if self.is_mamba else "attention"
         # Granularity a *continuing* prefill chunk must end on.
         #
@@ -3900,10 +3930,18 @@ class ModelRunner:
         # versus ~7 ms replayed), and a 1000-prompt run spends its whole steady
         # state with 300-500 sequences decoding.
         max_bs = self._mamba_graph_capacity()
-        buckets = [1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 160, 192, 224, 256]
-        # Above 256 the decode step is roughly linear in batch, so a coarser
-        # stride costs only the padding up to the next bucket (<= 12%).
-        buckets += list(range(288, 513, 32)) + list(range(576, 4097, 64))
+        if _is_hopper_gpu():
+            # Same capture grid vLLM uses on Hopper
+            # (``VllmConfig._set_cudagraph_sizes``): 1, 2, 4, step-8 to 256,
+            # step-16 to min(max_num_seqs*2, 512). Leave the Blackwell bucket
+            # list (including >512) unchanged.
+            max_bs = min(max_bs, _VLLM_DEFAULT_MAX_CUDAGRAPH_CAPTURE_SIZE)
+            buckets = _vllm_default_cudagraph_capture_sizes(max_bs)
+        else:
+            buckets = [1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 160, 192, 224, 256]
+            # Above 256 the decode step is roughly linear in batch, so a coarser
+            # stride costs only the padding up to the next bucket (<= 12%).
+            buckets += list(range(288, 513, 32)) + list(range(576, 4097, 64))
         self._mamba_graph_bs_list = [b for b in buckets if b <= max_bs]
         if max_bs > 0 and (
             not self._mamba_graph_bs_list

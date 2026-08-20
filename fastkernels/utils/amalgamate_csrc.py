@@ -268,7 +268,16 @@ def amalgamate(op: "Op") -> str:
     for src in op.sources:
         body = open(os.path.join(_CSRC, src), errors="ignore").read()
         parts.append(f"// ===== source: {src} =====")
-        parts.append(_expand(body, src, expanded))
+        expanded_body = _expand(body, src, expanded)
+        # e2m1x2 is SM100+/SM120 only. Hopper builds sm_90a and ptxas
+        # rejects those instructions if this TU is compiled unconditionally.
+        if src.endswith("nvfp4_kv_cache_kernels.cu"):
+            expanded_body = (
+                "#if defined(ENABLE_NVFP4_SM100) || defined(ENABLE_NVFP4_SM120)\n"
+                + expanded_body
+                + "\n#endif  // ENABLE_NVFP4_SM100 || ENABLE_NVFP4_SM120"
+            )
+        parts.append(expanded_body)
     merged = "\n".join(parts)
     if len(op.sources) > 1:
         merged = _dedup_top_level_defs(merged)
