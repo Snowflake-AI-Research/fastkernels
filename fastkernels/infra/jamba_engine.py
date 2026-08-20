@@ -627,13 +627,23 @@ class JambaEngine:
         self._use_compile = (
             os.environ.get("FASTKERNELS_JAMBA_COMPILE", "0") not in ("0", "false", "False")
         )
-        # Decode bucket schedule.  vLLM uses [1, 2, 4, 8, 16, 24, 32,
-        # 40, ...]; we cap at max_num_seqs.  Override via
+        # Decode bucket schedule.  Override via
         # ``FASTKERNELS_JAMBA_BUCKETS=1,2,4,8,16,32`` if you need a denser
         # or sparser schedule for a specific workload.
+        #
+        # Hopper FA3: one padded graph at max_num_seqs.  FA3 allocates
+        # split-KV ``oaccum`` inside the op (``new_empty([num_splits, H,
+        # total_q, D])``); capturing many sizes into a shared pool bakes
+        # incompatible pointers and mixed replay IMAs.  vLLM FULL decode
+        # pads attention to the captured size (Jamba is
+        # FULL_AND_PIECEWISE because Mamba is UNIFORM_BATCH).  Blackwell
+        # TRTLLM keeps a persistent workspace, so the multi-bucket list
+        # is safe there.
         env_buckets = os.environ.get("FASTKERNELS_JAMBA_BUCKETS")
         if env_buckets:
             buckets = sorted({int(x) for x in env_buckets.split(",") if x.strip()})
+        elif not self._use_trtllm:
+            buckets = [max_num_seqs]
         else:
             base = [1, 2, 4]
             base += list(range(8, max_num_seqs + 1, 8))
@@ -837,7 +847,12 @@ class JambaEngine:
                 _decode_step()
         torch.cuda.current_stream().wait_stream(s)
         torch.cuda.synchronize()
-        torch.cuda.empty_cache()
+        # Hopper FA3: do not empty_cache between captures.  FA3's per-call
+        # ``oaccum`` lives in the graph pool; emptying can recycle those
+        # addresses into a later (smaller) capture.  TRTLLM uses a
+        # persistent workspace, so the previous empty_cache is kept there.
+        if self._use_trtllm:
+            torch.cuda.empty_cache()
 
         self._refresh_fa3_decode_schedule(bufs["context_lens"])
         graph = torch.cuda.CUDAGraph()
