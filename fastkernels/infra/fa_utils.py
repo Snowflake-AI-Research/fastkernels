@@ -47,6 +47,7 @@ __all__ = [
     "fa3_scheduler_metadata",
     "fa3_scheduler_metadata_size",
     "fa_supports_head_size",
+    "fa_version_for_head_size",
     "group_fa_decode_ops",
     "refresh_fa3_decode_schedule",
 ]
@@ -72,6 +73,21 @@ get_scheduler_metadata = _vllm_get_scheduler_metadata
 FA_VERSION: int | None = (
     _vllm_get_flash_attn_version() if VLLM_FA_AVAILABLE else None
 )
+
+
+def fa_version_for_head_size(head_size: int) -> int | None:
+    """Per-layer FA version, matching vLLM ``get_flash_attn_version(head_size=)``.
+
+    The device default (``FA_VERSION``) is FA3 on Hopper.  FA3 does not
+    support ``head_size > 256``; vLLM upgrades those layers to FA4 when it
+    is available (Gemma4 global attention, 512).  Layers at ``<= 256`` keep
+    the device default so existing Hopper FA3 / Blackwell FA4 callers are
+    unchanged.
+    """
+    if head_size > 256 and VLLM_FA_AVAILABLE:
+        return _vllm_get_flash_attn_version(head_size=head_size)
+    return FA_VERSION
+
 
 # vLLM ``AttentionConfig.flash_attn_max_num_splits_for_cuda_graph``.
 FA3_CUDA_GRAPH_MAX_NUM_SPLITS = 32
@@ -115,6 +131,8 @@ def refresh_fa3_decode_schedule(
     with torch.inference_mode():
         for group in groups:
             lead = group[0]
+            if getattr(lead, "fa_version", FA_VERSION) != 3:
+                continue
             lead.update_scheduler_metadata(
                 context_lens,
                 max_seqlen_k,

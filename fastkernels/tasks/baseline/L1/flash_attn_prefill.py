@@ -8,7 +8,11 @@ FA2 otherwise) -- see :mod:`fa_utils`.
 import torch
 import torch.nn as nn
 
-from ....infra.fa_utils import FA_VERSION, fa3_scheduler_metadata, flash_attn_varlen_func
+from ....infra.fa_utils import (
+    fa3_scheduler_metadata,
+    fa_version_for_head_size,
+    flash_attn_varlen_func,
+)
 
 
 class FlashAttnPrefill(nn.Module):
@@ -18,6 +22,8 @@ class FlashAttnPrefill(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.sm_scale = head_dim ** -0.5
+        # Hopper FA3 cannot run head_dim>256; vLLM upgrades those layers to FA4.
+        self.fa_version = fa_version_for_head_size(head_dim)
 
     def forward(self, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs):
         # vLLM's wrapper takes keyword args in a different order than the
@@ -28,13 +34,13 @@ class FlashAttnPrefill(nn.Module):
             max_seqlen_q=max_seqlen_q,
             cu_seqlens_q=cu_seqlens_q,
             max_seqlen_k=max_seqlen_k,
-            fa_version=FA_VERSION,
+            fa_version=self.fa_version,
         )
         if kwargs.get("block_table") is not None:
             seqused_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
             fa_kw["seqused_k"] = seqused_k
             if (
-                FA_VERSION == 3
+                self.fa_version == 3
                 and not torch.cuda.is_current_stream_capturing()
             ):
                 page_size = k.shape[1] if k.dim() >= 2 else None

@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from ....infra.context import get_attn_backend_config
 from ....infra.tp import _tp_size
 from .attention_impl import Attention
 from .parallel_linear import QKVParallelLinear, RowParallelLinear
@@ -58,21 +59,23 @@ class Gemma4Attention(nn.Module):
             eps=config.rms_norm_eps,
             elementwise_affine=False,
         )
+        # vLLM ``Gemma4Config.verify_and_update_config`` pins
+        # ``flash_attn_version = 4`` for every layer when FA4 is available,
+        # so Hopper does not mix FA3 (256) with FA4 (512).  Blackwell still
+        # lands on Triton: FA4 TMEM-rejects 256/512 and FlashInfer rejects
+        # mm_prefix.  ``use_trtllm`` is that Blackwell path.
+        prefer_triton = get_attn_backend_config().use_trtllm
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
             1.0,
             num_kv_heads=self.num_kv_heads,
             sliding_window=config.sliding_window if self.is_sliding else None,
-            # Gemma4 is a PrefixLM: image tokens attend bidirectionally
-            # ("mm_prefix").  vLLM's selector rejects FlashInfer for it
-            # ("partial multimodal token full attention not supported") and
-            # FlashAttention too ("mm_prefix requires FlashAttention v4,
-            # which does not resolve for this head_size"), leaving
-            # TRITON_ATTN for *every* Gemma4 layer -- not just the 512-wide
-            # ones.  Match that so the benchmark compares the same kernel.
-            prefer_triton=True,
+            prefer_triton=prefer_triton,
         )
+        if not prefer_triton:
+            self.attn.prefill_op.fa_version = 4
+            self.attn.decode_op.fa_version = 4
 
     def _apply_rope(self, positions, q, k):
         if self.rotary_dim == self.head_dim:

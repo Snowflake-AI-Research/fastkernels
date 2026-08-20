@@ -32,10 +32,9 @@ from ..L1.store_kvcache import StoreKVCache, StoreKVCacheHND
 _TRITON_MIN_LAUNCH_GRID_SIZE_2D = 128
 _TRITON_NUM_PAR_SOFTMAX_SEGMENTS = 16
 
-# Largest head size the trtllm-gen / FlashAttention paged kernels advertise.
-# vLLM's ``FlashAttentionBackend.supports_head_size`` returns True up to 256
-# for every FA version (512 only for FA4 dense), and FlashInfer's trtllm-gen
-# paged path tops out here too; above it vLLM drops to TRITON_ATTN.
+# Largest head size the trtllm-gen paged kernels advertise.  Above this,
+# SM100 layers drop to TRITON_ATTN (FA4 TMEM-rejects 512).  Hopper uses FA4
+# for those heads instead; see ``_triton_only`` below.
 _TRTLLM_MAX_HEAD_SIZE = 256
 
 from ..L1.triton_unified_attention import (
@@ -210,13 +209,15 @@ class Attention(nn.Module):
         #   head_size 128/256, DECODER      -> FLASHINFER  (trtllm-gen)
         #   ENCODER_ONLY / ENCODER_DECODER  -> FLASH_ATTN  ("attention type
         #       not supported" excludes FlashInfer) -- see whisper_attention
-        #   PrefixLM bidirectional (Gemma4) -> TRITON_ATTN ("partial
-        #       multimodal token full attention not supported" excludes
-        #       FlashInfer; mm_prefix needs FA4, which "does not resolve for
-        #       this head_size", excluding FlashAttention)
+        #   PrefixLM bidirectional (Gemma4 sliding, 256) -> TRITON_ATTN
+        #       (FlashInfer rejects mm_prefix; FA3 fails "mm_prefix requires
+        #       FA4").  Gemma4 global layers (512) stay Triton on SM100
+        #       because FA4 TMEM-rejects head_size>128; on Hopper they run
+        #       FLASH_ATTN FA4 (FA3 caps at 256, FA4 is valid on SM90).
         #
-        # ``prefer_triton`` is how a model opts into that last case for *all*
-        # its layers, independent of head size.
+        # ``prefer_triton`` opts a layer into the mm_prefix / FA3-reject case.
+        # ``head_size > 256`` is only forced to Triton on the trtllm (SM100)
+        # path; Hopper uses FA4 for those heads.
         #
         # The Triton unified kernel indexes the cache as
         # ``[num_blocks, block_size, num_kv_heads, head_size]`` (NHD), as does
@@ -226,7 +227,9 @@ class Attention(nn.Module):
         # Note this does not depend on whether the Triton kernel imported: an
         # HND cache would silently transpose the head and block dims for
         # either consumer.
-        self._triton_only = prefer_triton or head_size > _TRTLLM_MAX_HEAD_SIZE
+        self._triton_only = prefer_triton or (
+            head_size > _TRTLLM_MAX_HEAD_SIZE and attn_cfg.use_trtllm
+        )
         self._use_trtllm = attn_cfg.use_trtllm and not self._triton_only
         self.kv_layout = "HND" if self._use_trtllm else "NHD"
 

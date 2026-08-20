@@ -12,9 +12,9 @@ import torch.nn as nn
 
 from ....infra.fa_utils import (
     FA3_CUDA_GRAPH_MAX_NUM_SPLITS,
-    FA_VERSION,
     fa3_scheduler_metadata,
     fa3_scheduler_metadata_size,
+    fa_version_for_head_size,
     flash_attn_varlen_func,
 )
 
@@ -26,6 +26,7 @@ class FlashAttnDecode(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
+        self.fa_version = fa_version_for_head_size(head_dim)
         self.page_size = page_size
         self._cu_seqlens_q = None
         # Persistent FA3 scheduler metadata.  vLLM builds this in
@@ -53,7 +54,7 @@ class FlashAttnDecode(nn.Module):
         max_seqlen_q: int = 1,
     ) -> None:
         """Recompute FA3 tile-scheduler metadata into the persistent buffer."""
-        if FA_VERSION != 3:
+        if self.fa_version != 3:
             self._sched_meta = None
             return
         if qkv_dtype is not None:
@@ -97,7 +98,7 @@ class FlashAttnDecode(nn.Module):
             self._cu_seqlens_q = torch.arange(
                 needed, dtype=torch.int32, device=device,
             )
-        if FA_VERSION == 3:
+        if self.fa_version == 3:
             cap = fa3_scheduler_metadata_size(max(max_batch_size, 1024))
             if self._sched_buf is None or self._sched_buf.numel() < cap:
                 self._sched_buf = torch.zeros(
@@ -120,7 +121,7 @@ class FlashAttnDecode(nn.Module):
             max_seqlen_k = int(cache_seqlens.max().item()) if cache_seqlens.numel() > 0 else 0
 
         capturing = torch.cuda.is_current_stream_capturing()
-        if capturing and FA_VERSION == 3:
+        if capturing and self.fa_version == 3:
             if self._sched_meta is None:
                 raise RuntimeError(
                     "FA3 CUDA-graph capture requires "
@@ -128,7 +129,7 @@ class FlashAttnDecode(nn.Module):
                 )
             meta = self._sched_meta
             num_splits = self._graph_num_splits
-        elif FA_VERSION == 3 and cache_seqlens is not None:
+        elif self.fa_version == 3 and cache_seqlens is not None:
             page_size = self.page_size
             if page_size is None and k_cache.dim() >= 2:
                 page_size = k_cache.shape[1]
@@ -163,7 +164,7 @@ class FlashAttnDecode(nn.Module):
             softmax_scale=softmax_scale,
             causal=True,
             block_table=block_table,
-            fa_version=FA_VERSION,
+            fa_version=self.fa_version,
             num_splits=num_splits,
         )
         if meta is not None:
