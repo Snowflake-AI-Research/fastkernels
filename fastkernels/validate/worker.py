@@ -72,6 +72,17 @@ def run_worker(
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".py", delete=False,
     ) as f:
+        # Uncaught CUDA errors otherwise unwind into Py_FinalizeEx, where a
+        # CUDAEvent destructor abort()s and the process hangs in the driver.
+        # The parent then waits out its timeout (hours) while the GPU stays
+        # reserved. Exit here, before any destructor runs.
+        f.write(
+            "import os as _fk_os, sys as _fk_sys, traceback as _fk_tb\n"
+            "def _fk_excepthook(typ, val, tb):\n"
+            "    _fk_tb.print_exception(typ, val, tb)\n"
+            "    _fk_os._exit(1)\n"
+            "_fk_sys.excepthook = _fk_excepthook\n"
+        )
         f.write(script)
         script_path = f.name
 

@@ -476,6 +476,7 @@ def _run_job_subprocess(
     watchdog_reason: str | None = None
     orphans_reaped = False
     last_output = [time.monotonic()]
+    fatal_at = [0.0]
     with log_path.open("w", buffering=1) as log:
         log.write(f"job_index: {job['index']}\n")
         log.write(f"name: {job['name']}\n")
@@ -513,6 +514,11 @@ def _run_job_subprocess(
                     return
                 for line in proc.stdout:
                     last_output[0] = time.monotonic()
+                    if fatal_at[0] == 0.0 and (
+                        "Traceback (most recent call last):" in line
+                        or "terminate called after throwing" in line
+                    ):
+                        fatal_at[0] = last_output[0]
                     try:
                         log.write(line)
                     except ValueError:
@@ -538,6 +544,13 @@ def _run_job_subprocess(
                     break
                 if stall_timeout > 0 and now - last_output[0] > stall_timeout:
                     watchdog_reason = f"no log output for {stall_timeout}s"
+                    break
+                # IMA/OOM already printed; the child is stuck in CUDA teardown.
+                # Do not wait out stall_timeout (default 900s).
+                if fatal_at[0] and now - fatal_at[0] > 10:
+                    watchdog_reason = (
+                        "fatal error in log; worker did not exit within 10s"
+                    )
                     break
                 time.sleep(1.0)
             if watchdog_reason:

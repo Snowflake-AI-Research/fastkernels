@@ -179,12 +179,15 @@ class BlockManager:
     ``deallocate``).
     """
 
-    def __init__(self, num_blocks: int):
+    def __init__(self, num_blocks: int, reserve_null_block: bool = False):
         self._num_blocks = num_blocks
-        self.free_block_ids: deque[int] = deque(range(num_blocks))
+        # Hopper FA3: block 0 is vLLM's NULL_BLOCK_ID. TRTLLM pads with -1
+        # and skips those entries, so B200 keeps the old 0-based pool.
+        self._start = 1 if reserve_null_block else 0
+        self.free_block_ids: deque[int] = deque(range(self._start, num_blocks))
 
     def reset(self) -> None:
-        self.free_block_ids = deque(range(self._num_blocks))
+        self.free_block_ids = deque(range(self._start, self._num_blocks))
 
     def can_allocate_n(self, n_blocks: int) -> bool:
         return len(self.free_block_ids) >= n_blocks
@@ -194,7 +197,8 @@ class BlockManager:
             seq.block_table.append(self.free_block_ids.popleft())
 
     def deallocate(self, seq: Sequence) -> None:
-        self.free_block_ids.extend(seq.block_table)
+        start = self._start
+        self.free_block_ids.extend(b for b in seq.block_table if b >= start)
         seq.block_table.clear()
 
 
@@ -505,17 +509,54 @@ class JambaEngine:
         self._page_size = attn_cfg.block_size
         self._kv_layout = attn_cfg.kv_layout
         self._use_trtllm = attn_cfg.use_trtllm
+        # vLLM FA3 full-graph capture sets max_seq_len = max_model_len
+        # (gpu_model_runner._build_attention_metadata).
+        self._graph_max_context_len = max_model_len
 
-        # Block budget: enough blocks for every seq in the bucket to
-        # cover the full max_model_len prompt + decode horizon.
-        # Conservative -- LlamaEngine sizes this dynamically from
-        # available GPU memory; we round up to keep the engine simple
-        # since the open Jamba models leave plenty of memory headroom.
+        # Per-seq table width stays at max_model_len so one long-context
+        # request can still fill the window. Total pages come from the
+        # leftover HBM after weights (same 0.9 util as LlamaEngine / vLLM);
+        # allocating max_num_seqs * max_model_len OOMs on Hopper page_size=16
+        # once bench_vllm passes the real 175k context.
         self._max_blocks_per_seq = (
             (max_model_len + self._page_size - 1) // self._page_size
         )
-        total_blocks = self.max_num_seqs * self._max_blocks_per_seq
+        bytes_per_block = (
+            2 * self._n_attn_layers * self._page_size
+            * self._n_kv_heads * self._head_dim * dtype.itemsize
+        )
+        k_m1 = max(self._mamba_conv_kernel - 1, 1)
+        mamba_bytes = (
+            self._n_mamba_layers * max_num_seqs * dtype.itemsize
+            * (k_m1 * self._mamba_intermediate
+               + self._mamba_intermediate * self._mamba_d_state)
+        )
+        workspace_bytes = 512 * 1024 * 1024 if self._use_trtllm else 0
+        # Decode-graph mempools plus mixed-prefill MoE scratch (cache13 ~2 GiB
+        # at 32k tokens). Packing KV to the 0.9 line leaves ~1 GiB free and
+        # OOMs on the first mixed step.
+        runtime_reserve = 8 * 1024 * 1024 * 1024
+        torch.cuda.empty_cache()
+        free, total = torch.cuda.mem_get_info()
+        available = (
+            int(total * 0.9 - (total - free))
+            - mamba_bytes - workspace_bytes - runtime_reserve
+        )
+        fit_blocks = max(0, available // bytes_per_block)
+        want_blocks = self.max_num_seqs * self._max_blocks_per_seq
+        total_blocks = min(want_blocks, fit_blocks)
+        if total_blocks < self._max_blocks_per_seq:
+            raise RuntimeError(
+                f"Not enough GPU memory for Jamba KV cache: {fit_blocks} blocks "
+                f"fit, need {self._max_blocks_per_seq} for "
+                f"max_model_len={max_model_len}"
+            )
         self._num_blocks = total_blocks
+        print(
+            f"  [JambaEngine] KV cache: {total_blocks} blocks x {self._page_size} "
+            f"= {total_blocks * self._page_size} token slots "
+            f"(cap {want_blocks} for {self.max_num_seqs} x {max_model_len})"
+        )
 
         # Allocate the global paged KV cache and bind per-layer slices.
         if self._kv_layout == "HND":
@@ -577,7 +618,10 @@ class JambaEngine:
         # ------------------------------------------------------------------
         # Block manager (paged KV) + Mamba state slot pool.
         # ------------------------------------------------------------------
-        self.block_manager = BlockManager(num_blocks=total_blocks)
+        self.block_manager = BlockManager(
+            num_blocks=total_blocks,
+            reserve_null_block=not self._use_trtllm,
+        )
         self.mamba_pool = _MambaSlotPool(
             max_num_seqs=max_num_seqs,
             num_mamba_layers=self._n_mamba_layers,
@@ -627,17 +671,9 @@ class JambaEngine:
         self._use_compile = (
             os.environ.get("FASTKERNELS_JAMBA_COMPILE", "0") not in ("0", "false", "False")
         )
-        # Decode bucket schedule.  Override via
-        # ``FASTKERNELS_JAMBA_BUCKETS=1,2,4,8,16,32`` if you need a denser
-        # or sparser schedule for a specific workload.
-        #
-        # Blackwell TRTLLM: existing dense list (step-8).  Hopper FA3: vLLM
-        # ``cudagraph_capture_sizes`` so B=1 / B=32 do not pad to
-        # max_num_seqs.  One shared pool plus FA3's per-call split-KV
-        # scratch IMAs on Hopper when many sizes share an address space;
-        # those graphs use a mempool per bucket and pin scratch after
-        # capture.  TRTLLM keeps a persistent workspace, so the shared
-        # pool is unchanged.
+        # Decode buckets. B200 TRTLLM: existing dense step-8 list.
+        # Hopper FA3: vLLM-style sizes in one shared pool (LlamaEngine /
+        # vLLM global graph pool). Override via FASTKERNELS_JAMBA_BUCKETS.
         env_buckets = os.environ.get("FASTKERNELS_JAMBA_BUCKETS")
         if env_buckets:
             buckets = sorted({int(x) for x in env_buckets.split(",") if x.strip()})
@@ -660,7 +696,6 @@ class JambaEngine:
             if self._use_cuda_graphs and self._use_trtllm
             else None
         )
-        self._cuda_graph_mempool_ids: dict[int, object] = {}
         self._compiled_decode_step = None
         self._decode_graphs: dict[int, _JambaDecodeGraph] = {}
         self._decode_static_buffers: dict[int, dict] = {}
@@ -695,6 +730,11 @@ class JambaEngine:
     # ------------------------------------------------------------------
     # Random seeds
     # ------------------------------------------------------------------
+    def _bt_pad(self) -> int:
+        # FA3 walks ceil(max_seqlen_k / page_size) columns (vLLM).
+        # Unused entries must be 0 (NULL_BLOCK_ID); -1 IMAs. TRTLLM skips -1.
+        return 0 if not self._use_trtllm else -1
+
     def _set_seeds(self, seed: int) -> None:
         random.seed(seed)
         np.random.seed(seed)
@@ -753,7 +793,7 @@ class JambaEngine:
         refresh_fa3_decode_schedule(
             self._fa_decode_groups,
             context_lens,
-            self.max_model_len,
+            self._graph_max_context_len,
             qkv_dtype=self.dtype,
         )
 
@@ -769,8 +809,15 @@ class JambaEngine:
         from ..tasks.baseline.L1.flash_attn_decode import FlashAttnDecode
 
         B = self.max_num_seqs
+        # Same max_seq_len the graphs recorded. Mixed eager (num_splits=0)
+        # shrinks process-wide split-KV scratch; pin must restore the
+        # captured shape, not B=256 / seqlen=1.
+        max_seq_len = self._graph_max_context_len
+        graph_bps = (max_seq_len + self._page_size - 1) // self._page_size
         seqlens = torch.ones(B, dtype=torch.int32, device=self.device)
-        bt = torch.zeros(B, 1, dtype=torch.int32, device=self.device)
+        bt = torch.zeros(
+            B, graph_bps, dtype=torch.int32, device=self.device,
+        )
         self._refresh_fa3_decode_schedule(seqlens)
         dummy_q: dict[tuple, torch.Tensor] = {}
         for attn in self.model.modules():
@@ -796,7 +843,7 @@ class JambaEngine:
                     q, k_cache, v_cache,
                     cache_seqlens=seqlens,
                     block_table=bt,
-                    max_seq_len=1,
+                    max_seq_len=max_seq_len,
                 )
             finally:
                 op._force_graph_splits = was
@@ -823,7 +870,10 @@ class JambaEngine:
 
     def _capture_decode_graph_inner(self, B: int) -> _JambaDecodeGraph:
         bufs = self._alloc_decode_buffers(B)
-        max_context_len = self._max_blocks_per_seq * self._page_size
+        max_context_len = (
+            self._max_blocks_per_seq * self._page_size
+            if self._use_trtllm else self._graph_max_context_len
+        )
         if not self._use_trtllm:
             # Same dummy as LlamaEngine.capture_cudagraph: one cached token,
             # skip the KV store.  context_len=0 is not a live decode shape.
@@ -921,14 +971,10 @@ class JambaEngine:
 
         self._refresh_fa3_decode_schedule(bufs["context_lens"])
         graph = torch.cuda.CUDAGraph()
-        pool = self._cuda_graph_mempool_id
-        if not self._use_trtllm:
-            pool = self._cuda_graph_mempool_ids.get(B)
-            if pool is None:
-                pool = torch.cuda.graph_pool_handle()
-                self._cuda_graph_mempool_ids[B] = pool
-        with torch.cuda.graph(graph, pool=pool):
+        with torch.cuda.graph(graph, pool=self._cuda_graph_mempool_id):
             _decode_step()
+        if self._cuda_graph_mempool_id is None:
+            self._cuda_graph_mempool_id = graph.pool()
 
         entry = _JambaDecodeGraph(
             bucket_size=B,
@@ -1333,7 +1379,7 @@ class JambaEngine:
 
         # Per-seq block_tables.
         bps = self._max_blocks_per_seq
-        bt_np = np.full((B, bps), -1, dtype=np.int32)
+        bt_np = np.full((B, bps), self._bt_pad(), dtype=np.int32)
         for i, (s, _) in enumerate(chunks):
             bt_np[i, :len(s.block_table)] = s.block_table
         block_tables = torch.from_numpy(bt_np).to(device)
@@ -1448,7 +1494,7 @@ class JambaEngine:
             for st, (_, cs) in zip(starts, chunks)
         ])
 
-        pbt_np = np.full((n_p_seqs, bps), -1, dtype=np.int32)
+        pbt_np = np.full((n_p_seqs, bps), self._bt_pad(), dtype=np.int32)
         for i, (s, _) in enumerate(chunks):
             pbt_np[i, :len(s.block_table)] = s.block_table
         seq_idx = np.repeat(np.arange(n_p_seqs, dtype=np.int64), plens)
@@ -1466,7 +1512,7 @@ class JambaEngine:
         )
         pos_d = lens_d - 1
         ctx_d = lens_d.astype(np.int32)
-        dbt_np = np.full((n_d, bps), -1, dtype=np.int32)
+        dbt_np = np.full((n_d, bps), self._bt_pad(), dtype=np.int32)
         for i, s in enumerate(decode_seqs):
             dbt_np[i, :len(s.block_table)] = s.block_table
         slot_d = (
@@ -1520,7 +1566,10 @@ class JambaEngine:
             prefill_block_tables=torch.from_numpy(pbt_np).to(device),
             decode_context_lens=torch.from_numpy(ctx_d).to(device),
             decode_block_tables=torch.from_numpy(dbt_np).to(device),
-            decode_max_context_len=bps * page_size,
+            decode_max_context_len=(
+                bps * page_size if self._use_trtllm
+                else (int(ctx_d.max()) if n_d else 1)
+            ),
             mamba_metadata=mamba_meta,
         )
         try:
@@ -1554,7 +1603,8 @@ class JambaEngine:
         n = len(running)
         if self._fa3_needs_pin:
             self._pin_fa3_workspace()
-        if self._use_cuda_graphs:
+        use_graph = self._use_cuda_graphs
+        if use_graph:
             B = self._pick_bucket(n)
             graph = self._decode_graphs.get(B)
             if graph is None:
@@ -1601,7 +1651,7 @@ class JambaEngine:
             cache_idx_np = np.fromiter(
                 (s.state_slot for s in running), dtype=np.int32, count=n,
             )
-            bt_np = np.full((n, bps), -1, dtype=np.int32)
+            bt_np = np.full((n, bps), self._bt_pad(), dtype=np.int32)
             for i, s in enumerate(running):
                 bt_np[i, :len(s.block_table)] = s.block_table
             self._decode_meta_key = running_key
@@ -1703,7 +1753,11 @@ class JambaEngine:
                 slot_mapping=slot_mapping,
                 context_lens=context_lens,
                 block_tables=block_tables,
-                max_context_len=self._max_blocks_per_seq * self._page_size,
+                max_context_len=(
+                    self._max_blocks_per_seq * self._page_size
+                    if self._use_trtllm
+                    else (int(ctx_np.max()) if n else 1)
+                ),
                 mamba_metadata=mamba_meta,
             )
             try:
