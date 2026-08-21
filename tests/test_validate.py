@@ -13,6 +13,7 @@ from fastkernels.validate import (
 )
 from fastkernels.validate.ray_runner import (
     _build_summary,
+    _is_fatal_worker_line,
     _latency_rows_for_result,
     _plan_jobs,
     _ray_job_id,
@@ -42,6 +43,26 @@ def _scenario(model: str, *, tp: int = 1, workloads=("mixed",)):
         dtype="bfloat16",
         legacy_workloads=tuple(workloads),
     )
+
+
+def test_fatal_worker_line_ignores_vllm_warning_tracebacks():
+    # Codestral: vLLM prints a config AttributeError as WARNING + traceback.
+    warning = (
+        "WARNING 08-21 09:44:11 [config.py:1242] "
+        "Traceback (most recent call last):"
+    )
+    assert _is_fatal_worker_line(warning) is False
+    assert _is_fatal_worker_line("Traceback (most recent call last):\n") is True
+    assert _is_fatal_worker_line(
+        '  File "engine.py", line 1, in generate\n'
+    ) is False
+    assert _is_fatal_worker_line(
+        "terminate called after throwing an instance of 'std::runtime_error'\n"
+    ) is True
+    assert _is_fatal_worker_line(
+        "torch.AcceleratorError: CUDA error: an illegal memory access "
+        "was encountered\n"
+    ) is True
 
 
 def test_build_vllm_command_forwards_supported_options(tmp_path):

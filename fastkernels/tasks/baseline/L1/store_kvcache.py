@@ -46,17 +46,22 @@ def _store_kvcache_hnd_kernel(
     """Store KV into HND layout [num_blocks, num_kv_heads, block_size, head_dim]."""
     idx = tl.program_id(0)
     head = tl.program_id(1)
-    slot = tl.load(slot_mapping_ptr + idx)
-    if slot == -1:
+    # int64: same overflow as the NHD store.  ``block_idx * H * page * D``
+    # in int32 wraps once block_idx >= 2^31 / (H * page * D) (131072 for
+    # Jamba Mini H=8, page=16, D=128 -- under the 201k-block B200 pool).
+    slot = tl.load(slot_mapping_ptr + idx).to(tl.int64)
+    if slot < 0:
         return
     block_idx = slot // PAGE_SIZE
     slot_in_block = slot % PAGE_SIZE
     src_k_offset = idx * key_stride_n + head * HEAD_DIM + tl.arange(0, HEAD_DIM)
     src_v_offset = idx * value_stride_n + head * HEAD_DIM + tl.arange(0, HEAD_DIM)
-    dst_offset = (block_idx * NUM_KV_HEADS * PAGE_SIZE * HEAD_DIM
-                  + head * PAGE_SIZE * HEAD_DIM
-                  + slot_in_block * HEAD_DIM
-                  + tl.arange(0, HEAD_DIM))
+    dst_offset = (
+        block_idx * NUM_KV_HEADS * PAGE_SIZE * HEAD_DIM
+        + head * PAGE_SIZE * HEAD_DIM
+        + slot_in_block * HEAD_DIM
+        + tl.arange(0, HEAD_DIM)
+    )
     k = tl.load(key_ptr + src_k_offset)
     v = tl.load(value_ptr + src_v_offset)
     tl.store(k_cache_ptr + dst_offset, k)
@@ -85,6 +90,8 @@ class StoreKVCacheHND(nn.Module):
 
     def forward(self, key, value, k_cache, v_cache, slot_mapping):
         N, num_kv_heads, head_dim = key.shape
+        if slot_mapping.dtype != torch.int64:
+            slot_mapping = slot_mapping.to(torch.int64)
         _store_kvcache_hnd_kernel[(N, num_kv_heads)](
             key, key.stride(0), value, value.stride(0),
             k_cache, v_cache, slot_mapping,

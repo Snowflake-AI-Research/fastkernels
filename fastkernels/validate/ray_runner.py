@@ -429,6 +429,23 @@ def _kill_process_group(
     _reclaim_gpus(physical_gpus)
 
 
+def _is_fatal_worker_line(line: str) -> bool:
+    """True if ``line`` is a real crash, not a library warning that embeds one.
+
+    vLLM logs some config AttributeErrors as ``WARNING ... Traceback (most
+    recent call last):`` (Codestral's missing max_position_embeddings).
+    Treating those as fatal kills a healthy worker 10s later.
+    """
+    s = line.lstrip()
+    if s.startswith("WARNING "):
+        return False
+    return (
+        "Traceback (most recent call last):" in line
+        or "terminate called after throwing" in line
+        or "illegal memory access" in line
+    )
+
+
 def _run_job_subprocess(
     job: dict,
     timeout: int,
@@ -514,10 +531,7 @@ def _run_job_subprocess(
                     return
                 for line in proc.stdout:
                     last_output[0] = time.monotonic()
-                    if fatal_at[0] == 0.0 and (
-                        "Traceback (most recent call last):" in line
-                        or "terminate called after throwing" in line
-                    ):
+                    if fatal_at[0] == 0.0 and _is_fatal_worker_line(line):
                         fatal_at[0] = last_output[0]
                     try:
                         log.write(line)

@@ -4692,6 +4692,10 @@ class ModelRunner:
         assert num_blocks > 0, f"Not enough GPU memory for MLA KV cache on rank {self.rank}"
         self.num_blocks = num_blocks
         self.block_size = _MLA_BLOCK_SIZE
+        # prepare_mixed_batch / prepare_prefill page with these, not
+        # self.block_size. Keep them in lockstep with MLA paging.
+        self._full_block_size = _MLA_BLOCK_SIZE
+        self._sliding_block_size = _MLA_BLOCK_SIZE
 
         # Update module-level BLOCK_SIZE so Sequence.num_blocks,
         # blocks_needed_for, BlockManager, prepare_prefill/decode, etc.

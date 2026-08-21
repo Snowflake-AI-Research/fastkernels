@@ -745,6 +745,13 @@ class JambaEngine:
     # ------------------------------------------------------------------
     # Decode-graph static buffers + capture.
     # ------------------------------------------------------------------
+    def _graph_blocks_per_seq(self, B: int) -> int:
+        # TRTLLM: pack to the per-seq share of the KV pool. Hopper FA3
+        # keeps full-width tables.
+        if not self._use_trtllm or B <= 0:
+            return self._max_blocks_per_seq
+        return max(1, min(self._max_blocks_per_seq, self._num_blocks // B))
+
     def _alloc_decode_buffers(self, B: int) -> dict:
         """Allocate the static-identity tensors a B-bucket decode graph
         reads from.  Tensors are reused across replays; the host loop
@@ -753,7 +760,7 @@ class JambaEngine:
         if B in self._decode_static_buffers:
             return self._decode_static_buffers[B]
         device = self.device
-        bps = self._max_blocks_per_seq
+        bps = self._graph_blocks_per_seq(B)
         bufs = {
             "step_input_ids": torch.zeros(B, dtype=torch.long, device=device),
             "step_positions": torch.zeros(B, dtype=torch.long, device=device),
@@ -871,7 +878,7 @@ class JambaEngine:
     def _capture_decode_graph_inner(self, B: int) -> _JambaDecodeGraph:
         bufs = self._alloc_decode_buffers(B)
         max_context_len = (
-            self._max_blocks_per_seq * self._page_size
+            bufs["block_tables"].shape[1] * self._page_size
             if self._use_trtllm else self._graph_max_context_len
         )
         if not self._use_trtllm:
@@ -947,11 +954,13 @@ class JambaEngine:
             finally:
                 reset_context()
 
-        # Dummy capture lengths are 1, not 0: a zero context length is not a
-        # state any real decode step reaches (matches LlamaEngine).
-        if int(bufs["context_lens"].max().item() or 0) == 0:
-            bufs["context_lens"].fill_(1)
-        self._refresh_fa3_decode_schedule(bufs["context_lens"])
+        # Hopper FA3: dummy capture lengths are 1, not 0. TRTLLM on
+        # Blackwell keeps the pre-H200 capture (zeroed static buffers);
+        # forcing seq_len=1 here is what 034c169 leaked onto B200.
+        if not self._use_trtllm:
+            if int(bufs["context_lens"].max().item() or 0) == 0:
+                bufs["context_lens"].fill_(1)
+            self._refresh_fa3_decode_schedule(bufs["context_lens"])
 
         torch.cuda.synchronize()
         if self._use_trtllm:
@@ -1609,6 +1618,11 @@ class JambaEngine:
             graph = self._decode_graphs.get(B)
             if graph is None:
                 graph = self._capture_decode_graph(B)
+            need_pages = max((len(s.block_table) for s in running), default=0)
+            if graph is not None and need_pages > graph.block_tables.shape[1]:
+                use_graph = False
+                graph = None
+                B = n
         else:
             graph = None
             B = n
@@ -1702,8 +1716,9 @@ class JambaEngine:
             bufs_context_lens.copy_(torch.from_numpy(full_ctx))
             if not reuse_invariants:
                 pad_bt = 0 if not self._use_trtllm else -1
-                full_bt = np.full((B, bps), pad_bt, dtype=np.int32)
-                full_bt[:n] = bt_np
+                graph_bps = int(bufs_block_tables.shape[1])
+                full_bt = np.full((B, graph_bps), pad_bt, dtype=np.int32)
+                full_bt[:n] = bt_np[:, :graph_bps]
                 # Mamba pad rows: cache_indices=-1 -- the vendored
                 # causal_conv1d_update / selective_state_update kernels
                 # skip rows whose state index is -1 (per
