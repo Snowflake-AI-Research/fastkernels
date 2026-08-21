@@ -547,6 +547,7 @@ def build_chunk_metadata(
     query_start_loc_p: torch.Tensor,
     chunk_size: int,
     num_computed_tokens_p: torch.Tensor | None = None,
+    host_qsl: list[int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute Mamba2 chunk-aligned varlen metadata.
 
@@ -574,7 +575,7 @@ def build_chunk_metadata(
     same device as ``query_start_loc_p``.
     """
     device = query_start_loc_p.device
-    qsl = query_start_loc_p.to("cpu").to(torch.int64).tolist()
+    qsl = host_qsl if host_qsl is not None else query_start_loc_p.tolist()
     starts = qsl[:-1]
     ends = qsl[1:]
     total = qsl[-1]

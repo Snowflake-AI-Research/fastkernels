@@ -3901,6 +3901,7 @@ class ModelRunner:
                     meta.query_start_loc_p,
                     chunk_size=chunk_size,
                     num_computed_tokens_p=num_computed,
+                    host_qsl=query_start_loc,
                 )
                 meta.cu_chunk_seqlen_p = cu_chunk
                 meta.seq_idx_p = seq_idx
@@ -3977,30 +3978,22 @@ class ModelRunner:
         )
         try:
             hidden = self.model(input_ids, positions)
-            # Logits at end of each prefill seq + all decode tokens.
-            indices: list[int] = []
+            # Same last-token gather as ``run_mamba``: stay on GPU. Prefill
+            # rows are the last token of each chunk; decode rows follow
+            # (Mamba2) or lead (Mamba v1, excluding GEMM-alignment pads).
+            parts: list[torch.Tensor] = []
             if prefill_seqs:
-                qsl = meta.query_start_loc_p.to("cpu").tolist()
-                if self.is_mamba2:
-                    indices.extend(qsl[i + 1] - 1 for i in range(len(prefill_seqs)))
-                else:
-                    indices.extend(
-                        meta.num_decode_tokens + qsl[i + 1] - 1
-                        for i in range(len(prefill_seqs))
-                    )
-            if self.is_mamba2:
-                indices.extend(
-                    range(
-                        meta.num_prefill_tokens,
-                        meta.num_prefill_tokens + len(decode_seqs),
-                    )
-                )
-            else:
-                # ``num_decode_tokens`` may include alignment-pad rows; only the
-                # real decode rows produce a token.
-                indices.extend(range(len(decode_seqs)))
-            idx_t = torch.tensor(indices, dtype=torch.int64,
-                                 device=hidden.device)
+                last_p = (meta.query_start_loc_p[1:] - 1).to(torch.int64)
+                if not self.is_mamba2:
+                    last_p = last_p + int(meta.num_decode_tokens)
+                parts.append(last_p)
+            if decode_seqs:
+                n_d = len(decode_seqs)
+                start = int(meta.num_prefill_tokens) if self.is_mamba2 else 0
+                parts.append(torch.arange(
+                    start, start + n_d, dtype=torch.int64, device=hidden.device,
+                ))
+            idx_t = parts[0] if len(parts) == 1 else torch.cat(parts)
             hidden_last = hidden.index_select(0, idx_t)
             logits = self.model.compute_logits(hidden_last)
         finally:
@@ -7106,6 +7099,7 @@ class LlamaEngine:
         self.max_model_len = self.model_runner.max_model_len
         print(f"  Scheduling: max_num_seqs={self.max_num_seqs}, "
               f"max_num_batched_tokens={self.max_num_batched_tokens}")
+        self._mamba_prefill_defer = 0
 
         self.tokenizer = _load_tokenizer(model_name)
         if self.tokenizer.pad_token_id is None:
@@ -8129,30 +8123,6 @@ class LlamaEngine:
         eos = self.tokenizer.eos_token_id
         mr = self.model_runner
 
-        # Optional per-step instrumentation -- enable with
-        # ``FASTKERNELS_PROFILE_MAMBA=1``.  Records wall-clock time spent
-        # in each phase (admit, decode-array prep, GPU dispatch, D2H
-        # wait, finalize/dealloc) and prints a summary at the end so
-        # we can see which phase dominates without resorting to a full
-        # CUDA profiler.
-        _profile = os.environ.get("FASTKERNELS_PROFILE_MAMBA", "0") == "1"
-        _stats = {
-            "fast_steps": 0,
-            "fast_admit": 0.0,
-            "fast_prep": 0.0,
-            "fast_dispatch": 0.0,
-            "fast_wait": 0.0,
-            "fast_finalize": 0.0,
-            "fast_pbar": 0.0,
-            "slow_steps": 0,
-            "slow_admit": 0.0,
-            "slow_call": 0.0,
-            "slow_finalize": 0.0,
-            "slow_pbar": 0.0,
-            "total_decode_tokens": 0,
-            "total_prefill_tokens": 0,
-        }
-
         # Build sequences in input order, plus a seq -> sp lookup (avoids
         # O(N^2) ``all_seqs.index(s)`` calls that dominated the old
         # scheduler at 1000 prompts).
@@ -8239,7 +8209,6 @@ class LlamaEngine:
             return done
 
         while waiting or running or prefilling:
-            _t0 = time.perf_counter() if _profile else 0.0
             _admit()
             decode_seqs = list(running)
 
@@ -8315,10 +8284,36 @@ class LlamaEngine:
                     )
                 ):
                     prefill_chunk_lens[-1] -= excess
-            _t_admit = (time.perf_counter() - _t0) if _profile else 0.0
 
             if not prefill_seqs and not decode_seqs:
                 break
+
+            # Hopper-only: a few leftover prefill tokens currently dump a
+            # graph-sized decode batch into eager mixed (~50ms vs ~25ms
+            # replay). Defer those crumbs so decode stays on the CUDA
+            # graph; every 8th step run the leftover prefills alone so
+            # they cannot starve. Fat prefills (>=2048 tokens) still mix.
+            # Blackwell keeps a single mixed forward.
+            held_decode: list[Sequence] = []
+            if (
+                _is_hopper_gpu()
+                and prefill_seqs
+                and decode_seqs
+                and all_greedy
+                and getattr(mr, "_mamba_graph_bs_for_n", None) is not None
+                and mr.max_num_batched_tokens >= len(decode_seqs)
+                and sum(prefill_chunk_lens) < 2048
+            ):
+                self._mamba_prefill_defer += 1
+                if self._mamba_prefill_defer < 8:
+                    prefill_seqs = []
+                    prefill_chunk_lens = []
+                else:
+                    held_decode = decode_seqs
+                    decode_seqs = []
+                    self._mamba_prefill_defer = 0
+            else:
+                self._mamba_prefill_defer = 0
 
             # =========================================================
             # FAST PATH: pure decode + greedy + CUDA-graph capture set up.
@@ -8330,25 +8325,14 @@ class LlamaEngine:
                 and all_greedy
                 and mr.max_num_batched_tokens >= len(decode_seqs)
             ):
-                _t1 = time.perf_counter() if _profile else 0.0
                 decode_data = mr._prepare_mamba_decode_arrays(decode_seqs)
-                _t_prep = (time.perf_counter() - _t1) if _profile else 0.0
-
-                _t1 = time.perf_counter() if _profile else 0.0
                 has_result, async_n = mr.call_mamba_decode_async(decode_data)
-                _t_dispatch = (time.perf_counter() - _t1) if _profile else 0.0
 
-                _t_wait = 0.0
-                _t_finalize = 0.0
                 # Drain any waiting prompts admitted between steps while
                 # we still keep pipelining decodes -- but only on the
                 # rank-0 path that actually owns the result.
                 if has_result:
-                    _t1 = time.perf_counter() if _profile else 0.0
                     token_ids = mr._wait_async_mamba_tokens(async_n)
-                    _t_wait = (time.perf_counter() - _t1) if _profile else 0.0
-
-                    _t1 = time.perf_counter() if _profile else 0.0
                     finished_now: list[Sequence] = []
                     new_running: list[Sequence] = []
                     for s, tok_id in zip(decode_seqs, token_ids):
@@ -8366,39 +8350,22 @@ class LlamaEngine:
                             s.state_slot = None
                             if pbar is not None:
                                 _pbar_pending += 1
-                    running = new_running
-                    _t_finalize = (time.perf_counter() - _t1) if _profile else 0.0
+                    running = new_running + held_decode
                 else:
                     # Worker rank or graph fell through; treat as no-op.
-                    running = decode_seqs
+                    running = list(decode_seqs) + held_decode
 
-                _t1 = time.perf_counter() if _profile else 0.0
                 if pbar is not None and _pbar_pending:
                     pbar.update(_pbar_pending)
                     _pbar_pending = 0
-                _t_pbar = (time.perf_counter() - _t1) if _profile else 0.0
-
-                if _profile:
-                    _stats["fast_steps"] += 1
-                    _stats["fast_admit"] += _t_admit
-                    _stats["fast_prep"] += _t_prep
-                    _stats["fast_dispatch"] += _t_dispatch
-                    _stats["fast_wait"] += _t_wait
-                    _stats["fast_finalize"] += _t_finalize
-                    _stats["fast_pbar"] += _t_pbar
-                    _stats["total_decode_tokens"] += len(decode_seqs)
                 continue
 
             # =========================================================
             # SLOW PATH: any mixed prefill+decode step (or non-greedy).
             # =========================================================
-            _t1 = time.perf_counter() if _profile else 0.0
             logits = mr.call(
                 "run_mamba_mixed", prefill_seqs, decode_seqs, prefill_chunk_lens,
             )
-            _t_call = (time.perf_counter() - _t1) if _profile else 0.0
-
-            _t1 = time.perf_counter() if _profile else 0.0
             # Greedy sampling for the whole batch in one argmax + one D2H copy.
             # Per-row ``argmax().item()`` costs a launch and a device sync each,
             # which at ~500 rows per mixed step dominated the step's host time.
@@ -8456,72 +8423,14 @@ class LlamaEngine:
                     s.state_slot = None
                     if pbar is not None:
                         _pbar_pending += 1
-            running = new_running
-            _t_finalize_slow = (time.perf_counter() - _t1) if _profile else 0.0
+            running = new_running + held_decode
 
-            _t1 = time.perf_counter() if _profile else 0.0
             if pbar is not None and _pbar_pending:
                 pbar.update(_pbar_pending)
                 _pbar_pending = 0
-            _t_pbar = (time.perf_counter() - _t1) if _profile else 0.0
-
-            if _profile:
-                _stats["slow_steps"] += 1
-                _stats["slow_admit"] += _t_admit
-                _stats["slow_call"] += _t_call
-                _stats["slow_finalize"] += _t_finalize_slow
-                _stats["slow_pbar"] += _t_pbar
-                _stats["total_prefill_tokens"] += sum(prefill_chunk_lens)
-                _stats["total_decode_tokens"] += len(decode_seqs)
 
         if pbar is not None:
             pbar.close()
-
-        if _profile:
-            def _fmt(t):
-                return f"{t * 1000:>9.1f} ms"
-            print("\n=== _generate_mamba per-phase timing ===")
-            n_fast = _stats["fast_steps"]
-            n_slow = _stats["slow_steps"]
-            print(f"  Steps: fast_decode={n_fast}  slow_mixed={n_slow}  "
-                  f"decode_tokens={_stats['total_decode_tokens']}  "
-                  f"prefill_tokens={_stats['total_prefill_tokens']}")
-            if n_fast:
-                tot_fast = sum([
-                    _stats["fast_admit"], _stats["fast_prep"],
-                    _stats["fast_dispatch"], _stats["fast_wait"],
-                    _stats["fast_finalize"], _stats["fast_pbar"],
-                ])
-                print(f"  FAST PATH ({n_fast} steps, total {_fmt(tot_fast)}):")
-                print(f"    admit         {_fmt(_stats['fast_admit'])}  "
-                      f"({100*_stats['fast_admit']/max(tot_fast,1e-9):5.1f}%)")
-                print(f"    decode_prep   {_fmt(_stats['fast_prep'])}  "
-                      f"({100*_stats['fast_prep']/max(tot_fast,1e-9):5.1f}%)")
-                print(f"    gpu_dispatch  {_fmt(_stats['fast_dispatch'])}  "
-                      f"({100*_stats['fast_dispatch']/max(tot_fast,1e-9):5.1f}%)")
-                print(f"    gpu+d2h_wait  {_fmt(_stats['fast_wait'])}  "
-                      f"({100*_stats['fast_wait']/max(tot_fast,1e-9):5.1f}%)")
-                print(f"    finalize      {_fmt(_stats['fast_finalize'])}  "
-                      f"({100*_stats['fast_finalize']/max(tot_fast,1e-9):5.1f}%)")
-                print(f"    pbar          {_fmt(_stats['fast_pbar'])}  "
-                      f"({100*_stats['fast_pbar']/max(tot_fast,1e-9):5.1f}%)")
-                print(f"    avg/step      {_fmt(tot_fast/n_fast)}")
-            if n_slow:
-                tot_slow = sum([
-                    _stats["slow_admit"], _stats["slow_call"],
-                    _stats["slow_finalize"], _stats["slow_pbar"],
-                ])
-                print(f"  SLOW PATH ({n_slow} steps, total {_fmt(tot_slow)}):")
-                print(f"    admit         {_fmt(_stats['slow_admit'])}  "
-                      f"({100*_stats['slow_admit']/max(tot_slow,1e-9):5.1f}%)")
-                print(f"    mr.call(mix)  {_fmt(_stats['slow_call'])}  "
-                      f"({100*_stats['slow_call']/max(tot_slow,1e-9):5.1f}%)")
-                print(f"    finalize      {_fmt(_stats['slow_finalize'])}  "
-                      f"({100*_stats['slow_finalize']/max(tot_slow,1e-9):5.1f}%)")
-                print(f"    pbar          {_fmt(_stats['slow_pbar'])}  "
-                      f"({100*_stats['slow_pbar']/max(tot_slow,1e-9):5.1f}%)")
-                print(f"    avg/step      {_fmt(tot_slow/n_slow)}")
-            print("=" * 50)
 
         # Release any cached transient activations back to the OS so the
         # next ``generate()`` call (e.g. the next benchmark scenario)
