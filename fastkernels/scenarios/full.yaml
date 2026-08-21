@@ -122,7 +122,7 @@ scenarios:
     dtype: bfloat16
     workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
   - model: ai21labs/AI21-Jamba-Mini-1.7
-    tp: 2
+    tp: 1
     dtype: bfloat16
     workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
 

@@ -34,6 +34,10 @@ class FlashAttnDecode(nn.Module):
         self._sched_buf: torch.Tensor | None = None
         self._sched_meta: torch.Tensor | None = None
         self._graph_num_splits = FA3_CUDA_GRAPH_MAX_NUM_SPLITS
+        # Jamba Hopper capture/pin: keep FA3 on num_splits=32 so eager
+        # warmup cannot shrink the process-wide split-KV scratch below
+        # the largest captured graph.  B200 never sets this (FA4 / TRTLLM).
+        self._force_graph_splits = False
         self._window_size = (-1, -1)
         self._qkv_dtype = torch.bfloat16
 
@@ -121,7 +125,11 @@ class FlashAttnDecode(nn.Module):
             max_seqlen_k = int(cache_seqlens.max().item()) if cache_seqlens.numel() > 0 else 0
 
         capturing = torch.cuda.is_current_stream_capturing()
-        if capturing and self.fa_version == 3:
+        use_graph_splits = (
+            self.fa_version == 3
+            and (capturing or self._force_graph_splits)
+        )
+        if use_graph_splits:
             if self._sched_meta is None:
                 raise RuntimeError(
                     "FA3 CUDA-graph capture requires "

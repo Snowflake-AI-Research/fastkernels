@@ -502,8 +502,7 @@ if __name__ == "__main__":
 # used to carry a byte-identical copy that counted position-wise agreement
 # instead, which drifted from bench_microsoft_bitnet's and overstated agreement
 # (222.9 vs 204.8 tokens on a 1000-request Codestral run). bench_vllm's
-# module-level imports are stdlib-only, as bench_jamba and bench_fla already
-# rely on.
+# module-level imports are stdlib-only, as bench_fla already relies on.
 from fastkernels.validate.bench_vllm import compute_alignment  # noqa: E402
 
 

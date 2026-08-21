@@ -631,36 +631,40 @@ class JambaEngine:
         # ``FASTKERNELS_JAMBA_BUCKETS=1,2,4,8,16,32`` if you need a denser
         # or sparser schedule for a specific workload.
         #
-        # Hopper FA3: one padded graph at max_num_seqs.  FA3 allocates
-        # split-KV ``oaccum`` inside the op (``new_empty([num_splits, H,
-        # total_q, D])``); capturing many sizes into a shared pool bakes
-        # incompatible pointers and mixed replay IMAs.  vLLM FULL decode
-        # pads attention to the captured size (Jamba is
-        # FULL_AND_PIECEWISE because Mamba is UNIFORM_BATCH).  Blackwell
-        # TRTLLM keeps a persistent workspace, so the multi-bucket list
-        # is safe there.
+        # Blackwell TRTLLM: existing dense list (step-8).  Hopper FA3: vLLM
+        # ``cudagraph_capture_sizes`` so B=1 / B=32 do not pad to
+        # max_num_seqs.  One shared pool plus FA3's per-call split-KV
+        # scratch IMAs on Hopper when many sizes share an address space;
+        # those graphs use a mempool per bucket and pin scratch after
+        # capture.  TRTLLM keeps a persistent workspace, so the shared
+        # pool is unchanged.
         env_buckets = os.environ.get("FASTKERNELS_JAMBA_BUCKETS")
         if env_buckets:
             buckets = sorted({int(x) for x in env_buckets.split(",") if x.strip()})
-        elif not self._use_trtllm:
-            buckets = [max_num_seqs]
-        else:
+        elif self._use_trtllm:
             base = [1, 2, 4]
             base += list(range(8, max_num_seqs + 1, 8))
             buckets = sorted(set(b for b in base if b <= max_num_seqs))
+        else:
+            buckets = [b for b in (1, 2, 4) if b <= max_num_seqs]
+            if max_num_seqs >= 8:
+                buckets.extend(range(8, min(max_num_seqs, 256) + 1, 8))
+            if max_num_seqs > 256:
+                buckets.extend(range(272, max_num_seqs + 1, 16))
         if max_num_seqs not in buckets:
             buckets.append(max_num_seqs)
             buckets = sorted(set(buckets))
         self._decode_buckets = buckets
-        # Pre-create a shared CUDA-graph mempool so all bucket captures
-        # share one address space (avoids ``cudaErrorIllegalAddress``
-        # when smaller-bucket replays alias larger-bucket pool blocks).
         self._cuda_graph_mempool_id = (
-            torch.cuda.graph_pool_handle() if self._use_cuda_graphs else None
+            torch.cuda.graph_pool_handle()
+            if self._use_cuda_graphs and self._use_trtllm
+            else None
         )
+        self._cuda_graph_mempool_ids: dict[int, object] = {}
         self._compiled_decode_step = None
         self._decode_graphs: dict[int, _JambaDecodeGraph] = {}
         self._decode_static_buffers: dict[int, dict] = {}
+        self._fa3_needs_pin = False
         # Last decode step's (bucket, running sequence ids) and the per-sequence
         # invariants uploaded for it. See ``_run_decode_step``.
         self._decode_meta_key: tuple | None = None
@@ -674,11 +678,19 @@ class JambaEngine:
                 f"token slots, {self._n_attn_layers} attn layers, "
                 f"{self._kv_layout} layout)"
             )
-            # Capture LARGEST bucket first so subsequent smaller-bucket
-            # captures see a memory layout consistent with what their
-            # tensors will be in at runtime (LlamaEngine pattern).
-            for bucket in reversed(self._decode_buckets):
-                self._capture_decode_graph(bucket)
+            if not self._use_trtllm:
+                for group in self._fa_decode_groups:
+                    for op in group:
+                        op._force_graph_splits = True
+            try:
+                for bucket in reversed(self._decode_buckets):
+                    self._capture_decode_graph(bucket)
+            finally:
+                if not self._use_trtllm:
+                    for group in self._fa_decode_groups:
+                        for op in group:
+                            op._force_graph_splits = False
+                    self._pin_fa3_workspace()
 
     # ------------------------------------------------------------------
     # Random seeds
@@ -745,6 +757,51 @@ class JambaEngine:
             qkv_dtype=self.dtype,
         )
 
+    def _pin_fa3_workspace(self) -> None:
+        """Re-grow FA3 split-KV scratch to max batch after B=1 capture.
+
+        Hopper only.  Mixed eager decode (num_splits=0) and the last
+        captured graph (B=1) shrink that scratch; a later large-bucket
+        replay IMAs.  TRTLLM keeps a persistent workspace.
+        """
+        if self._use_trtllm:
+            return
+        from ..tasks.baseline.L1.flash_attn_decode import FlashAttnDecode
+
+        B = self.max_num_seqs
+        seqlens = torch.ones(B, dtype=torch.int32, device=self.device)
+        bt = torch.zeros(B, 1, dtype=torch.int32, device=self.device)
+        self._refresh_fa3_decode_schedule(seqlens)
+        dummy_q: dict[tuple, torch.Tensor] = {}
+        for attn in self.model.modules():
+            op = getattr(attn, "decode_op", None)
+            k_cache = getattr(attn, "k_cache", None)
+            v_cache = getattr(attn, "v_cache", None)
+            if not isinstance(op, FlashAttnDecode):
+                continue
+            if k_cache is None or not k_cache.numel():
+                continue
+            key = (op.num_heads, op.head_dim)
+            q = dummy_q.get(key)
+            if q is None:
+                q = torch.zeros(
+                    B, op.num_heads, op.head_dim,
+                    dtype=self.dtype, device=self.device,
+                )
+                dummy_q[key] = q
+            was = op._force_graph_splits
+            op._force_graph_splits = True
+            try:
+                op(
+                    q, k_cache, v_cache,
+                    cache_seqlens=seqlens,
+                    block_table=bt,
+                    max_seq_len=1,
+                )
+            finally:
+                op._force_graph_splits = was
+        self._fa3_needs_pin = False
+
     def _capture_decode_graph(self, B: int) -> _JambaDecodeGraph:
         if B in self._decode_graphs:
             return self._decode_graphs[B]
@@ -767,6 +824,14 @@ class JambaEngine:
     def _capture_decode_graph_inner(self, B: int) -> _JambaDecodeGraph:
         bufs = self._alloc_decode_buffers(B)
         max_context_len = self._max_blocks_per_seq * self._page_size
+        if not self._use_trtllm:
+            # Same dummy as LlamaEngine.capture_cudagraph: one cached token,
+            # skip the KV store.  context_len=0 is not a live decode shape.
+            bufs["context_lens"].fill_(1)
+            bufs["slot_mapping"].fill_(-1)
+            bufs["block_tables"].zero_()
+            bufs["cache_indices"].zero_()
+            self._refresh_fa3_decode_schedule(bufs["context_lens"])
 
         mamba_meta = JambaMambaMetadata(
             conv_states=self.mamba_pool.conv_states,
@@ -838,25 +903,31 @@ class JambaEngine:
             bufs["context_lens"].fill_(1)
         self._refresh_fa3_decode_schedule(bufs["context_lens"])
 
-        # Warmup outside the graph stream so allocator state settles.
         torch.cuda.synchronize()
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            for _ in range(3):
-                _decode_step()
-        torch.cuda.current_stream().wait_stream(s)
-        torch.cuda.synchronize()
-        # Hopper FA3: do not empty_cache between captures.  FA3's per-call
-        # ``oaccum`` lives in the graph pool; emptying can recycle those
-        # addresses into a later (smaller) capture.  TRTLLM uses a
-        # persistent workspace, so the previous empty_cache is kept there.
         if self._use_trtllm:
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                for _ in range(3):
+                    _decode_step()
+            torch.cuda.current_stream().wait_stream(s)
+            torch.cuda.synchronize()
             torch.cuda.empty_cache()
+        else:
+            # Same-stream warmup: a side-stream eager FA3 call (num_splits=0)
+            # shrinks process-wide split-KV scratch and the graph IMAs.
+            _decode_step()
+            torch.cuda.synchronize()
 
         self._refresh_fa3_decode_schedule(bufs["context_lens"])
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=self._cuda_graph_mempool_id):
+        pool = self._cuda_graph_mempool_id
+        if not self._use_trtllm:
+            pool = self._cuda_graph_mempool_ids.get(B)
+            if pool is None:
+                pool = torch.cuda.graph_pool_handle()
+                self._cuda_graph_mempool_ids[B] = pool
+        with torch.cuda.graph(graph, pool=pool):
             _decode_step()
 
         entry = _JambaDecodeGraph(
@@ -921,6 +992,9 @@ class JambaEngine:
         # Reset state pools for a fresh generate() call.
         self.block_manager.reset()
         self.mamba_pool.reset()
+        self._decode_meta_key = None
+        self._decode_meta_bt = None
+        self._decode_meta_cache_idx = None
 
         # Build sequences in input order.  Sequence carries
         # block_table, num_computed_tokens, generated_ids, state_slot,
@@ -1465,6 +1539,8 @@ class JambaEngine:
             reset_context()
 
         decode_tokens = logits[n_p_seqs:].argmax(dim=-1).tolist()
+        if not self._use_trtllm:
+            self._fa3_needs_pin = True
         return logits[:n_p_seqs], completed_mask, decode_tokens
 
     # ------------------------------------------------------------------
@@ -1476,6 +1552,8 @@ class JambaEngine:
     # ------------------------------------------------------------------
     def _run_decode_step(self, running: list[Sequence]) -> list[int]:
         n = len(running)
+        if self._fa3_needs_pin:
+            self._pin_fa3_workspace()
         if self._use_cuda_graphs:
             B = self._pick_bucket(n)
             graph = self._decode_graphs.get(B)
@@ -1560,8 +1638,9 @@ class JambaEngine:
             full_pos = np.zeros(B, dtype=np.int64)
             full_pos[:n] = pos_np
             # Paged-attn pad rows: slot=-1 (skip store), ctx_len=0
-            # (kernel attends to nothing), block_table all-(-1)
-            # (sentinel; never read because ctx_len=0).
+            # (kernel attends to nothing).  Hopper FA3 can still touch a
+            # page when seqused_k is 0, so pad block_tables with 0 (same
+            # as LlamaEngine).  TRTLLM keeps the -1 sentinel.
             full_slot = np.full(B, -1, dtype=np.int64)
             full_slot[:n] = slot_np
             full_ctx = np.zeros(B, dtype=np.int32)
@@ -1572,7 +1651,8 @@ class JambaEngine:
             bufs_slot_mapping.copy_(torch.from_numpy(full_slot))
             bufs_context_lens.copy_(torch.from_numpy(full_ctx))
             if not reuse_invariants:
-                full_bt = np.full((B, bps), -1, dtype=np.int32)
+                pad_bt = 0 if not self._use_trtllm else -1
+                full_bt = np.full((B, bps), pad_bt, dtype=np.int32)
                 full_bt[:n] = bt_np
                 # Mamba pad rows: cache_indices=-1 -- the vendored
                 # causal_conv1d_update / selective_state_update kernels

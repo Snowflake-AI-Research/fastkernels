@@ -74,6 +74,15 @@ def _is_pure_mamba_model(model_name: str) -> bool:
     return "mamba" in lower and "jamba" not in lower
 
 
+def _is_jamba_model(model_name: str) -> bool:
+    return "jamba" in model_name.lower()
+
+
+# Previous bench_jamba default for both engines. JambaEngine's own default
+# is 32; without this the mixed scheduler would not match the old harness.
+_JAMBA_MAX_NUM_SEQS = 256
+
+
 # vLLM hopper CUDA-graph cap (``min(max_num_seqs * 2, 512)``). On H200 the
 # default max_num_seqs=1024 exceeds Mamba cache blocks (~849 at 0.9 / 128k).
 _HOPPER_MAMBA_MAX_NUM_SEQS = 512
@@ -634,7 +643,7 @@ def _load_tokenizer(model_name: str):
 
 def _needs_trust_remote_code(model_name: str) -> bool:
     lower = model_name.lower()
-    return "kimi" in lower or "qwen3-next" in lower
+    return "kimi" in lower or "qwen3-next" in lower or "jamba" in lower
 
 
 def _is_qwen_omni_model(model_name: str) -> bool:
@@ -1009,26 +1018,41 @@ def main():
     sys.path.insert(0, cfg["project_root"])
     pkg = cfg["package_name"]
 
-    mod = __import__(f"{pkg}.infra.engine", fromlist=["LlamaEngine", "SamplingParams"])
-    LlamaEngine, SamplingParams = mod.LlamaEngine, mod.SamplingParams
-
-    engine_kwargs = dict(
-        model_name=cfg["model"],
-        seed=cfg["seed"],
-        enforce_eager=cfg.get("enforce_eager", False),
-        tensor_parallel_size=cfg["tp"],
-    )
-    if "gpu_memory_utilization" in cfg:
-        engine_kwargs["gpu_memory_utilization"] = cfg["gpu_memory_utilization"]
-    if "max_model_len" in cfg:
-        engine_kwargs["max_model_len"] = cfg["max_model_len"]
-    if "max_layers" in cfg:
-        engine_kwargs["max_layers"] = cfg["max_layers"]
-    if cfg.get("kv_cache_dtype"):
-        engine_kwargs["kv_cache_dtype"] = cfg["kv_cache_dtype"]
-    if "max_num_seqs" in cfg:
-        engine_kwargs["max_num_seqs"] = cfg["max_num_seqs"]
-    engine = LlamaEngine(**engine_kwargs)
+    is_jamba = "jamba" in cfg["model"].lower()
+    if is_jamba:
+        mod = __import__(
+            f"{pkg}.infra.jamba_engine",
+            fromlist=["JambaEngine", "SamplingParams"],
+        )
+        Engine, SamplingParams = mod.JambaEngine, mod.SamplingParams
+        engine_kwargs = dict(
+            model_name=cfg["model"],
+            seed=cfg["seed"],
+            max_num_seqs=cfg.get("max_num_seqs") or 256,
+        )
+        if "max_model_len" in cfg:
+            engine_kwargs["max_model_len"] = cfg["max_model_len"]
+        engine = Engine(**engine_kwargs)
+    else:
+        mod = __import__(f"{pkg}.infra.engine", fromlist=["LlamaEngine", "SamplingParams"])
+        Engine, SamplingParams = mod.LlamaEngine, mod.SamplingParams
+        engine_kwargs = dict(
+            model_name=cfg["model"],
+            seed=cfg["seed"],
+            enforce_eager=cfg.get("enforce_eager", False),
+            tensor_parallel_size=cfg["tp"],
+        )
+        if "gpu_memory_utilization" in cfg:
+            engine_kwargs["gpu_memory_utilization"] = cfg["gpu_memory_utilization"]
+        if "max_model_len" in cfg:
+            engine_kwargs["max_model_len"] = cfg["max_model_len"]
+        if "max_layers" in cfg:
+            engine_kwargs["max_layers"] = cfg["max_layers"]
+        if cfg.get("kv_cache_dtype"):
+            engine_kwargs["kv_cache_dtype"] = cfg["kv_cache_dtype"]
+        if "max_num_seqs" in cfg:
+            engine_kwargs["max_num_seqs"] = cfg["max_num_seqs"]
+        engine = Engine(**engine_kwargs)
 
     # Warmup -- same 16-token prompt as the vLLM worker, so both sides enter
     # the scenario loop having done identical work. ignore_eos so the 16 decode
@@ -1062,12 +1086,13 @@ def main():
         # before timing, so the first timed generate() would otherwise absorb
         # a Triton JIT/autotune spike. The reset() below frees what this
         # allocated (finished seqs release their Mamba state slots).
+        prefill_kw = {} if is_jamba else {"decode_text": False}
         engine.generate(
             prompts,
             SamplingParams(temperature=temperature, top_p=top_p,
                            max_tokens=1, ignore_eos=True),
             use_tqdm=False,
-            decode_text=False,
+            **prefill_kw,
         )
 
         engine.block_manager.reset()
@@ -1077,7 +1102,7 @@ def main():
             prompts,
             sp_list,
             use_tqdm=True,
-            decode_text=False,
+            **prefill_kw,
         )
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - start
@@ -2467,7 +2492,7 @@ def compute_alignment(
 
     Same keys and semantics as ``bench_microsoft_bitnet.compute_alignment`` and
     ``comparison.alignment_from_token_ids``, so one aggregate query spans every
-    generative harness. bench_jamba, bench_fla, and bench_sglang import this
+    generative harness. bench_fla and bench_sglang import this
     function rather than re-deriving it -- three copies are how the two
     definitions drifted apart in the first place.
     """
@@ -2608,6 +2633,10 @@ def main():
     is_vlm = _is_vlm_model(args.model)
     is_qwen_omni = _is_qwen_omni_model(args.model)
     is_whisper = _is_whisper_model(args.model)
+    is_jamba = _is_jamba_model(args.model)
+    if is_jamba and args.tp != 1:
+        print("  NOTE: JambaEngine is single-process; using --tp 1.")
+        args.tp = 1
     engine_env = _apply_per_model_defaults(args.model, args)
     hopper_mamba_max_num_seqs = (
         _HOPPER_MAMBA_MAX_NUM_SEQS
@@ -2620,6 +2649,9 @@ def main():
         )
         else None
     )
+    engine_max_num_seqs = hopper_mamba_max_num_seqs
+    if engine_max_num_seqs is None and is_jamba:
+        engine_max_num_seqs = _JAMBA_MAX_NUM_SEQS
 
     if args.max_layers is not None:
         if args.max_layers < 1:
@@ -2903,11 +2935,13 @@ def main():
     print(f"  Seed           : {args.seed}")
     print(f"  Trust RC       : {args.trust_remote_code}")
     print(f"  Max seq len    : {global_max_seq_len}")
-    if hopper_mamba_max_num_seqs is not None:
-        print(
-            f"  max_num_seqs   : {hopper_mamba_max_num_seqs} "
-            "(Hopper Mamba; vLLM CUDA-graph cap)"
+    if engine_max_num_seqs is not None:
+        reason = (
+            "Hopper Mamba; vLLM CUDA-graph cap"
+            if hopper_mamba_max_num_seqs is not None
+            else "JambaEngine default"
         )
+        print(f"  max_num_seqs   : {engine_max_num_seqs} ({reason})")
     if engine_env:
         print(
             "  Engine env     : "
@@ -2949,7 +2983,7 @@ def main():
         max_layers=args.max_layers, max_model_len=global_max_seq_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
         kv_cache_dtype=args.kv_cache_dtype,
-        max_num_seqs=hopper_mamba_max_num_seqs,
+        max_num_seqs=engine_max_num_seqs,
         engine_env=engine_env,
         scenarios=scenario_data, latency=latency_data,
     )
@@ -2981,8 +3015,8 @@ def main():
                     else {}
                 ),
                 **(
-                    {"max_num_seqs": hopper_mamba_max_num_seqs}
-                    if hopper_mamba_max_num_seqs is not None
+                    {"max_num_seqs": engine_max_num_seqs}
+                    if engine_max_num_seqs is not None
                     else {}
                 ),
                 "scenarios": scenario_data,
@@ -3055,8 +3089,8 @@ def main():
                 else {}
             ),
             **(
-                {"max_num_seqs": hopper_mamba_max_num_seqs}
-                if hopper_mamba_max_num_seqs is not None
+                {"max_num_seqs": engine_max_num_seqs}
+                if engine_max_num_seqs is not None
                 else {}
             ),
             "project_root": kb_root,

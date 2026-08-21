@@ -52,6 +52,7 @@ _MODULE_TO_HARNESS: dict[str, str] = {
     "mamba2": "bench_vllm",
     "qwen3_next": "bench_vllm",
     "kimi_linear": "bench_vllm",
+    "jamba": "bench_vllm",
     "qwen2_vl": "bench_vllm",
     "qwen3_vl": "bench_vllm",
     "qwen2_5_omni": "bench_vllm",
@@ -95,8 +96,6 @@ def _harness_for(hf_name: str, draft_model: str | None = None) -> str | None:
         return "bench_sglang"
     if n.startswith("fla-hub/"):
         return "bench_fla"
-    if "jamba" in n:
-        return "bench_jamba"
     if "bitnet" in n:
         return "bench_microsoft_bitnet"
     if "llada" in n:
@@ -115,7 +114,6 @@ def _harness_for(hf_name: str, draft_model: str | None = None) -> str | None:
 _REQUESTS_FLAG = {
     "bench_vllm": "--num-seqs",
     "bench_fla": "--num-seqs",
-    "bench_jamba": "--num-seqs",
     "bench_sglang": "--num-seqs",
     "bench_microsoft_bitnet": "--num-prompts",
     "bench_detection": "--num-images",
@@ -170,7 +168,6 @@ _HF_MODEL_ARG = {
     "bench_vllm",
     "bench_sglang",
     "bench_fla",
-    "bench_jamba",
     "bench_microsoft_bitnet",
     "bench_vllm_omni",
     "bench_diffusers",

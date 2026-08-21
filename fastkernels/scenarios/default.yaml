@@ -8,7 +8,7 @@ scenarios:
   - model: meta-llama/Llama-3.1-8B-Instruct
     tp: 1
     dtype: bfloat16
-    workloads: [LLM.mixed, LLM.long_context]
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
   - model: Qwen/Qwen3-Next-80B-A3B-Instruct
     tp: 2
     dtype: bfloat16
@@ -20,32 +20,32 @@ scenarios:
   - model: openai/gpt-oss-120b
     tp: 2
     dtype: mxfp4
-    workloads: [LLM.mixed, LLM.long_context]
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
   - model: fla-hub/gla-2.7B-100B
     tp: 1
     dtype: bfloat16
-    workloads: [LLM.mixed, LLM.long_context]
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
   - model: black-forest-labs/FLUX.1-dev
     tp: 1
     dtype: bfloat16
-    workloads: [Diffusion.res_1024, Diffusion.res_512]
+    workloads: [Diffusion.res_1024, Diffusion.res_512, Diffusion.single_1024, Diffusion.single_512]
   - model: Qwen/Qwen3-VL-235B-A22B-Instruct-FP8
     tp: 4
     dtype: fp8
-    workloads: [VLM.text_only, VLM.image, VLM.video]
+    workloads: [VLM.text_only, VLM.image, VLM.video, VLM.single_image, VLM.single_video]
   - model: jameslahm/yolov10n
     tp: 1
-    dtype: bfloat16
-    workloads: [Detection.coco_val]
+    dtype: float16
+    workloads: [Detection.coco_val, Detection.single_image, Detection.batch_4]
   - model: OpenFold/OpenFold3
     tp: 1
     dtype: bfloat16
-    workloads: [StructurePrediction.short, StructurePrediction.medium, StructurePrediction.long, StructurePrediction.extra_long]
+    workloads: [StructurePrediction.short, StructurePrediction.medium, StructurePrediction.long, StructurePrediction.extra_long, StructurePrediction.single_short, StructurePrediction.single_medium, StructurePrediction.single_long, StructurePrediction.single_extra_long]
   - model: BAAI/bge-m3
     tp: 1
-    dtype: bfloat16
-    workloads: [Embedding.bge_m3_mldr_docs]
+    dtype: float16
+    workloads: [Embedding.bge_m3_mldr_docs, Embedding.single_request, Embedding.fixed_batch_32]
   - model: Etched/oasis-500m
     tp: 1
-    dtype: float16
-    workloads: [WorldModel.short_bs4_16f_4ddim, WorldModel.medium_bs8_24f_4ddim, WorldModel.long_bs8_32f_4ddim, WorldModel.denoise_bs4_16f_8ddim]
+    dtype: float16   # bench_oasis hardcodes float16 on cuda
+    workloads: [WorldModel.short_bs4_16f_4ddim, WorldModel.medium_bs8_24f_4ddim, WorldModel.long_bs8_32f_4ddim, WorldModel.denoise_bs4_16f_8ddim, WorldModel.latency_bs1_8f_4ddim]

@@ -891,7 +891,7 @@ def _reference_name(harness: str) -> str:
     return {
         "bench_vllm": "vLLM",
         "bench_fla": "FLA",
-        "bench_jamba": "FLA",
+        "bench_jamba": "vLLM",
         "bench_sglang": "SGLang",
         "bench_vllm_omni": "vllm-omni",
         "bench_diffusers": "diffusers",

@@ -813,8 +813,7 @@ def main():
     parser.add_argument("--skip-latency", action="store_true")
     parser.add_argument("--latency-iters", type=int, default=5,
                         help="Median over this many timed iterations after "
-                             "warmup.  Default 5 matches bench_vllm.py and "
-                             "bench_jamba.py.")
+                             "warmup.  Default 5 matches bench_vllm.py.")
     parser.add_argument(
         "--scenario", type=str, default=None,
         help="Run only the throughput scenario with this name "
