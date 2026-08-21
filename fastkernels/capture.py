@@ -3788,6 +3788,9 @@ def _run_scenarios_parallel(scenarios, args, gpu_ids: list[str]) -> int:
 # per task) and lays out one folder per run, mirroring ``fastkernels validate``:
 # ``<root>/<NN_model_tpN_dtype>/`` holds that scenario's ``report*.json`` and
 # ``run.log``, with a ``run.jsonl`` event stream and ``summary.json`` at the root.
+# Each Ray task re-pins ``CUDA_VISIBLE_DEVICES`` to the exclusive GPUs Ray
+# assigned (``ray.get_gpu_ids()``), because ``num_gpus`` alone does not isolate
+# the nested capture subprocess from sibling jobs.
 _RAY_PROGRESS_INTERVAL_SEC = 30.0
 
 
@@ -3884,6 +3887,87 @@ def _visible_to_physical_gpu_ids(visible: list[str], parent_visible: list[str]) 
     return out
 
 
+def _parse_cvd(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [tok.strip() for tok in value.split(",") if tok.strip()]
+
+
+def _ray_gpu_id_tokens(raw_ids) -> list[str]:
+    """Normalize ``ray.get_gpu_ids()`` (ints, floats like ``0.0``, strings)."""
+    tokens: list[str] = []
+    for gpu in raw_ids or []:
+        if isinstance(gpu, float):
+            tokens.append(str(int(gpu)))
+        elif isinstance(gpu, int):
+            tokens.append(str(gpu))
+        else:
+            tokens.append(str(gpu).strip())
+    return tokens
+
+
+def _gpu_token_as_index(token: str) -> int | None:
+    """Parse a CVD / Ray GPU token as a non-negative integer index, or None."""
+    token = token.strip()
+    if token.isdigit():
+        return int(token)
+    try:
+        value = float(token)
+    except ValueError:
+        return None
+    if value < 0 or value != int(value):
+        return None
+    return int(value)
+
+
+def _ray_exclusive_gpu_ids(
+    *,
+    env_cvd: list[str],
+    ray_gpu_ids: list[str],
+    parent_visible: list[str],
+    expected: int,
+) -> list[str]:
+    """Physical GPU ids this Ray task exclusively owns.
+
+    Ray's ``num_gpus=tp`` reservation does not always narrow
+    ``CUDA_VISIBLE_DEVICES`` on the nested capture subprocess (the worker
+    copies the driver env, which still lists every GPU). Every rank-0 then
+    uses physical GPU 0, so a tp=1 Llama KV cache (~90% of an H200) OOMs a
+    concurrent tp=2 Qwen3-Next. Pin the child to *exactly* ``expected``
+    devices:
+
+    1. If Ray already isolated this worker (``CUDA_VISIBLE_DEVICES`` length
+       equals ``expected``), keep that list. ``ray.get_gpu_ids()`` may be
+       ``0..N-1`` *into that list*; remapping those through ``parent_visible``
+       would steal GPU 0 from a sibling.
+    2. Otherwise treat ``ray.get_gpu_ids()`` as indices into the current CVD
+       (if set) or as physical / parent-visible ids.
+    """
+    if expected <= 0:
+        return []
+    if len(env_cvd) == expected:
+        return list(env_cvd)
+
+    if env_cvd and len(ray_gpu_ids) == expected:
+        idxs = [_gpu_token_as_index(tok) for tok in ray_gpu_ids]
+        if all(i is not None and 0 <= i < len(env_cvd) for i in idxs):
+            return [env_cvd[i] for i in idxs]
+
+    if len(ray_gpu_ids) == expected:
+        return _visible_to_physical_gpu_ids(ray_gpu_ids, parent_visible)
+
+    if env_cvd:
+        mapped = _visible_to_physical_gpu_ids(env_cvd, parent_visible)
+        if len(mapped) == expected:
+            return mapped
+
+    raise RuntimeError(
+        f"Ray task expected {expected} exclusive GPU(s), got "
+        f"CUDA_VISIBLE_DEVICES={env_cvd!r} ray.get_gpu_ids()={ray_gpu_ids!r} "
+        f"parent={parent_visible!r}"
+    )
+
+
 def _reclaim_gpus(gpu_ids: list[str]) -> None:
     """SIGKILL any compute process still holding ``gpu_ids`` (re-parented ranks
     that outlived the worker and would otherwise perturb the next task)."""
@@ -3936,15 +4020,46 @@ def _ray_capture_job(job: dict, parent_visible_gpus: list[str],
     env = os.environ.copy()
     env[_WORKER_INDEX_ENV] = str(job["index"])
     env["FASTKERNELS_NCCL_PORT"] = str(job["nccl_port"])
-    visible = [t.strip() for t in env.get("CUDA_VISIBLE_DEVICES", "").split(",")
-               if t.strip()]
-    physical = _visible_to_physical_gpu_ids(visible, parent_visible_gpus)
+    try:
+        import ray as _ray
+        raw_ids = list(_ray.get_gpu_ids())
+    except Exception:  # noqa: BLE001 - pin from CVD alone if Ray is unavailable
+        raw_ids = []
+    ray_ids = _ray_gpu_id_tokens(raw_ids)
+    env_cvd = _parse_cvd(env.get("CUDA_VISIBLE_DEVICES"))
+    logf = open(log_path, "w", buffering=1)
+    try:
+        physical = _ray_exclusive_gpu_ids(
+            env_cvd=env_cvd,
+            ray_gpu_ids=ray_ids,
+            parent_visible=parent_visible_gpus,
+            expected=int(job["tp"]),
+        )
+    except RuntimeError as exc:
+        logf.write(f"GPU PIN FAILED: {exc}\n")
+        logf.close()
+        return {"index": job["index"], "status": "error", "rc": 2,
+                "detail": str(exc), "log": str(log_path), "orphans": False}
+
+    # Pin this worker *and* the capture child. Ray's num_gpus reservation is
+    # not sufficient: the nested subprocess used to inherit the driver's full
+    # CUDA_VISIBLE_DEVICES and every rank-0 landed on physical GPU 0.
+    cvd = ",".join(physical)
+    os.environ["CUDA_VISIBLE_DEVICES"] = cvd
+    env["CUDA_VISIBLE_DEVICES"] = cvd
+    logf.write(f"job_index: {job['index']}\n")
+    logf.write(f"name: {job['name']}\n")
+    logf.write(f"tp: {job['tp']}\n")
+    logf.write(f"CUDA_VISIBLE_DEVICES: {cvd}\n")
+    logf.write(f"ray.get_gpu_ids(): {raw_ids!r}\n")
+    logf.write(f"parent_visible_gpus: {','.join(parent_visible_gpus)}\n")
+    logf.write("command: " + " ".join(job["cmd"]) + "\n\n")
+    logf.flush()
 
     start = time.monotonic()
     watchdog_reason: str | None = None
     proc: subprocess.Popen | None = None
     orphans = False
-    logf = open(log_path, "w", buffering=1)
     try:
         proc = subprocess.Popen(
             job["cmd"], stdout=logf, stderr=subprocess.STDOUT,
@@ -4034,8 +4149,9 @@ def _run_scenarios_ray(scenarios, args, gpu_ids: list[str], root: Path) -> int:
                              "job_count": len(jobs)})
 
     prev_cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if args.gpus:
-        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_ids)
+    # Always pin the driver to the detected pool so Ray's GPU resource count
+    # matches ``gpu_ids`` even when ``--gpus`` was omitted.
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_ids)
     try:
         _init_ray(ray)
         print(f"  Ray dashboard: {_dashboard_url(ray) or 'unavailable'}", flush=True)
@@ -4083,11 +4199,10 @@ def _run_scenarios_ray(scenarios, args, gpu_ids: list[str], root: Path) -> int:
             ray.shutdown()
         except Exception:  # noqa: BLE001
             pass
-        if args.gpus:
-            if prev_cvd is None:
-                os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-            else:
-                os.environ["CUDA_VISIBLE_DEVICES"] = prev_cvd
+        if prev_cvd is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = prev_cvd
 
     _write_capture_summary(root, scenarios, results)
     _append_run_event(root, {"event": "run_finished", "results": {
