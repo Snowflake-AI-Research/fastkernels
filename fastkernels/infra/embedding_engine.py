@@ -99,6 +99,16 @@ class EmbeddingEngine:
 
         torch.manual_seed(seed)
 
+        # Hopper-only, ColBERT, 1-seq. BERT-base is launch-bound at ~56
+        # tokens (~0.26 ms behind vLLM). Throughput keeps eager varlen
+        # (many distinct packed shapes). B200 is unchanged.
+        self._hopper_colbert_graphs: dict[int, tuple] = {}
+        self._use_hopper_colbert_cudagraph = (
+            self.model_key == "colbertv2"
+            and self.device.type == "cuda"
+            and torch.cuda.get_device_capability()[0] == 9
+        )
+
     @staticmethod
     def _bucket_tokens(n: int) -> int:
         """Round a row count up to a coarse bucket.
@@ -144,6 +154,57 @@ class EmbeddingEngine:
         if current:
             batches.append(current)
         return batches
+
+    def _colbert_projected_forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        hidden_states = self.model.forward_varlen(
+            input_ids=input_ids,
+            positions=positions,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
+        hidden_states = hidden_states.to(self.model.colbert_linear.weight.dtype)
+        return self.model.norm(self.model.colbert_linear(hidden_states))
+
+    def _hopper_colbert_graph_forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+    ) -> torch.Tensor:
+        n = int(input_ids.shape[0])
+        entry = self._hopper_colbert_graphs.get(n)
+        if entry is None:
+            static_ids = input_ids.clone()
+            static_pos = positions.clone()
+            static_cu = cu_seqlens.clone()
+            stream = torch.cuda.Stream(device=self.device)
+            stream.wait_stream(torch.cuda.current_stream(self.device))
+            with torch.cuda.stream(stream):
+                for _ in range(3):
+                    static_out = self._colbert_projected_forward(
+                        static_ids, static_pos, static_cu, max_seqlen,
+                    )
+            torch.cuda.current_stream(self.device).wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                static_out = self._colbert_projected_forward(
+                    static_ids, static_pos, static_cu, max_seqlen,
+                )
+            entry = (graph, static_ids, static_pos, static_cu, static_out)
+            self._hopper_colbert_graphs[n] = entry
+        graph, static_ids, static_pos, static_cu, static_out = entry
+        static_ids.copy_(input_ids)
+        static_pos.copy_(positions)
+        static_cu.copy_(cu_seqlens)
+        graph.replay()
+        return static_out
 
     def token_embed(
         self,
@@ -241,20 +302,27 @@ class EmbeddingEngine:
                 cu_seqlens[1:] = torch.tensor(
                     lengths, dtype=torch.int32, device=self.device,
                 ).cumsum(0)
-                hidden_states = self._forward_varlen(
-                    input_ids=flat_ids,
-                    positions=flat_positions,
-                    cu_seqlens=cu_seqlens,
-                    max_seqlen=max(lengths) if lengths else 0,
-                )
-                head_dtype = self.model.colbert_linear.weight.dtype
-                hidden_states = hidden_states.to(head_dtype)
-                if self.model_key == "bge_m3":
-                    projected = self.model.norm(self.model.colbert_linear(hidden_states))
-                    slice_offset = 1
-                else:
-                    projected = self.model.norm(self.model.colbert_linear(hidden_states))
+                max_seqlen = max(lengths) if lengths else 0
+                if self._use_hopper_colbert_cudagraph and len(lengths) == 1:
+                    projected = self._hopper_colbert_graph_forward(
+                        flat_ids, flat_positions, cu_seqlens, max_seqlen,
+                    )
                     slice_offset = 0
+                else:
+                    hidden_states = self._forward_varlen(
+                        input_ids=flat_ids,
+                        positions=flat_positions,
+                        cu_seqlens=cu_seqlens,
+                        max_seqlen=max_seqlen,
+                    )
+                    head_dtype = self.model.colbert_linear.weight.dtype
+                    hidden_states = hidden_states.to(head_dtype)
+                    if self.model_key == "bge_m3":
+                        projected = self.model.norm(self.model.colbert_linear(hidden_states))
+                        slice_offset = 1
+                    else:
+                        projected = self.model.norm(self.model.colbert_linear(hidden_states))
+                        slice_offset = 0
 
                 # No explicit upcast here: ``head_dtype`` above is already fp32
                 # (embedder_loader keeps colbert_linear in fp32 for both
