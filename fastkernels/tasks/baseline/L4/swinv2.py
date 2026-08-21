@@ -116,6 +116,15 @@ class SwinV2Model(nn.Module):
         self.global_pool = "avg"
         self.num_classes = num_classes
 
+        # Hopper only: match timm's native-dtype LayerNorm. L1 defaults to
+        # fp32 promotion (DeepSeek indexer); here it is 53 extra cast+fp32
+        # reductions per forward and is the 0.89x default-res gap. B200
+        # keeps the L1 default.
+        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9:
+            for m in self.modules():
+                if isinstance(m, LayerNorm):
+                    m.promote_fp32 = False
+
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         """Extract features: (B, C, H, W) -> (B, H', W', C')."""
         x = self.patch_embed.proj(x)
