@@ -639,6 +639,9 @@ class ModelRunner:
         # returns early when empty (TRTLLM / MLA / no FlashAttn layers).
         self._fa_decode_ops: list = []
         self._fa_decode_groups: list = []
+        # Hopper FlashMLA: one FlashMLASchedMeta per CUDA-graph bucket.
+        # Empty on B200 (FlashInfer MLA) and on Qwen3-Next (no MLA).
+        self._kimi_mla_sched: dict = {}
 
         torch.cuda.set_device(rank)
         self._dist_initialized = False
@@ -835,9 +838,19 @@ class ModelRunner:
                 self._init_fi_allreduce_fusion_workspace()
                 self.allocate_mamba_state_cache()
                 if not self.enforce_eager:
+                    # Hopper only: compiling on Blackwell would capture
+                    # compiled modules into the B200 TRTLLM graphs.
+                    if _is_hopper_gpu():
+                        if rank == 0:
+                            print("  [4/6] Compiling Qwen3-Next...", flush=True)
+                        self._compile_model()
                     if rank == 0:
                         print("  [4/6] Preparing Qwen3-Next decode buffers...", flush=True)
                     self._init_kimi_decode_buffers()
+                    # FA3 scheduler_metadata must exist before capture so the
+                    # graph records num_splits=32. No-op on B200 (TRTLLM, no
+                    # FlashAttnDecode modules).
+                    self._init_fa3_decode_buffers()
                     if rank == 0:
                         print("  [5/6] Capturing Qwen3-Next CUDA graphs...", flush=True)
                     self.capture_kimi_cudagraph()
@@ -1513,7 +1526,13 @@ class ModelRunner:
         from ..tasks.baseline.L1.flash_attn_decode import FlashAttnDecode
         from .fa_utils import group_fa_decode_ops
 
-        ops = [m for m in self.model.modules() if isinstance(m, FlashAttnDecode)]
+        root = self.model
+        ops = [m for m in root.modules() if isinstance(m, FlashAttnDecode)]
+        if not ops and getattr(self, "_eager_model", None) is not None:
+            ops = [
+                m for m in self._eager_model.modules()
+                if isinstance(m, FlashAttnDecode)
+            ]
         self._fa_decode_ops = ops
         self._fa_decode_groups = group_fa_decode_ops(ops)
         if not ops:
@@ -2870,6 +2889,16 @@ class ModelRunner:
         if not bs_list:
             return
         self._kimi_graph_bs_list = bs_list
+        # Hopper Kimi: one FlashMLASchedMeta per bucket. get_mla_metadata()
+        # now returns an empty object; the kernel fills it on first use.
+        # Creating a fresh one inside the graph reallocates every layer
+        # every step. B200 uses FlashInfer MLA and never reads this.
+        self._kimi_mla_sched = {}
+        if self.is_kimi_linear and _is_hopper_gpu():
+            from vllm.third_party.flashmla.flash_mla_interface import (
+                FlashMLASchedMeta,
+            )
+            self._kimi_mla_sched = {b: FlashMLASchedMeta() for b in bs_list}
 
         sm_ = self.mamba_state_manager
         max_blocks = self._kd_max_blocks
@@ -2950,6 +2979,9 @@ class ModelRunner:
                 ctx = get_context()
                 ctx.kda_state = sm_
                 ctx.kda_metadata = md
+                mla_meta = self._kimi_mla_sched.get(bs)
+                if mla_meta is not None:
+                    ctx.mla_sched_meta = mla_meta
                 self._refresh_fa3_decode_schedule(seq_lens_v)
 
                 # Mark the batch dim dynamic BEFORE the first

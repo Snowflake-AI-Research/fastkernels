@@ -126,6 +126,9 @@ class Qwen3NextAttention(nn.Module):
         # launch overhead.
         self._fused_qk_rope_gate = True
         self._norm_gain_cache: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._use_custom_op = False
+        self._layer_name = ""
+        self.rotary_emb = None
         if self._use_trtllm:
             from ..L1.flashinfer_decode import TRTLLMDecode
             from ..L1.flashinfer_prefill import TRTLLMPrefill
@@ -174,7 +177,19 @@ class Qwen3NextAttention(nn.Module):
 
     def forward(self, hidden_states, rotary_emb=None, positions=None,
                 state_manager=None):
+        if rotary_emb is not None:
+            self.rotary_emb = rotary_emb
+        if self._use_custom_op:
+            return torch.ops.fastkernels.qwen3_next_attention(
+                hidden_states, positions, self._layer_name,
+            )
+        return self.forward_impl(hidden_states, positions, state_manager)
+
+    def forward_impl(self, hidden_states, positions=None, state_manager=None):
         md = get_context().kda_metadata
+        if state_manager is None:
+            state_manager = get_context().kda_state
+        rotary_emb = self.rotary_emb
         if md is None or state_manager is None:
             raise RuntimeError(
                 "Qwen3NextAttention requires engine-managed KV state and metadata",

@@ -141,6 +141,8 @@ class SharedExpertMoE(nn.Module):
         # ``reduce_results=False`` hands the un-reduced partial sum back to the
         # caller, which folds the collective into its next norm.
         self.reduce_results = reduce_results
+        self._use_custom_op = False
+        self._layer_name = ""
 
         # trtllm-gen BF16 MoE: what vLLM 0.26 runs for this MoE on Blackwell
         # (``FLASHINFER_TRTLLM`` unquantized backend ->
@@ -289,7 +291,18 @@ class SharedExpertMoE(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.reshape(-1, self.hidden_size)
+        if self._use_custom_op:
+            # All-reduce stays outside the opaque op so the decoder's fused
+            # AR+norm can still match it. vLLM / KimiMoE do the same.
+            output = torch.ops.fastkernels.moe_forward(
+                hidden_states, self._layer_name,
+            )
+            if self.tp_size > 1 and self.reduce_results:
+                output = self.allreduce(output)
+            return output.view(orig_shape)
+        return self.forward_impl(hidden_states).view(orig_shape)
 
+    def forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
         shared_output, shared_gate = self._shared_expert_output(hidden_states)
         if self.gate_linear is not None:
             router_logits = self.gate_linear(
@@ -348,6 +361,6 @@ class SharedExpertMoE(nn.Module):
             output = moe_shared_gate_add(
                 routed_output, shared_output, shared_gate,
             )
-        if self.tp_size > 1 and self.reduce_results:
+        if self.tp_size > 1 and self.reduce_results and not self._use_custom_op:
             output = self.allreduce(output)
-        return output.view(orig_shape)
+        return output

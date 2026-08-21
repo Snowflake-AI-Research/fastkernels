@@ -244,6 +244,10 @@ class Qwen3NextModel(nn.Module):
             config.max_position_embeddings,
             config.rope_theta,
         )
+        for layer in self.layers:
+            attn = getattr(layer, "self_attn", None)
+            if attn is not None:
+                attn.rotary_emb = self.rotary_emb
 
     def forward(self, input_ids, positions=None, state_manager=None):
         if input_ids.dim() > 1:

@@ -15,6 +15,7 @@ layer, so the model owns that half of the contract.
 
 from __future__ import annotations
 
+import torch
 import torch.nn as nn
 
 from ....infra.tp import _tp_size
@@ -28,6 +29,12 @@ from ..L2.shared_expert_moe import SharedExpertMoE
 def fused_ar_norm(norm: GemmaRMSNorm, hidden_states, residual, fuse: bool):
     """``norm(all_reduce(hidden_states), residual)``, fused when ``fuse``."""
     if fuse:
+        # Opaque under torch.compile: tracing into FlashInfer's fused
+        # collective hits Python logging / datetime and aborts Dynamo.
+        if torch.compiler.is_compiling():
+            return torch.ops.fastkernels.fused_allreduce_add_gemma_rmsnorm(
+                hidden_states, residual, norm.weight, float(norm.variance_epsilon),
+            )
         return fused_allreduce_add_gemma_rmsnorm(hidden_states, residual, norm)
     return norm(hidden_states, residual)
 

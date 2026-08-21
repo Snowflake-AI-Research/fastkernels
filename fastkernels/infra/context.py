@@ -287,6 +287,11 @@ class Context:
     # Hybrid recurrent state for Kimi Linear KDA and Qwen3-Next GDN layers.
     kda_state: object = None
     kda_metadata: object = None
+    # Persistent FlashMLA tile-scheduler object for Hopper dense decode.
+    # Built once per CUDA-graph bucket OUTSIDE capture; the kernel fills
+    # its tensors on the first call and reuses the same pointers after.
+    # None on B200 (FlashInfer MLA) and on eager mixed/prefill.
+    mla_sched_meta: object = None
 
     # --- Hybrid (Jamba) prefill flat-varlen remap.  When a left-padded
     # ``[B, T_max]`` batch enters JambaAttention, the prefill kernel
@@ -366,6 +371,10 @@ def auto_register_no_compile_layers(model: "nn.Module") -> None:
         # "ConstraintViolationError (... kda_metadata.state_indices.size()[0],
         # L['input_ids'].size()[0])". Behind the op boundary it stays opaque.
         "KimiDeltaAttention",
+        # Qwen3-Next: GDN / full-attn / shared-expert MoE were never listed,
+        # so ``_compile_model`` traced into FlashAttn, GDN recurrence, and
+        # Triton experts under fullgraph. Same contract as KDA / KimiMoE.
+        "Qwen3NextAttention", "Qwen3NextGDNAttention",
         "Attention", "MLAAttention", "SparseAttnIndexer",
         "WhisperCrossAttention",
         "Mamba2Mixer",

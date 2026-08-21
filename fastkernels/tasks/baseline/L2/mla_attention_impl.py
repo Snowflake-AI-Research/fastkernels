@@ -589,9 +589,14 @@ class MLAAttention(nn.Module):
                 )
                 o = o.reshape(-1, o.shape[-2], o.shape[-1])
                 return self._v_up_proj(o)
-            tile_sched_meta, _ = self.get_metadata(
-                cache_seqlens, self.num_heads, num_heads_k=1,
-            )
+            # Prefer the engine's persistent FlashMLASchedMeta (filled
+            # outside CUDA-graph capture). Fall back to a fresh empty
+            # object for eager mixed/prefill.
+            tile_sched_meta = getattr(ctx, "mla_sched_meta", None)
+            if tile_sched_meta is None:
+                tile_sched_meta, _ = self.get_metadata(
+                    cache_seqlens, self.num_heads, num_heads_k=1,
+                )
             o, _ = self.decode_op(
                 q,
                 kv_cache.unsqueeze(-2),

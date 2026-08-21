@@ -458,6 +458,8 @@ class Qwen3NextGDNAttention(nn.Module):
             torch.cuda.is_available()
             and torch.cuda.get_device_capability()[0] >= 9
         )
+        self._use_custom_op = False
+        self._layer_name = ""
 
     @staticmethod
     def _sharded_weight_loader(param, loaded_weight):
@@ -524,7 +526,16 @@ class Qwen3NextGDNAttention(nn.Module):
 
 
     def forward(self, hidden_states: torch.Tensor, state_manager=None) -> torch.Tensor:
+        if self._use_custom_op:
+            return torch.ops.fastkernels.qwen3_next_gdn_attention(
+                hidden_states, self._layer_name,
+            )
+        return self.forward_impl(hidden_states, state_manager)
+
+    def forward_impl(self, hidden_states: torch.Tensor, state_manager=None) -> torch.Tensor:
         md = get_context().kda_metadata
+        if state_manager is None:
+            state_manager = get_context().kda_state
         if md is None or state_manager is None:
             raise RuntimeError(
                 "Qwen3NextGDNAttention requires engine-managed recurrent state "

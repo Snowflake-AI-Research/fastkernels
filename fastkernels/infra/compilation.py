@@ -70,6 +70,8 @@ SPLITTING_OPS: list[str] = [
     "fastkernels::unified_mla_attention",
     "fastkernels::sparse_attn_indexer",
     "fastkernels::kda_attention",
+    "fastkernels::qwen3_next_attention",
+    "fastkernels::qwen3_next_gdn_attention",
 ]
 
 
@@ -265,6 +267,31 @@ def _fused_ar_add_rmsnorm_fake(
     return torch.empty_like(x), torch.empty_like(residual)
 
 
+def _fused_ar_add_gemma_rmsnorm_impl(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gemma-convention fused AR+add+RMSNorm (``weight_bias=1.0``)."""
+    from ..tasks.baseline.L2.flashinfer_allreduce_fusion import (
+        fused_allreduce_add_rmsnorm,
+    )
+
+    return fused_allreduce_add_rmsnorm(
+        x, residual, weight, eps, weight_bias=1.0,
+    )
+
+
+def _fused_ar_add_gemma_rmsnorm_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(x), torch.empty_like(residual)
+
+
 def _fused_ar_rmsnorm_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -320,6 +347,38 @@ def _kda_attention_fake(
     layer_name: str,
 ) -> None:
     return None
+
+
+def _qwen3_next_attention_impl(
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    layer = get_no_compile_layers()[layer_name]
+    return layer.forward_impl(hidden_states, positions)
+
+
+def _qwen3_next_attention_fake(
+    hidden_states: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+def _qwen3_next_gdn_attention_impl(
+    hidden_states: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    layer = get_no_compile_layers()[layer_name]
+    return layer.forward_impl(hidden_states)
+
+
+def _qwen3_next_gdn_attention_fake(
+    hidden_states: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
 
 
 _registered = False
@@ -408,6 +467,20 @@ def ensure_custom_ops_registered() -> None:
     lib.impl("fused_allreduce_add_rmsnorm", _fused_ar_add_rmsnorm_impl, "CUDA")
     abstract_lib.impl("fused_allreduce_add_rmsnorm", _fused_ar_add_rmsnorm_fake)
 
+    lib.define(
+        "fused_allreduce_add_gemma_rmsnorm(Tensor x, Tensor residual, "
+        "Tensor weight, float eps) -> (Tensor, Tensor)"
+    )
+    lib.impl(
+        "fused_allreduce_add_gemma_rmsnorm",
+        _fused_ar_add_gemma_rmsnorm_impl,
+        "CUDA",
+    )
+    abstract_lib.impl(
+        "fused_allreduce_add_gemma_rmsnorm",
+        _fused_ar_add_gemma_rmsnorm_fake,
+    )
+
     # No-residual variant: layer 0's input_layernorm consumes the vocab-parallel
     # embedding's all-reduce and has no residual yet. One site per step, but the
     # first collective in the decode graph, so it absorbs the step's launch skew.
@@ -427,6 +500,22 @@ def ensure_custom_ops_registered() -> None:
     lib.impl("kda_attention", _kda_attention_impl, "CUDA")
     lib.impl("kda_attention", _kda_attention_impl, "CPU")
     abstract_lib.impl("kda_attention", _kda_attention_fake)
+
+    lib.define(
+        "qwen3_next_attention(Tensor hidden_states, Tensor positions, "
+        "str layer_name) -> Tensor"
+    )
+    lib.impl("qwen3_next_attention", _qwen3_next_attention_impl, "CUDA")
+    lib.impl("qwen3_next_attention", _qwen3_next_attention_impl, "CPU")
+    abstract_lib.impl("qwen3_next_attention", _qwen3_next_attention_fake)
+
+    lib.define(
+        "qwen3_next_gdn_attention(Tensor hidden_states, str layer_name) "
+        "-> Tensor"
+    )
+    lib.impl("qwen3_next_gdn_attention", _qwen3_next_gdn_attention_impl, "CUDA")
+    lib.impl("qwen3_next_gdn_attention", _qwen3_next_gdn_attention_impl, "CPU")
+    abstract_lib.impl("qwen3_next_gdn_attention", _qwen3_next_gdn_attention_fake)
 
     # Keep references alive for the lifetime of the process.
     ensure_custom_ops_registered._lib = lib  # type: ignore[attr-defined]
