@@ -116,7 +116,16 @@ class TargetVerifyGraphRunner:
         # Capture every integer batch size up to the max -- mirrors sglang's
         # spec-decoding default schedule.
         self.capture_bs: List[int] = list(range(1, self.B_max + 1))
-        prefix_buckets = [160, 256, 512, 1024, 2048, engine.max_model_len]
+        # FA3 bakes max_seqlen_k into the graph and walks
+        # ceil(max_seqlen_k / page_size) pages, so Hopper needs tighter
+        # buckets than the coarse grid. FA4 (Blackwell) keeps the original
+        # list -- do not change B200 capture.
+        from .fa_utils import FA_VERSION
+        if FA_VERSION == 3:
+            prefix_buckets = [128, 192, 256, 384, 512, 768, 1024, 2048]
+        else:
+            prefix_buckets = [160, 256, 512, 1024, 2048]
+        prefix_buckets.append(engine.max_model_len)
         self.capture_prefix_lens: List[int] = sorted({
             min(engine.max_model_len, b) for b in prefix_buckets
             if b > 0
@@ -308,16 +317,20 @@ class TargetVerifyGraphRunner:
         if slot_mapping_real.data_ptr() != bufs.slot_mapping[:BN_real].data_ptr():
             bufs.slot_mapping[:BN_real].copy_(slot_mapping_real, non_blocking=True)
 
-        k_real = block_table_real.shape[1]
-        if k_real >= self.max_blocks:
-            bufs.block_table_prefix[:raw_bs].copy_(
-                block_table_real[:, :self.max_blocks], non_blocking=True,
-            )
-        else:
-            bufs.block_table_prefix[:raw_bs, :k_real].copy_(
-                block_table_real, non_blocking=True,
-            )
-            bufs.block_table_prefix[:raw_bs, k_real:].fill_(scratch_block)
+        if (
+            block_table_real.data_ptr()
+            != bufs.block_table_prefix[:raw_bs].data_ptr()
+        ):
+            k_real = block_table_real.shape[1]
+            if k_real >= self.max_blocks:
+                bufs.block_table_prefix[:raw_bs].copy_(
+                    block_table_real[:, :self.max_blocks], non_blocking=True,
+                )
+            else:
+                bufs.block_table_prefix[:raw_bs, :k_real].copy_(
+                    block_table_real, non_blocking=True,
+                )
+                bufs.block_table_prefix[:raw_bs, k_real:].fill_(scratch_block)
 
         if (
             cache_seqlens_prefix_real.data_ptr()
@@ -563,6 +576,10 @@ class DraftChainGraphRunner:
 
             bufs.scores_out[:B].copy_(scores)
 
+        # Hopper FA3: write scheduler_metadata outside the graph. B200 no-op.
+        dummy_seqlens = torch.ones(BK, dtype=torch.int32, device=self.engine.device)
+        self.engine._refresh_draft_fa3_decode(dummy_seqlens)
+
         # Warmup
         _run_chain()
         torch.cuda.synchronize()
@@ -646,6 +663,11 @@ class DraftChainGraphRunner:
                 bt_branch_real, non_blocking=True,
             )
             bufs.bt_branch[:BK_real, w_real:].fill_(scratch_block)
+
+        # Hopper FA3: rewrite tile schedule for this bucket before replay.
+        seqlens = (bufs.base_pos[:B_pad] + max(self.S - 1, 1)).to(torch.int32)
+        seqlens = seqlens.clamp(min=1)
+        self.engine._refresh_draft_fa3_decode(seqlens.repeat_interleave(K))
 
         # --- replay ------------------------------------------------------
         self.graphs[B_pad].replay()

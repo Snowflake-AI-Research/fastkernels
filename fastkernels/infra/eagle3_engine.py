@@ -281,6 +281,8 @@ class LlamaEagle3Engine:
         self._draft_chain_runner = None
         self._draft_extend_runner = None
         self._graph_pool = None
+        self._draft_fa_decode_ops = []
+        self._draft_fa_decode_groups = []
         # Width of the captured ``bt_branch`` block table = enough to cover
         # the full draft prefix (at max_model_len) plus the branch tail
         # (at most 2 blocks for typical S-1=2 step chains).
@@ -410,6 +412,9 @@ class LlamaEagle3Engine:
                 max_blocks_branch=self._chain_max_blocks_branch,
                 graph_pool=self._graph_pool,
             )
+            # Hopper FA3: scheduler_metadata must live outside the graph.
+            # B200 FA4 skips this (refresh_fa3_decode_schedule is a no-op).
+            self._init_draft_fa3_decode(max_bs * self.topk)
             chain_runner.capture_all()
             if self._graph_pool is None:
                 self._graph_pool = chain_runner.graph_pool
@@ -436,6 +441,52 @@ class LlamaEagle3Engine:
         print(
             f"[EAGLE-3] Captured {len(extend_runner.graphs)} "
             f"draft-extend graphs."
+        )
+
+    def _init_draft_fa3_decode(self, max_decode_bs: int):
+        """Persistent FA3 scheduler buffers for draft-chain CUDA graphs.
+
+        Same pattern as LlamaEngine._init_fa3_decode_buffers. No-op on
+        Blackwell (FA4). ``max_decode_bs`` is B_max * topk, the decode
+        token count the chain graph launches.
+        """
+        from ..tasks.baseline.L1.flash_attn_decode import FlashAttnDecode
+        from .fa_utils import FA_VERSION, group_fa_decode_ops
+
+        ops = [m for m in self.draft.modules() if isinstance(m, FlashAttnDecode)]
+        self._draft_fa_decode_ops = ops
+        self._draft_fa_decode_groups = group_fa_decode_ops(ops)
+        if not ops:
+            return
+        for group in self._draft_fa_decode_groups:
+            lead = group[0]
+            if not lead.page_size:
+                lead.page_size = self.block_size
+            lead.preallocate(max_decode_bs, self.device)
+            if FA_VERSION == 3:
+                lead._force_graph_splits = True
+            for op in group[1:]:
+                op.page_size = lead.page_size
+                op._cu_seqlens_q = lead._cu_seqlens_q
+                op._sched_buf = lead._sched_buf
+                op._sched_meta = lead._sched_meta
+                if FA_VERSION == 3:
+                    op._force_graph_splits = True
+
+    def _refresh_draft_fa3_decode(
+        self,
+        context_lens: torch.Tensor,
+        max_seqlen_k: int | None = None,
+    ):
+        from .fa_utils import refresh_fa3_decode_schedule
+
+        if max_seqlen_k is None:
+            max_seqlen_k = self.max_model_len
+        refresh_fa3_decode_schedule(
+            self._draft_fa_decode_groups,
+            context_lens,
+            max_seqlen_k,
+            qkv_dtype=self.dtype,
         )
 
     # ------------------------------------------------------------------
@@ -473,43 +524,12 @@ class LlamaEagle3Engine:
     def _slot_for(self, blocks: List[int], pos: int) -> int:
         return blocks[pos // self.block_size] * self.block_size + (pos % self.block_size)
 
-    @torch.inference_mode()
-    def _remap_target_kv_after_verify(
-        self,
-        seqs: List[_Eagle3Sequence],
-        accept_index_cpu: List[List[int]],
-        accept_num_cpu: List[int],
-    ):
-        """After tree verify, K/V for tree node ``i`` was written at the slot
-        for logical position ``t_committed_len + i`` (linear write order).
-        For the next iteration we need K/V for the k-th accepted token at the
-        slot for logical position ``t_committed_len + k``. With chain drafting
-        accepted tree indices are already ``[0, 1, 2, ...]`` so this is a no-op,
-        but with tree drafting the accepted chain typically picks non-contiguous
-        tree nodes and we MUST remap, otherwise subsequent attention reads
-        garbage K/V from rejected branches.
-
-        Mirrors sglang's ``move_kv_cache(tgt_cache_loc, src_cache_loc)``.
-        """
-        N = self.num_draft_tokens
-        src_slots: list[int] = []
-        dst_slots: list[int] = []
-        for i, seq in enumerate(seqs):
-            n_accept = int(accept_num_cpu[i])
-            base = seq.t_committed_len
-            for k in range(n_accept + 1):
-                flat = int(accept_index_cpu[i][k])
-                tree_idx = flat - i * N
-                if tree_idx == k:
-                    continue
-                src_slots.append(self._slot_for(seq.t_blocks, base + tree_idx))
-                dst_slots.append(self._slot_for(seq.t_blocks, base + k))
-
-        if not src_slots:
+    def _move_kv_cache(self, src_slots: torch.Tensor, dst_slots: torch.Tensor):
+        """Copy token-granular K/V rows, matching sglang ``move_kv_cache``."""
+        src_t = src_slots.long().reshape(-1)
+        dst_t = dst_slots.long().reshape(-1)
+        if src_t.numel() == 0:
             return
-
-        src_t = torch.tensor(src_slots, device=self.device, dtype=torch.long)
-        dst_t = torch.tensor(dst_slots, device=self.device, dtype=torch.long)
         kv = self.target_kv.kv
         BS = self.block_size
         if self.kv_layout == "NHD":
@@ -522,16 +542,43 @@ class LlamaEagle3Engine:
             src_vals = flat[:, :, src_t].clone()
             flat[:, :, dst_t] = src_vals
         else:
-            # HND: kv [2, L, NB, H, BS, D]. NB and BS are non-adjacent so
-            # we cannot trivially view as [..., NB*BS, ...]. Instead index
-            # block / offset directly per slot.
-            src_blk = (src_t // BS).tolist()
-            src_off = (src_t % BS).tolist()
-            dst_blk = (dst_t // BS).tolist()
-            dst_off = (dst_t % BS).tolist()
-            for n in range(len(src_blk)):
-                kv[:, :, dst_blk[n], :, dst_off[n], :] = \
-                    kv[:, :, src_blk[n], :, src_off[n], :].clone()
+            src_blk = src_t // BS
+            src_off = src_t % BS
+            dst_blk = dst_t // BS
+            dst_off = dst_t % BS
+            src_vals = kv[:, :, src_blk, :, src_off, :].clone()
+            kv[:, :, dst_blk, :, dst_off, :] = src_vals
+
+    @torch.inference_mode()
+    def _remap_target_kv_after_verify(
+        self,
+        slot_t: torch.Tensor,
+        accept_index: torch.Tensor,
+        accept_token_num: torch.Tensor,
+    ):
+        """After tree verify, K/V for tree node ``i`` was written at the slot
+        for logical position ``t_committed_len + i`` (linear write order).
+        For the next iteration we need K/V for the k-th accepted token at the
+        slot for logical position ``t_committed_len + k``. With chain drafting
+        accepted tree indices are already ``[0, 1, 2, ...]`` so this is a no-op,
+        but with tree drafting the accepted chain typically picks non-contiguous
+        tree nodes and we MUST remap, otherwise subsequent attention reads
+        garbage K/V from rejected branches.
+
+        Stays on GPU: ``slot_t[accept_index]`` -> ``slot_t[row*N + k]``,
+        matching sglang's ``move_kv_cache(tgt_cache_loc, src_cache_loc)``.
+        Invalid (k > n_accept) columns copy identity so we never compact a
+        boolean mask (which would sync).
+        """
+        B, k_max = accept_index.shape
+        N = self.num_draft_tokens
+        device = accept_index.device
+        k = torch.arange(k_max, device=device, dtype=torch.long)
+        row = torch.arange(B, device=device, dtype=torch.long).unsqueeze(1)
+        valid = k.unsqueeze(0) <= accept_token_num.long().unsqueeze(1)
+        dst_flat = row * N + k
+        src_flat = torch.where(valid, accept_index.long(), dst_flat)
+        self._move_kv_cache(slot_t[src_flat], slot_t[dst_flat])
 
     # ------------------------------------------------------------------
     # Target prefill on the prompt
@@ -1091,6 +1138,8 @@ class LlamaEagle3Engine:
 
         This runs before tree construction so the fused tree-build kernel can
         directly produce FA3 expand metadata from the target slot mapping.
+        When a verify CUDA-graph runner is live, metadata is written straight
+        into its persistent buffers so replay can skip the extra copy.
         """
         bs = len(seqs)
         N = self.num_draft_tokens
@@ -1115,13 +1164,33 @@ class LlamaEagle3Engine:
             bt[i, :len(b)] = b
 
         device = self.device
+        runner = self._target_verify_runner
+        use_bufs = runner is not None and bs <= runner.B_max
+        slot_src = torch.tensor(slot_mapping, dtype=torch.int32, device=device)
+        cache_src = torch.tensor(prefix_lens_cpu, dtype=torch.int32, device=device)
+        bt_src = torch.from_numpy(bt).to(device)
+        if use_bufs:
+            bufs = runner.bufs
+            BN = bs * N
+            slot_t = bufs.slot_mapping[:BN]
+            slot_t.copy_(slot_src)
+            bt_t = bufs.block_table_prefix[:bs]
+            k_real = min(max_blocks, runner.max_blocks)
+            bt_t[:, :k_real].copy_(bt_src[:, :k_real])
+            if k_real < runner.max_blocks:
+                bt_t[:, k_real:].fill_(self._scratch_block_t)
+            cache_seqlens_prefix = bufs.cache_seqlens_prefix[:bs]
+            cache_seqlens_prefix.copy_(cache_src)
+        else:
+            slot_t = slot_src
+            bt_t = bt_src
+            cache_seqlens_prefix = cache_src
+
         return {
-            "slot_t": torch.tensor(slot_mapping, dtype=torch.int32, device=device),
-            "bt_t": torch.from_numpy(bt).to(device),
+            "slot_t": slot_t,
+            "bt_t": bt_t,
             "prefix_lens_cpu": prefix_lens_cpu,
-            "cache_seqlens_prefix": torch.tensor(
-                prefix_lens_cpu, dtype=torch.int32, device=device,
-            ),
+            "cache_seqlens_prefix": cache_seqlens_prefix,
             "max_seqlen_k_prefix": max(prefix_lens_cpu) if prefix_lens_cpu else 0,
         }
 
@@ -1313,66 +1382,43 @@ class LlamaEagle3Engine:
 
         # 4. Accept tokens; roll back rejected target KV.
         N = self.num_draft_tokens
-        accept_num_cpu = accept_token_num.tolist()
-        accept_index_cpu = accept_index.tolist()
-        predicts_cpu = predicts.tolist() if predicts is not None else None
-        verified_ids_cpu = (
-            verified_ids_padded.tolist()
-            if verified_ids_padded is not None else None
+        k_max = accept_index.shape[1]
+        k = torch.arange(k_max, device=self.device, dtype=torch.long)
+        valid = k.unsqueeze(0) <= accept_token_num.long().unsqueeze(1)
+        safe_idx = torch.where(
+            valid, accept_index.long(), torch.zeros_like(accept_index, dtype=torch.long),
         )
 
-        # Remap target K/V so that logical position ``t_committed_len + k``
-        # holds the K/V for the k-th accepted token (NOT for the k-th tree
-        # node in flat write order). Must run before we touch t_committed_len
-        # or free any blocks. With chain drafting this is a no-op; with tree
-        # drafting it is required for correctness.
-        self._remap_target_kv_after_verify(seqs, accept_index_cpu, accept_num_cpu)
-
-        accepted_ids_per_seq: list[list[int]] = []
-        flat_accepted_indices: list[int] = []
-        aux_offsets = [0]
-        for i in range(len(seqs)):
-            n_accept = int(accept_num_cpu[i])
-            indices = accept_index_cpu[i][: n_accept + 1]
-            if verified_ids_cpu is not None:
-                accepted_ids_per_seq.append(
-                    [int(x) for x in verified_ids_cpu[i][: n_accept + 1]]
-                )
-            else:
-                accepted_ids_per_seq.append(
-                    [int(predicts_cpu[idx]) for idx in indices]
-                )
-            flat_accepted_indices.extend(indices)
-            aux_offsets.append(len(flat_accepted_indices))
-
-        if accepted_aux_padded is not None:
-            accepted_aux_flat = None
-        elif len(aux_list) > 0:
-            # Only the accepted path feeds the draft extend. Avoid materializing
-            # [B*N, 3H] every step when the accepted set is at most B*(S+1).
-            flat_idx_t = torch.tensor(
-                flat_accepted_indices, device=self.device, dtype=torch.long,
-            )
-            accepted_aux_flat = torch.cat(
-                [a[flat_idx_t] for a in aux_list], dim=-1,
-            )
+        # GPU remap + gather before the one D2H of accept counts / ids.
+        self._remap_target_kv_after_verify(
+            target_inputs["slot_t"], accept_index, accept_token_num,
+        )
+        if verified_ids_padded is not None:
+            acc_ids_2d = verified_ids_padded.long()
         else:
-            accepted_aux_flat = None
+            acc_ids_2d = predicts.long()[safe_idx]
+        if accepted_aux_padded is not None:
+            acc_aux_2d = accepted_aux_padded
+        elif len(aux_list) > 0:
+            acc_aux_2d = torch.cat([a[safe_idx] for a in aux_list], dim=-1)
+        else:
+            acc_aux_2d = None
 
-        # Per-seq accepted tokens + aux for the post-verify draft extend.
-        accepted_lists: list[list[int]] = []
+        accept_num_cpu = accept_token_num.tolist()
+        acc_ids_cpu = acc_ids_2d.tolist()
+
         accepted_aux_per_seq: list[torch.Tensor] = []
 
         for i, seq in enumerate(seqs):
             n_accept = int(accept_num_cpu[i])  # # accepted SPECULATIVE
-            accepted_ids = accepted_ids_per_seq[i]
+            n = n_accept + 1
+            accepted_ids = [int(x) for x in acc_ids_cpu[i][:n]]
             seq.token_ids.extend(accepted_ids)
             seq.generated_ids.extend(accepted_ids)
             seq.last_token = accepted_ids[-1]
-            accepted_lists.append(accepted_ids)
 
             tentative_committed = seq.t_committed_len + N
-            new_committed = seq.t_committed_len + (n_accept + 1)
+            new_committed = seq.t_committed_len + n
             old_blocks = (tentative_committed + self.block_size - 1) // self.block_size
             new_blocks = (new_committed + self.block_size - 1) // self.block_size
             if new_blocks < old_blocks:
@@ -1381,17 +1427,11 @@ class LlamaEagle3Engine:
             seq.t_blocks = seq.t_blocks[:new_blocks]
             seq.t_committed_len = new_committed
 
-            if accepted_aux_padded is not None:
-                acc_aux = accepted_aux_padded[i, : n_accept + 1]
-                accepted_aux_per_seq.append(acc_aux)
-            elif accepted_aux_flat is not None:
-                acc_aux = accepted_aux_flat[
-                    aux_offsets[i]:aux_offsets[i + 1]
-                ]                                          # [n_accept+1, 3*H_t]
-                accepted_aux_per_seq.append(acc_aux)
+            if acc_aux_2d is not None:
+                accepted_aux_per_seq.append(acc_aux_2d[i, :n])
             else:
                 accepted_aux_per_seq.append(torch.zeros(
-                    (len(accepted_ids), self.target_config.hidden_size * 3),
+                    (n, self.target_config.hidden_size * 3),
                     device=self.device, dtype=self.dtype,
                 ))
 
@@ -1429,12 +1469,10 @@ class LlamaEagle3Engine:
         for i, seq in enumerate(seqs):
             if seq.finished:
                 continue
-            acc_ids = accepted_lists[i]
-            acc_aux = accepted_aux_per_seq[i]
-            ids = torch.tensor(acc_ids, dtype=torch.int64, device=self.device)
-            ext_input_ids.append(ids)
-            ext_hiddens.append(acc_aux)
-            ext_lens.append(len(acc_ids))
+            n = int(accept_num_cpu[i]) + 1
+            ext_input_ids.append(acc_ids_2d[i, :n].to(torch.int64))
+            ext_hiddens.append(accepted_aux_per_seq[i])
+            ext_lens.append(n)
             live_seqs.append(seq)
 
         if live_seqs:
