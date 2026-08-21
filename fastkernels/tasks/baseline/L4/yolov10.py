@@ -37,6 +37,10 @@ _PREFIX_MAP = [
 ]
 
 
+def _is_hopper_gpu() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9
+
+
 class YOLOv10ForObjectDetection(nn.Module):
     def __init__(self, conf_threshold: float = 0.25):
         super().__init__()
@@ -44,6 +48,11 @@ class YOLOv10ForObjectDetection(nn.Module):
         self.neck = YOLOv10Neck()
         self.detect = YOLOv10DetectHead(nc=80, ch=(64, 128, 256))
         self.conf_threshold = conf_threshold
+        # Hopper-only CUDA graphs. YOLOv10n is launch-bound at bs=1/4 (~400
+        # kernels, ~0.7 ms of Python/launch overhead vs ultralytics). B200 is
+        # left on the eager path.
+        self._use_hopper_cudagraph = False
+        self._hopper_graphs: dict[tuple, tuple[torch.cuda.CUDAGraph, torch.Tensor, torch.Tensor]] = {}
 
     @classmethod
     def from_pretrained(
@@ -89,12 +98,47 @@ class YOLOv10ForObjectDetection(nn.Module):
         fuse_module(model)
         model.detect.export = True
         model = model.to(device=device, dtype=dtype).eval()
+        if str(device).startswith("cuda") and _is_hopper_gpu():
+            model._use_hopper_cudagraph = True
         return model
 
-    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+    def _forward_impl(self, pixel_values: torch.Tensor) -> torch.Tensor:
         feats = self.backbone(pixel_values)
         pyramid = self.neck(feats)
         return self.detect(pyramid)
+
+    def _capture_hopper_graph(
+        self, pixel_values: torch.Tensor
+    ) -> tuple[torch.cuda.CUDAGraph, torch.Tensor, torch.Tensor]:
+        static_in = pixel_values.clone()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                static_out = self._forward_impl(static_in)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            static_out = self._forward_impl(static_in)
+        return graph, static_in, static_out
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        if not self._use_hopper_cudagraph:
+            return self._forward_impl(pixel_values)
+        key = (
+            int(pixel_values.shape[0]),
+            int(pixel_values.shape[-2]),
+            int(pixel_values.shape[-1]),
+            pixel_values.dtype,
+        )
+        entry = self._hopper_graphs.get(key)
+        if entry is None:
+            entry = self._capture_hopper_graph(pixel_values)
+            self._hopper_graphs[key] = entry
+        graph, static_in, static_out = entry
+        static_in.copy_(pixel_values)
+        graph.replay()
+        return static_out
 
     def predict(
         self,

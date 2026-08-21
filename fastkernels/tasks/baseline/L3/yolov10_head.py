@@ -107,11 +107,21 @@ class YOLOv10DetectHead(nn.Module):
         return y
 
     def inference(self, x: list[torch.Tensor]):
-        shape = x[0].shape
-        x_cat = torch.cat([xi.view(shape[0], self.no, -1) for xi in x], 2)
-        if self.dynamic or self.shape != shape:
-            self.anchors, self.strides = (t.transpose(0, 1) for t in make_anchors(x, self.stride, 0.5))
-            self.shape = shape
+        b, _, h, w = x[0].shape
+        x_cat = torch.cat([xi.view(b, self.no, -1) for xi in x], 2)
+        # Anchors depend only on feature-map HW. Keying on full BCHW rebuilt
+        # them on every batch-size change and freed the buffers Hopper CUDA
+        # graphs had captured.
+        spatial = (h, w)
+        if self.dynamic or self.shape != spatial:
+            anchors, strides = (t.transpose(0, 1).contiguous() for t in make_anchors(x, self.stride, 0.5))
+            if self.anchors.numel() == anchors.numel() and self.strides.numel() == strides.numel():
+                self.anchors.copy_(anchors)
+                self.strides.copy_(strides)
+            else:
+                self.register_buffer("anchors", anchors)
+                self.register_buffer("strides", strides)
+            self.shape = spatial
         box, cls = x_cat.split((self.reg_max * 4, self.nc), 1)
         dbox = dist2bbox(self.dfl(box), self.anchors.unsqueeze(0), xywh=True, dim=1) * self.strides
         return torch.cat((dbox, self._sigmoid(cls)), 1)
