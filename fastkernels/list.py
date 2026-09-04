@@ -11,8 +11,14 @@ from __future__ import annotations
 
 import argparse
 import ast
+import importlib
+import importlib.abc
+import importlib.machinery
+import importlib.util
+import re
 import sys
 import textwrap
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -439,25 +445,66 @@ def print_scenario_operator_map(scenario_ref: str) -> None:
 _CANDIDATE_BASELINE_PACKAGE = "fastkernels.tasks.baseline"
 _candidates_applied = False
 
+# Candidate dotted imports (``fastkernels.tasks.candidate.L{n}.{stem}``, including
+# ``from ..L{n}.{stem} import ...``): load the candidate file if present, otherwise
+# alias the matching baseline. ``install_candidate_finder(standalone=True, keep={target})`` makes
+# every non-keep candidate name resolve to baseline even when those files exist.
+_CANDIDATE_PREFIX = "fastkernels.tasks.candidate."
+_CANDIDATE_LEVEL_RE = re.compile(r"^L[1-4]$")
+_candidate_finder: _CandidateFinder | None = None
+_standalone = False
+_keep: frozenset[str] = frozenset()
+
+
+def install_candidate_finder(*, standalone: bool | None = None, keep: Iterable[str] | None = None) -> None:
+    """Register the candidate import finder (idempotent). Pass *standalone*/*keep* to set policy."""
+    global _candidate_finder, _standalone, _keep
+    if standalone is not None:
+        _standalone = standalone
+        _keep = frozenset(keep or ())
+    if _candidate_finder is None:
+        _candidate_finder = _CandidateFinder()
+        sys.meta_path.insert(0, _candidate_finder)
+
+
+class _AliasLoader(importlib.abc.Loader):
+    def __init__(self, baseline_name: str):
+        self.baseline_name = baseline_name
+
+    def create_module(self, spec):
+        return importlib.import_module(self.baseline_name)
+
+    def exec_module(self, module):
+        pass
+
+
+class _CandidateFinder(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):  # noqa: ARG002
+        if not fullname.startswith(_CANDIDATE_PREFIX):
+            return None
+        rest = fullname[len(_CANDIDATE_PREFIX):]
+        parts = rest.split(".")
+        if len(parts) == 1 and _CANDIDATE_LEVEL_RE.match(parts[0]):
+            return importlib.machinery.ModuleSpec(fullname, loader=None, is_package=True)
+        if len(parts) != 2 or not _CANDIDATE_LEVEL_RE.match(parts[0]):
+            return None
+        level, stem = parts
+        cand = __import__("fastkernels").CANDIDATE_DIR / level / f"{stem}.py"
+        use_file = cand.is_file() and not (_standalone and fullname not in _keep)
+        if use_file:
+            return importlib.util.spec_from_file_location(fullname, cand)
+        baseline = f"fastkernels.tasks.baseline.{level}.{stem}"
+        return importlib.machinery.ModuleSpec(fullname, _AliasLoader(baseline), origin=baseline)
+
 
 def _load_candidate_class(path: Path, class_name: str):
     """Import a candidate file and return its operator class (prefers the class
     named like the baseline op; falls back to the last ``nn.Module`` defined)."""
-    import importlib.util
-
     import torch.nn as nn
 
-    mod_name = f"_fk_candidate_{path.parent.name}_{path.stem}"
-    spec = importlib.util.spec_from_file_location(mod_name, str(path))
-    if spec is None or spec.loader is None:
-        return None
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = mod
-    try:
-        spec.loader.exec_module(mod)
-    except Exception:
-        sys.modules.pop(mod_name, None)
-        raise
+    install_candidate_finder(standalone=False)
+    dotted = f"fastkernels.tasks.candidate.{path.parent.name}.{path.stem}"
+    mod = importlib.import_module(dotted)
     cls = getattr(mod, class_name, None)
     if cls is None:
         for value in vars(mod).values():
