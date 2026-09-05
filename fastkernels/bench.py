@@ -42,6 +42,7 @@ Usage::
     fastkernels bench                              # all candidates vs baseline
     fastkernels bench --self-test --level 1        # baselines vs themselves
     fastkernels bench --target rms_norm --gpus 0   # one operator, one GPU
+    fastkernels bench --standalone                 # ignore other candidates' files
 
 Known limitations (honest by design):
 
@@ -82,7 +83,6 @@ import argparse
 import dataclasses
 import gc
 import importlib
-import importlib.util
 import inspect
 import json
 import math
@@ -240,31 +240,25 @@ def _candidate_file(op: Operator) -> Path:
     return CANDIDATE_DIR / f"L{op.level}" / f"{op.stem}.py"
 
 
-def _load_candidate_class(op: Operator) -> type | None:
+def _load_candidate_class(op: Operator, *, standalone: bool = False) -> type | None:
     """Load the candidate class for *op* from ``tasks/candidate/L{level}/{stem}.py``.
 
-    Prefers a proper dotted import (``fastkernels.tasks.candidate.L{level}.{stem}``,
-    a PEP-420 namespace subpackage) so intra-candidate relative imports work;
-    falls back to loading the file by path when the candidate dir has been moved
-    via ``FASTKERNELS_CANDIDATE_DIR``. Returns ``None`` if the file or the class
-    named identically to the baseline is absent.
+    Uses a dotted import (``fastkernels.tasks.candidate.L{level}.{stem}``) so
+    intra-candidate relative imports work; missing imported candidates resolve
+    to their baseline via ``fastkernels.list.install_candidate_finder``. With
+    *standalone*, imported candidate modules resolve to baseline even when those
+    files exist. Returns ``None`` if the target file or the identically-named
+    class is absent.
     """
+    from .list import install_candidate_finder
+    dotted = op.module_path.replace(".tasks.baseline.", ".tasks.candidate.")
+    if standalone:
+        install_candidate_finder(standalone=True, keep={dotted})
+    else:
+        install_candidate_finder(standalone=False)
     if not _candidate_file(op).exists():
         return None
-    dotted = op.module_path.replace(".tasks.baseline.", ".tasks.candidate.")
-    module = None
-    try:
-        module = importlib.import_module(dotted)
-    except Exception:
-        module = None
-    if module is None:
-        try:
-            spec = importlib.util.spec_from_file_location(
-                f"_fk_candidate_L{op.level}_{op.stem}", _candidate_file(op))
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)  # type: ignore[union-attr]
-        except Exception:
-            return None
+    module = importlib.import_module(dotted)
     return getattr(module, op.class_name, None)
 
 
@@ -2286,18 +2280,16 @@ def _worker_main(args) -> int:
 
     try:
         baseline_cls = _import_symbol(op.qualname)
+        candidate_cls = (baseline_cls if args.self_test
+                         else _load_candidate_class(op, standalone=args.standalone))
     except Exception as exc:  # noqa: BLE001
         _emit({"op": op.qualname, "level": op.level, "shape": "-", "dtype": "-",
-               "status": RUNTIME_ERROR, "detail": f"cannot import baseline: {exc!r}"})
+               "status": RUNTIME_ERROR, "detail": f"cannot import: {exc!r}"})
         return 1
-    if args.self_test:
-        candidate_cls = baseline_cls
-    else:
-        candidate_cls = _load_candidate_class(op)
-        if candidate_cls is None:
-            _emit({"op": op.qualname, "level": op.level, "shape": "-", "dtype": "-",
-                   "status": SKIPPED, "detail": "no candidate class found"})
-            return 0
+    if candidate_cls is None:
+        _emit({"op": op.qualname, "level": op.level, "shape": "-", "dtype": "-",
+               "status": SKIPPED, "detail": "no candidate class found"})
+        return 0
     # Re-check integrity after importing candidate/baseline modules: catches an
     # eval-function or timing-primitive patch installed at candidate import time,
     # regardless of whether any case reaches the timing stage.
@@ -2399,6 +2391,8 @@ def _worker_command(op: Operator, args) -> list[str]:
            "--iters", str(args.iters), "--rounds", str(args.rounds)]
     if args.self_test:
         cmd.append("--self-test")
+    if args.standalone:
+        cmd.append("--standalone")
     return cmd
 
 
@@ -2573,7 +2567,8 @@ def _dist_worker_entry(rank, world_size, port, op_qualname, wargs, out_path, gpu
         op = _parse_operator(op_qualname)
         baseline_cls = _import_symbol(op_qualname)
         candidate_cls = (baseline_cls if wargs["self_test"]
-                         else _load_candidate_class(op))
+                         else _load_candidate_class(
+                             op, standalone=wargs.get("standalone", False)))
         if candidate_cls is None:
             return
         integrity = _snapshot_integrity()
@@ -2629,7 +2624,8 @@ def _run_distributed(ops: list[Operator], args, gpu_ids: list[str]) -> list[Scen
         jsonl.write_text("")
         wargs = {"captures": str(args.captures), "max_shapes": args.max_shapes,
                  "warmup": args.warmup, "iters": args.iters,
-                 "rounds": args.rounds, "self_test": bool(args.self_test)}
+                 "rounds": args.rounds, "self_test": bool(args.self_test),
+                 "standalone": bool(args.standalone)}
         print(f"  -> [GPUs {','.join(ranks_gpus)}] {op.qualname} "
               f"(distributed, world_size={world_size}) started")
         try:
@@ -2716,6 +2712,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         "skipped by default; pass --level 4 or --target to run them.")
     p.add_argument("--self-test", action="store_true",
                    help="Benchmark each baseline against itself (identity check).")
+    p.add_argument("--standalone", action="store_true",
+                   help="Isolate each candidate from other candidates: imported "
+                        "candidate modules resolve to their baseline counterparts.")
     p.add_argument("--gpus", default=None,
                    help="Comma-separated GPU ids to use (default: all visible).")
     p.add_argument("--max-shapes", type=int, default=DEFAULT_MAX_SHAPES,

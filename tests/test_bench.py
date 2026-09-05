@@ -242,6 +242,11 @@ def test_section_6():
                 "6c. eval CLI accepts --max-requests, --max-layers, --gpus",
             )
 
+    sys.path.insert(0, PACKAGE_DIR)
+    from fastkernels.bench import _build_arg_parser
+    check("--standalone" in _build_arg_parser().format_help(),
+          "6e. bench CLI accepts --standalone")
+
     # 6d. Default JSON output path
     with _Timeout(30):
         from fastkernels import RESULTS_DIR, run_output_path
