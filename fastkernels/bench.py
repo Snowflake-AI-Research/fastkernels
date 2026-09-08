@@ -525,17 +525,18 @@ def _sanitize_float_params(module: nn.Module) -> None:
     garbage* to a small normal.
 
     Many modules allocate weights with ``torch.empty`` and rely on a weight
-    loader to fill them; reconstructed fresh, those params hold arbitrary memory
-    (often non-finite or huge), which overflows to NaN once run through e.g.
-    attention. We only touch params that look like garbage (non-finite or
-    extreme magnitude), leaving legitimately-initialized weights (norm ones,
-    embeddings) alone. Applied to baseline + candidate, then shared via
-    ``load_state_dict``."""
+    loader to fill them; reconstructed fresh, those params hold NaN, huge
+    values, all zeros, or tiny subnormals. We rewrite those and
+    leave real init (norm ones, embeddings) alone. Applied to baseline +
+    candidate, then shared via ``load_state_dict``."""
     _HIGH_PREC = (torch.float16, torch.bfloat16, torch.float32)
     with torch.no_grad():
         for p in module.parameters():
             if p.dtype in _HIGH_PREC and p.numel() > 0:
-                if not torch.isfinite(p).all() or p.detach().abs().max().item() > 1e4:
+                amax = p.detach().float().abs().max().item()
+                # empty() is often exact zeros (mmap) or tiny subnormals
+                # (CPU->GPU copy); both are uninitialized, not real weights.
+                if not math.isfinite(amax) or amax < 1e-6 or amax > 1e4:
                     p.normal_(0, 0.02)
 
 
@@ -784,12 +785,18 @@ def _materialize_tensor(name: str, shape, dtype_str: str, device: str, init_args
     if not isinstance(dt, torch.dtype):
         raise _UnsupportedInput(f"{name}: unknown dtype {dtype_str!r}")
     shape = tuple(int(s) for s in shape)
+    lname = name.lower().rsplit(".", 1)[-1].split("[", 1)[0]
+    is_mask = "mask" in lname
     if dt in _FP8_TYPES:
         t = torch.randn(shape, device=device, dtype=torch.float32).clamp_(-2, 2).to(dt)
+    elif is_mask and dt.is_floating_point:
+        # AF3 0/1 masks: randn -> inf*(mask-1) zeros softmax / out*mask.
+        t = torch.ones(shape, device=device, dtype=dt)
     elif dt.is_floating_point:
         t = torch.randn(shape, device=device, dtype=dt)
     elif dt == torch.bool:
-        t = torch.randint(0, 2, shape, device=device, dtype=torch.bool)
+        t = (torch.ones(shape, device=device, dtype=torch.bool) if is_mask
+             else torch.randint(0, 2, shape, device=device, dtype=torch.bool))
     else:
         t = _materialize_int(name, shape, dt, device, init_args)
     # Honor a captured non-contiguous layout (e.g. a column-major FP8 scale):
@@ -1374,6 +1381,19 @@ def _build_flashinfer_mla_decode_inputs(fwd_args, device, init_args):
     return [], kw
 
 
+def _build_of3_attention_inputs(fwd_args, device, init_args):
+    """OF3Attention: captured ``biases`` are 0/1 or -inf masks materialized as
+    randn, which zeros softmax. Fill them with zeros (additive identity)."""
+    kw = _materialize_all(fwd_args, device, init_args)
+    biases = kw.get("biases")
+    if isinstance(biases, list):
+        kw["biases"] = [
+            torch.zeros_like(b) if isinstance(b, torch.Tensor) else b
+            for b in biases
+        ]
+    return [], kw
+
+
 def _build_chunk_gla_inputs(fwd_args, device, init_args):
     """Inputs for ``ChunkGLA.forward``. ``g`` is a log-space forget gate: a
     random (possibly positive) gate makes the chunk scan's ``exp(cumsum(g))``
@@ -1414,13 +1434,21 @@ def _build_attention_prefill_inputs(fwd_args, device, init_args):
 
 
 def _build_recurrent_prefill_inputs(fwd_args, device, init_args):
-    """GLA / GLADecoderLayer (linear-attention recurrent state): drop the opaque
-    captured ``RecurrentCache`` so forward runs its cacheless prefill path
-    (``initial_state=None``, no cache write). The packed ``cu_seqlens`` lives
-    under the captured ``**kwargs`` catch-all, so ``module(**kw)`` re-nests it
-    out of reach -- the whole [1, T] row is treated as one dense sequence, which
-    is a valid GLA forward for a self-consistent baseline-vs-baseline check."""
-    kw = _materialize_all(fwd_args, device, init_args, skip=("past_key_values",))
+    """GLA / GLADecoderLayer: drop the opaque captured ``RecurrentCache`` so
+    forward runs its cacheless prefill path. Flatten captured ``**kwargs`` and
+    replace random ``cu_seqlens`` with ``[0, T]`` when B=1."""
+    kw = _materialize_all(fwd_args, device, init_args, skip=("past_key_values", "cu_seqlens"))
+    nested = kw.pop("kwargs", None)
+    if isinstance(nested, dict):
+        kw.update(nested)
+    kw.pop("past_key_values", None)
+    kw.pop("cu_seqlens", None)
+    hs = kw.get("hidden_states")
+    # Captured cu_seqlens is random ints under **kwargs; B=1 packed prefill
+    # gets [0, T], otherwise omit and run dense [B, T].
+    if isinstance(hs, torch.Tensor) and hs.dim() == 3 and int(hs.shape[0]) == 1:
+        kw["cu_seqlens"] = torch.tensor(
+            [0, int(hs.shape[1])], device=hs.device, dtype=torch.int32)
     return [], kw
 
 
@@ -1471,7 +1499,8 @@ def _build_kimi_recurrent_inputs(fwd_args, device, init_args):
     hs = kw.get("hidden_states")
     if not isinstance(hs, torch.Tensor):
         raise _UnsupportedInput("kimi recurrent: missing hidden_states")
-    _set_kimi_prefill_context(int(hs.shape[0]), sm, device)
+    n = int(hs.shape[1]) if hs.dim() >= 3 else int(hs.shape[0])
+    _set_kimi_prefill_context(n, sm, device)
     if "rotary_emb" in fwd_args:
         kw["rotary_emb"] = None
     kw["state_manager"] = sm
@@ -1531,7 +1560,8 @@ def _build_kimi_mla_inputs(fwd_args, device, init_args):
     hs = kw.get("hidden_states")
     if not isinstance(hs, torch.Tensor):
         raise _UnsupportedInput("KimiMLAAttention: missing hidden_states")
-    _set_mla_prefill_context(int(hs.shape[0]), device, fwd_args.get("_ctx"))
+    n = int(hs.shape[1]) if hs.dim() >= 3 else int(hs.shape[0])
+    _set_mla_prefill_context(n, device, fwd_args.get("_ctx"))
     return [], kw
 
 
@@ -1680,6 +1710,8 @@ _INPUT_BUILDERS = {
     "fastkernels.tasks.baseline.L2.qwen3_next_attention:Qwen3NextAttention":
         _build_qwen3_next_attention_inputs,
     # AlphaFold3: fill the missing batch feature-dict keys (ref_pos, ids, ...).
+    "fastkernels.tasks.baseline.L2.alphafold3_of3_attention:OF3Attention":
+        _build_of3_attention_inputs,
     "fastkernels.tasks.baseline.L2.alphafold3_atom_attention:AtomAttentionEncoder":
         _build_af3_inputs,
     "fastkernels.tasks.baseline.L2.alphafold3_atom_attention:AtomAttentionDecoder":

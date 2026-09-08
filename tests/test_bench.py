@@ -285,6 +285,8 @@ def test_section_7():
         SKIPPED,
         _compare,
         _fix_paged_decode,
+        _sanitize_float_params,
+        _materialize_tensor,
     )
 
     with _Timeout(30):
@@ -319,6 +321,31 @@ def test_section_7():
         check(int(kw["cache_seqlens"].min()) >= 1
               and int(kw["max_seq_len"]) == int(kw["cache_seqlens"].max()),
               "7b. cache_seqlens and max_seq_len are consistent")
+
+    with _Timeout(30):
+        class _M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w = nn.Parameter(torch.zeros(64, 64))
+                self.scale = nn.Parameter(torch.ones(64))
+        m = _M()
+        _sanitize_float_params(m)
+        check(m.w.abs().max().item() > 0,
+              "7c. sanitize rewrites all-zero empty weights")
+        check(torch.equal(m.scale, torch.ones(64)),
+              "7c. ones() params are left alone")
+        m.w.data.fill_(1e-40)
+        _sanitize_float_params(m)
+        check(m.w.abs().max().item() > 1e-6,
+              "7c. sanitize rewrites subnormal empty weights")
+
+    with _Timeout(30):
+        mask = _materialize_tensor("mask", [4, 8], "float32", "cpu", {})
+        check(torch.equal(mask, torch.ones(4, 8)),
+              "7d. float mask materializes as ones")
+        x = _materialize_tensor("hidden_states", [2, 8], "float32", "cpu", {})
+        check(x.abs().max().item() > 0 and not torch.equal(x, torch.ones_like(x)),
+              "7d. non-mask activations stay randn")
 
 
 # ===========================================================================
