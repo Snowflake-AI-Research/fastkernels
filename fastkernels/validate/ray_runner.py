@@ -60,6 +60,10 @@ _CACHE_SUBDIRS = {
     # deep_gemm and modelinfos caches.
     "VLLM_CACHE_ROOT": "vllm",
     "CUDA_CACHE_PATH": "cuda",
+    # FlashInfer stores JIT ninja/cubins under
+    # $FLASHINFER_WORKSPACE_BASE/.cache/flashinfer. Point the base at this
+    # subdir so a run does not share ~/.cache/flashinfer with other jobs.
+    "FLASHINFER_WORKSPACE_BASE": "flashinfer",
 }
 
 
@@ -1465,7 +1469,7 @@ def _build_summary(root: Path, scenarios, results: dict[int, str]) -> dict:
         model = data.get("model") or task.get("name") or scenario.hf_name
         status = results.get(index, task.get("status", "?"))
         draft_model = getattr(scenario, "draft_model", None)
-        declared = list(_scenario_workloads(scenario))
+        declared = list(task.get("workloads") or _scenario_workloads(scenario))
         models.append(
             {
                 "index": index,

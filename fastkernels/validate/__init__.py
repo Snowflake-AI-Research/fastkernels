@@ -163,6 +163,10 @@ _WORKLOADS_FLAG = {
     # sweep ran one forward while full.yaml advertised predictor + encoder +
     # single_video and the summary showed no row for any of them.
     "bench_vjepa2": "--workloads",
+    # bench_vllm used to ignore the scenario list and always run mixed +
+    # long-context + both latency probes. Passing the declaration keeps a
+    # scenario that omits a probe (BitNet drops fixed-batch-32) honest.
+    "bench_vllm": "--workloads",
 }
 _HF_MODEL_ARG = {
     "bench_vllm",
@@ -321,6 +325,8 @@ def _build_cmd(
             cmd += ["--cache-dir", str(output_dir / "cache")]
     if harness == "bench_vllm" and getattr(args, "vllm_python", None):
         cmd += ["--vllm-python", args.vllm_python]
+    if harness == "bench_vllm" and getattr(args, "skip_fastkernels", False):
+        cmd.append("--skip-fastkernels")
     cmd += _output_args(harness, output_dir)
     if harness == "bench_vllm" and getattr(args, "resume", False):
         cmd.append("--resume")
@@ -490,7 +496,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--vllm-python",
         default=None,
-        help="Optional interpreter for bench_vllm's reference worker.",
+        help="Optional interpreter for bench_vllm's vLLM worker. Pair with "
+        "tests/compare_vllm_versions.sh for an isolated older vLLM. Compare versions "
+        "by running validate once per interpreter (distinct --run-id) and "
+        "diffing with python -m fastkernels.validate.compare_vllm_runs.",
+    )
+    parser.add_argument(
+        "--skip-fastkernels",
+        action="store_true",
+        help="Skip the fastkernels engine in bench_vllm (vLLM-only).",
     )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
@@ -552,6 +566,7 @@ def main(argv: list[str] | None = None) -> int:
             if harness is None:
                 print(f"[{index}] {scenario.hf_name}: NO HARNESS MAPPED")
                 continue
+            declared = _scenario_workloads(scenario)
             output_dir = run_root / _safe_slug(
                 f"{index:03d}_{harness}_{scenario.hf_name}"
             )
@@ -560,7 +575,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"[{index}] {scenario.hf_name} "
                 f"(tp={scenario.tp}, dtype={scenario.dtype}) -> {harness}"
             )
-            print("      workloads: " + ", ".join(_scenario_workloads(scenario)))
+            print("      workloads: " + ", ".join(declared))
             print("      " + " ".join(cmd))
         return 0
 

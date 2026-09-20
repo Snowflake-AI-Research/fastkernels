@@ -9,6 +9,7 @@ import pytest
 from fastkernels.validate import (
     ValidateScenario,
     _build_cmd,
+    _harness_for,
     _resolve_validate_scenarios,
 )
 from fastkernels.validate.ray_runner import (
@@ -21,6 +22,7 @@ from fastkernels.validate.ray_runner import (
     _throughput_rows_for_result,
     _visible_to_physical_gpu_ids,
     _write_summary,
+    _cache_env,
 )
 from fastkernels.workloads import LLM
 
@@ -31,6 +33,7 @@ def _args(**overrides):
         "max_requests": None,
         "resume": False,
         "vllm_python": None,
+        "skip_fastkernels": False,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -86,6 +89,75 @@ def test_build_vllm_command_forwards_supported_options(tmp_path):
     assert cmd[cmd.index("--vllm-python") + 1] == "/opt/vllm/bin/python"
     assert cmd[cmd.index("--output-dir") + 1] == str(tmp_path)
     assert "--resume" in cmd
+    assert cmd[cmd.index("--workloads") + 1] == "mixed"
+
+
+def test_build_vllm_command_forwards_interpreter_and_skip_fastkernels(tmp_path):
+    cmd = _build_cmd(
+        _scenario("meta-llama/Llama-3.1-8B-Instruct"),
+        "bench_vllm",
+        _args(
+            vllm_python="/opt/vllm-a/bin/python",
+            skip_fastkernels=True,
+        ),
+        tmp_path,
+    )
+
+    assert cmd[cmd.index("--vllm-python") + 1] == "/opt/vllm-a/bin/python"
+    assert "--skip-fastkernels" in cmd
+    assert "--vllm-python-b" not in cmd
+
+
+def test_skip_fastkernels_is_forwarded_without_an_alternate_interpreter(tmp_path):
+    cmd = _build_cmd(
+        _scenario("meta-llama/Llama-3.1-8B-Instruct"),
+        "bench_vllm",
+        _args(skip_fastkernels=True),
+        tmp_path,
+    )
+    assert "--skip-fastkernels" in cmd
+    assert "--vllm-python" not in cmd
+    assert "--vllm-python-b" not in cmd
+
+
+def test_cache_env_isolates_flashinfer_with_other_compiler_caches(tmp_path):
+    env = _cache_env(tmp_path)
+    assert env["FLASHINFER_WORKSPACE_BASE"] == str(tmp_path / "flashinfer")
+    assert env["VLLM_CACHE_ROOT"] == str(tmp_path / "vllm")
+    assert env["TRITON_CACHE_DIR"] == str(tmp_path / "triton")
+    assert (tmp_path / "flashinfer").is_dir()
+
+
+def test_compare_runs_joins_vllm_only_metrics(tmp_path):
+    from fastkernels.validate.compare_vllm_runs import compare_runs
+
+    def _write(root: Path, model: str, tok_per_s: float, ms_per_tok: float):
+        job = root / "00-job"
+        job.mkdir(parents=True)
+        (job / "results.json").write_text(
+            json.dumps(
+                {
+                    "model": model,
+                    "scenarios": [
+                        {"scenario": "mixed", "vllm_tok_per_s": tok_per_s},
+                    ],
+                    "latency_scenarios": [
+                        {
+                            "scenario": "single-request",
+                            "vllm_ms_per_tok": ms_per_tok,
+                        },
+                    ],
+                }
+            )
+        )
+
+    left = tmp_path / "vllm-0.18.0"
+    right = tmp_path / "vllm-0.26.0"
+    _write(left, "meta-llama/Llama-3.1-8B-Instruct", 100.0, 2.0)
+    _write(right, "meta-llama/Llama-3.1-8B-Instruct", 200.0, 1.0)
+    rows = { (r["kind"], r["workload"]): r for r in compare_runs(left, right) }
+    assert rows[("throughput", "mixed")]["speedup"] == 2.0
+    assert rows[("latency", "single-request")]["speedup"] == 2.0
 
 
 def test_build_eagle_command_splits_target_and_draft(tmp_path):
@@ -195,6 +267,22 @@ def test_plan_jobs_skips_nvfp4_on_hopper(tmp_path):
     assert jobs == []
     assert cached == []
     assert results == {0: "SKIP(nvfp4-hopper)"}
+
+
+def test_vllm_only_scenario_maps_every_row_to_bench_vllm():
+    scenarios = _resolve_validate_scenarios("vllm_only")
+    assert scenarios
+    harnesses = {
+        _harness_for(s.hf_name, getattr(s, "draft_model", None))
+        for s in scenarios
+    }
+    assert harnesses == {"bench_vllm"}
+    full_vllm = {
+        s.hf_name
+        for s in _resolve_validate_scenarios("full")
+        if _harness_for(s.hf_name, getattr(s, "draft_model", None)) == "bench_vllm"
+    }
+    assert {s.hf_name for s in scenarios} <= full_vllm
 
 
 def test_plan_jobs_keeps_nvfp4_off_hopper(tmp_path):
@@ -596,6 +684,97 @@ def test_bench_vjepa2_without_workloads_keeps_single_task_behaviour():
     from fastkernels.validate.bench_vjepa2 import _resolve_workloads
 
     assert _resolve_workloads("", "encoder", "1,2") == (["encoder"], [1, 2])
+
+
+def test_vllm_scenario_passes_every_declared_workload_in_one_call(tmp_path):
+    from fastkernels.validate import _scenario_workloads
+
+    scenario = next(
+        s
+        for s in _resolve_validate_scenarios("full")
+        if _harness_for(s.hf_name, getattr(s, "draft_model", None)) == "bench_vllm"
+        and "whisper" not in s.hf_name.lower()
+        and "vl" not in s.hf_name.lower()
+        and "omni" not in s.hf_name.lower()
+    )
+    cmd = _build_cmd(scenario, "bench_vllm", _args(), tmp_path)
+    declared = _scenario_workloads(scenario)
+    assert cmd[cmd.index("--workloads") + 1] == ",".join(declared)
+    assert cmd.count("--workloads") == 1
+
+
+def test_bench_vllm_accepts_every_declared_full_yaml_workload():
+    from fastkernels.validate import _scenario_workloads
+    from fastkernels.validate.bench_vllm import _known_bench_vllm_workload_names
+
+    known = _known_bench_vllm_workload_names()
+    for table in ("full", "vllm_only"):
+        for scenario in _resolve_validate_scenarios(table):
+            if _harness_for(
+                scenario.hf_name, getattr(scenario, "draft_model", None)
+            ) != "bench_vllm":
+                continue
+            for workload in _scenario_workloads(scenario):
+                assert workload in known, (table, scenario.hf_name, workload)
+
+
+def test_bench_vllm_rejects_a_workload_it_cannot_run():
+    from fastkernels.validate.bench_vllm import _parse_workloads
+
+    try:
+        _parse_workloads("not-a-workload")
+    except SystemExit as exc:
+        assert "not a bench_vllm workload" in str(exc)
+    else:
+        raise AssertionError("unknown workload should not resolve")
+
+
+def test_bench_vllm_parse_workloads_accepts_underscores():
+    from fastkernels.validate.bench_vllm import _parse_workloads
+
+    assert _parse_workloads("mixed,long_context") == ["mixed", "long-context"]
+
+
+def test_bench_vllm_two_sided_speedup_treats_fastkernels_as_ours():
+    from fastkernels.validate.bench_vllm import _throughput_row, _latency_row
+
+    ours = {
+        "elapsed": 1.0,
+        "total_output_tokens": 200,
+        "outputs": [[1, 2]],
+    }
+    ref = {
+        "elapsed": 2.0,
+        "total_output_tokens": 200,
+        "outputs": [[1, 2]],
+    }
+    row = _throughput_row(
+        {"name": "mixed"}, ours, ref, "fastkernels", "vllm",
+        temperature=1.0, is_whisper=False,
+    )
+    assert row["fastkernels_tok_per_s"] == 200.0
+    assert row["vllm_tok_per_s"] == 100.0
+    assert row["speedup"] == 2.0
+
+    lat = _latency_row(
+        {
+            "name": "single-request",
+            "batch_size": 1,
+            "output_len": 10,
+            "num_iters": 5,
+            "latencies": [0.5, 0.5, 0.5, 0.5, 0.5],
+        },
+        {
+            "name": "single-request",
+            "batch_size": 1,
+            "output_len": 10,
+            "num_iters": 5,
+            "latencies": [1.0, 1.0, 1.0, 1.0, 1.0],
+        },
+        "fastkernels",
+        "vllm",
+    )
+    assert lat["speedup"] == 2.0
 
 
 def test_vjepa2_standard_shape_is_read_and_legacy_shape_still_parses():

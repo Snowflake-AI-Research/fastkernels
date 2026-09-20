@@ -1515,7 +1515,8 @@ def resolve_benchmark(name_or_path: str | Path) -> list[BenchmarkScenario]:
     An existing filesystem path is loaded directly. Otherwise the argument is
     treated as a name resolved against the packaged ``scenarios/`` directory
     (e.g. ``"minimal"`` or ``"minimal.yaml"`` -> ``scenarios/minimal.yaml``), so
-    callers get the shipped ``full`` / ``default`` / ``minimal`` tables for free.
+    callers get the shipped ``full`` / ``default`` / ``minimal`` / ``vllm_only``
+    tables for free.
     """
     p = Path(name_or_path)
     if p.exists():
