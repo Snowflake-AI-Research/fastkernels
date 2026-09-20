@@ -1,0 +1,89 @@
+# Models whose validate harness is bench_vllm (vLLM as the SOTA reference).
+# Subset of full.yaml: no SGLang/EAGLE-3, FLA, BitNet, omni-diffusion, or
+# non-vLLM modalities. Same schema; per-workload shapes live in workloads.py.
+#
+# Compare two vLLM interpreters by running this table once per version:
+#   python -m fastkernels validate vllm_only \
+#       --skip-fastkernels \
+#       --vllm-python "$(conda info --base)/envs/vllm-0.18.0/bin/python" \
+#       --run-id vllm-0.18.0
+#   python -m fastkernels.validate.compare_vllm_runs vllm-0.18.0 vllm-0.26.0
+
+scenarios:
+  # --- Dense & MoE LLMs ---
+  - model: meta-llama/Llama-3.1-8B-Instruct
+    tp: 1
+    dtype: bfloat16
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+  # DeepSeek-V3.2-Exp is excluded by default: at tp=8 its runtime dominates a
+  # full sweep. Uncomment to include it.
+  # - model: deepseek-ai/DeepSeek-V3.2-Exp
+  #   tp: 8
+  #   dtype: fp8
+  #   workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+  - model: mistralai/Mixtral-8x7B-Instruct-v0.1
+    tp: 2
+    dtype: bfloat16
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+  # GLM-5.2 in NVFP4: routed experts only (attention, shared experts and the
+  # dense MLPs stay BF16 per the checkpoint's own exclude list), with an fp8
+  # KV cache. The KV dtype is what selects vLLM's attention backend here -- a
+  # quantized MLA cache on Blackwell picks FLASHINFER_MLA_SPARSE (plain 576-byte
+  # fp8 slots) over FLASHMLA_SPARSE, plus the TRTLLM_RAGGED MLA prefill backend.
+  - model: nvidia/GLM-5.2-NVFP4
+    tp: 8
+    dtype: nvfp4
+    kv_cache_dtype: fp8_e4m3
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+  - model: openai/gpt-oss-120b
+    tp: 2
+    dtype: mxfp4
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+  - model: google/gemma-4-26B-A4B-it
+    tp: 1
+    dtype: bfloat16
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+
+  # --- Linear Attention & hybrids (still served by vLLM) ---
+  - model: state-spaces/mamba-2.8b-hf
+    tp: 1
+    dtype: bfloat16
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+  - model: mistralai/Mamba-Codestral-7B-v0.1
+    tp: 1
+    dtype: bfloat16
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+  - model: Qwen/Qwen3-Next-80B-A3B-Instruct
+    tp: 2
+    dtype: bfloat16
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+  - model: moonshotai/Kimi-Linear-48B-A3B-Instruct
+    tp: 2
+    dtype: bfloat16
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+  - model: ai21labs/AI21-Jamba-Mini-1.7
+    tp: 1
+    dtype: bfloat16
+    workloads: [LLM.mixed, LLM.long_context, LLM.single_request, LLM.fixed_batch_32]
+
+  # --- ASR / VLM / Omni (bench_vllm, not bench_vllm_omni) ---
+  - model: openai/whisper-large-v3
+    tp: 1
+    dtype: float16
+    workloads: [ASR.librispeech, ASR.single_utterance, ASR.fixed_batch_32]
+  - model: Qwen/Qwen2-VL-7B-Instruct
+    tp: 1
+    dtype: bfloat16
+    workloads: [VLM.text_only, VLM.image, VLM.video, VLM.single_image, VLM.single_video]
+  - model: Qwen/Qwen3-VL-8B-Instruct
+    tp: 1
+    dtype: bfloat16
+    workloads: [VLM.text_only, VLM.image, VLM.video, VLM.single_image, VLM.single_video]
+  - model: Qwen/Qwen3-VL-235B-A22B-Instruct-FP8
+    tp: 4
+    dtype: fp8
+    workloads: [VLM.text_only, VLM.image, VLM.video, VLM.single_image, VLM.single_video]
+  - model: Qwen/Qwen2.5-Omni-7B
+    tp: 1
+    dtype: bfloat16
+    workloads: [OmniModal.text, OmniModal.image, OmniModal.video, OmniModal.audio, OmniModal.single_text, OmniModal.single_image, OmniModal.single_video, OmniModal.single_audio]

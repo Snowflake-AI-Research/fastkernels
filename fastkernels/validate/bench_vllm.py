@@ -17,12 +17,13 @@ that processes all scenarios sequentially, avoiding repeated model loading.
 
 Usage:
     # LLM benchmark
-    python tests/bench_vllm.py --model meta-llama/Llama-3.1-8B-Instruct
+    python -m fastkernels.validate.bench_vllm --model meta-llama/Llama-3.1-8B-Instruct
 
     # VLM benchmark (auto-detected from model name)
-    python tests/bench_vllm.py --model Qwen/Qwen2-VL-7B-Instruct
+    python -m fastkernels.validate.bench_vllm --model Qwen/Qwen2-VL-7B-Instruct
 
-    python tests/bench_vllm.py --skip-vllm  # fastkernels only
+    python -m fastkernels.validate.bench_vllm --skip-vllm  # fastkernels only
+    python -m fastkernels.validate.bench_vllm --skip-fastkernels  # vLLM only
 """
 
 from __future__ import annotations
@@ -603,6 +604,132 @@ QWEN_OMNI_LATENCY_SCENARIOS = [
 ]
 
 
+def _normalize_workload_name(name: str) -> str:
+    return name.strip().replace("_", "-")
+
+
+def _known_bench_vllm_workload_names() -> set[str]:
+    groups = (
+        SCENARIOS,
+        LATENCY_SCENARIOS,
+        VLM_SCENARIOS,
+        VLM_LATENCY_SCENARIOS,
+        QWEN_OMNI_SCENARIOS,
+        QWEN_OMNI_LATENCY_SCENARIOS,
+        WHISPER_SCENARIOS,
+        WHISPER_LATENCY_SCENARIOS,
+    )
+    return {s["name"] for group in groups for s in group}
+
+
+def _parse_workloads(raw: str | None) -> list[str] | None:
+    """Parse ``--workloads``. ``None`` keeps the harness defaults for this model."""
+    if raw is None or not str(raw).strip():
+        return None
+    names: list[str] = []
+    seen: set[str] = set()
+    for part in str(raw).split(","):
+        name = _normalize_workload_name(part)
+        if name and name not in seen:
+            seen.add(name)
+            names.append(name)
+    known = _known_bench_vllm_workload_names()
+    unknown = [name for name in names if name not in known]
+    if unknown:
+        raise SystemExit(
+            f"ERROR: --workloads entry {unknown[0]!r} is not a bench_vllm "
+            f"workload. Known: {', '.join(sorted(known))}."
+        )
+    return names
+
+
+def _select_named_scenarios(
+    scenarios: list[dict],
+    wanted: list[str] | None,
+) -> list[dict]:
+    if wanted is None:
+        return list(scenarios)
+    wanted_set = set(wanted)
+    return [s for s in scenarios if s["name"] in wanted_set]
+
+
+def _num_requests(raw_item: dict) -> int:
+    return raw_item.get("num_seqs") or len(raw_item.get("outputs", []))
+
+
+def _throughput_row(
+    scenario: dict,
+    ours: dict,
+    ref: dict | None,
+    ours_prefix: str,
+    ref_prefix: str,
+    *,
+    temperature: float,
+    is_whisper: bool,
+) -> dict:
+    ours_tps = ours["total_output_tokens"] / ours["elapsed"]
+    num_requests = _num_requests(ours)
+    result = {
+        "scenario": scenario["name"],
+        "num_seqs": num_requests,
+        f"{ours_prefix}_elapsed": ours["elapsed"],
+        f"{ours_prefix}_output_tokens": ours["total_output_tokens"],
+        f"{ours_prefix}_tok_per_s": ours_tps,
+    }
+    if "input_len" in scenario:
+        result["input_len"] = scenario["input_len"]
+    if "output_len" in scenario:
+        result["output_len"] = scenario["output_len"]
+    elif num_requests:
+        result["avg_output_len"] = ours["total_output_tokens"] / num_requests
+    if is_whisper:
+        result["total_audio_duration_s"] = ours.get("total_audio_duration_s", 0)
+    if ref is not None:
+        ref_tps = ref["total_output_tokens"] / ref["elapsed"]
+        result[f"{ref_prefix}_elapsed"] = ref["elapsed"]
+        result[f"{ref_prefix}_output_tokens"] = ref["total_output_tokens"]
+        result[f"{ref_prefix}_tok_per_s"] = ref_tps
+        result["speedup"] = ours_tps / ref_tps
+        if temperature == 0.0:
+            result["alignment"] = compute_alignment(
+                ours["outputs"], ref["outputs"]
+            )
+    return result
+
+
+def _latency_row(ours: dict, ref: dict | None, ours_prefix: str, ref_prefix: str) -> dict:
+    ours_lats = np.array(ours["latencies"])
+    ours_med = float(np.median(ours_lats))
+    ours_p99 = float(np.percentile(ours_lats, 99))
+    bs = ours["batch_size"]
+    out_len = ours["output_len"]
+    total_out_tokens = bs * out_len
+    ours_ms_per_tok = (ours_med / total_out_tokens) * 1000
+    result = {
+        "scenario": ours["name"],
+        "batch_size": bs,
+        "output_len": out_len,
+        "num_iters": ours["num_iters"],
+        f"{ours_prefix}_median_s": ours_med,
+        f"{ours_prefix}_p99_s": ours_p99,
+        f"{ours_prefix}_ms_per_tok": ours_ms_per_tok,
+        f"{ours_prefix}_latencies": ours["latencies"],
+    }
+    if "input_len" in ours:
+        result["input_len"] = ours["input_len"]
+    if ref is not None:
+        ref_lats = np.array(ref["latencies"])
+        ref_med = float(np.median(ref_lats))
+        ref_p99 = float(np.percentile(ref_lats, 99))
+        ref_ms_per_tok = (ref_med / total_out_tokens) * 1000
+        result[f"{ref_prefix}_median_s"] = ref_med
+        result[f"{ref_prefix}_p99_s"] = ref_p99
+        result[f"{ref_prefix}_ms_per_tok"] = ref_ms_per_tok
+        result[f"{ref_prefix}_latencies"] = ref["latencies"]
+        result["speedup"] = ref_med / ours_med
+    return result
+
+
 def _is_vlm_model(model_name: str) -> bool:
     lower = model_name.lower()
     return "qwen" in lower and "vl" in lower
@@ -864,6 +991,24 @@ def _fastkernels_limit_layers(hf_config):
 def main():
     from vllm import LLM, SamplingParams
 
+    def _supported_llm_kwargs(kwargs):
+        import inspect
+        sig = inspect.signature(LLM.__init__)
+        if any(
+            p.kind is inspect.Parameter.VAR_KEYWORD
+            for p in sig.parameters.values()
+        ):
+            return kwargs
+        accepted = set(sig.parameters)
+        dropped = sorted(k for k in kwargs if k not in accepted)
+        if dropped:
+            print(
+                "  NOTE: dropping LLM kwargs unsupported by this vLLM: "
+                f"{dropped}",
+                flush=True,
+            )
+        return {k: v for k, v in kwargs.items() if k in accepted}
+
     with open(sys.argv[1]) as f:
         cfg = json.load(f)
     llm_kwargs = dict(
@@ -902,7 +1047,7 @@ def main():
         llm_kwargs["hf_overrides"] = _fastkernels_limit_layers
     # Reference-only backend overrides for models vLLM's default selection
     # cannot run on this hardware (see _REFERENCE_ENGINE_OVERRIDES).
-    llm = LLM(**llm_kwargs)
+    llm = LLM(**_supported_llm_kwargs(llm_kwargs))
 
     # Warmup -- ignore_eos so all 16 decode steps run (parity with the engines).
     llm.generate(
@@ -1524,6 +1669,24 @@ def main():
     from vllm import LLM, SamplingParams
     from transformers import AutoProcessor
 
+    def _supported_llm_kwargs(kwargs):
+        import inspect
+        sig = inspect.signature(LLM.__init__)
+        if any(
+            p.kind is inspect.Parameter.VAR_KEYWORD
+            for p in sig.parameters.values()
+        ):
+            return kwargs
+        accepted = set(sig.parameters)
+        dropped = sorted(k for k in kwargs if k not in accepted)
+        if dropped:
+            print(
+                "  NOTE: dropping LLM kwargs unsupported by this vLLM: "
+                f"{dropped}",
+                flush=True,
+            )
+        return {k: v for k, v in kwargs.items() if k in accepted}
+
     with open(sys.argv[1]) as f:
         cfg = json.load(f)
 
@@ -1568,7 +1731,7 @@ def main():
         llm_kwargs["limit_mm_per_prompt"] = cfg["limit_mm_per_prompt"]
     if cfg.get("max_layers") is not None:
         llm_kwargs["hf_overrides"] = _fastkernels_limit_layers
-    llm = LLM(**llm_kwargs)
+    llm = LLM(**_supported_llm_kwargs(llm_kwargs))
 
     # Warmup -- ignore_eos so all 16 decode steps run (parity with the engines).
     llm.generate(
@@ -2091,6 +2254,24 @@ def _load_librispeech(dataset_name, dataset_split, num_seqs, seed):
 def main():
     from vllm import LLM, SamplingParams
 
+    def _supported_llm_kwargs(kwargs):
+        import inspect
+        sig = inspect.signature(LLM.__init__)
+        if any(
+            p.kind is inspect.Parameter.VAR_KEYWORD
+            for p in sig.parameters.values()
+        ):
+            return kwargs
+        accepted = set(sig.parameters)
+        dropped = sorted(k for k in kwargs if k not in accepted)
+        if dropped:
+            print(
+                "  NOTE: dropping LLM kwargs unsupported by this vLLM: "
+                f"{dropped}",
+                flush=True,
+            )
+        return {k: v for k, v in kwargs.items() if k in accepted}
+
     with open(sys.argv[1]) as f:
         cfg = json.load(f)
 
@@ -2117,7 +2298,7 @@ def main():
         llm_kwargs["load_format"] = cfg["load_format"]
     if cfg.get("kv_cache_dtype"):
         llm_kwargs["kv_cache_dtype"] = cfg["kv_cache_dtype"]
-    llm = LLM(**llm_kwargs)
+    llm = LLM(**_supported_llm_kwargs(llm_kwargs))
 
     from vllm.inputs import ExplicitEncoderDecoderPrompt, TextPrompt
 
@@ -2575,11 +2756,24 @@ def main():
     parser.add_argument("--enforce-eager", action="store_true", default=False)
     parser.add_argument("--skip-vllm", action="store_true")
     parser.add_argument(
+        "--skip-fastkernels",
+        action="store_true",
+        help="Skip the fastkernels engine (vLLM-only).",
+    )
+    parser.add_argument(
         "--vllm-python",
         type=str,
         default=None,
-        help="Python interpreter for the vLLM reference worker. Defaults to "
-        "the current interpreter.",
+        help="Python interpreter for the vLLM worker. Defaults to the current "
+        "interpreter.",
+    )
+    parser.add_argument(
+        "--workloads",
+        type=str,
+        default=None,
+        help="Comma-separated workload names to run (e.g. "
+             "'mixed,long-context,single-request'). Default: all workloads "
+             "for this model type. Underscores are accepted as hyphens.",
     )
     parser.add_argument(
         "--gpu-memory-utilization",
@@ -2589,10 +2783,10 @@ def main():
     )
     parser.add_argument(
         "--resume", action="store_true",
-        help="Reuse cached phase outputs (vllm_raw.json / fastkernels_raw.json) "
-             "under the output dir when their config fingerprint matches, "
-             "instead of rerunning that phase. Lets an interrupted run continue "
-             "without recomputing the completed (e.g. vLLM) side.",
+        help="Reuse cached phase outputs (vllm_raw.json / "
+             "fastkernels_raw.json) under the output dir when their config "
+             "fingerprint matches, instead of rerunning that phase. Lets an "
+             "interrupted run continue without recomputing a completed side.",
     )
     parser.add_argument("--skip-throughput", action="store_true",
                         help="Skip the throughput phase (run latency only)")
@@ -2625,6 +2819,8 @@ def main():
     args.trust_remote_code = (
         args.trust_remote_code or _needs_trust_remote_code(args.model)
     )
+    if args.skip_vllm and args.skip_fastkernels:
+        raise SystemExit("nothing to run: both --skip-vllm and --skip-fastkernels")
 
     if args.num_seqs is None:
         args.num_seqs = 100 if _is_whisper_model(args.model) else 1000
@@ -2669,11 +2865,13 @@ def main():
     elif args.run_id is not None:
         print("  NOTE: --run-id is ignored because --output-dir was provided.")
 
-    kb_nccl_port, kb_nccl_lock = _reserve_tcp_port(
-        preferred=_parse_port_env("FASTKERNELS_NCCL_PORT"),
-    )
-    _HELD_PORT_LOCKS.append(kb_nccl_lock)
-    os.environ["FASTKERNELS_NCCL_PORT"] = str(kb_nccl_port)
+    kb_nccl_port = None
+    if not args.skip_fastkernels:
+        kb_nccl_port, kb_nccl_lock = _reserve_tcp_port(
+            preferred=_parse_port_env("FASTKERNELS_NCCL_PORT"),
+        )
+        _HELD_PORT_LOCKS.append(kb_nccl_lock)
+        os.environ["FASTKERNELS_NCCL_PORT"] = str(kb_nccl_port)
 
     vllm_port = None
     flashinfer_namespace = None
@@ -2737,6 +2935,20 @@ def main():
             raise SystemExit(
                 f"--scenario={args.scenario!r} did not match any throughput "
                 f"scenario for this model type."
+            )
+
+    wanted_workloads = _parse_workloads(args.workloads)
+    if wanted_workloads is not None:
+        throughput_scenarios = _select_named_scenarios(
+            throughput_scenarios, wanted_workloads
+        )
+        latency_scenarios = _select_named_scenarios(
+            latency_scenarios, wanted_workloads
+        )
+        if not throughput_scenarios and not latency_scenarios:
+            raise SystemExit(
+                f"ERROR: --workloads {args.workloads!r} matches no scenario "
+                "for this model type."
             )
 
     # Pre-generate all scenario data
@@ -2913,8 +3125,14 @@ def main():
         )
         global_max_seq_len = model_max_ctx
 
+    if args.skip_fastkernels:
+        title = "  vLLM -- Multi-Scenario Benchmark"
+    elif args.skip_vllm:
+        title = "  fastkernels -- Multi-Scenario Benchmark"
+    else:
+        title = "  fastkernels Baseline vs vLLM -- Multi-Scenario Benchmark"
     print("=" * 70)
-    print("  fastkernels Baseline vs vLLM -- Multi-Scenario Benchmark")
+    print(title)
     print("=" * 70)
     print(f"  Model          : {args.model}")
     model_type_str = (
@@ -2947,11 +3165,14 @@ def main():
             "  Engine env     : "
             + ", ".join(f"{key}={value}" for key, value in sorted(engine_env.items()))
         )
-    print(f"  fastkernels port   : {kb_nccl_port}")
+    if kb_nccl_port is not None:
+        print(f"  fastkernels port   : {kb_nccl_port}")
     if vllm_port is not None:
         print(f"  vLLM port      : {vllm_port}")
         if flashinfer_namespace is not None:
             print(f"  vLLM FI ns     : {flashinfer_namespace}")
+    if args.vllm_python:
+        print(f"  vLLM python    : {args.vllm_python}")
     print(f"  Output dir     : {args.output_dir}")
     if not args.skip_throughput:
         print(f"  Scenarios      : {', '.join(s['name'] for s in throughput_scenarios)}")
@@ -2992,17 +3213,91 @@ def main():
     kb_raw_path = (os.path.join(args.output_dir, "fastkernels_raw.json")
                    if args.output_dir else None)
 
+    short_name = args.model.split("/")[-1]
+    vllm_config = {
+        "model": args.model,
+        "tp": args.tp,
+        "seed": args.seed,
+        "temperature": args.temperature,
+        "enforce_eager": args.enforce_eager,
+        "max_model_len": global_max_seq_len,
+        **(
+            {"gpu_memory_utilization": args.gpu_memory_utilization}
+            if args.gpu_memory_utilization is not None
+            else {}
+        ),
+        **(
+            {"max_num_seqs": engine_max_num_seqs}
+            if engine_max_num_seqs is not None
+            else {}
+        ),
+        "scenarios": scenario_data,
+        "latency_scenarios": latency_data,
+        "trust_remote_code": args.trust_remote_code,
+        "load_format": "fastsafetensors",
+        "is_qwen_omni": is_qwen_omni,
+    }
+    if args.max_layers is not None:
+        vllm_config["max_layers"] = args.max_layers
+    if args.kv_cache_dtype:
+        vllm_config["kv_cache_dtype"] = args.kv_cache_dtype
+    if is_qwen_omni:
+        vllm_config["limit_mm_per_prompt"] = {
+            "image": 1,
+            "video": 1,
+            "audio": 1,
+        }
+
     # -- Run vLLM (one subprocess, all scenarios) --
     vllm_raw = None
     if not args.skip_vllm:
         if args.resume and vllm_raw_path:
             vllm_raw = _load_raw(vllm_raw_path, fingerprint)
         if vllm_raw is not None:
-            print(f"  Resumed vLLM reference from cache: {vllm_raw_path}",
+            print(f"  Resumed vLLM outputs from cache: {vllm_raw_path}",
                   flush=True)
         else:
-            short_name = args.model.split("/")[-1]
-            vllm_config = {
+            os.environ["MASTER_ADDR"] = "127.0.0.1"
+            os.environ["MASTER_PORT"] = str(vllm_port)
+            vllm_raw = run_worker(
+                vllm_worker, vllm_config,
+                f"vLLM [{short_name}] all scenarios (TP={args.tp})",
+                timeout=10800,
+                python_executable=args.vllm_python,
+            )
+            if vllm_raw is not None and vllm_raw_path:
+                _save_raw(vllm_raw_path, vllm_raw, fingerprint)
+        if vllm_raw is None:
+            print("  ERROR: vLLM reference subprocess failed.")
+            sys.exit(1)
+        # Restore env set up for the vLLM subprocess (done above under
+        # `not skip_vllm` regardless of whether we ran or resumed it).
+        if previous_flashinfer_namespace_env is None:
+            os.environ.pop("FASTKERNELS_FLASHINFER_SOCKET_NAMESPACE", None)
+        else:
+            os.environ["FASTKERNELS_FLASHINFER_SOCKET_NAMESPACE"] = (
+                previous_flashinfer_namespace_env
+            )
+        # The fastkernels worker takes max_layers via its JSON config, not the
+        # env; clear it so the sitecustomize's vLLM weight filter stays inert
+        # in that subprocess.
+        if previous_max_layers_env is None:
+            os.environ.pop("FASTKERNELS_MAX_LAYERS", None)
+        else:
+            os.environ["FASTKERNELS_MAX_LAYERS"] = previous_max_layers_env
+
+    # -- Run fastkernels (one subprocess, all scenarios) --
+    kb_raw = None
+    if not args.skip_fastkernels:
+        if args.resume and kb_raw_path:
+            kb_raw = _load_raw(kb_raw_path, fingerprint)
+        if kb_raw is not None:
+            print(f"  Resumed fastkernels outputs from cache: {kb_raw_path}",
+                  flush=True)
+        else:
+            kb_root = str(_PROJECT_ROOT)
+            package_name = _PACKAGE_DIR.name
+            kb_config = {
                 "model": args.model,
                 "tp": args.tp,
                 "seed": args.seed,
@@ -3019,201 +3314,103 @@ def main():
                     if engine_max_num_seqs is not None
                     else {}
                 ),
+                "project_root": kb_root,
+                "package_name": package_name,
                 "scenarios": scenario_data,
                 "latency_scenarios": latency_data,
-                "trust_remote_code": args.trust_remote_code,
-                "load_format": "fastsafetensors",
-                "is_qwen_omni": is_qwen_omni,
             }
             if args.max_layers is not None:
-                vllm_config["max_layers"] = args.max_layers
+                kb_config["max_layers"] = args.max_layers
             if args.kv_cache_dtype:
-                vllm_config["kv_cache_dtype"] = args.kv_cache_dtype
-            if is_qwen_omni:
-                vllm_config["limit_mm_per_prompt"] = {
-                    "image": 1,
-                    "video": 1,
-                    "audio": 1,
-                }
+                kb_config["kv_cache_dtype"] = args.kv_cache_dtype
             os.environ["MASTER_ADDR"] = "127.0.0.1"
-            os.environ["MASTER_PORT"] = str(vllm_port)
-            vllm_raw = run_worker(
-                vllm_worker, vllm_config,
-                f"vLLM [{short_name}] all scenarios (TP={args.tp})",
+            os.environ["MASTER_PORT"] = str(kb_nccl_port)
+            kb_raw = run_worker(
+                kb_worker, kb_config,
+                f"fastkernels [{short_name}] all scenarios (TP={args.tp})",
                 timeout=10800,
-                python_executable=args.vllm_python,
             )
-            # Persist the vLLM reference immediately, BEFORE the fastkernels
-            # phase runs, so a fastkernels crash never discards it.
-            if vllm_raw is not None and vllm_raw_path:
-                _save_raw(vllm_raw_path, vllm_raw, fingerprint)
-        # Restore env set up for the vLLM subprocess (done above under
-        # `not skip_vllm` regardless of whether we ran or resumed it).
-        if previous_flashinfer_namespace_env is None:
-            os.environ.pop("FASTKERNELS_FLASHINFER_SOCKET_NAMESPACE", None)
-        else:
-            os.environ["FASTKERNELS_FLASHINFER_SOCKET_NAMESPACE"] = (
-                previous_flashinfer_namespace_env
-            )
-        # The fastkernels worker takes max_layers via its JSON config, not the
-        # env; clear it so the sitecustomize's vLLM weight filter stays inert
-        # in that subprocess.
-        if previous_max_layers_env is None:
-            os.environ.pop("FASTKERNELS_MAX_LAYERS", None)
-        else:
-            os.environ["FASTKERNELS_MAX_LAYERS"] = previous_max_layers_env
-        if vllm_raw is None:
-            print("  ERROR: vLLM reference subprocess failed.")
+            if kb_raw is not None and kb_raw_path:
+                _save_raw(kb_raw_path, kb_raw, fingerprint)
+        if kb_raw is None:
+            print("  ERROR: fastkernels subprocess failed.")
             sys.exit(1)
 
-    # -- Run fastkernels (one subprocess, all scenarios) --
-    kb_raw = None
-    if args.resume and kb_raw_path:
-        kb_raw = _load_raw(kb_raw_path, fingerprint)
     if kb_raw is not None:
-        print(f"  Resumed fastkernels outputs from cache: {kb_raw_path}",
-              flush=True)
+        ours_raw, ref_raw = kb_raw, vllm_raw
+        ours_prefix, ref_prefix = "fastkernels", "vllm"
+        ours_label, ref_label = "FASTKERNELS", "vLLM"
     else:
-        kb_root = str(_PROJECT_ROOT)
-        package_name = _PACKAGE_DIR.name
-        kb_config = {
-            "model": args.model,
-            "tp": args.tp,
-            "seed": args.seed,
-            "temperature": args.temperature,
-            "enforce_eager": args.enforce_eager,
-            "max_model_len": global_max_seq_len,
-            **(
-                {"gpu_memory_utilization": args.gpu_memory_utilization}
-                if args.gpu_memory_utilization is not None
-                else {}
-            ),
-            **(
-                {"max_num_seqs": engine_max_num_seqs}
-                if engine_max_num_seqs is not None
-                else {}
-            ),
-            "project_root": kb_root,
-            "package_name": package_name,
-            "scenarios": scenario_data,
-            "latency_scenarios": latency_data,
-        }
-        if args.max_layers is not None:
-            kb_config["max_layers"] = args.max_layers
-        if args.kv_cache_dtype:
-            kb_config["kv_cache_dtype"] = args.kv_cache_dtype
-        short_name = args.model.split("/")[-1]
-        os.environ["MASTER_ADDR"] = "127.0.0.1"
-        os.environ["MASTER_PORT"] = str(kb_nccl_port)
-        kb_raw = run_worker(
-            kb_worker, kb_config,
-            f"fastkernels [{short_name}] all scenarios (TP={args.tp})",
-            timeout=10800,
-        )
-        if kb_raw is not None and kb_raw_path:
-            _save_raw(kb_raw_path, kb_raw, fingerprint)
-    if kb_raw is None:
-        print("  ERROR: fastkernels subprocess failed.")
-        sys.exit(1)
+        ours_raw, ref_raw = vllm_raw, None
+        ours_prefix, ref_prefix = "vllm", "vllm"
+        ours_label, ref_label = "vLLM", "vLLM"
 
-    kb_latency = kb_raw.get("latency", [])
-    vllm_latency = vllm_raw.get("latency", []) if vllm_raw else []
+    ours_latency = ours_raw.get("latency", []) if ours_raw else []
+    ref_latency = ref_raw.get("latency", []) if ref_raw else []
+    output_names = {
+        "fastkernels": "fastkernels_outputs.json",
+        "vllm": "vllm_outputs.json",
+    }
 
     # -- Compute throughput metrics per scenario --
     all_results = []
-    if not args.skip_throughput:
-        kb_results = kb_raw["throughput"]
-        vllm_results = vllm_raw["throughput"] if vllm_raw else None
+    if not args.skip_throughput and throughput_scenarios:
+        ours_results = ours_raw["throughput"]
+        ref_results = ref_raw["throughput"] if ref_raw else None
 
         for i, scenario in enumerate(throughput_scenarios):
-            kb_data = kb_results[i]
-            kb_tps = kb_data["total_output_tokens"] / kb_data["elapsed"]
-
-            # Actual requests processed. Whisper workers report ``num_seqs``
-            # explicitly; text/VLM workers don't, so fall back to the number of
-            # returned outputs. Curated datasets (e.g. long-context, 64 rows)
-            # run fewer than ``--num-seqs`` requests, so we must not assume
-            # ``args.num_seqs`` here or the averages come out wrong.
-            num_requests = kb_data.get("num_seqs") or len(
-                kb_data.get("outputs", []))
-
-            result = {
-                "scenario": scenario["name"],
-                "num_seqs": num_requests,
-                "fastkernels_elapsed": kb_data["elapsed"],
-                "fastkernels_output_tokens": kb_data["total_output_tokens"],
-                "fastkernels_tok_per_s": kb_tps,
-            }
-            if "input_len" in scenario:
-                result["input_len"] = scenario["input_len"]
-            if "output_len" in scenario:
-                result["output_len"] = scenario["output_len"]
-            elif num_requests:
-                result["avg_output_len"] = (
-                    kb_data["total_output_tokens"] / num_requests
-                )
-            if is_whisper:
-                result["total_audio_duration_s"] = kb_data.get(
-                    "total_audio_duration_s", 0)
-
-            if vllm_results is not None:
-                v_data = vllm_results[i]
-                v_tps = v_data["total_output_tokens"] / v_data["elapsed"]
-                speedup = kb_tps / v_tps
-                result["vllm_elapsed"] = v_data["elapsed"]
-                result["vllm_output_tokens"] = v_data["total_output_tokens"]
-                result["vllm_tok_per_s"] = v_tps
-                result["speedup"] = speedup
-
-                if args.temperature == 0.0:
-                    alignment = compute_alignment(
-                        kb_data["outputs"], v_data["outputs"]
-                    )
-                    result["alignment"] = alignment
-
+            ours_data = ours_results[i]
+            ref_data = ref_results[i] if ref_results is not None else None
+            result = _throughput_row(
+                scenario, ours_data, ref_data, ours_prefix, ref_prefix,
+                temperature=args.temperature, is_whisper=is_whisper,
+            )
             if args.output_dir:
                 scenario_dir = os.path.join(args.output_dir, scenario["name"])
                 os.makedirs(scenario_dir, exist_ok=True)
-
-                kb_out_path = os.path.join(scenario_dir, "fastkernels_outputs.json")
-                with open(kb_out_path, "w") as f:
-                    json.dump(kb_data, f, indent=2)
-
-                if vllm_results is not None:
-                    vllm_out_path = os.path.join(scenario_dir, "vllm_outputs.json")
-                    with open(vllm_out_path, "w") as f:
-                        json.dump(vllm_results[i], f, indent=2)
-
+                ours_out = os.path.join(scenario_dir, output_names[ours_prefix])
+                with open(ours_out, "w") as f:
+                    json.dump(ours_data, f, indent=2)
+                if ref_data is not None:
+                    ref_out = os.path.join(scenario_dir, output_names[ref_prefix])
+                    with open(ref_out, "w") as f:
+                        json.dump(ref_data, f, indent=2)
             all_results.append(result)
 
+        ours_hdr = f"{ours_label} tok/s"
+        ref_hdr = f"{ref_label} tok/s"
         print(f"\n\n{'=' * 90}")
         print("  THROUGHPUT SUMMARY")
         print(f"{'=' * 90}")
         if is_whisper:
             header = (
                 f"  {'SCENARIO':<16} {'SEQS':>5} {'AUDIO':>8} {'OUT':>5} "
-                f"{'FASTKERNELS tok/s':>15} {'vLLM tok/s':>12} {'SPEEDUP':>8} "
+                f"{ours_hdr:>15} {ref_hdr:>12} {'SPEEDUP':>8} "
                 f"{'AVG PREFIX TOKS':>15}"
             )
         elif is_vlm or is_qwen_omni:
             header = (
                 f"  {'SCENARIO':<16} {'SEQS':>5} {'OUT':>5} "
-                f"{'FASTKERNELS tok/s':>15} {'vLLM tok/s':>12} {'SPEEDUP':>8} "
+                f"{ours_hdr:>15} {ref_hdr:>12} {'SPEEDUP':>8} "
                 f"{'AVG PREFIX TOKS':>15}"
             )
         else:
             header = (
                 f"  {'SCENARIO':<16} {'SEQS':>5} {'IN':>5} {'OUT':>5} "
-                f"{'FASTKERNELS tok/s':>15} {'vLLM tok/s':>12} {'SPEEDUP':>8} "
+                f"{ours_hdr:>15} {ref_hdr:>12} {'SPEEDUP':>8} "
                 f"{'AVG PREFIX TOKS':>15}"
             )
         print(header)
         print(f"  {'-' * 90}")
 
+        ours_tps_key = f"{ours_prefix}_tok_per_s"
+        ref_tps_key = f"{ref_prefix}_tok_per_s"
         for r in all_results:
-            kb_tps_str = f"{r['fastkernels_tok_per_s']:,.0f}"
-            v_tps_str = (
-                f"{r['vllm_tok_per_s']:,.0f}" if "vllm_tok_per_s" in r else "N/A"
+            ours_tps_str = f"{r[ours_tps_key]:,.0f}"
+            ref_tps_str = (
+                f"{r[ref_tps_key]:,.0f}"
+                if ref_raw is not None and ref_tps_key in r
+                else "N/A"
             )
             speedup_str = f"{r['speedup']:.2f}x" if "speedup" in r else "N/A"
 
@@ -3233,7 +3430,7 @@ def main():
                 print(
                     f"  {r['scenario']:<16} {r['num_seqs']:>5} {audio_str:>8} "
                     f"{out_str} "
-                    f"{kb_tps_str:>15} {v_tps_str:>12} {speedup_str:>8} "
+                    f"{ours_tps_str:>15} {ref_tps_str:>12} {speedup_str:>8} "
                     f"{match_str:>15}"
                 )
             elif is_vlm or is_qwen_omni:
@@ -3244,7 +3441,7 @@ def main():
                 )
                 print(
                     f"  {r['scenario']:<16} {r['num_seqs']:>5} {out_str} "
-                    f"{kb_tps_str:>15} {v_tps_str:>12} {speedup_str:>8} "
+                    f"{ours_tps_str:>15} {ref_tps_str:>12} {speedup_str:>8} "
                     f"{match_str:>15}"
                 )
             else:
@@ -3256,7 +3453,7 @@ def main():
                 in_str = f"{r['input_len']:>5}" if "input_len" in r else f"{'var':>5}"
                 print(
                     f"  {r['scenario']:<16} {r['num_seqs']:>5} {in_str} {out_str} "
-                    f"{kb_tps_str:>15} {v_tps_str:>12} {speedup_str:>8} "
+                    f"{ours_tps_str:>15} {ref_tps_str:>12} {speedup_str:>8} "
                     f"{match_str:>15}"
                 )
 
@@ -3264,63 +3461,39 @@ def main():
 
     # -- Latency summary table --
     latency_combined = []
-    if kb_latency:
+    if ours_latency:
+        ours_med_hdr = f"{ours_label} med"
+        ref_med_hdr = f"{ref_label} med"
+        ours_ms_hdr = f"{ours_label} ms/tok"
+        ref_ms_hdr = f"{ref_label} ms/tok"
         print(f"\n{'=' * 110}")
         print("  LATENCY SUMMARY")
         print(f"{'=' * 110}")
         print(
             f"  {'SCENARIO':<18} {'BS':>4} {'OUT':>5} {'ITERS':>6}"
-            f"  {'FASTKERNELS med':>12} {'vLLM med':>12}"
-            f"  {'FASTKERNELS ms/tok':>15} {'vLLM ms/tok':>12} {'SPEEDUP':>8}"
+            f"  {ours_med_hdr:>12} {ref_med_hdr:>12}"
+            f"  {ours_ms_hdr:>15} {ref_ms_hdr:>12} {'SPEEDUP':>8}"
         )
         print(f"  {'-' * 100}")
 
-        for i, kb_lat in enumerate(kb_latency):
-            kb_lats = np.array(kb_lat["latencies"])
-            kb_med = float(np.median(kb_lats))
-            kb_p99 = float(np.percentile(kb_lats, 99))
-            bs = kb_lat["batch_size"]
-            out_len = kb_lat["output_len"]
-            total_out_tokens = bs * out_len
-            kb_ms_per_tok = (kb_med / total_out_tokens) * 1000
-
-            lat_result = {
-                "scenario": kb_lat["name"],
-                "batch_size": bs,
-                "output_len": out_len,
-                "num_iters": kb_lat["num_iters"],
-                "fastkernels_median_s": kb_med,
-                "fastkernels_p99_s": kb_p99,
-                "fastkernels_ms_per_tok": kb_ms_per_tok,
-                "fastkernels_latencies": kb_lat["latencies"],
-            }
-            if "input_len" in kb_lat:
-                lat_result["input_len"] = kb_lat["input_len"]
-
-            v_med_str = "N/A"
-            speedup_str = "N/A"
-            v_ms_str = "N/A"
-            if i < len(vllm_latency):
-                v_lat = vllm_latency[i]
-                v_lats = np.array(v_lat["latencies"])
-                v_med = float(np.median(v_lats))
-                v_p99 = float(np.percentile(v_lats, 99))
-                v_ms_per_tok = (v_med / total_out_tokens) * 1000
-                speedup = v_med / kb_med
-                v_med_str = f"{v_med:.4f}s"
-                speedup_str = f"{speedup:.2f}x"
-                v_ms_str = f"{v_ms_per_tok:.2f}"
-                lat_result["vllm_median_s"] = v_med
-                lat_result["vllm_p99_s"] = v_p99
-                lat_result["vllm_ms_per_tok"] = v_ms_per_tok
-                lat_result["speedup"] = speedup
-                lat_result["vllm_latencies"] = v_lat["latencies"]
-
+        for i, ours_lat in enumerate(ours_latency):
+            ref_lat = ref_latency[i] if i < len(ref_latency) else None
+            lat_result = _latency_row(ours_lat, ref_lat, ours_prefix, ref_prefix)
+            ours_med = lat_result[f"{ours_prefix}_median_s"]
+            ours_ms = lat_result[f"{ours_prefix}_ms_per_tok"]
+            if ref_lat is not None:
+                ref_med_str = f"{lat_result[f'{ref_prefix}_median_s']:.4f}s"
+                ref_ms_str = f"{lat_result[f'{ref_prefix}_ms_per_tok']:.2f}"
+                speedup_str = f"{lat_result['speedup']:.2f}x"
+            else:
+                ref_med_str = "N/A"
+                ref_ms_str = "N/A"
+                speedup_str = "N/A"
             print(
-                f"  {kb_lat['name']:<18} {bs:>4}"
-                f" {out_len:>5} {kb_lat['num_iters']:>6}"
-                f"  {kb_med:.4f}s{'':<3} {v_med_str:>12}"
-                f"  {kb_ms_per_tok:>13.2f}   {v_ms_str:>10} {speedup_str:>8}"
+                f"  {ours_lat['name']:<18} {ours_lat['batch_size']:>4}"
+                f" {ours_lat['output_len']:>5} {ours_lat['num_iters']:>6}"
+                f"  {ours_med:.4f}s{'':<3} {ref_med_str:>12}"
+                f"  {ours_ms:>13.2f}   {ref_ms_str:>10} {speedup_str:>8}"
             )
             latency_combined.append(lat_result)
 
@@ -3349,6 +3522,8 @@ def main():
             combined["max_layers"] = args.max_layers
         if vllm_port is not None:
             combined["vllm_port"] = vllm_port
+        if args.vllm_python:
+            combined["vllm_python"] = args.vllm_python
         if all_results:
             combined["scenarios"] = all_results
         if latency_combined:
