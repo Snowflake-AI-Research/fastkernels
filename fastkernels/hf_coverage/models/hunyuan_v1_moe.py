@@ -4,6 +4,7 @@ import torch
 
 from fastkernels.hf_coverage.models.hunyuan_v1_dense import build_from_config as build_dense
 from fastkernels.hf_coverage.models.llama import make_workloads
+from fastkernels.hf_coverage.patches.hunyuan_moe_precision import HunyuanFusedExperts
 from fastkernels.tasks.baseline.L2.shared_expert_moe import SharedExpertMoE
 from fastkernels.tasks.baseline.L2.parallel_linear import ReplicatedLinear
 
@@ -26,6 +27,10 @@ def build_from_config(config, device, dtype):
             shared_expert_intermediate_size=config.intermediate_size,
             routing="softmax", renormalize=True, keep_router_weights_fp32=True,
         ).to(device=device, dtype=dtype)
+        # Preserve the native rounded down projection and FP32 weighted reduction.
+        # Select before loading, so expert weights retain their unshuffled layout.
+        layer.mlp.use_trtllm = False
+        layer.mlp.fused_experts = HunyuanFusedExperts()
         layer.mlp.gate = FP32Gate(config.hidden_size, experts, bias=False).to(device=device, dtype=torch.float32)
     return model.eval()
 

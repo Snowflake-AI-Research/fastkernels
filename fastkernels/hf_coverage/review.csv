@@ -169,7 +169,7 @@ higgs_audio_v2,us,,registered; full workload review unfinished,Review default co
 higgs_audio_v2_tokenizer,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 hubert,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 hunyuan_v1_dense,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-hunyuan_v1_moe,us,investigate,registered; full workload review unfinished,Current GPU comparison checks logits and complete state through two continuations; numerical failure persists (minimum matched fraction 0.972148). Stage and common-input root-cause investigation pending; historical logit passes do not close it.
+hunyuan_v1_moe,us,optional,registered; full workload review unfinished,"Current declared workload passed paired GPU checks on common weights and inputs; 21 tensors, minimum matched fraction 1.000000. Diagnostic timing measured; final construction review remains."
 hy_v3,reviewer,investigate,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
 ibert,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 idefics,reviewer,investigate,full workload selected; complete run missing,Check whether zero cross-attention gates hide the visual branch under random initialization.
