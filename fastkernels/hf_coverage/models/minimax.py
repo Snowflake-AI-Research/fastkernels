@@ -5,14 +5,14 @@ from torch import nn
 
 from fastkernels.hf_coverage.models.llama import make_workloads as decoder_workloads
 from fastkernels.hf_coverage.models.olmo2 import PostNormModel, decoder_config
+from fastkernels.hf_coverage.patches.hunyuan_moe_precision import HunyuanFusedExperts
 from fastkernels.hf_coverage.patches.product_gate import ProductGate
 from fastkernels.hf_coverage.runner import Workload
-from fastkernels.tasks.baseline.L1.chunk_gla import ChunkGLA
-from fastkernels.tasks.baseline.L1.fused_recurrent_gla import FusedRecurrentGLA
-from fastkernels.tasks.baseline.L1.linear import Linear
+from fastkernels.tasks.baseline.L1.linear import BMM, Linear
 from fastkernels.tasks.baseline.L1.sigmoid import Sigmoid
 from fastkernels.tasks.baseline.L1.silu import SiLU
 from fastkernels.tasks.baseline.L1.t5_layer_norm import T5LayerNorm
+from fastkernels.tasks.baseline.L1.tensor_ops import Exp
 from fastkernels.tasks.baseline.L2.shared_expert_moe import SharedExpertMoE
 from fastkernels.tasks.baseline.L4.llama import LlamaForCausalLM
 
@@ -27,10 +27,11 @@ class LightningAttention(nn.Module):
         self.output_gate = Linear(config.hidden_size, width, False)
         self.norm = T5LayerNorm(width, eps=1e-6)
         self.activation, self.sigmoid, self.product = SiLU(), Sigmoid(), ProductGate()
-        self.prefill, self.decode = ChunkGLA(), FusedRecurrentGLA()
+        self.bmm, self.exp = BMM(), Exp()
+        self.block_size = config.block_size
         self.state = None
-        # HF stores these derived inference constants. Load all of them so the
-        # source rounding remains inspectable; GLA consumes their log-decay rate.
+        # Keep native rounded tables and block/state stores: GLA
+        # evaluates log decay with different chunking and FP32 accumulation.
         block = config.block_size
         for name, shape in (("slope_rate", (self.heads, 1, 1)),
                             ("query_decay", (self.heads, block, 1)),
@@ -38,17 +39,50 @@ class LightningAttention(nn.Module):
                             ("diagonal_decay", (1, self.heads, block, block))):
             self.register_buffer(name, torch.empty(shape))
 
+    def _multiply(self, left, right):
+        left, right = torch.broadcast_tensors(left, right)
+        return self.product(torch.cat((left, right), dim=-1))
+
+    def _attention(self, query, key, value):
+        batch, length = query.shape[:2]
+        query, key, value = query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)
+        outputs = []
+        state = self.state
+        if state is None:
+            state = value.new_zeros((batch, self.heads, self.head_dim, self.head_dim))
+            for start in range(0, length, self.block_size):
+                end = min(start + self.block_size, length)
+                count = end - start
+                q, k, v = query[:, :, start:end], key[:, :, start:end], value[:, :, start:end]
+                query_decay = self.query_decay[:, :count]
+                key_decay = self.key_decay[:, -count:]
+                diagonal = self.diagonal_decay[:, :, :count, :count]
+                block_decay = self.exp(-self.slope_rate * count)
+
+                scores = self.bmm(q, k.transpose(-1, -2))
+                intra = self.bmm(self._multiply(scores, diagonal), v)
+                inter = self.bmm(self._multiply(q, query_decay), state)
+                outputs.append(inter + intra)
+                update = self.bmm(self._multiply(k, key_decay).transpose(-1, -2), v)
+                state = self._multiply(state, block_decay) + update
+        else:
+            ratio = self.exp(-self.slope_rate)
+            for index in range(length):
+                q = query[:, :, index:index + 1]
+                k = key[:, :, index:index + 1]
+                v = value[:, :, index:index + 1]
+                update = self.bmm(k.transpose(-1, -2), v)
+                state = self._multiply(ratio, state) + update
+                outputs.append(self.bmm(q, state))
+        self.state = state
+        return torch.cat(outputs, dim=-2).transpose(1, 2).reshape(batch * length, -1)
+
     def forward(self, positions, hidden_states):
         batch = self.batch_size
         length = hidden_states.shape[0] // batch
         qkv = self.activation(self.qkv_proj(hidden_states))
         q, k, v = qkv.view(batch, length, self.heads, 3 * self.head_dim).split(self.head_dim, -1)
-        gate = self.log_decay.expand(batch, length, self.heads, self.head_dim).contiguous()
-        operation = self.prefill if self.state is None else self.decode
-        output, state = operation(q.contiguous(), k.contiguous(), v.contiguous(), gate,
-                                  scale=1.0, initial_state=self.state, output_final_state=True)
-        self.state = state.to(hidden_states.dtype)
-        output = self.norm(output.reshape(hidden_states.shape[0], -1))
+        output = self.norm(self._attention(q, k, v))
         gate = self.sigmoid(self.output_gate(hidden_states))
         return self.out_proj(self.product(torch.cat((gate, output), -1)))
 
@@ -62,6 +96,10 @@ class MiniMaxLayer(nn.Module):
         self.mlp = SharedExpertMoE(hidden_size=config.hidden_size, num_experts=config.num_local_experts,
                                   top_k=config.num_experts_per_tok, moe_intermediate_size=config.intermediate_size,
                                   keep_router_weights_fp32=True)
+        # Native grouped_mm rounds down projections before FP32 route weighting
+        # and reduction. Select this carrier before loading unshuffled weights.
+        self.mlp.use_trtllm = False
+        self.mlp.fused_experts = HunyuanFusedExperts()
         stem = "linear_attn" if kind == "linear_attention" else "full_attn"
         self.attention_alpha, self.attention_beta = getattr(config, stem + "_alpha_factor"), getattr(config, stem + "_beta_factor")
         self.mlp_alpha, self.mlp_beta = config.mlp_alpha_factor, config.mlp_beta_factor
@@ -119,9 +157,6 @@ def load_state_dict_into(model, state_dict, config):
         parameter.weight_loader(parameter, state_dict[name], shard)
     for layer in model.model.layers:
         layer.mlp.process_weights_after_loading()
-        if isinstance(layer.self_attn, LightningAttention):
-            attn = layer.self_attn
-            attn.log_decay = -attn.slope_rate.float().reshape(1, 1, attn.heads, 1)
 
 
 def make_workloads(model, inputs, config, *, case=None):
