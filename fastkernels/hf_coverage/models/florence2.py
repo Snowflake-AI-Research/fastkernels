@@ -12,7 +12,7 @@ from fastkernels.tasks.baseline.L1.linear import Linear
 from fastkernels.tasks.baseline.L1.segment_csr import SegmentCSR
 from fastkernels.tasks.baseline.L1.softmax import LogSoftmax
 from fastkernels.tasks.baseline.L1.tensor_ops import Pad
-from fastkernels.tasks.baseline.L3.yolov10_head import v10postprocess
+from ..patches.single_class_detection_topk import v10postprocess_single_class
 from ..runner import Workload
 from . import bart
 
@@ -152,12 +152,12 @@ class Florence(nn.Module):
         self.log_softmax = LogSoftmax(-1)
 
     def topk(self, scores, count):
-        # The unchanged detection selector carries candidate positions as its
-        # four box fields. Its top-k accepts the forced-token -infinity scores.
+        # The singleton-class detection patch carries positions as box fields
+        # and preserves the first top-k order, including forced-token ties.
         batch, length = scores.shape
         indices = torch.arange(length, device=scores.device, dtype=torch.float32)
         metadata = indices[None, :, None].expand(batch, -1, 4)
-        boxes, values, _ = v10postprocess(torch.cat((metadata, scores.float()[..., None]), -1), count, nc=1)
+        boxes, values, _ = v10postprocess_single_class(torch.cat((metadata, scores.float()[..., None]), -1), count, nc=1)
         return values, boxes[..., 0].long()
 
     def encode(self, inputs):

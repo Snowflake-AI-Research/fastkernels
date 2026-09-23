@@ -120,7 +120,7 @@ fastspeech2_conformer,us,,no registered runnable implementation,Full text-to-wav
 flaubert,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 flava,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 flex_olmo,us,,registered; full workload review unfinished,"Current BF16 GPU prefill+two continuations and all selected cache outputs pass 15 checks; diagnostic ours/HF 1.06x,1.07x,1.06x. Historical seed19 weights/input prefix retained; minimum99.77% within tolerance. Residual difference isolated to fused expert projection/routing rounding; no model patch or tolerance change."
-florence2,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+florence2,us,optional,registered; full workload review unfinished,"Current declared workload passed paired GPU checks on common weights and inputs; 17 tensors, minimum matched fraction 1.000000. Diagnostic timing measured; final construction review remains."
 fnet,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 focalnet,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 fsmt,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
