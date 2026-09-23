@@ -47,7 +47,7 @@ cohere2_vision,us,,no registered runnable implementation,Implementation and all2
 cohere_asr,us,,no registered runnable implementation,Registered constructor-derived case passes GPU outputs and all self/cross caches over prefill plus two continuations (30 tensors). Diagnostic latency measured with 10 warmups/50 samples; construction uses existing operations and patches.
 colmodernvbert,us,,registered; full workload review unfinished,"Existing document/query GPU evidence reviewed and retained: selected retrieval task, outputs and meaningful computation covered. No generation continuation requirement for this task."
 colpali,us,,registered; full workload review unfinished,"Existing document/query GPU evidence reviewed and retained: selected retrieval task, outputs and meaningful computation covered. No generation continuation requirement for this task."
-colqwen2,us,,registered; full workload review unfinished,Unpadded text query now skips absent image inputs; CPU routing check passes. Preserve existing document evidence. Query GPU comparison and default-scope review pending; padded query attention remains unsupported.
+colqwen2,us,optional,registered; full workload review unfinished,"Current declared workload passed paired GPU checks on common weights and inputs; 10 tensors, minimum matched fraction 0.993490. Diagnostic timing measured; final construction review remains."
 conditional_detr,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 convbert,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 convnext,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
@@ -115,11 +115,11 @@ exaone_moe,reviewer,investigate,registered; full workload review unfinished,Inve
 falcon,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 falcon_h1,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 falcon_mamba,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-fast_vlm,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+fast_vlm,us,,registered; full workload review unfinished,"Current BF16 GPU prefill+two continuations and all selected cache outputs pass 16 checks; diagnostic ours/HF 0.73x,0.45x,0.41x."
 fastspeech2_conformer,us,,no registered runnable implementation,Full text-to-waveform composition passes declared FP32 GPU check (six outputs); native regulator requires FP32. Shared vocoder random initialization made output informative; nearest-even duration composition and full expansion reviewed. No BF16 acceptance claim.
 flaubert,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 flava,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-flex_olmo,us,,registered; full workload review unfinished,Primary logits pass but key caches fail (worst 98.17% within tolerance). CPU FP32 controls are not full GPU acceptance; remaining cause unresolved.
+flex_olmo,us,,registered; full workload review unfinished,"Current BF16 GPU prefill+two continuations and all selected cache outputs pass 15 checks; diagnostic ours/HF 1.06x,1.07x,1.06x. Historical seed19 weights/input prefix retained; minimum99.77% within tolerance. Residual difference isolated to fused expert projection/routing rounding; no model patch or tolerance change."
 florence2,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
 fnet,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 focalnet,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
@@ -138,11 +138,11 @@ glm4,reviewer,optional,full workload selected; complete run missing,Check readin
 glm46v,us,,registered; full workload review unfinished,"Extended BF16 GPU prefill+two continuations and selected cache/state outputs pass 18 tensor checks. Existing construction retained; reviewed scaling/default computation. Diagnostic ours/HF ratios: prefill=0.75x, decode_1=1.07x, decode_2=1.06x."
 glm4_moe,us,,registered; full workload review unfinished,Primary logits pass but deeper key caches fail (worst 96.58% within tolerance). Native rotary reuse repaired a component; rerun still failed caches. Continue from downstream divergence.
 glm4_moe_lite,reviewer,investigate,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
-glm4v,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-glm4v_moe,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-glm_image,us,,registered; full workload review unfinished,"Two continuation steps and cache outputs implemented, CPU native/position/strict-load checks complete. Retain old GPU pass for its one-step workload; current extended GPU run pending."
+glm4v,us,,registered; full workload review unfinished,"Current BF16 GPU prefill+two continuations and all selected cache outputs pass 18 checks; diagnostic ours/HF 0.80x,1.12x,1.14x."
+glm4v_moe,us,,registered; full workload review unfinished,"Current BF16 GPU prefill+two continuations and all selected cache outputs pass 18 checks; diagnostic ours/HF 0.66x,0.68x,0.66x."
+glm_image,us,,registered; full workload review unfinished,"Current BF16 GPU prefill+two continuations and all selected cache outputs pass 18 checks; diagnostic ours/HF 0.72x,1.34x,1.50x."
 glm_moe_dsa,reviewer,investigate,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
-glm_ocr,us,,registered; full workload review unfinished,Two continuation steps and cache outputs implemented through shared GLM wrapper; CPU native/position/strict-load checks complete. Retain old GPU pass for its one-step workload; current extended GPU run pending.
+glm_ocr,us,,registered; full workload review unfinished,"Current BF16 GPU prefill+two continuations and all selected cache outputs pass 18 checks; diagnostic ours/HF 0.93x,1.12x,1.09x."
 glmasr,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
 glpn,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 got_ocr2,reviewer,optional,full-size numerical pass,"Supply --input-dict or implement valid shared synthetic input preparation. Review construction and outputs; full numerical pass retained, but saved timing is withheld because of GPU thermal throttling."
@@ -180,14 +180,14 @@ imagegpt,reviewer,optional,full-size numerical pass,Review construction and outp
 informer,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
 instructblip,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
 instructblipvideo,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-internvl,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+internvl,us,,registered; full workload review unfinished,Extended to two supplied-token continuations and all logical caches. Native CPU state/history checks and strict candidate weight loading pass; candidate GPU comparison pending. Historical one-step evidence retained.
 jais2,reviewer,complete_execution,full workload selected; complete run missing,CPU comparison passed; review scaled case and obtain paired GPU evidence.
 jamba,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 janus,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
 jetmoe,reviewer,investigate,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
 jina_embeddings_v3,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 kosmos2,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-kosmos2_5,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+kosmos2_5,us,optional,registered; full workload review unfinished,"Current declared workload passed paired GPU checks on common weights and inputs; 51 tensors, minimum matched fraction 0.997987. Diagnostic timing measured; final construction review remains."
 kyutai_speech_to_text,us,,registered; full workload review unfinished,Supply --input-dict or implement valid shared synthetic input preparation. Review default computation; approve scaled values and complete missing behavior.
 laguna,reviewer,investigate,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
 lasr,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
@@ -198,9 +198,9 @@ led,us,,full-size numerical pass,Review construction and outputs; validate the a
 levit,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 lfm2,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 lfm2_moe,reviewer,investigate,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
-lfm2_vl,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+lfm2_vl,us,optional,registered; full workload review unfinished,"Current declared workload passed paired GPU checks on common weights and inputs; 19 tensors, minimum matched fraction 1.000000. Diagnostic timing measured; final construction review remains."
 lightglue,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-lighton_ocr,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+lighton_ocr,us,,registered; full workload review unfinished,Extended to two supplied-token continuations and all logical caches. Native CPU state/history checks and strict candidate weight loading pass; candidate GPU comparison pending. Historical one-step evidence retained.
 lilt,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 llama,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 llama4,us,,no registered runnable implementation,Registered constructor-derived text-only case passes GPU outputs and caches over prefill plus two continuations (27 tensors). Diagnostic latency is 2.63x HF prefill and 1.74-1.89x decode. Image path is outside this selected scope.
@@ -208,7 +208,7 @@ llava,reviewer,optional,full workload selected; complete run missing,Check readi
 llava_next,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 llava_next_video,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 llava_onevision,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-longcat_flash,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+longcat_flash,us,,registered; full workload review unfinished,Extended to two supplied-token continuations and all logical caches. Native CPU state/history checks and strict candidate weight loading pass; candidate GPU comparison pending. Historical one-step evidence retained.
 longformer,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 longt5,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 luke,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
@@ -231,9 +231,9 @@ minicpmv4_6,reviewer,investigate,registered; full workload review unfinished,Inv
 minimax,us,,registered; full workload review unfinished,"Primary logits pass but linear-attention state fails (worst 96.08% within tolerance). Decay-table controls explain an FP32 diagnostic discrepancy, not the remaining BF16 failure."
 minimax_m2,us,,registered; full workload review unfinished,Prepare correctly packed common weights for --state-dict; ordinary random initialization is insufficient. Review default computation; approve scaled values and complete missing behavior.
 ministral,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-ministral3,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+ministral3,us,,registered; full workload review unfinished,Extended to two supplied-token continuations and all logical caches. Native CPU state/history checks and strict candidate weight loading pass; candidate GPU comparison pending. Historical one-step evidence retained.
 mistral,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-mistral3,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+mistral3,us,,registered; full workload review unfinished,Extended to two supplied-token continuations and all logical caches. Native CPU state/history checks and strict candidate weight loading pass; candidate GPU comparison pending. Historical one-step evidence retained.
 mistral4,us,,registered; full workload review unfinished,Prepare correctly packed common weights for --state-dict; ordinary random initialization is insufficient. Review default computation; approve scaled values and complete missing behavior.
 mixtral,reviewer,investigate,full workload selected; complete run missing,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
 mlcd,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
@@ -301,7 +301,7 @@ pixtral,us,,registered; full workload review unfinished,Review default computati
 plbart,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 poolformer,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 pop2piano,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-pp_doclayout_v2,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+pp_doclayout_v2,us,,no registered runnable implementation,"Complete unregistered assembly and strict 805-weight CPU comparison: 15 outputs exact. Native random BatchNorm gains collapse proposal ranking; initialization decision pending. CUDA sampler, internal validity sort and proposal TopK diagnostics passed; full GPU model untested."
 pp_doclayout_v3,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 pp_formulanet,reviewer,investigate,full workload selected; complete run missing,Tiny vision initialization produced zero cross-attention keys/values; establish informative shared-weight testing before accepting numerical agreement.
 pp_lcnet,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
@@ -345,7 +345,7 @@ rt_detr_v2,reviewer,optional,full workload selected; complete run missing,Check 
 rwkv,reviewer,investigate,full-size numerical mismatch,Investigate saved numerical mismatch and 84.65x prefill time; current recurrence changed since that run; see REVIEW.md.
 sam,us,,full-size numerical pass,Supply --input-dict or implement valid shared synthetic input preparation. Review construction and outputs; validate the approved scaled case when changed.
 sam2,us,,full-size numerical pass,Supply --input-dict or implement valid shared synthetic input preparation. Review construction and outputs; validate the approved scaled case when changed.
-sam2_video,us,,full-size numerical pass,Shared synthetic video and point prompts now prepare successfully without --input-dict; native session setup checked on CPU. Historical full numerical pass retained for its original inputs; new-input GPU comparison pending. Saved timing remains withheld for thermal throttling.
+sam2_video,us,,full-size numerical pass,New random-input GPU run exposed missing native point-coordinate cast; existing positional-dtype patch now matches saved native CPU prompt outputs exactly. Same-input full GPU rerun pending; historical pass used BF16 point inputs.
 sam3,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 sam3_lite_text,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 sam3_tracker,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.

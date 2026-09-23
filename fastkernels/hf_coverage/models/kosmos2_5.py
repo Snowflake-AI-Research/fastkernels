@@ -3,7 +3,6 @@
 from types import SimpleNamespace
 import torch
 from torch import nn
-from fastkernels.tasks.baseline.L1.dense_attention import DenseAttention
 from fastkernels.tasks.baseline.L1.embedding import Embedding
 from fastkernels.tasks.baseline.L1.linear import Linear
 from fastkernels.tasks.baseline.L1.l2_norm import L2Norm
@@ -13,6 +12,7 @@ from fastkernels.tasks.baseline.L1.t5_layer_norm import T5LayerNorm
 from fastkernels.tasks.baseline.L2.t5_dense import T5DenseGatedActDense
 from ..patches.codec_top1 import CodecTop1
 from .kosmos2 import TextModel, ImageProjection, make_workloads
+from .git import GitAttention
 
 
 class PatchValidity(nn.Module):
@@ -36,7 +36,9 @@ class VisionAttention(nn.Module):
         self.heads, self.width = config.num_attention_heads, config.head_dim
         self.query, self.key, self.value = [Linear(config.hidden_size, self.heads * self.width, bias=False) for _ in range(3)]
         self.output = Linear(self.heads * self.width, config.hidden_size, bias=False)
-        self.attention = DenseAttention(backend='sdpa')
+        # Pinned HF's vision registry lookup falls back to eager attention.
+        # Preserve its BF16 score rounding and FP32 softmax with existing ops.
+        self.attention = GitAttention(vision=True)
 
     def forward(self, hidden, mask):
         batch, length = hidden.shape[:2]

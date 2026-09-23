@@ -155,14 +155,14 @@ def load_state_dict_into(model, state_dict, config):
         raise KeyError(f"Unmapped InternVL state: {sorted(remaining)}")
 
 
-def make_workloads(model, inputs, config):
+def make_workloads(model, inputs, config, *, case=None):
     model.model.pixels = inputs["pixel_values"]
     # The generic Llama runner assumes a fixed RoPE table. InternVL's table
     # grows dynamically, so size its workload buffers for the requested length.
     workload_config = replace(model.config, max_position_embeddings=max(
         model.config.max_position_embeddings, inputs["input_ids"].shape[1]))
-    workloads = llama.make_workloads(model, {"input_ids": inputs["input_ids"]}, workload_config)
+    workloads = llama.make_workloads(model, {"input_ids": inputs["input_ids"]}, workload_config, case=case)
     prefill = workloads["prefill"]
     workloads["prefill"] = Workload(run=lambda: {**prefill.run(), "image_hidden_states": model.model.image_hidden_states},
-                                    prepare=prefill.prepare)
+                                    prepare=prefill.prepare, collect=prefill.collect)
     return workloads

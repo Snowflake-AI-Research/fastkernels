@@ -142,10 +142,10 @@ def load_state_dict_into(model, state_dict, config):
         raise KeyError(f"Unmapped LightOnOCR state: {sorted(remaining)}")
 
 
-def make_workloads(model, inputs, config):
+def make_workloads(model, inputs, config, *, case=None):
     model.model.pixels, model.model.sizes = inputs["pixel_values"], inputs["image_sizes"]
-    workloads = llama.make_workloads(model, {"input_ids": inputs["input_ids"]}, model.config)
+    workloads = llama.make_workloads(model, {"input_ids": inputs["input_ids"]}, model.config, case=case)
     prefill = workloads["prefill"]
     workloads["prefill"] = Workload(run=lambda: {**prefill.run(), "image_hidden_states": model.model.image_hidden_states},
-                                    prepare=prefill.prepare)
+                                    prepare=prefill.prepare, collect=prefill.collect)
     return workloads

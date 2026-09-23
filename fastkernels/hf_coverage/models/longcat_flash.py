@@ -3,6 +3,7 @@ from copy import copy
 import torch
 from torch import nn
 
+from fastkernels.hf_coverage.runner import Workload
 from fastkernels.hf_coverage.models.deepseek_v2 import ExpandedAttention
 from fastkernels.hf_coverage.models.llama import make_workloads as decoder_workloads
 from fastkernels.hf_coverage.models.olmo2 import PostNormModel, decoder_config
@@ -155,6 +156,17 @@ def load_state_dict_into(model, state_dict, config):
         target.weight_loader(target, state_dict[name], shard)
 
 
-def make_workloads(model, inputs, config):
+def make_workloads(model, inputs, config, *, case=None):
     attentions = [a.attn for layer in model.model.layers for a in layer.self_attn]
-    return decoder_workloads(model, inputs, config, attentions=attentions)
+    workloads = decoder_workloads(model, inputs, config, attentions=attentions, case=case)
+    if case is None or case.get('workload') != 'causal_lm_continuation':
+        return workloads
+    for name, work in list(workloads.items()):
+        def collect(output, parent=work.collect):
+            output = parent(output)
+            # ExpandedAttention pads physical values to the query/key width.
+            # Expose only HF's logical value dimensions for state comparison.
+            return {key: value[..., :config.v_head_dim] if key.endswith('.value') else value
+                    for key, value in output.items()}
+        workloads[name] = Workload(run=work.run, prepare=work.prepare, collect=collect)
+    return workloads

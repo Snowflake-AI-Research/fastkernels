@@ -2894,11 +2894,14 @@ CASES = {
             'num_key_value_heads': 2, 'vocab_size': 1024, 'bos_token_id': 1, 'eos_token_id': 1,
             'pad_token_id': 0,
         },
-        'input': {'kind': 'tokens', 'batch_size': 2, 'sequence_length': 270},
+        'input': {'kind': 'tokens', 'batch_size': 2, 'sequence_length': 271},
         'reference_backend': 'sdpa',
-        'workload': 'causal_lm',
+        'workload': 'causal_lm_continuation',
+        'outputs': ['logits', 'past_key_values'],
         'dimension_purpose': ('Retain native head128, MHA, all7experts/top7, joint Q/K norms, post-normalized branches and '
-            'FP32 RoPE. Special IDs remapped inside reduced vocabulary.'),
+            'FP32 RoPE. Special IDs remapped inside reduced vocabulary. The 271-token input provides '
+            '269 prompt tokens and two supplied-token continuations; compare all logits and logical '
+            'key/value caches at each step.'),
     },
 
     'florence2': {
@@ -5119,6 +5122,7 @@ CASES = {
 
     'internvl': {
         'reference': {
+            'continuation_outputs': ['logits', 'past_key_values'],
             'config_class': 'transformers:InternVLConfig',
             'model_class': 'transformers:InternVLForConditionalGeneration',
             'source': {
@@ -5142,11 +5146,10 @@ CASES = {
         },
         'input': {
             'kind': 'text_image', 'text_batch_size': 1, 'image_batch_size': 1, 'shape': [3, 56, 56],
-            'sequence_length': 39, 'image_token_positions': [3, 4, 5, 6],
+            'sequence_length': 40, 'image_token_positions': [3, 4, 5, 6],
         },
-        'workload': 'causal_lm',
-        'outputs': ['logits', 'image_hidden_states'],
-        'decode_outputs': ['logits'],
+        'workload': 'causal_lm_continuation',
+        'outputs': ['logits', 'past_key_values', 'image_hidden_states'],
         'reference_backend': 'sdpa',
         'dimension_purpose': ('Retain 7:1 grouped-query attention, learned visual layer scales, and spatial downsampling by '
             'two. Dynamic rotary frequency scaling remains enabled; its 32,768-token boundary is checked '
@@ -5311,13 +5314,14 @@ CASES = {
 
     'kosmos2_5': {
         'reference': {
+            'fan_in_normal_modules': ['vision_model'],
             'config_class': 'transformers:Kosmos2_5Config',
             'model_class': 'transformers:Kosmos2_5ForConditionalGeneration',
             'source': {
                 'kind': 'example_checkpoint', 'checkpoint': 'microsoft/kosmos-2.5',
                 'revision': 'ec3c8051b697166514a31d646cfa36d6ef4c93d7',
                 'url': 'https://huggingface.co/microsoft/kosmos-2.5/blob/ec3c8051b697166514a31d646cfa36d6ef4c93d7/config.json',
-                'description': 'Pinned native task example checkpoint; LXMERT config example selects its base task.',
+                'description': 'Pinned native Kosmos2.5 conditional-generation model forward example checkpoint; this case tests its explicit forward outputs and initial cache.',
             },
         },
         'dimension_overrides': {
@@ -5336,6 +5340,10 @@ CASES = {
             'hidden/MLP/vocabulary widths,64patchdevelopmentgrid and64latentqueries from2048. All '
             'normalization,projectionattention and decoder paths retained.'),
         'reference_backend': 'sdpa',
+        'initialization_reason': (
+            'Native vision initialization makes all 18 BF16 attention and MLP residual blocks exact identities. '
+            'Use shared fan-in random vision matrices to exercise those blocks; preserve embeddings, '
+            'biases, normalization and all other weights.'),
     },
 
     'kyutai_speech_to_text': {
@@ -5538,6 +5546,7 @@ CASES = {
 
     'lfm2_vl': {
         'reference': {
+            'continuation_outputs': ['logits', 'past_key_values'],
             'config_class': 'transformers:Lfm2VlConfig',
             'model_class': 'transformers:Lfm2VlForConditionalGeneration',
             'source': {
@@ -5562,11 +5571,10 @@ CASES = {
         },
         'input': {
             'kind': 'text_image', 'text_batch_size': 1, 'image_batch_size': 1, 'shape': [32, 768],
-            'spatial_shapes': [[4, 6]], 'sequence_length': 18, 'image_token_positions': [3, 4, 5, 6, 7, 8],
+            'spatial_shapes': [[4, 6]], 'sequence_length': 19, 'image_token_positions': [3, 4, 5, 6, 7, 8],
         },
-        'workload': 'causal_lm',
-        'outputs': ['logits', 'image_hidden_states', 'past_key_values'],
-        'decode_outputs': ['logits', 'past_key_values'],
+        'workload': 'causal_lm_continuation',
+        'outputs': ['logits', 'past_key_values', 'image_hidden_states'],
         'reference_backend': 'sdpa',
         'dimension_purpose': ('Retain head64/4:1 grouped attention, initial conv/conv/attention/conv blocks and conv3 states;'
             ' native SigLIP2 head72/patch16, source4x4 learned positions resized to4x6 valid patches '
@@ -5594,6 +5602,7 @@ CASES = {
 
     'lighton_ocr': {
         'reference': {
+            'continuation_outputs': ['logits', 'past_key_values'],
             'config_class': 'transformers:LightOnOcrConfig',
             'model_class': 'transformers:LightOnOcrForConditionalGeneration',
             'source': {
@@ -5618,11 +5627,10 @@ CASES = {
         },
         'input': {
             'kind': 'text_image', 'text_batch_size': 1, 'image_batch_size': 1, 'shape': [3, 84, 84],
-            'sequence_length': 39, 'image_token_positions': [3, 4, 5, 6, 7, 8], 'image_sizes': [[56, 84]],
+            'sequence_length': 40, 'image_token_positions': [3, 4, 5, 6, 7, 8], 'image_sizes': [[56, 84]],
         },
-        'workload': 'causal_lm',
-        'outputs': ['logits', 'image_hidden_states'],
-        'decode_outputs': ['logits'],
+        'workload': 'causal_lm_continuation',
+        'outputs': ['logits', 'past_key_values', 'image_hidden_states'],
         'reference_backend': 'sdpa',
         'dimension_purpose': ('Retain a language head width of 128 even though hidden width divided by head count is 64, 2:1 '
             'grouped-query attention, tied embeddings, and query/key normalization. A padded 84 by 84 image'
@@ -5822,6 +5830,7 @@ CASES = {
 
     'longcat_flash': {
         'reference': {
+            'continuation_outputs': ['logits', 'past_key_values'],
             'config_class': 'transformers:LongcatFlashConfig',
             'model_class': 'transformers:LongcatFlashForCausalLM',
             'source': {
@@ -5837,9 +5846,9 @@ CASES = {
             'head_dim': 32, 'n_routed_experts': 16, 'zero_expert_num': 8, 'vocab_size': 512,
             'max_position_embeddings': 128,
         },
-        'input': {'kind': 'tokens', 'batch_size': 2, 'sequence_length': 17},
-        'outputs': ['logits'],
-        'workload': 'causal_lm',
+        'input': {'kind': 'tokens', 'batch_size': 2, 'sequence_length': 18},
+        'outputs': ['logits', 'past_key_values'],
+        'workload': 'causal_lm_continuation',
         'dimension_purpose': ('Two logicalblocks eachtwoMLAattentions/twodenseMLPs+shortcutMoE; '
             'bothlearned16/identity8experts, top12of24; preserveLoRAscalings/defaultinterleavedinputRoPE; '
             'reducewidth/depth/ranks.'),
@@ -6343,6 +6352,7 @@ CASES = {
 
     'ministral3': {
         'reference': {
+            'continuation_outputs': ['logits', 'past_key_values'],
             'config_class': 'transformers:Ministral3Config',
             'model_class': 'transformers:Ministral3ForCausalLM',
             'source': {
@@ -6366,8 +6376,9 @@ CASES = {
             'max_position_embeddings': 2048,
             'rope_parameters': {'original_max_position_embeddings': 128},
         },
-        'input': {'kind': 'tokens', 'batch_size': 2, 'sequence_length': 270},
-        'workload': 'causal_lm',
+        'input': {'kind': 'tokens', 'batch_size': 2, 'sequence_length': 271},
+        'workload': 'causal_lm_continuation',
+        'outputs': ['logits', 'past_key_values'],
         'reference_backend': 'sdpa',
         'dimension_purpose': ('Retain head128/4:1 GQA, YaRN factor16/mscale ratio and query-temperature beta. Reduce context '
             'boundary16384 to128 and max context262144 to2048;270 tokens exercise before/after boundary and'
@@ -6404,6 +6415,7 @@ CASES = {
 
     'mistral3': {
         'reference': {
+            'continuation_outputs': ['logits', 'past_key_values'],
             'config_class': 'transformers:Mistral3Config',
             'model_class': 'transformers:Mistral3ForConditionalGeneration',
             'source': {
@@ -6422,12 +6434,11 @@ CASES = {
         },
         'reference_backend': {'': 'sdpa', 'text_config': 'sdpa', 'vision_config': 'sdpa'},
         'input': {
-            'kind': 'text_image', 'text_batch_size': 1, 'image_batch_size': 1, 'sequence_length': 11,
+            'kind': 'text_image', 'text_batch_size': 1, 'image_batch_size': 1, 'sequence_length': 12,
             'shape': [3, 56, 84], 'image_sizes': [[56, 84]], 'image_token_positions': [0, 1, 2, 3, 4, 5],
         },
-        'workload': 'causal_lm',
+        'workload': 'causal_lm_continuation',
         'outputs': ['logits', 'past_key_values', 'image_hidden_states'],
-        'decode_outputs': ['logits', 'past_key_values'],
         'dimension_purpose': ('Retain40text/24visionlayers,4:1textGQA,2x2spatialmerger; reducewidths/headcount/vocab/image. '
             'Rectangular4x6patchgrid exercises bothvisionpositionaxes and6mergedimagefeatures.'),
     },

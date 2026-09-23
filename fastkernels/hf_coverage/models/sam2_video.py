@@ -8,6 +8,7 @@ from fastkernels.hf_coverage.models.sam import SamAttentionCore
 from fastkernels.tasks.baseline.L1.dense_attention import DenseAttention
 from fastkernels.hf_coverage.patches.codec_top1 import CodecTop1
 from fastkernels.hf_coverage.patches.sam_sine_dtype import SamSineDtype
+from fastkernels.hf_coverage.patches.sam_position_dtype import SamPositionDtype
 from fastkernels.hf_coverage.runner import Workload
 from fastkernels.tasks.baseline.L1.conv2d import Conv2d
 from fastkernels.tasks.baseline.L1.interpolate import Interpolate
@@ -193,7 +194,10 @@ class Sam2VideoModel(sam2.Sam2Model):
 
 
 def build_from_config(config, device, dtype):
-    model = Sam2VideoModel(config).to(device=device, dtype=dtype).eval()
+    model = Sam2VideoModel(config)
+    # Native accepts FP32 point metadata and casts after coordinate normalization.
+    model.prompt_encoder.pe_layer = SamPositionDtype(config.prompt_encoder_config.hidden_size // 2)
+    model = model.to(device=device, dtype=dtype).eval()
     # Match the ordinary native SDPA path with an existing attention operation.
     for module in model.modules():
         if hasattr(module, "attend") and isinstance(module.attend, SamAttentionCore):

@@ -107,13 +107,20 @@ def load_state_dict_into(model, state_dict, config):
         raise KeyError(f'Unmapped Mistral3 weights: {sorted(remaining)}')
 
 
-def make_workloads(model, inputs, config):
+def make_workloads(model, inputs, config, *, case=None):
     pixels = inputs['pixel_values']
     sizes = inputs['image_sizes']
     if any(tuple(size) != tuple(pixels.shape[-2:]) for size in sizes.tolist()):
         raise ValueError('This workload uses equally sized, unpadded images')
     model.model.pixel_values = pixels
-    workloads = llama.make_workloads(model, {'input_ids': inputs['input_ids']}, model.config)
+    workloads = llama.make_workloads(model, {'input_ids': inputs['input_ids']}, model.config, case=case)
+    if case is not None and case.get('workload') == 'causal_lm_continuation':
+        prefill = workloads['prefill']
+        workloads['prefill'] = Workload(
+            run=lambda: {**prefill.run(), 'image_hidden_states': model.model.image_hidden_states},
+            prepare=prefill.prepare, collect=prefill.collect,
+        )
+        return workloads
     batch, total_length = inputs['input_ids'].shape
 
     def run_phase(work, length, include_image):

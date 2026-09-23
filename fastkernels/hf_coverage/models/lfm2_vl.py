@@ -99,18 +99,31 @@ def load_state_dict_into(model, state, config):
         raise KeyError(f"Unmapped LFM2-VL weights: {sorted(remaining)}")
 
 
-def make_workloads(model, inputs, config):
+def make_workloads(model, inputs, config, *, case=None):
     ids = inputs["input_ids"]
+    continuation = case is not None and case.get("workload") == "causal_lm_continuation"
+    steps = 2 if continuation else 1
+    prefix_length = ids.shape[1] - steps
+    if prefix_length < 1:
+        raise ValueError("LFM2-VL requires a prompt and the supplied continuation tokens")
     positions = torch.arange(ids.shape[1], device=ids.device)
 
     def prefill():
-        return model(ids[:, :-1], positions[:-1], inputs)
+        return model(ids[:, :prefix_length], positions[:prefix_length], inputs)
 
-    def prepare_decode():
-        model.language.reset()
-        prefill()
+    workloads = {"prefill": Workload(run=prefill, prepare=model.language.reset)}
+    for step in range(steps):
+        def decode(step=step):
+            position = prefix_length + step
+            return model(ids[:, position:position + 1], positions[position:position + 1])
 
-    return {
-        "prefill": Workload(run=prefill, prepare=model.language.reset),
-        "decode": Workload(run=lambda: model(ids[:, -1:], positions[-1:]), prepare=prepare_decode),
-    }
+        def prepare_decode(step=step):
+            model.language.reset()
+            prefill()
+            for prior in range(step):
+                position = prefix_length + prior
+                model(ids[:, position:position + 1], positions[position:position + 1])
+
+        name = f"decode_{step + 1}" if continuation else "decode"
+        workloads[name] = Workload(run=decode, prepare=prepare_decode)
+    return workloads

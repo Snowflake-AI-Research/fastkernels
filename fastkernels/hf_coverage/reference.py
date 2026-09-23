@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.metadata
 import inspect
 import json
+import math
 from pathlib import Path
 import sys
 
@@ -208,8 +209,8 @@ def prepare(job: dict, directory: Path) -> dict:
                 for name, layer in model.get_submodule(prefix).named_modules():
                     if isinstance(layer, torch.nn.Linear):
                         fan_in = layer.in_features
-                    elif isinstance(layer, (torch.nn.Conv1d, torch.nn.ConvTranspose1d)):
-                        fan_in = layer.in_channels * layer.kernel_size[0] / layer.groups
+                    elif isinstance(layer, (torch.nn.Conv1d, torch.nn.Conv2d, torch.nn.ConvTranspose1d)):
+                        fan_in = layer.in_channels * math.prod(layer.kernel_size) / layer.groups
                         if isinstance(layer, torch.nn.ConvTranspose1d):
                             fan_in /= layer.stride[0]
                     else:
