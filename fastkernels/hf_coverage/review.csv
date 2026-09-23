@@ -119,7 +119,7 @@ fast_vlm,us,registered; full workload review unfinished,Review default computati
 fastspeech2_conformer,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
 flaubert,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 flava,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-flex_olmo,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+flex_olmo,us,registered; full workload review unfinished,Primary logits pass but key caches fail (worst 98.17% within tolerance). CPU FP32 controls are not full GPU acceptance; remaining cause unresolved.
 florence2,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
 fnet,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 focalnet,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
@@ -136,7 +136,7 @@ git,reviewer,full-size numerical pass,Review construction and outputs; validate 
 glm,reviewer,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
 glm4,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 glm46v,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-glm4_moe,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+glm4_moe,us,registered; full workload review unfinished,Primary logits pass but deeper key caches fail (worst 96.58% within tolerance). Native rotary reuse repaired a component; rerun still failed caches. Continue from downstream divergence.
 glm4_moe_lite,reviewer,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
 glm4v,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
 glm4v_moe,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
@@ -169,7 +169,7 @@ higgs_audio_v2,us,registered; full workload review unfinished,Review default com
 higgs_audio_v2_tokenizer,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 hubert,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 hunyuan_v1_dense,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-hunyuan_v1_moe,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+hunyuan_v1_moe,us,registered; full workload review unfinished,Primary logits pass but deeper key/value caches fail (worst 90.44% within tolerance). Router/expert controls and FP32 diagnostics exist; remaining BF16 cause is unresolved.
 hy_v3,reviewer,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
 ibert,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 idefics,reviewer,full workload selected; complete run missing,Check whether zero cross-attention gates hide the visual branch under random initialization.
@@ -228,7 +228,7 @@ metaclip_2,reviewer,full workload selected; complete run missing,Check readiness
 mgp_str,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 mimi,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 minicpmv4_6,reviewer,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
-minimax,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+minimax,us,registered; full workload review unfinished,"Primary logits pass but linear-attention state fails (worst 96.08% within tolerance). Decay-table controls explain an FP32 diagnostic discrepancy, not the remaining BF16 failure."
 minimax_m2,us,registered; full workload review unfinished,Prepare correctly packed common weights for --state-dict; ordinary random initialization is insufficient. Review default computation; approve scaled values and complete missing behavior.
 ministral,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 ministral3,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
@@ -289,7 +289,7 @@ pegasus,us,full-size numerical pass,Review construction and outputs; validate th
 pegasus_x,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 perceiver,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 perception_lm,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-persimmon,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+persimmon,reviewer,full workload selected; complete run missing,Primary logits pass but layer-1 key caches fail (worst 95.43% within tolerance). Native rotary improves but does not resolve; isolate layer-0 attention/MLP and layer-1 Q/K normalization on common inputs.
 phi,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 phi3,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 phi4_multimodal,us,registered; full workload review unfinished,Supply --input-dict or implement valid shared synthetic input preparation. Prepare common state including adapter weights for --state-dict. Review default computation; approve scaled values and complete missing behavior.
@@ -366,7 +366,7 @@ slanet,us,full-size numerical pass,Review construction and outputs; validate the
 slanext,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 smollm3,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 smolvlm,reviewer,full-size numerical mismatch,Supply --input-dict or implement valid shared synthetic input preparation. Verify vision fix; isolate remaining text-layer difference on identical inputs; see REVIEW.md.
-solar_open,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+solar_open,us,registered; full workload review unfinished,Primary logits pass but key caches fail (worst 98.43% within tolerance). Common-input expert checks pass; isolate remaining accumulated error.
 speech_encoder_decoder,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 speech_to_text,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 speecht5,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.

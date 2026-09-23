@@ -11,14 +11,15 @@ You own **221 registered implementations**:
 
 | Work | Models | Focus |
 |---|---:|---|
-| Recorded numerical failures | 32 | Reproduce and diagnose disagreements; fix them or identify the unresolved decision. |
-| Workloads awaiting evidence review | 112 | Check existing tests and complete preparation, validation, or implementation where needed. |
-| Independent review of full-size numerical passes | 77 | Verify construction rules, meaningful computation, outputs, and source compatibility. |
+| Known numerical issues | 35 | Investigate failed main-run, cache, or FP32 diagnostic comparisons. |
+| Incomplete execution evidence | 4 | Resolve CTRL's runtime errors; obtain paired GPU evidence for Gemma3, Jais2, and PPLCNetV3. |
+| Earlier passing main results | 182 | Review construction and supporting evidence; prioritize any specific warning in `review.csv`. |
 
-Of the 112, **106 already have passing development GPU comparisons**. Start by
-reviewing that evidence. The README's acceptance policy applies equally to
-full-size and reduced workloads; rerun only for a concrete gap. The CSV's
-`historical_evidence` column records earlier full-size milestones, not current
+The 182 comprise 77 full-size passes and 105 development passes. Both can supply
+acceptable evidence under the README's policy. Review adequate passing results
+after unresolved failures and suspicious results; rerun only for a concrete gap.
+A passing main result does not override a failed supplemental cache check.
+The CSV's `historical_evidence` column records earlier milestones, not current
 acceptance requirements or final classifications.
 
 Prioritize numerical failures and the four large slowdowns below. Performance
@@ -59,7 +60,9 @@ obtain evidence for the reviewed case. Ordinary new runs need no private scripts
 
 These are starting points from saved investigations. Check whether each issue
 still applies to current code. Additional preparation, weak-signal, and execution
-issues are listed per model in `review.csv`.
+issues are listed per model in `review.csv`. Read existing findings before
+repeating diagnostics; some component causes are isolated while full-model
+acceptance remains unresolved.
 
 ### SmolVLM
 
