@@ -88,8 +88,22 @@ sampling rate, for example, does not determine audio duration.
 
 Use valid shared random weights and synthetic inputs. Check that initialization
 does not zero gates or collapse outputs and hide required computation. Such tests
-need investigation before acceptance. Random video does not establish tracking
-quality. Cases requiring supplied inputs, packed weights, or adapter weights are
+need investigation before acceptance. A case may name zero-initialized gates in
+`reference.randomize_zero_parameters`; preparation gives only those parameters
+shared normal random values (standard deviation 0.2, seed plus two), so enabled
+branches affect the outputs. Supplied weights are preserved. The case and saved
+preparation record disclose this choice.
+
+When native initialization collapses outputs or makes untrained generation
+invalid, `reference.fan_in_normal_modules` names modules whose matrix weights
+use random values scaled by their number of input terms (seed plus three).
+Convolutions account for filter size and groups; transposed convolutions also
+account for stride. Embeddings, biases, normalization weights, and tied output
+heads are preserved. Preparation records the affected weight names and standard
+deviations. Each use needs a demonstrated reason.
+
+These checks test numerical computation, not audio or tracking quality. Cases
+requiring supplied inputs, packed weights, or adapter weights are
 flagged in `review.csv`: `--input-dict` and `--state-dict` load common tensors but
 do not generate missing formats. Implement valid synthetic preparation where needed.
 

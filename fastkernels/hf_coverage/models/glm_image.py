@@ -15,7 +15,7 @@ from fastkernels.tasks.baseline.L2.vit_encoder_attention import VitEncoderAttent
 from fastkernels.tasks.baseline.L2.vit_encoder_mlp import VitEncoderMlp
 from ..patches.codec_top1 import CodecTop1
 from ..patches.product_gate import ProductGate
-from . import glm4v, qwen2_vl
+from . import glm4v
 
 
 class Block(nn.Module):
@@ -191,7 +191,7 @@ def load_state_dict_into(model, state_dict, config):
         raise KeyError(f'Unmapped GLM-Image weights: {sorted(remaining)}')
 
 
-def make_workloads(model, inputs, config):
+def make_workloads(model, inputs, config, *, case=None):
     # Input embedding vocabulary differs from the image-token output vocabulary.
     model.config.vocab_size = config.text_config.vision_vocab_size
-    return qwen2_vl.make_workloads(model, inputs, config)
+    return glm4v.make_workloads(model, inputs, config, case=case)

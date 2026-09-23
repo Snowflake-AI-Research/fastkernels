@@ -5,7 +5,8 @@ from copy import copy
 import torch
 from torch import nn
 
-from fastkernels.hf_coverage.models.llama import make_workloads
+from fastkernels.hf_coverage.models.llama import make_workloads as llama_workloads
+from fastkernels.hf_coverage.runner import Workload
 from fastkernels.hf_coverage.models.olmo2 import decoder_config
 from fastkernels.hf_coverage.patches.ernie4_5_rope import FP32RotaryEmbedding
 from fastkernels.tasks.baseline.L1.linear import Linear, Matmul
@@ -127,3 +128,18 @@ def load_state_dict_into(model, state_dict, config):
         parameter.copy_(state_dict[name])
     for name, (parameter, shard) in packed.items():
         parameter.weight_loader(parameter, state_dict[name], shard)
+
+
+def make_workloads(model, inputs, config, *, case=None):
+    workloads = llama_workloads(model, inputs, config, case=case)
+    if case is None or case.get("workload") != "causal_lm_continuation":
+        return workloads
+    for name, work in list(workloads.items()):
+        def collect(output, parent=work.collect):
+            output = parent(output)
+            # Physical value pages include constant head-width padding. Compare
+            # only HF's logical values; the full pages remain in timed execution.
+            return {key: value[..., :config.v_head_dim] if key.endswith(".value") else value
+                    for key, value in output.items()}
+        workloads[name] = Workload(run=work.run, prepare=work.prepare, collect=collect)
+    return workloads

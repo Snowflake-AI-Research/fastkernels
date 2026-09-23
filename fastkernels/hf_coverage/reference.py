@@ -31,6 +31,20 @@ def verify_reference_pin(expected: str) -> dict:
             "imported_version": transformers.__version__}
 
 
+def resolve_generation_config(reference):
+    """Read optional pinned token metadata without loading checkpoint weights."""
+    source = reference.get("generation_config_source")
+    inline = reference.get("generation_config")
+    if source is None:
+        return inline, None
+    if inline is not None:
+        raise ValueError("Specify generation_config or generation_config_source, not both")
+    from huggingface_hub import hf_hub_download
+
+    path = Path(hf_hub_download(source["repo"], "generation_config.json", revision=source["revision"]))
+    return json.loads(path.read_text()), {**source, "sha256": digest(path)}
+
+
 def load_reference_model(model_class, config, weights, dtype, *, load_with_base_class=False,
                          reference_backend=None, load_device="cpu", generation_config=None,
                          adapter_config=None):
@@ -181,17 +195,55 @@ def prepare(job: dict, directory: Path) -> dict:
         else:
             model = model_class(config).eval()
             weights = dict(model.state_dict())
-            del model
             source_weights_sha256 = None
             initialization = "HF FP32 initialization converted by pinned HF from_pretrained loading rules"
+            # Declared subtrees use unit fan-in variance when native random
+            # initialization hides computation or produces invalid generation.
+            # Supplied weights and non-matrix parameters are never changed.
+            fan_in_stds = {}
+            embedding_weights = {layer.weight.data_ptr() for layer in model.modules()
+                                 if isinstance(layer, torch.nn.Embedding)}
+            weight_generator = torch.Generator().manual_seed(job["seed"] + 3)
+            for prefix in ref.get("fan_in_normal_modules", []):
+                for name, layer in model.get_submodule(prefix).named_modules():
+                    if isinstance(layer, torch.nn.Linear):
+                        fan_in = layer.in_features
+                    elif isinstance(layer, (torch.nn.Conv1d, torch.nn.ConvTranspose1d)):
+                        fan_in = layer.in_channels * layer.kernel_size[0] / layer.groups
+                        if isinstance(layer, torch.nn.ConvTranspose1d):
+                            fan_in /= layer.stride[0]
+                    else:
+                        continue
+                    if layer.weight.data_ptr() in embedding_weights:
+                        continue  # Preserve embeddings and their tied output heads.
+                    key = ".".join(part for part in (prefix, name, "weight") if part)
+                    std = fan_in ** -0.5
+                    weights[key].normal_(std=std, generator=weight_generator)
+                    fan_in_stds[key] = std
+            if fan_in_stds:
+                initialization += "; matrix fan-in normal, seed+3: " + json.dumps(fan_in_stds, sort_keys=True)
+            del model
+            # Some HF constructors zero gates and hide otherwise enabled branches.
+            # Randomize only explicitly named zero parameters, identically on both sides.
+            names = ref.get("randomize_zero_parameters", [])
+            gate_generator = torch.Generator().manual_seed(job["seed"] + 2)
+            for name in names:
+                if torch.count_nonzero(weights[name]).item():
+                    raise ValueError(f"Expected zero-initialized parameter: {name}")
+                weights[name].normal_(mean=0.0, std=0.2, generator=gate_generator)
+            if names:
+                initialization += "; named zero parameters use shared N(0, 0.2^2), seed+2: " + ", ".join(names)
+        generation_config, generation_record = resolve_generation_config(ref)
         model, loading_info = load_reference_model(
             model_class, config, weights, dtype,
             load_with_base_class=ref.get("load_with_base_class", False),
             reference_backend=case.get("reference_backend", "eager"),
             load_device=ref.get("load_device", "cpu"),
-            generation_config=ref.get("generation_config"),
+            generation_config=generation_config,
             adapter_config=ref.get("adapter_config"),
         )
+        if generation_record is not None:
+            loading_info["generation_config_source"] = generation_record
         serialized_weights = {key: value for key, value in weights.items()
                               if any(key.endswith(suffix) for suffix in serialized_suffixes)}
         # Native MXFP4 deserialization stores packed tensors outside Parameters;
@@ -370,7 +422,9 @@ def prepare(job: dict, directory: Path) -> dict:
             for name, length, tower in (("input_ids", "encoder_sequence_length", "encoder"),
                                         ("decoder_input_ids", "decoder_sequence_length", "decoder")):
                 vocabulary_key = "src_vocab_size" if tower == "encoder" else "tgt_vocab_size"
-                if hasattr(config, vocabulary_key):
+                if tower + "_vocab_size" in spec:
+                    vocabulary_size = spec[tower + "_vocab_size"]
+                elif hasattr(config, vocabulary_key):
                     vocabulary_size = getattr(config, vocabulary_key)
                 else:
                     vocabulary_size = (config.vocab_size if hasattr(config, "vocab_size")
@@ -379,8 +433,11 @@ def prepare(job: dict, directory: Path) -> dict:
                     token for token in range(spec.get("content_token_id_min", 0), vocabulary_size)
                     if token not in special_ids
                 ])
+                shape = (spec["batch_size"], spec[length])
+                if tower == "decoder" and "decoder_channels" in spec:
+                    shape += (spec["decoder_channels"],)
                 inputs[name] = vocabulary[torch.randint(
-                    vocabulary.numel(), (spec["batch_size"], spec[length]), generator=generator,
+                    vocabulary.numel(), shape, generator=generator,
                 )]
             if prefix:
                 inputs["input_ids"][:, :len(prefix)] = torch.tensor(prefix)
@@ -423,9 +480,9 @@ def prepare(job: dict, directory: Path) -> dict:
                                        ("feature_attention_lengths", "feature_attention_mask")):
                 if lengths in spec:
                     inputs[mask_name] = (
-                        torch.arange(spec.get("audio_shape", spec["shape"])[-1])[None, :]
+                        torch.arange(spec.get("audio_shape", spec["shape"])[spec.get("audio_time_axis", -1)])[None, :]
                         < torch.tensor(spec[lengths])[:, None]
-                    ).long()
+                    ).to(getattr(torch, spec.get("dtypes", {}).get(mask_name, "long")))
             if "video_shape" in spec:
                 inputs["pixel_values_videos"] = torch.randn(
                     spec["image_batch_size"], *spec["video_shape"], generator=generator,
@@ -437,7 +494,8 @@ def prepare(job: dict, directory: Path) -> dict:
                 inputs["image_attention_mask"] = torch.tensor(spec["image_attention_mask"], dtype=torch.bool)
             for name in ("image_grid_thw", "image_merge_sizes", "video_grid_thw",
                          "video_merge_sizes", "video_compression_mask", "image_position_ids",
-                         "target_sizes", "target_sizes_videos", "moe_mm_token_type_ids"):
+                         "target_sizes", "target_sizes_videos", "moe_mm_token_type_ids",
+                         "aspect_ratio_ids", "aspect_ratio_mask", "cross_attention_mask"):
                 if name in spec:
                     inputs[name] = torch.tensor(spec[name], dtype=(torch.bool
                         if name == "video_compression_mask" else torch.long))
@@ -990,13 +1048,16 @@ def execute(job: dict, directory: Path) -> dict:
     ref = job["case"]["reference"]
     config = symbol(ref["config_class"]).from_dict(prepared["config"])
     config._attn_implementation = job["case"].get("reference_backend", "eager")
+    generation_config, generation_record = resolve_generation_config(ref)
     model, loading_info = load_reference_model(symbol(ref["model_class"]), config,
                                                prepared["weights"], getattr(torch, job["dtype"]),
                                                load_with_base_class=ref.get("load_with_base_class", False),
                                                reference_backend=job["case"].get("reference_backend", "eager"),
                                                load_device=ref.get("load_device", "cpu"),
-                                               generation_config=ref.get("generation_config"),
+                                               generation_config=generation_config,
                                                adapter_config=ref.get("adapter_config"))
+    if generation_record is not None:
+        loading_info["generation_config_source"] = generation_record
     model.to(device="cuda:0")
     speakers_record = None
     if "speakers" in ref:

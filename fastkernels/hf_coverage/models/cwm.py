@@ -1,6 +1,6 @@
 """CWM causal LM with Llama-3 RoPE and its full/sliding layer pattern."""
 
-from fastkernels.hf_coverage.models.llama import load_state_dict_into, make_workloads
+from fastkernels.hf_coverage.models.llama import load_state_dict_into, make_workloads as llama_workloads
 from fastkernels.infra.tp import _tp_size
 from fastkernels.tasks.baseline.L2.attention_impl import Attention
 from fastkernels.tasks.baseline.L4.llama import LlamaConfig, LlamaForCausalLM
@@ -44,3 +44,9 @@ def build_from_config(config, device, dtype):
                 num_kv_heads=attention.num_kv_heads, sliding_window=config.sliding_window,
             )
     return model.to(device=device, dtype=dtype).eval()
+
+
+def make_workloads(model, inputs, config, *, case=None):
+    windows = [config.sliding_window if kind == "sliding_attention" else None
+               for kind in config.layer_types]
+    return llama_workloads(model, inputs, config, case=case, cache_windows=windows)

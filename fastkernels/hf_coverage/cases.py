@@ -181,6 +181,7 @@ CASES = {
 
     'aria': {
         'reference': {
+            'continuation_outputs': ['logits', 'past_key_values'],
             'config_class': 'transformers:AriaConfig',
             'model_class': 'transformers:AriaForConditionalGeneration',
             'source': {
@@ -205,11 +206,10 @@ CASES = {
         },
         'input': {
             'kind': 'text_image', 'text_batch_size': 1, 'image_batch_size': 1, 'shape': [3, 70, 70],
-            'sequence_length': 23, 'image_token_positions': list(range(3, 11)),
+            'sequence_length': 24, 'image_token_positions': list(range(3, 11)),
         },
-        'workload': 'causal_lm',
-        'outputs': ['logits'],
-        'decode_outputs': ['logits'],
+        'workload': 'causal_lm_continuation',
+        'outputs': ['logits', 'past_key_values'],
         'reference_backend': 'sdpa',
         'dimension_purpose': ('Preserve Idefics3 tanh-GELU vision, both stacked projector attention projections and learned '
             'queries, shared experts plus routed top6 of8, native text head_dim128 and RoPE/cache. Reduced '
@@ -1412,9 +1412,10 @@ CASES = {
     },
 
     'cwm': {
-        'workload': 'causal_lm',
+        'workload': 'causal_lm_continuation',
         'reference_backend': 'sdpa',
         'reference': {
+            'continuation_outputs': ['logits', 'past_key_values'],
             'config_class': 'transformers:CwmConfig',
             'model_class': 'transformers:CwmForCausalLM',
             'forward_kwargs': {'logits_to_keep': 0},
@@ -1430,8 +1431,8 @@ CASES = {
             'head_dim': 64, 'num_hidden_layers': 4, 'vocab_size': 1024, 'max_position_embeddings': 1024,
             'sliding_window': 64, 'bos_token_id': 1, 'eos_token_id': [2, 3, 4],
         },
-        'input': {'kind': 'tokens', 'batch_size': 2, 'sequence_length': 257},
-        'outputs': ['logits'],
+        'input': {'kind': 'tokens', 'batch_size': 2, 'sequence_length': 258},
+        'outputs': ['logits', 'past_key_values'],
         'dimension_purpose': ('Retains GQA6:1, MLP/H3.5, one whole FSSS layer group, and Llama-3 factor16 frequency scaling. '
             'Context/window bounds both shrink128x; 256-token prompt exceeds window64. Development only.'),
     },
@@ -1630,8 +1631,9 @@ CASES = {
             'num_hidden_layers': 3, 'num_attention_heads': 2, 'num_key_value_heads': 2, 'kv_lora_rank': 128,
             'vocab_size': 1024, 'bos_token_id': 1022, 'eos_token_id': 1023,
         },
-        'input': {'kind': 'tokens', 'batch_size': 2, 'sequence_length': 270},
-        'workload': 'causal_lm',
+        'input': {'kind': 'tokens', 'batch_size': 2, 'sequence_length': 271},
+        'workload': 'causal_lm_continuation',
+        'outputs': ['logits', 'past_key_values'],
         'reference_backend': 'sdpa',
         'dimension_purpose': ('Preserve direct query path,128+64 QK subspaces/value128, dense first then64 '
             'experts/top6/shared2, unnormalized softmax routing and native YaRN. Reduce latent width512 '
@@ -1666,6 +1668,7 @@ CASES = {
 
     'deepseek_vl': {
         'reference': {
+            'continuation_outputs': ['logits', 'past_key_values'],
             'config_class': 'transformers:DeepseekVLConfig',
             'model_class': 'transformers:DeepseekVLForConditionalGeneration',
             'source': {
@@ -1690,11 +1693,10 @@ CASES = {
         },
         'input': {
             'kind': 'text_image', 'text_batch_size': 1, 'image_batch_size': 1, 'shape': [3, 64, 64],
-            'sequence_length': 39, 'image_token_positions': list(range(3, 19)),
+            'sequence_length': 40, 'image_token_positions': list(range(3, 19)),
         },
-        'workload': 'causal_lm',
-        'outputs': ['logits', 'image_hidden_states'],
-        'decode_outputs': ['logits'],
+        'workload': 'causal_lm_continuation',
+        'outputs': ['logits', 'image_hidden_states', 'past_key_values'],
         'reference_backend': 'sdpa',
         'dimension_purpose': ('Preserve RGB patch16 SigLIP without optional pooling head, exact GELU, two-layer alignment '
             'MLP, MHA Llama with native head_dim128/defaultRoPE and cache. Reduced depth/width/image size '
@@ -1703,6 +1705,7 @@ CASES = {
 
     'deepseek_vl_hybrid': {
         'reference': {
+            'continuation_outputs': ['logits', 'past_key_values'],
             'config_class': 'transformers:DeepseekVLHybridConfig',
             'model_class': 'transformers:DeepseekVLHybridForConditionalGeneration',
             'source': {
@@ -1731,12 +1734,11 @@ CASES = {
         },
         'input': {
             'kind': 'text_image', 'text_batch_size': 1, 'image_batch_size': 1, 'shape': [3, 80, 80],
-            'sequence_length': 47, 'image_token_positions': list(range(3, 28)),
+            'sequence_length': 48, 'image_token_positions': list(range(3, 28)),
             'high_res_shape': [3, 256, 256],
         },
-        'workload': 'causal_lm',
-        'outputs': ['logits', 'image_hidden_states'],
-        'decode_outputs': ['logits'],
+        'workload': 'causal_lm_continuation',
+        'outputs': ['logits', 'image_hidden_states', 'past_key_values'],
         'reference_backend': {'': 'sdpa', 'high_res_vision_config': 'eager'},
         'dimension_purpose': ('Retain both vision towers, SAM local-window padding, first global layer2 and distinct final '
             'layer3 branches, learned alpha, nonidentity16-to20 resize and two stride2 projections, '
@@ -1862,40 +1864,60 @@ CASES = {
         'reference_backend': None,
     },
 
-    'dia': {
-        'reference': {
-            'config_class': 'transformers:DiaConfig',
-            'model_class': 'transformers:DiaForConditionalGeneration',
-            'source': {
-                'kind': 'constructor_defaults',
-                'description': ('Pinned HF conversion script convert_dia_to_hf.py explicitly initializes DiaConfig as '
-                    'author Dia1.6B; public author checkpoint config uses a different schema. Verified '
-                    'author checkpoint nari-labs/Dia-1.6B@257bc72f9b78182ccc6fa07675a9ae4c1a44e2cd; retain '
-                    'all9audiochannels.'),
-            },
-            'forward_kwargs': {'use_cache': True},
-        },
-        'dimension_overrides': {
-            'encoder_config': {
-                'hidden_size': 64, 'num_hidden_layers': 2, 'num_attention_heads': 4, 'num_key_value_heads': 4,
-                'head_dim': 32, 'intermediate_size': 128,
-            },
-            'decoder_config': {
-                'hidden_size': 96, 'num_hidden_layers': 2, 'num_attention_heads': 4, 'num_key_value_heads': 1,
-                'head_dim': 32, 'intermediate_size': 192, 'cross_num_attention_heads': 4,
-                'cross_num_key_value_heads': 4, 'cross_head_dim': 32, 'cross_hidden_size': 64,
-            },
-        },
-        'reference_backend': {'': 'sdpa', 'encoder_config': 'sdpa', 'decoder_config': 'sdpa'},
-        'input': {
-            'kind': 'external',
-            'description': 'Explicit seeded text ids and native nine-channel audio codes; original vocabularies retained.',
-        },
-        'workload': 'forward',
-        'outputs': ['logits', 'encoder_last_hidden_state', 'past_key_values'],
-        'dimension_purpose': ('Two encoder+decoder layers; unequal hidden/head widths and decoderQ4/KV1 exercise grouped '
-            'attention; all9audio channels and original vocabularies;33text/17audio steps.'),
-    },
+    'dia': {'reference': {'config_class': 'transformers:DiaConfig',
+                           'model_class': 'transformers:DiaForConditionalGeneration',
+                           'source': {'kind': 'constructor_defaults',
+                                      'description': 'Pinned HF conversion script convert_dia_to_hf.py '
+                                                     'explicitly initializes DiaConfig as author '
+                                                     'Dia1.6B; public author checkpoint config uses a '
+                                                     'different schema. Verified author checkpoint '
+                                                     'nari-labs/Dia-1.6B@257bc72f9b78182ccc6fa07675a9ae4c1a44e2cd; '
+                                                     'retain all9audiochannels.'},
+                           'forward_kwargs': {'use_cache': True},
+                           'reuse_encoder': True},
+             'dimension_overrides': {'encoder_config': {'hidden_size': 64,
+                                                        'num_hidden_layers': 2,
+                                                        'num_attention_heads': 4,
+                                                        'num_key_value_heads': 4,
+                                                        'head_dim': 32,
+                                                        'intermediate_size': 128},
+                                     'decoder_config': {'hidden_size': 96,
+                                                        'num_hidden_layers': 2,
+                                                        'num_attention_heads': 4,
+                                                        'num_key_value_heads': 1,
+                                                        'head_dim': 32,
+                                                        'intermediate_size': 192,
+                                                        'cross_num_attention_heads': 4,
+                                                        'cross_num_key_value_heads': 4,
+                                                        'cross_head_dim': 32,
+                                                        'cross_hidden_size': 64}},
+             'reference_backend': {'': 'sdpa', 'encoder_config': 'sdpa', 'decoder_config': 'sdpa'},
+             'input': {'kind': 'seq2seq_tokens',
+                       'batch_size': 1,
+                       'encoder_sequence_length': 33,
+                       'decoder_sequence_length': 19,
+                       'encoder_vocab_size': 256,
+                       'decoder_vocab_size': 1024,
+                       'decoder_channels': 9,
+                       'decoder_start_token_id': 1026,
+                       'encoder_prefix_token_ids': [],
+                       'encoder_suffix_token_ids': [],
+                       'description': 'Synthetic byte text and nine-channel audio token inference. '
+                                      'Keep33 text steps and17 audio prefill frames plus2 supplied '
+                                      'continuations. Each channel starts with native BOS1026; other '
+                                      'frames contain code IDs0–1023. Sampling bounds retain full text '
+                                      'range and exclude reserved audio IDs; model vocabulary1028 and '
+                                      'full logits remain unchanged.'},
+             'workload': 'seq2seq_continuation',
+             'outputs': ['logits', 'encoder_last_hidden_state', 'past_key_values'],
+             'dimension_purpose': 'Inherited two-layer encoder/decoder dimensions are unchanged by '
+                                  'this cache-interface and input-preparation fix: encoder64/128, '
+                                  'decoder96/192, attention head32, decoder query/KV4:1, cross '
+                                  'query/KV4:4. These FFN ratios2:1 and head32 differ from native4:1 '
+                                  'and head128 and retain their separate dimension-policy review '
+                                  'caveat. All9audio channels and original model vocabularies256/1028 '
+                                  'remain.33text steps and17audio prefill frames plus2 supplied frames '
+                                  'exercise self-cache growth and constant cross-cache reuse.'},
 
     'diffllama': {
         'reference': {
@@ -2328,6 +2350,7 @@ CASES = {
 
     'ernie4_5_moe': {
         'reference': {
+            'continuation_outputs': ['logits', 'past_key_values'],
             'config_class': 'transformers:Ernie4_5_MoeConfig',
             'model_class': 'transformers:Ernie4_5_MoeForCausalLM',
             'source': {
@@ -2342,8 +2365,9 @@ CASES = {
             'num_hidden_layers': 3, 'num_attention_heads': 5, 'num_key_value_heads': 1, 'vocab_size': 1024,
             'moe_layer_end_index': 2,
         },
-        'input': {'kind': 'tokens', 'batch_size': 2, 'sequence_length': 270},
-        'workload': 'causal_lm',
+        'input': {'kind': 'tokens', 'batch_size': 2, 'sequence_length': 271},
+        'workload': 'causal_lm_continuation',
+        'outputs': ['logits', 'past_key_values'],
         'reference_backend': 'sdpa',
         'dimension_purpose': ('Retain head width128 and5:1 GQA, first dense then routed layers,64 experts/top6/two shared '
             'experts, FP32 router and FP32 interleaved RoPE.'),
@@ -2388,7 +2412,7 @@ CASES = {
         'input': {
             'kind': 'text_image',
             'text_batch_size': 1,
-            'sequence_length': 32,
+            'sequence_length': 33,
             'image_batch_size': 1,
             'shape': [16, 588],
             'video_shape': [64, 588],
@@ -2400,13 +2424,13 @@ CASES = {
             'input_ids': [
                 [
                     1, 3, 402, 400, 400, 400, 400, 403, 4, 404, 401, 401, 401, 401, 401, 401, 401, 401, 405,
-                    5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
+                    5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
                 ],
             ],
             'mm_token_type_ids': True,
-            'moe_mm_token_type_ids': [[0, 0, 1, 1, 1, 1, 1, 1, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]],
+            'moe_mm_token_type_ids': [[0, 0, 1, 1, 1, 1, 1, 1, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]],
         },
-        'workload': 'causal_lm',
+        'workload': 'causal_lm_continuation',
         'outputs': ['logits', 'past_key_values'],
         'reference_backend': 'sdpa',
         'dimension_purpose': ('Preserve head128 5:1GQA, firstdense then2modality-isolatedtop6-of8expertlayers, '
@@ -2712,6 +2736,7 @@ CASES = {
 
     'fast_vlm': {
         'reference': {
+            'continuation_outputs': ['logits', 'past_key_values'],
             'config_class': 'transformers:FastVlmConfig',
             'model_class': 'transformers:FastVlmForConditionalGeneration',
             'source': {
@@ -2736,11 +2761,10 @@ CASES = {
         },
         'input': {
             'kind': 'text_image', 'text_batch_size': 1, 'image_batch_size': 1, 'shape': [3, 128, 128],
-            'sequence_length': 23, 'image_token_positions': [3, 4, 5, 6],
+            'sequence_length': 24, 'image_token_positions': [3, 4, 5, 6],
         },
-        'workload': 'causal_lm',
-        'outputs': ['logits', 'image_hidden_states'],
-        'decode_outputs': ['logits'],
+        'workload': 'causal_lm_continuation',
+        'outputs': ['logits', 'image_hidden_states', 'past_key_values'],
         'reference_backend': {'': 'sdpa', 'vision_config': 'eager'},
         'dimension_purpose': ('All five FastViT stages, four downsampling transitions, both position convolutions, both '
             'attention stages, learned scales, final squeeze-excitation, native wrapper pooling and GELU '
@@ -2748,6 +2772,65 @@ CASES = {
             'depth/width/input size reduced.'),
     },
 
+    'fastspeech2_conformer': {'reference': {'config_class': 'transformers:FastSpeech2ConformerWithHifiGanConfig',
+                                         'model_class': 'transformers:FastSpeech2ConformerWithHifiGan',
+                                         'source': {'kind': 'example_checkpoint',
+                                                    'checkpoint': 'espnet/fastspeech2_conformer_with_hifigan',
+                                                    'revision': '7c7b76ccfcda92b7e9708f0c78e0b73f6f2247a3',
+                                                    'url': 'https://github.com/huggingface/transformers/blob/da6c53e431f7c9ef0691239d4ce89b0f711ecad7/src/transformers/models/fastspeech2_conformer/modeling_fastspeech2_conformer.py#L1550-L1562',
+                                                    'description': 'Pinned public text-to-waveform example '
+                                                                   'selects the complete '
+                                                                   'FastSpeech2ConformerWithHifiGan task, '
+                                                                   'including duration/pitch/energy, '
+                                                                   'postnet and full HiFi-GAN.'},
+                                         'fan_in_normal_modules': ['vocoder']},
+                           'dimension_overrides': {'model_config': {'hidden_size': 192,
+                                                                    'encoder_num_attention_heads': 1,
+                                                                    'decoder_num_attention_heads': 1,
+                                                                    'encoder_layers': 2,
+                                                                    'decoder_layers': 2,
+                                                                    'encoder_linear_units': 768,
+                                                                    'decoder_linear_units': 768,
+                                                                    'duration_predictor_channels': 128,
+                                                                    'pitch_predictor_channels': 128,
+                                                                    'energy_predictor_channels': 128,
+                                                                    'speech_decoder_postnet_units': 128,
+                                                                    'encoder_config': {'layers': 2,
+                                                                                       'num_attention_heads': 1,
+                                                                                       'linear_units': 768},
+                                                                    'decoder_config': {'layers': 2,
+                                                                                       'num_attention_heads': 1,
+                                                                                       'linear_units': 768}},
+                                                   'vocoder_config': {'upsample_initial_channel': 64}},
+                           'dimension_purpose': 'Two encoder/decoder blocks, width192/one head preserves '
+                                                'native192-wide heads and4:1 feed-forward ratio. Predictor '
+                                                'channels128 and postnet units128 reduce ordinary widths '
+                                                'while retaining every predictor/postnet layer. HiFi-GAN '
+                                                'channels64 retains all4 upsamplers, rates[8,8,2,2], all3 '
+                                                'residual kernel types and all3 dilation stages. Native '
+                                                'mel80/vocab78 and convolution kernels remain. '
+                                                'Explicit32-token synthetic text exercises encoder kernel7 '
+                                                'and decoder kernel31; learned durations determine actual '
+                                                'output length.',
+                           'input': {'kind': 'tokens',
+                                     'vocab_size': 78,
+                                     'batch_size': 1,
+                                     'sequence_length': 32},
+                           'workload': 'forward',
+                           'default_dtype': 'float32',
+                           'reference_backend': None,
+                           'outputs': ['spectrogram',
+                                       'encoder_last_hidden_state',
+                                       'duration_outputs',
+                                       'pitch_outputs',
+                                       'energy_outputs',
+                                       'waveform'],
+                           'notes': 'FP32 is explicit: native length_regulator allocates FP32, causing '
+                                    'BF16 decoder convolution dtype failure. Direct nearest-even '
+                                    'composition uses admitted casts/fixed half scaling/subtractions, two '
+                                    'CodecTop1 predicates and gather; repeat expansion uses existing '
+                                    'Offset2Batch per token, linear output storage with unoptimized launch '
+                                    'count.'},
     'flaubert': {
         'reference': {
             'config_class': 'transformers:FlaubertConfig',
@@ -3052,6 +3135,56 @@ CASES = {
         'outputs': ['logits', 'image_hidden_states', 'past_key_values'],
     },
 
+    'gemma3n': {
+        'reference': {
+            'config_class': 'transformers:Gemma3nConfig',
+            'model_class': 'transformers:Gemma3nForConditionalGeneration',
+            'continuation_outputs': ['logits', 'past_key_values'],
+            'randomize_zero_parameters': [f'model.language_model.layers.{i}.altup.correct_output_scale' for i in range(15)],
+            'source': {
+                'kind': 'constructor_defaults',
+                'url': 'https://github.com/huggingface/transformers/blob/da6c53e431f7c9ef0691239d4ce89b0f711ecad7/src/transformers/models/gemma3n/configuration_gemma3n.py#L401-L453',
+                'description': ('The composite config example explicitly constructs default text, vision, and audio configs. '
+                    'Its snippet omits vision/audio config imports and incorrectly constructs Gemma3nTextConfig as the model. '
+                    'Select the demonstrated three default subconfigs via the actual usable Gemma3nConfig() constructor '
+                    'and Gemma3nForConditionalGeneration, rather than substituting an unrelated checkpoint. '
+                    'Retain all three modalities; vision is mobilenetv5_300m_enc, not the stale resnet50 prose default.'),
+            },
+        },
+        'reference_backend': None,
+        'dimension_overrides': {
+            'text_config': {'vocab_size':512,'vocab_size_per_layer_input':256,'hidden_size':1024,
+                'intermediate_size':8192,'num_hidden_layers':15,'num_attention_heads':4,'num_key_value_heads':1,
+                'head_dim':256,'num_kv_shared_layers':5,'hidden_size_per_layer_input':128,
+                'activation_sparsity_pattern':[.95]*5+[0.]*10},
+            'audio_config': {'hidden_size':384,'conf_num_attention_heads':2,'conf_num_hidden_layers':2,'vocab_offset':384},
+            'vision_config': {'vocab_offset':256,'model_args':{'channel_multiplier':.125}},
+            'boi_token_id':254,'eoi_token_id':256,'image_token_id':257,
+            'boa_token_id':255,'eoa_token_id':384,'audio_token_id':385,
+        },
+        'dimension_purpose': ('Text halves width/head count while keeping 256-wide heads, Q:KV4:1, FF8:1, AltUp4, Laurel64, '
+            'PLE width/hidden ratio1:8, rotary bases, softcaps, and512 sliding window. Three five-layer attention cycles '
+            'retain sparse nonshared, dense nonshared, and dense shared stages; explicitly set sparse5 so scaling does not '
+            'erase dense nonshared layers. Audio keeps192-wide heads,128 mel bins, both subsampling convs, chunk12, '
+            'left context13, causal kernel5, FF4:1, and4:1 reduction across two repeated complete Conformer blocks. '
+            'Vision scales convolution widths only, retaining every MobileNetV5 stage/block, all attention heads/key/value '
+            'dimensions, projection2048, and256 image tokens. Image512 retains MSFA nearest alignment and nontrivial '
+            'average pooling into16x16 output; audio132frames exercises three attention chunks, partial chunk and padding. '
+            'Keep188 audio soft tokens including native learned padding. Prefill516 crosses the unchanged512 window; '
+            'two supplied tokens check cache continuation. Vocabulary offsets are remapped consistently, retaining128 '
+            'hard tokens per nontext modality. The existing named-zero-parameter initializer makes AltUp scales informative; native vision/audio scales stay unchanged.'),
+        'input': {
+            'kind':'text_image', 'text_batch_size':1, 'image_batch_size':1,
+            'sequence_length':518, 'shape':[3,512,512], 'audio_shape':[132,128],
+            'audio_time_axis':0, 'input_features_lengths':[119],
+            'dtypes':{'input_features_mask':'bool'},
+            'image_token_positions':list(range(3,259)),
+            'audio_token_positions':list(range(261,449)),
+            'fixed_token_ids':{0:2,1:10,2:254,259:256,260:255,449:384,516:2,517:10},
+        },
+        'workload':'causal_lm_continuation',
+        'outputs':['logits','image_hidden_states','audio_hidden_states','past_key_values'],
+    },
     'gemma4': {
         'reference': {
             'config_class': 'transformers:Gemma4Config',
@@ -3268,10 +3401,10 @@ CASES = {
         },
         'input': {
             'kind': 'text_image', 'text_batch_size': 1, 'image_batch_size': 1, 'shape': [24, 1176],
-            'flatten_pixel_batch': True, 'image_grid_thw': [[1, 6, 4]], 'video_grid_thw': [],
-            'sequence_length': 15, 'image_token_positions': [3, 4, 5, 6, 7, 8], 'mm_token_type_ids': True,
+            'flatten_pixel_batch': True, 'image_grid_thw': [[1, 6, 4]],
+            'sequence_length': 16, 'image_token_positions': [3, 4, 5, 6, 7, 8], 'mm_token_type_ids': True,
         },
-        'workload': 'causal_lm',
+        'workload': 'causal_lm_continuation',
         'outputs': ['logits', 'rope_deltas', 'past_key_values'],
         'reference_backend': 'sdpa',
         'dimension_purpose': ('Reduced depth, text/vision width and learned image grid. Full vocabulary/special IDs; native '
@@ -3357,10 +3490,10 @@ CASES = {
         },
         'input': {
             'kind': 'text_image', 'text_batch_size': 1, 'image_batch_size': 1, 'shape': [24, 1176],
-            'flatten_pixel_batch': True, 'image_grid_thw': [[1, 6, 4]], 'video_grid_thw': [],
-            'sequence_length': 15, 'image_token_positions': [3, 4, 5, 6, 7, 8], 'mm_token_type_ids': True,
+            'flatten_pixel_batch': True, 'image_grid_thw': [[1, 6, 4]],
+            'sequence_length': 16, 'image_token_positions': [3, 4, 5, 6, 7, 8], 'mm_token_type_ids': True,
         },
-        'workload': 'causal_lm',
+        'workload': 'causal_lm_continuation',
         'outputs': ['logits', 'rope_deltas', 'past_key_values'],
         'reference_backend': 'sdpa',
         'dimension_purpose': ('Reduced depth, text/vision width and learned image grid. Full vocabulary/special IDs; native '
@@ -3399,10 +3532,10 @@ CASES = {
         },
         'input': {
             'kind': 'text_image', 'text_batch_size': 1, 'image_batch_size': 1, 'shape': [24, 1176],
-            'flatten_pixel_batch': True, 'image_grid_thw': [[1, 6, 4]], 'video_grid_thw': [],
-            'sequence_length': 15, 'image_token_positions': [3, 4, 5, 6, 7, 8], 'mm_token_type_ids': True,
+            'flatten_pixel_batch': True, 'image_grid_thw': [[1, 6, 4]],
+            'sequence_length': 16, 'image_token_positions': [3, 4, 5, 6, 7, 8], 'mm_token_type_ids': True,
         },
-        'workload': 'causal_lm',
+        'workload': 'causal_lm_continuation',
         'outputs': ['logits', 'rope_deltas', 'past_key_values'],
         'reference_backend': 'sdpa',
         'dimension_purpose': ('Preserve explicit text head128,12:1GQA, first dense then routed layer, top8/16 experts, one '
@@ -3438,11 +3571,11 @@ CASES = {
         },
         'input': {
             'kind': 'text_image', 'text_batch_size': 1, 'image_batch_size': 1, 'shape': [6, 768],
-            'flatten_pixel_batch': True, 'image_grid_thw': [[1, 2, 3], [1, 2, 3]], 'sequence_length': 16,
+            'flatten_pixel_batch': True, 'image_grid_thw': [[1, 2, 3], [1, 2, 3]], 'sequence_length': 17,
             'image_token_positions': [3, 4, 5, 6, 7, 8],
-            'input_ids': [[42, 43, 16384, 167855, 167855, 167855, 167855, 167855, 167855, 16385, 44, 45, 46, 47, 16384, 2]],
+            'input_ids': [[42, 43, 16384, 167855, 167855, 167855, 167855, 167855, 167855, 16385, 44, 45, 46, 47, 16384, 2, 101]],
         },
-        'workload': 'causal_lm',
+        'workload': 'causal_lm_continuation',
         'outputs': ['logits', 'rope_deltas', 'past_key_values'],
         'reference_backend': 'sdpa',
         'dimension_purpose': ('Image-to-image prompt with complete source image and final target image marker/grid. Preserve '
@@ -3508,10 +3641,10 @@ CASES = {
         },
         'input': {
             'kind': 'text_image', 'text_batch_size': 1, 'image_batch_size': 1, 'shape': [24, 1176],
-            'flatten_pixel_batch': True, 'image_grid_thw': [[1, 6, 4]], 'video_grid_thw': [],
-            'sequence_length': 15, 'image_token_positions': [3, 4, 5, 6, 7, 8], 'mm_token_type_ids': True,
+            'flatten_pixel_batch': True, 'image_grid_thw': [[1, 6, 4]],
+            'sequence_length': 16, 'image_token_positions': [3, 4, 5, 6, 7, 8], 'mm_token_type_ids': True,
         },
-        'workload': 'causal_lm',
+        'workload': 'causal_lm_continuation',
         'outputs': ['logits', 'rope_deltas', 'past_key_values'],
         'reference_backend': 'sdpa',
         'dimension_purpose': ('Reduced depth, text/vision width and learned image grid. Full vocabulary/special IDs; native '
@@ -6407,6 +6540,85 @@ CASES = {
         'workload': 'forward',
         'reference_backend': None,
     },
+
+    'mllama': {'reference': {'config_class': 'transformers:MllamaConfig',
+                              'model_class': 'transformers:MllamaForConditionalGeneration',
+                              'source': {'kind': 'constructor_defaults',
+                                         'description': 'Pinned configuration_mllama.py:155-173 documents '
+                                                        'MllamaVisionConfig()+MllamaTextConfig() and '
+                                                        'MllamaForConditionalGeneration. Use '
+                                                        'keyword-equivalent '
+                                                        'MllamaConfig(vision_config=...,text_config=...), '
+                                                        'equal to bare defaults; literal '
+                                                        'two-positional-argument doc syntax fails strict '
+                                                        'constructor. This is a constructor workload, not '
+                                                        'inaccessible gated checkpoint config.',
+                                         'revision': 'da6c53e431f7c9ef0691239d4ce89b0f711ecad7',
+                                         'url': 'https://github.com/huggingface/transformers/blob/da6c53e431f7c9ef0691239d4ce89b0f711ecad7/src/transformers/models/mllama/configuration_mllama.py#L155-L173'},
+                              'native_position_ids': True,
+                              'native_cache_defaults': True,
+                              'continuation_input_names': ['cross_attention_mask'],
+                              'continuation_outputs': ['logits', 'past_key_values'],
+                              'randomize_zero_parameters': ['model.vision_model.gated_positional_embedding.gate',
+                                                            'model.vision_model.pre_tile_positional_embedding.gate',
+                                                            'model.vision_model.post_tile_positional_embedding.gate',
+                                                            'model.language_model.layers.1.cross_attn_attn_gate',
+                                                            'model.language_model.layers.1.cross_attn_mlp_gate',
+                                                            'model.language_model.layers.3.cross_attn_attn_gate',
+                                                            'model.language_model.layers.3.cross_attn_mlp_gate']},
+                'config_overrides': {},
+                'dimension_overrides': {'vision_config': {'hidden_size': 160,
+                                                          'attention_heads': 2,
+                                                          'intermediate_size': 640,
+                                                          'num_hidden_layers': 6,
+                                                          'num_global_layers': 2,
+                                                          'intermediate_layers_indices': [0, 1, 2, 3, 4],
+                                                          'vision_output_dim': 960,
+                                                          'image_size': 112},
+                                        'text_config': {'hidden_size': 512,
+                                                        'intermediate_size': 1792,
+                                                        'num_hidden_layers': 5,
+                                                        'num_attention_heads': 4,
+                                                        'num_key_value_heads': 1,
+                                                        'cross_attention_layers': [1, 3],
+                                                        'vocab_size': 1024,
+                                                        'bos_token_id': 1016,
+                                                        'eos_token_id': 1017,
+                                                        'pad_token_id': 1020},
+                                        'image_token_index': 1024},
+                'dimension_purpose': 'Preserve vision head width 80 and 4:1 feed-forward ratio; text head '
+                                     'width 128, 4:1 query/KV grouping and 3.5:1 feed-forward ratio. Six '
+                                     'local vision blocks retain five intermediate feature taps and the '
+                                     'final block; two global blocks retain learned gates. Five text layers '
+                                     'alternate self/cross/self/cross/self attention. Four tiles and native '
+                                     '14-pixel patches at image size 112 retain 64 patch tokens, a class '
+                                     'token and seven padding tokens per tile. A 128-token prefix plus two '
+                                     'continuations checks both cache types. Vocabulary 1024 remaps special '
+                                     'IDs together and retains eight extra embedding entries. Named zero '
+                                     'gates are randomized equally on both sides so the image path is '
+                                     'active.',
+                'input': {'kind': 'text_image',
+                          'shape': [1, 4, 3, 112, 112],
+                          'text_batch_size': 1,
+                          'image_batch_size': 1,
+                          'batch_size': 1,
+                          'sequence_length': 130,
+                          'image_token_positions': [3],
+                          'aspect_ratio_ids': [[2]],
+                          'aspect_ratio_mask': [[[1, 1, 0, 0]]],
+                          'cross_attention_mask': [[[[0, 0, 0, 0]] if position < 3 else [[1, 1, 0, 0]]
+                                                       for position in range(130)]]},
+                'workload': 'causal_lm_continuation',
+                'outputs': ['logits', 'past_key_values'],
+                'decode_outputs': ['logits', 'past_key_values'],
+                'reference_backend': 'sdpa',
+                'notes': 'Native zero position/cross gates are randomized with shared seeded N(0,.2²) by '
+                         'explicit reference.randomize_zero_parameters. Preserve already nonzero global '
+                         'gates. CPU checks compare generic prefill+2 and separate vision outputs; no CUDA '
+                         'claim. RMSNormNative/SiLU are unchanged internal ops; ProductGate is existing '
+                         'explicit patch. Primary runner still needs GPU validation. Generic preparation '
+                         'including metadata fields and zero-gate hook verified CPU in '
+                         'prepared-cpu-report.json.'},
 
     'mobilebert': {
         'reference': {
@@ -9323,6 +9535,344 @@ CASES = {
             'unchanged. Development dimensions only.'),
     },
 
+    'seamless_m4t': {
+        'variants': {
+            'text': {
+                'reference': {
+                    'config_class': 'transformers:SeamlessM4TConfig',
+                    'model_class': 'transformers:SeamlessM4TModel',
+                    'source': {
+                        'kind': 'example_checkpoint',
+                        'checkpoint': 'facebook/hf-seamless-m4t-medium',
+                        'revision': 'ecf60d4df63baaac3f82ae6a7ad7adcb19dcb26c',
+                        'url': 'https://huggingface.co/facebook/hf-seamless-m4t-medium/blob/ecf60d4df63baaac3f82ae6a7ad7adcb19dcb26c/config.json',
+                        'description': (
+                            'Pinned HF docs/source/en/model_doc/seamless_m4t.md demonstrates both '
+                            'text-to-speech and audio-to-speech generation with medium checkpoint and '
+                            'target rus. Generation IDs/maps from same revision generation_config.json, '
+                            'restricted only to evaluated rus language.'
+                        ),
+                    },
+                    'generation_config': {
+                        'bos_token_id': 2,
+                        'decoder_start_token_id': 3,
+                        'eos_token_id': 3,
+                        'max_new_tokens': 256,
+                        'pad_token_id': 0,
+                        't2u_lang_code_to_id': {'rus': 10067},
+                        'text_decoder_lang_to_code_id': {'rus': 256147},
+                        'transformers_version': '4.35.0.dev0',
+                        'vocoder_lang_code_to_id': {'rus': 23},
+                    },
+                    'generation_output_names': ['waveform', 'waveform_lengths'],
+                    'fan_in_normal_modules': ['t2u_model.model.decoder', 'vocoder.dur_predictor', 'vocoder.hifi_gan'],
+                },
+                'dimension_overrides': {
+                    'decoder_attention_heads': 2,
+                    'decoder_ffn_dim': 512,
+                    'decoder_layers': 2,
+                    'encoder_attention_heads': 2,
+                    'encoder_ffn_dim': 512,
+                    'encoder_layers': 2,
+                    'hidden_size': 128,
+                    'lang_embed_dim': 32,
+                    'speech_encoder_attention_heads': 2,
+                    'speech_encoder_intermediate_size': 512,
+                    'speech_encoder_layers': 2,
+                    'spkr_embed_dim': 32,
+                    't2u_decoder_attention_heads': 2,
+                    't2u_decoder_ffn_dim': 1024,
+                    't2u_decoder_layers': 2,
+                    't2u_encoder_attention_heads': 2,
+                    't2u_encoder_ffn_dim': 1024,
+                    't2u_encoder_layers': 2,
+                    'unit_embed_dim': 256,
+                    'upsample_initial_channel': 128,
+                },
+                'input': {'kind': 'tokens', 'batch_size': 1, 'sequence_length': 13},
+                'workload': 'generate',
+                'outputs': ['waveform', 'waveform_lengths'],
+                'generation_kwargs': {'tgt_lang': 'rus', 'text_max_new_tokens': 4, 'speech_max_new_tokens': 4},
+                'implementation_kwargs': {
+                    'generation_config': {
+                        'bos_token_id': 2,
+                        'decoder_start_token_id': 3,
+                        'eos_token_id': 3,
+                        'max_new_tokens': 256,
+                        'pad_token_id': 0,
+                        't2u_lang_code_to_id': {'rus': 10067},
+                        'text_decoder_lang_to_code_id': {'rus': 256147},
+                        'transformers_version': '4.35.0.dev0',
+                        'vocoder_lang_code_to_id': {'rus': 23},
+                    },
+                },
+                'reference_backend': 'eager',
+                'dimension_purpose': (
+                    'Reduce transformer depth to2, width to128 with64-wide heads and original FF ratios; '
+                    'retain full text/unit/language vocabularies, 160 input features, relative positions,'
+                    ' kernel31 speech convolution, stride8 adapter, all5 vocoder upsampling stages and '
+                    'all3 residual kernels/dilations. Text13tokens and audio65frames exercise positional '
+                    'and temporal kernels;4 generated text/unit steps exercise cached updates. Both '
+                    'documented input modalities retain complete speech synthesis. Shared FP32 fan-in '
+                    'initialization of complete unitdecoder linear layers prevents untrained tied '
+                    'language-token repetition from creating out-of-range vocoder IDs; duration predictor'
+                    ' and HiFiGAN fan-in give meaningful duration/output signal. '
+                    'Embeddings/tiedhead/LN/biases unchanged; no forced/suppressed tokens or pretrained '
+                    'weights.'
+                ),
+            },
+            'audio': {
+                'reference': {
+                    'config_class': 'transformers:SeamlessM4TConfig',
+                    'model_class': 'transformers:SeamlessM4TModel',
+                    'source': {
+                        'kind': 'example_checkpoint',
+                        'checkpoint': 'facebook/hf-seamless-m4t-medium',
+                        'revision': 'ecf60d4df63baaac3f82ae6a7ad7adcb19dcb26c',
+                        'url': 'https://huggingface.co/facebook/hf-seamless-m4t-medium/blob/ecf60d4df63baaac3f82ae6a7ad7adcb19dcb26c/config.json',
+                        'description': (
+                            'Pinned HF docs/source/en/model_doc/seamless_m4t.md demonstrates both '
+                            'text-to-speech and audio-to-speech generation with medium checkpoint and '
+                            'target rus. Generation IDs/maps from same revision generation_config.json, '
+                            'restricted only to evaluated rus language.'
+                        ),
+                    },
+                    'generation_config': {
+                        'bos_token_id': 2,
+                        'decoder_start_token_id': 3,
+                        'eos_token_id': 3,
+                        'max_new_tokens': 256,
+                        'pad_token_id': 0,
+                        't2u_lang_code_to_id': {'rus': 10067},
+                        'text_decoder_lang_to_code_id': {'rus': 256147},
+                        'transformers_version': '4.35.0.dev0',
+                        'vocoder_lang_code_to_id': {'rus': 23},
+                    },
+                    'generation_output_names': ['waveform', 'waveform_lengths'],
+                    'fan_in_normal_modules': ['t2u_model.model.decoder', 'vocoder.dur_predictor', 'vocoder.hifi_gan'],
+                },
+                'dimension_overrides': {
+                    'decoder_attention_heads': 2,
+                    'decoder_ffn_dim': 512,
+                    'decoder_layers': 2,
+                    'encoder_attention_heads': 2,
+                    'encoder_ffn_dim': 512,
+                    'encoder_layers': 2,
+                    'hidden_size': 128,
+                    'lang_embed_dim': 32,
+                    'speech_encoder_attention_heads': 2,
+                    'speech_encoder_intermediate_size': 512,
+                    'speech_encoder_layers': 2,
+                    'spkr_embed_dim': 32,
+                    't2u_decoder_attention_heads': 2,
+                    't2u_decoder_ffn_dim': 1024,
+                    't2u_decoder_layers': 2,
+                    't2u_encoder_attention_heads': 2,
+                    't2u_encoder_ffn_dim': 1024,
+                    't2u_encoder_layers': 2,
+                    'unit_embed_dim': 256,
+                    'upsample_initial_channel': 128,
+                },
+                'input': {
+                    'kind': 'spectrogram',
+                    'name': 'input_features',
+                    'batch_size': 1,
+                    'shape': [65, 160],
+                    'attention_mask_length': 65,
+                },
+                'workload': 'generate',
+                'outputs': ['waveform', 'waveform_lengths'],
+                'generation_kwargs': {'tgt_lang': 'rus', 'text_max_new_tokens': 4, 'speech_max_new_tokens': 4},
+                'implementation_kwargs': {
+                    'generation_config': {
+                        'bos_token_id': 2,
+                        'decoder_start_token_id': 3,
+                        'eos_token_id': 3,
+                        'max_new_tokens': 256,
+                        'pad_token_id': 0,
+                        't2u_lang_code_to_id': {'rus': 10067},
+                        'text_decoder_lang_to_code_id': {'rus': 256147},
+                        'transformers_version': '4.35.0.dev0',
+                        'vocoder_lang_code_to_id': {'rus': 23},
+                    },
+                },
+                'reference_backend': 'eager',
+                'dimension_purpose': (
+                    'Reduce transformer depth to2, width to128 with64-wide heads and original FF ratios; '
+                    'retain full text/unit/language vocabularies, 160 input features, relative positions,'
+                    ' kernel31 speech convolution, stride8 adapter, all5 vocoder upsampling stages and '
+                    'all3 residual kernels/dilations. Text13tokens and audio65frames exercise positional '
+                    'and temporal kernels;4 generated text/unit steps exercise cached updates. Both '
+                    'documented input modalities retain complete speech synthesis. Shared FP32 fan-in '
+                    'initialization of complete unitdecoder linear layers prevents untrained tied '
+                    'language-token repetition from creating out-of-range vocoder IDs; duration predictor'
+                    ' and HiFiGAN fan-in give meaningful duration/output signal. '
+                    'Embeddings/tiedhead/LN/biases unchanged; no forced/suppressed tokens or pretrained '
+                    'weights.'
+                ),
+            },
+        },
+    },
+
+    'seamless_m4t_v2': {
+        'variants': {
+            'text': {
+                'reference': {
+                    'config_class': 'transformers:SeamlessM4Tv2Config',
+                    'model_class': 'transformers:SeamlessM4Tv2Model',
+                    'source': {
+                        'kind': 'example_checkpoint',
+                        'checkpoint': 'facebook/seamless-m4t-v2-large',
+                        'revision': '5f8cc790b19fc3f67a61c105133b20b34e3dcb76',
+                        'description': (
+                            'Pinned HF seamless_m4t_v2 model documentation explicitly demonstrates both '
+                            'text/audio-to-speech generation; retain character-conditioned unit synthesis'
+                            ' and full vocoder.'
+                        ),
+                        'url': 'https://huggingface.co/facebook/seamless-m4t-v2-large/blob/5f8cc790b19fc3f67a61c105133b20b34e3dcb76/config.json',
+                    },
+                    'generation_config_source': {
+                        'repo': 'facebook/seamless-m4t-v2-large',
+                        'revision': '5f8cc790b19fc3f67a61c105133b20b34e3dcb76',
+                    },
+                    'generation_output_names': ['waveform', 'waveform_lengths'],
+                    'fan_in_normal_modules': ['t2u_model.model.decoder', 'vocoder.dur_predictor', 'vocoder.hifi_gan'],
+                },
+                'implementation_kwargs': {
+                    'generation_config_source': {
+                        'repo': 'facebook/seamless-m4t-v2-large',
+                        'revision': '5f8cc790b19fc3f67a61c105133b20b34e3dcb76',
+                    },
+                },
+                'dimension_overrides': {
+                    'decoder_attention_heads': 2,
+                    'decoder_ffn_dim': 1024,
+                    'decoder_layers': 2,
+                    'encoder_attention_heads': 2,
+                    'encoder_ffn_dim': 1024,
+                    'encoder_layers': 2,
+                    'hidden_size': 128,
+                    'lang_embed_dim': 32,
+                    'speech_encoder_attention_heads': 2,
+                    'speech_encoder_chunk_size': 32,
+                    'speech_encoder_intermediate_size': 512,
+                    'speech_encoder_layers': 2,
+                    'speech_encoder_left_chunk_num': 2,
+                    'spkr_embed_dim': 32,
+                    't2u_decoder_attention_heads': 2,
+                    't2u_decoder_ffn_dim': 1024,
+                    't2u_decoder_layers': 2,
+                    't2u_encoder_attention_heads': 2,
+                    't2u_encoder_ffn_dim': 1024,
+                    't2u_encoder_layers': 2,
+                    't2u_variance_predictor_embed_dim': 128,
+                    't2u_variance_predictor_hidden_dim': 32,
+                    'unit_embed_dim': 160,
+                    'upsample_initial_channel': 128,
+                },
+                'input': {'kind': 'tokens', 'batch_size': 1, 'sequence_length': 13},
+                'workload': 'generate',
+                'outputs': ['waveform', 'waveform_lengths'],
+                'generation_kwargs': {'tgt_lang': 'rus', 'text_max_new_tokens': 4},
+                'reference_backend': 'eager',
+                'dimension_purpose': (
+                    'Use2repeated transformer layers, hidden128 and2heads preservinghead64; text/unit '
+                    'FF1024 preserve8:1, speechFF512 preserve4:1. Retain vocabulary/character/language '
+                    'maps, both character and vocoder learned-duration expansions, kernel31 causal speech'
+                    ' convolution, relative clipping64/8, stride8 adapter, all5 HiFiGAN stages/residual '
+                    'kernels. Character predictor input128/hidden32 preserves native4:1; vocoder '
+                    'unit/lang/speaker widths scaled uniformly8x to160/32/32. Audio129frames with '
+                    'explicit chunk32 and2prior chunks exercises partialfinalchunk, historycutoff, '
+                    'futurechunk masking and visible relative distances95>64 and31>8. Text13tokens '
+                    'and4generatedsteps preservecached decoding and several character groups. Shared '
+                    'standard fan-in random weights in declared subtrees expose duration/vocoder '
+                    'computations without token forcing/suppression; BF16 waveform signal still requires '
+                    'review.'
+                ),
+            },
+            'audio': {
+                'reference': {
+                    'config_class': 'transformers:SeamlessM4Tv2Config',
+                    'model_class': 'transformers:SeamlessM4Tv2Model',
+                    'source': {
+                        'kind': 'example_checkpoint',
+                        'checkpoint': 'facebook/seamless-m4t-v2-large',
+                        'revision': '5f8cc790b19fc3f67a61c105133b20b34e3dcb76',
+                        'description': (
+                            'Pinned HF seamless_m4t_v2 model documentation explicitly demonstrates both '
+                            'text/audio-to-speech generation; retain character-conditioned unit synthesis'
+                            ' and full vocoder.'
+                        ),
+                        'url': 'https://huggingface.co/facebook/seamless-m4t-v2-large/blob/5f8cc790b19fc3f67a61c105133b20b34e3dcb76/config.json',
+                    },
+                    'generation_config_source': {
+                        'repo': 'facebook/seamless-m4t-v2-large',
+                        'revision': '5f8cc790b19fc3f67a61c105133b20b34e3dcb76',
+                    },
+                    'generation_output_names': ['waveform', 'waveform_lengths'],
+                    'fan_in_normal_modules': ['t2u_model.model.decoder', 'vocoder.dur_predictor', 'vocoder.hifi_gan'],
+                },
+                'implementation_kwargs': {
+                    'generation_config_source': {
+                        'repo': 'facebook/seamless-m4t-v2-large',
+                        'revision': '5f8cc790b19fc3f67a61c105133b20b34e3dcb76',
+                    },
+                },
+                'dimension_overrides': {
+                    'decoder_attention_heads': 2,
+                    'decoder_ffn_dim': 1024,
+                    'decoder_layers': 2,
+                    'encoder_attention_heads': 2,
+                    'encoder_ffn_dim': 1024,
+                    'encoder_layers': 2,
+                    'hidden_size': 128,
+                    'lang_embed_dim': 32,
+                    'speech_encoder_attention_heads': 2,
+                    'speech_encoder_chunk_size': 32,
+                    'speech_encoder_intermediate_size': 512,
+                    'speech_encoder_layers': 2,
+                    'speech_encoder_left_chunk_num': 2,
+                    'spkr_embed_dim': 32,
+                    't2u_decoder_attention_heads': 2,
+                    't2u_decoder_ffn_dim': 1024,
+                    't2u_decoder_layers': 2,
+                    't2u_encoder_attention_heads': 2,
+                    't2u_encoder_ffn_dim': 1024,
+                    't2u_encoder_layers': 2,
+                    't2u_variance_predictor_embed_dim': 128,
+                    't2u_variance_predictor_hidden_dim': 32,
+                    'unit_embed_dim': 160,
+                    'upsample_initial_channel': 128,
+                },
+                'input': {
+                    'kind': 'spectrogram',
+                    'name': 'input_features',
+                    'batch_size': 1,
+                    'shape': [129, 160],
+                    'attention_mask_length': 129,
+                },
+                'workload': 'generate',
+                'outputs': ['waveform', 'waveform_lengths'],
+                'generation_kwargs': {'tgt_lang': 'rus', 'text_max_new_tokens': 4},
+                'reference_backend': 'eager',
+                'dimension_purpose': (
+                    'Use2repeated transformer layers, hidden128 and2heads preservinghead64; text/unit '
+                    'FF1024 preserve8:1, speechFF512 preserve4:1. Retain vocabulary/character/language '
+                    'maps, both character and vocoder learned-duration expansions, kernel31 causal speech'
+                    ' convolution, relative clipping64/8, stride8 adapter, all5 HiFiGAN stages/residual '
+                    'kernels. Character predictor input128/hidden32 preserves native4:1; vocoder '
+                    'unit/lang/speaker widths scaled uniformly8x to160/32/32. Audio129frames with '
+                    'explicit chunk32 and2prior chunks exercises partialfinalchunk, historycutoff, '
+                    'futurechunk masking and visible relative distances95>64 and31>8. Text13tokens '
+                    'and4generatedsteps preservecached decoding and several character groups. Shared '
+                    'standard fan-in random weights in declared subtrees expose duration/vocoder '
+                    'computations without token forcing/suppression; BF16 waveform signal still requires '
+                    'review.'
+                ),
+            },
+        },
+    },
+
     'segformer': {
         'reference': {
             'config_class': 'transformers.models.segformer.configuration_segformer:SegformerConfig',
@@ -10570,6 +11120,31 @@ CASES = {
         'reference_backend': None,
     },
 
+    'vits': {'reference': {'config_class': 'transformers:VitsConfig',
+                        'model_class': 'transformers:VitsModel',
+                        'source': {'kind': 'example_checkpoint',
+                                   'checkpoint': 'facebook/mms-tts-eng',
+                                   'revision': 'c71de0fe7204c83f1c10820a7d696d0b450048ba',
+                                   'url': 'https://huggingface.co/facebook/mms-tts-eng/blob/c71de0fe7204c83f1c10820a7d696d0b450048ba/config.json',
+                                   'description': 'Pinned VitsModel.forward text-to-speech example selects '
+                                                  'facebook/mms-tts-eng; retain single-speaker stochastic '
+                                                  'duration and nonzero native noise.'}},
+          'dimension_overrides': {'num_hidden_layers': 2, 'upsample_initial_channel': 64},
+          'input': {'kind': 'tokens', 'batch_size': 1, 'sequence_length': 13},
+          'workload': 'forward',
+          'outputs': ['waveform', 'sequence_lengths', 'spectrogram'],
+          'reference_backend': 'eager',
+          'generation_seed': 555,
+          'dimension_purpose': 'Reduce repeated text layers6 to2 and decoder initial channels512 to64. '
+                               'Preserve native hidden192, head96, FF768, flow192, vocabulary38, all4 '
+                               'duration-flow definitions (native inference skips the first convolutional '
+                               'flow), all4 prior flows with4 WaveNet layers, all3 depthwise dilations, '
+                               'all10 spline bins, native window4 and all4 decoder upsample stages8/8/2/2 '
+                               'with3 residual kernels3/7/11 and dilations1/3/5. Thirteen tokens exceed '
+                               'both sides of relative window4 and exercise noncentral dilated kernels; '
+                               'stochastic generated lengths retain dynamic alignment. Native '
+                               'duration/prior noise scales remain0.8/0.667. Seed555 fixes common draws, '
+                               'including typed/layout-matched prior sampling; no noise suppression.'},
     'vitmatte': {
         'reference': {
             'config_class': 'transformers:VitMatteConfig',

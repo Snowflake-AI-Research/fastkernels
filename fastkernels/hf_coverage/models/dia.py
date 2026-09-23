@@ -3,7 +3,7 @@
 import torch
 from torch import nn
 
-from fastkernels.hf_coverage.runner import Workload, seq2seq_cache_outputs
+from fastkernels.hf_coverage.runner import Workload, seq2seq_cache_outputs, seq2seq_continuation_workloads
 from fastkernels.tasks.baseline.L1.dense_attention import DenseAttention
 from fastkernels.tasks.baseline.L1.embedding import Embedding
 from fastkernels.tasks.baseline.L1.linear import Linear
@@ -143,10 +143,23 @@ class Dia(nn.Module):
         return {"logits": logits, "encoder_last_hidden_state": memory,
                 **seq2seq_cache_outputs(next_cache)}, tuple(next_cache)
 
-    def forward(self, input_ids, decoder_input_ids, attention_mask=None):
+    def forward(self, input_ids=None, decoder_input_ids=None, attention_mask=None,
+                encoder_hidden_states=None, past_key_values=None, decoder_attention_mask=None):
+        if decoder_attention_mask is not None:
+            raise ValueError("Dia coverage selects decoder sequences without padding")
+        if decoder_input_ids is None:
+            raise ValueError("Dia coverage requires supplied nine-channel decoder tokens")
         mask = None if attention_mask is None else attention_mask.bool()
-        memory = self.encode(input_ids, mask)
-        return self.decode(decoder_input_ids, memory, mask)[0]
+        memory = encoder_hidden_states
+        if memory is None:
+            if input_ids is None:
+                raise ValueError("Dia requires text IDs or retained encoder hidden states")
+            memory = self.encode(input_ids, mask)
+        if decoder_input_ids.ndim == 2:
+            decoder_input_ids = decoder_input_ids.reshape(
+                memory.shape[0], self.config.decoder_config.num_channels, -1).transpose(1, 2)
+        output, cache = self.decode(decoder_input_ids, memory, mask, past_key_values)
+        return {**output, "past_key_values": cache}
 
 
 def build_from_config(config, device, dtype):
@@ -170,5 +183,19 @@ def load_state_dict_into(model, state_dict, config):
     model.load_state_dict(mapped, strict=True)
 
 
-def make_workloads(model, inputs, config):
-    return {"forward": Workload(run=lambda: model(**inputs))}
+def make_workloads(model, inputs, config, case=None):
+    if case is not None and case.get("workload") == "seq2seq_continuation":
+        inputs = dict(inputs)
+        ids = inputs["decoder_input_ids"]
+        if ids.ndim == 3:
+            if ids.shape[-1] != config.decoder_config.num_channels:
+                raise ValueError("Dia decoder input must retain every audio channel")
+            # Native Dia also accepts [batch * channels, frames]. This layout
+            # lets the shared continuation helper slice whole channel frames.
+            inputs["decoder_input_ids"] = ids.transpose(1, 2).reshape(-1, ids.shape[1])
+        return seq2seq_continuation_workloads(model, inputs)
+
+    def forward():
+        return {name: value for name, value in model(**inputs).items() if name != "past_key_values"}
+
+    return {"forward": Workload(run=forward)}

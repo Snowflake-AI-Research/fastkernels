@@ -237,7 +237,7 @@ def load_state_dict_into(model, state, config):
                 expert.process_weights_after_loading()
 
 
-def make_workloads(model, inputs, config):
+def make_workloads(model, inputs, config, case=None):
     ids = inputs["input_ids"]
     if ids.shape[0] != 1:
         raise ValueError("The selected development case has one sequence")
@@ -246,10 +246,26 @@ def make_workloads(model, inputs, config):
     metadata["video_grid_thw"][:, 0] //= config.vision_config.temporal_merge_size
     positions, delta = multimodal_positions(ids[0], inputs["mm_token_type_ids"][0], metadata, config)
     modality = inputs["moe_mm_token_type_ids"]
+    continuation = case is not None and case.get("workload") == "causal_lm_continuation"
+    steps = 2 if continuation else 1
+    prefix_length = ids.shape[1] - steps
+    if prefix_length < 1:
+        raise ValueError("ERNIE VL continuation requires a nonempty prefix")
     def prefill():
-        return model(ids[:, :-1], positions[:, :-1], modality[:, :-1], inputs)
-    def prepare_decode():
-        model.reset()
-        prefill()
-    return {"prefill": Workload(run=prefill, prepare=model.reset),
-            "decode": Workload(run=lambda: model(ids[:, -1:], positions[:, -1:], modality[:, -1:]), prepare=prepare_decode)}
+        return model(ids[:, :prefix_length], positions[:, :prefix_length], modality[:, :prefix_length], inputs)
+    calls = []
+    for step in range(steps):
+        index = prefix_length + step
+        def decode(index=index):
+            return model(ids[:, index:index + 1], positions[:, index:index + 1], modality[:, index:index + 1])
+        calls.append(decode)
+    workloads = {"prefill": Workload(run=prefill, prepare=model.reset)}
+    for step, decode in enumerate(calls):
+        def prepare_decode(step=step):
+            model.reset()
+            prefill()
+            for prior in calls[:step]:
+                prior()
+        name = f"decode_{step + 1}" if continuation else "decode"
+        workloads[name] = Workload(run=decode, prepare=prepare_decode)
+    return workloads

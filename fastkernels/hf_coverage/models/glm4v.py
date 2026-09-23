@@ -19,6 +19,7 @@ from fastkernels.tasks.baseline.L1.silu import SiLU
 from fastkernels.tasks.baseline.L1.vision_rotary_emb import VisionRotaryEmbedding
 from fastkernels.tasks.baseline.L4.llama import LlamaForCausalLM
 from ..patches.product_gate import ProductGate
+from ..runner import Workload
 from . import glm4, llama, qwen2, qwen2_vl
 from .olmo2 import decoder_config
 from .qwen2_precision import DenseCachedAttention, SeparateQKV
@@ -281,4 +282,18 @@ def load_vision(vision, remaining):
     vision.load_state_dict(mapped, strict=True)
 
 
-make_workloads = qwen2_vl.make_workloads
+def make_workloads(model, inputs, config, case=None):
+    if case is None or case.get('workload') != 'causal_lm_continuation':
+        return qwen2_vl.make_workloads(model, inputs, config)
+    if inputs['input_ids'].shape[0] != 1:
+        raise ValueError('The GLM multimodal case uses one sequence')
+    model.model.inputs = dict(inputs)
+    # The shared position helper accepts grids for both modalities; HF's
+    # image-only call omits video metadata rather than passing an empty grid.
+    model.model.inputs.setdefault('video_grid_thw', inputs['image_grid_thw'].new_empty((0, 3)))
+    workloads = llama.make_workloads(model, inputs, model.config, case=case)
+    for phase, workload in list(workloads.items()):
+        def run(workload=workload):
+            return {**workload.run(), 'rope_deltas': model.model.rope_delta}
+        workloads[phase] = Workload(run=run, prepare=workload.prepare, collect=workload.collect)
+    return workloads

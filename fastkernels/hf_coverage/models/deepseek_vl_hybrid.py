@@ -105,6 +105,6 @@ def load_state_dict_into(model, state_dict, config):
         raise KeyError(f"Unmapped DeepSeek-VL hybrid weights: {sorted(remaining)}")
 
 
-def make_workloads(model, inputs, config):
+def make_workloads(model, inputs, config, *, case=None):
     model.model.high_res_pixel_values = inputs["high_res_pixel_values"]
-    return llava.make_workloads(model, inputs, model.config)
+    return llava.make_workloads(model, inputs, model.config, case=case)

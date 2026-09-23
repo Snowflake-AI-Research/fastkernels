@@ -155,8 +155,8 @@ def load_state_dict_into(model, state_dict, config):
         raise KeyError(f'Unmapped Aria weights: {sorted(remaining)}')
 
 
-def make_workloads(model, inputs, config):
+def make_workloads(model, inputs, config, *, case=None):
     # The pinned conditional-generation wrapper does not populate its declared
     # image_hidden_states field. The entire frontend still runs during prefill.
     model.model.pixel_values = inputs['pixel_values']
-    return llama.make_workloads(model, {'input_ids': inputs['input_ids']}, model.config)
+    return llama.make_workloads(model, {'input_ids': inputs['input_ids']}, model.config, case=case)
