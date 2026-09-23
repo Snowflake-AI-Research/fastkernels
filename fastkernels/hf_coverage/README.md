@@ -107,6 +107,23 @@ requiring supplied inputs, packed weights, or adapter weights are
 flagged in `review.csv`: `--input-dict` and `--state-dict` load common tensors but
 do not generate missing formats. Implement valid synthetic preparation where needed.
 
+Phi4 speech has a CPU preparer for its active random adapters and synthetic audio.
+It reads the pinned configuration, downloads no pretrained weights, and refuses
+an existing nonempty output directory. Its fixed seeds reproduce the reviewed
+workload; preparing inputs does not establish correctness.
+
+```bash
+python -m fastkernels.hf_coverage.prepare_phi4 \
+  --hf-source "$HF_COVERAGE_REFERENCE_SOURCE" \
+  --output-dir "$HF_COVERAGE_RUNS/phi4-speech-inputs"
+CUDA_VISIBLE_DEVICES=0 python -m fastkernels.hf_coverage phi4_multimodal \
+  --variant speech --hf-python "$VIRTUAL_ENV/bin/python" \
+  --hf-source "$HF_COVERAGE_REFERENCE_SOURCE" \
+  --state-dict "$HF_COVERAGE_RUNS/phi4-speech-inputs/weights.pt" \
+  --input-dict "$HF_COVERAGE_RUNS/phi4-speech-inputs/inputs.pt" \
+  --output-dir "$HF_COVERAGE_RUNS/phi4-speech"
+```
+
 **Reuse adequate existing results, whether full-size or reduced.** They must
 cover the reviewed implementation, required outputs, and meaningful computation.
 Run again to address a specific evidence gap or evaluate a changed workload,
