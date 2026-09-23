@@ -366,7 +366,7 @@ slanet,us,,full-size numerical pass,Review construction and outputs; validate th
 slanext,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 smollm3,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 smolvlm,reviewer,investigate,full-size numerical mismatch,Supply --input-dict or implement valid shared synthetic input preparation. Verify vision fix; isolate remaining text-layer difference on identical inputs; see REVIEW.md.
-solar_open,us,investigate,registered; full workload review unfinished,Current GPU comparison checks logits and complete state through two continuations; numerical failure persists (minimum matched fraction 0.984346). Stage and common-input root-cause investigation pending; historical logit passes do not close it.
+solar_open,us,optional,registered; full workload review unfinished,"Current declared workload passed paired GPU checks on common weights and inputs; 21 tensors, minimum matched fraction 0.995963. Diagnostic timing measured; final construction review remains."
 speech_encoder_decoder,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 speech_to_text,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 speecht5,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.

@@ -5,7 +5,18 @@ from copy import copy
 
 from fastkernels.hf_coverage.models.dots1 import build_from_config as build_dots
 from fastkernels.hf_coverage.models.llama import make_workloads
+from fastkernels.hf_coverage.models.qwen2_precision import DenseCachedAttention
+from fastkernels.tasks.baseline.L1.rotary_emb import RotaryEmbedding
 from fastkernels.tasks.baseline.L1.yarn_rotary_emb import YaRNRotaryEmbedding
+
+
+class NativeYaRNRotary(YaRNRotaryEmbedding):
+    """Keep YaRN frequencies while reusing HF's separately rounded products."""
+
+    def forward(self, positions, query, key):
+        return RotaryEmbedding.forward_native(
+            positions, query, key, self.head_dim, self.cos_sin_cache.to(query.dtype),
+        )
 
 
 def build_from_config(config, device, dtype):
@@ -16,13 +27,16 @@ def build_from_config(config, device, dtype):
     rope = config.rope_parameters
     if rope["rope_type"] != "yarn" or config.partial_rotary_factor != 1.0:
         raise ValueError("Selected Solar Open uses full-head YaRN")
-    rotary = YaRNRotaryEmbedding(model.config.head_dim, config.max_position_embeddings,
+    rotary = NativeYaRNRotary(model.config.head_dim, config.max_position_embeddings,
                                 rope["rope_theta"], rope["factor"], rope["original_max_position_embeddings"],
                                 beta_fast=rope.get("beta_fast", 32), beta_slow=rope.get("beta_slow", 1)).to(device=device, dtype=dtype)
     model.model.rotary_emb = rotary
     for layer in model.model.layers:
         layer.self_attn.q_norm = layer.self_attn.k_norm = None
         layer.self_attn.rotary_emb = rotary
+        layer.self_attn.attn = DenseCachedAttention(
+            config.num_attention_heads, config.num_key_value_heads, config.head_dim,
+        )
         bias = layer.mlp.gate.e_score_correction_bias
         bias.data = bias.data.float()
     return model
