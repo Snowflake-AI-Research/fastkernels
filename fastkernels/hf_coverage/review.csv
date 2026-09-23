@@ -96,7 +96,7 @@ edgetam_video,reviewer,optional,full-size numerical pass,Supply --input-dict or 
 efficientloftr,reviewer,investigate,full-size numerical pass,Investigate 5.43x forward time: two-value predicates use expensive Top1 reductions; review construction and patch implementation; see REVIEW.md.
 efficientnet,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 electra,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-emu3,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+emu3,us,,registered; full workload review unfinished,Pending pinned HF semantic bug: public generation wrapper drops image inputs; current FP32/BF16 rechecks make zero vision-encoder calls. Image-code components match. Do not remove image computation or bypass the public task for acceptance.
 encodec,reviewer,investigate,full-size numerical pass,Review recurrence patches and measured per-step launch overhead (up to 5.09x forward time); retain existing weight scope; see REVIEW.md.
 encoder_decoder,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 eomt,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
@@ -228,7 +228,7 @@ metaclip_2,reviewer,optional,full workload selected; complete run missing,Check 
 mgp_str,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 mimi,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 minicpmv4_6,reviewer,investigate,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
-minimax,us,investigate,registered; full workload review unfinished,Current GPU comparison checks logits and complete state through two continuations; numerical failure persists (minimum matched fraction 0.959885). Stage and common-input root-cause investigation pending; historical logit passes do not close it.
+minimax,us,investigate,registered; full workload review unfinished,Complete-state GPU check fails last recurrent state. Controlled native-order recurrence plus native expert arithmetic jointly closes all 33 outputs; either alone does not. Map this numerical cause to admitted operations/patches and validate production implementation; no tolerance waiver.
 minimax_m2,us,,registered; full workload review unfinished,Prepare correctly packed common weights for --state-dict; ordinary random initialization is insufficient. Review default computation; approve scaled values and complete missing behavior.
 ministral,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 ministral3,us,optional,registered; full workload review unfinished,"Current declared workload passed paired GPU checks on common weights and inputs; 21 tensors, minimum matched fraction 0.999899. Diagnostic timing measured; final construction review remains."
@@ -292,7 +292,7 @@ perception_lm,us,,registered; full workload review unfinished,Review default com
 persimmon,reviewer,investigate,full workload selected; complete run missing,Primary logits pass but layer-1 key caches fail (worst 95.43% within tolerance). Native rotary improves but does not resolve; isolate layer-0 attention/MLP and layer-1 Q/K normalization on common inputs.
 phi,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 phi3,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-phi4_multimodal,us,,registered; full workload review unfinished,Supply --input-dict or implement valid shared synthetic input preparation. Prepare common state including adapter weights for --state-dict. Review default computation; approve scaled values and complete missing behavior.
+phi4_multimodal,us,,registered; full workload review unfinished,"Speech uses proportional widths and shared random active adapters: CPU outputs exact, GPU third-step logits fail; other logits, generated IDs and caches pass. Isolate numerical boundary. Vision remains pending verified native BF16 position-index error; neither modality pair nor whole entry accepted."
 phimoe,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 pi0,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
 pix2struct,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
@@ -316,7 +316,7 @@ pvt,us,,full-size numerical pass,Review construction and outputs; validate the a
 pvt_v2,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 qianfan_ocr,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
 qwen2,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-qwen2_5_omni,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+qwen2_5_omni,us,,registered; full workload review unfinished,Native random talker can emit codes outside codec embedding range; saved invalid code reproduced and no collapsed-weight cause found. Resolve valid shared preparation without seed search or suppression; separately isolate differing speech samples. No full-waveform acceptance.
 qwen2_5_vl,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
 qwen2_audio,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
 qwen2_moe,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.

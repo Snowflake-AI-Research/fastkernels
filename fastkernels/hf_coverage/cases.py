@@ -7877,7 +7877,7 @@ CASES = {
                     'source': {
                         'kind': 'example_checkpoint', 'checkpoint': 'microsoft/Phi-4-multimodal-instruct',
                         'revision': '93f923e1a7727d1c4f446756212d9d3e8fcc5d81',
-                        'description': 'Author README literal vision generation example; official pinned config conversion and active vision LoRA preserved.',
+                        'description': 'Author README literal vision generation example; official pinned config conversion and active random vision LoRA at the original rank/scaling.',
                         'url': 'https://huggingface.co/microsoft/Phi-4-multimodal-instruct',
                         'config_converter': 'transformers.models.phi4_multimodal.convert_phi4_multimodal_weights_to_hf:convert_config',
                     },
@@ -7895,12 +7895,12 @@ CASES = {
                 'reference_backend': {'': 'sdpa', 'vision_config': 'sdpa', 'audio_config': 'sdpa'},
                 'dimension_overrides': {
                     'hidden_size': 384,
-                    'intermediate_size': 512,
+                    'intermediate_size': 1024,
                     'num_hidden_layers': 1,
                     'num_attention_heads': 3,
                     'num_key_value_heads': 1,
                     'vision_config': {
-                        'hidden_size': 144, 'intermediate_size': 256, 'num_hidden_layers': 2,
+                        'hidden_size': 144, 'intermediate_size': 538, 'num_hidden_layers': 2,
                         'num_attention_heads': 2, 'image_size': 448, 'crop_size': 448,
                     },
                     'audio_config': {
@@ -7917,14 +7917,14 @@ CASES = {
                     'eos_token_id': [200020, 199999], 'pad_token_id': 199999,
                 },
                 'outputs': ['sequences', 'logits', 'past_key_values'],
-                'dimension_purpose': ('Development dimensions reduce depth/width while preserving original text '
-                    'head128/GQA3:1, partial LongRoPE arrays and4096/131072/262144 boundaries, full '
-                    'vocabulary, trained active LoRA rank/scaling, all frontend block kinds and returned '
-                    'greedy sequences. Original448 crop and actual author image geometry retained; '
-                    'single4008-frame audio exercises the native500-frame unfold boundary. Public audio '
-                    'asset is403; synthetic ordinary features are disclosed. Both literal author workloads '
-                    'are required for this corpus entry. Source conversion metadata is separate from true '
-                    'dimension overrides.'),
+                'dimension_purpose': (
+                    'Hidden and feed-forward widths scale by eight, preserving attention head widths and '
+                    'feed-forward ratios. Retain one text/audio block and two vision blocks for penultimate '
+                    'features; keep text GQA3:1, partial LongRoPE, vocabulary, and active LoRA ranks/scales. '
+                    'Audio convolution channels reduce to eight while retaining all three stride-two stages '
+                    'and depthwise groups. Keep 448-pixel crops and author-example image geometry. Synthetic '
+                    '4008-frame audio crosses the 500-frame encoder chunk boundary. Both modalities generate '
+                    'four tokens and compare logits and final cache; vision source semantics remain under review.'),
             },
             'speech': {
                 'reference': {
@@ -7933,7 +7933,7 @@ CASES = {
                     'source': {
                         'kind': 'example_checkpoint', 'checkpoint': 'microsoft/Phi-4-multimodal-instruct',
                         'revision': '93f923e1a7727d1c4f446756212d9d3e8fcc5d81',
-                        'description': 'Author README literal speech generation example; official pinned config conversion and active speech LoRA preserved.',
+                        'description': 'Author README literal speech generation example; official pinned config conversion and active random speech LoRA at the original rank/scaling.',
                         'url': 'https://huggingface.co/microsoft/Phi-4-multimodal-instruct',
                         'config_converter': 'transformers.models.phi4_multimodal.convert_phi4_multimodal_weights_to_hf:convert_config',
                     },
@@ -7951,12 +7951,12 @@ CASES = {
                 'reference_backend': {'': 'sdpa', 'vision_config': 'sdpa', 'audio_config': 'sdpa'},
                 'dimension_overrides': {
                     'hidden_size': 384,
-                    'intermediate_size': 512,
+                    'intermediate_size': 1024,
                     'num_hidden_layers': 1,
                     'num_attention_heads': 3,
                     'num_key_value_heads': 1,
                     'vision_config': {
-                        'hidden_size': 144, 'intermediate_size': 256, 'num_hidden_layers': 2,
+                        'hidden_size': 144, 'intermediate_size': 538, 'num_hidden_layers': 2,
                         'num_attention_heads': 2, 'image_size': 448, 'crop_size': 448,
                     },
                     'audio_config': {
@@ -7973,14 +7973,14 @@ CASES = {
                     'eos_token_id': [200020, 199999], 'pad_token_id': 199999,
                 },
                 'outputs': ['sequences', 'logits', 'past_key_values'],
-                'dimension_purpose': ('Development dimensions reduce depth/width while preserving original text '
-                    'head128/GQA3:1, partial LongRoPE arrays and4096/131072/262144 boundaries, full '
-                    'vocabulary, trained active LoRA rank/scaling, all frontend block kinds and returned '
-                    'greedy sequences. Original448 crop and actual author image geometry retained; '
-                    'single4008-frame audio exercises the native500-frame unfold boundary. Public audio '
-                    'asset is403; synthetic ordinary features are disclosed. Both literal author workloads '
-                    'are required for this corpus entry. Source conversion metadata is separate from true '
-                    'dimension overrides.'),
+                'dimension_purpose': (
+                    'Hidden and feed-forward widths scale by eight, preserving attention head widths and '
+                    'feed-forward ratios. Retain one text/audio block and two vision blocks for penultimate '
+                    'features; keep text GQA3:1, partial LongRoPE, vocabulary, and active LoRA ranks/scales. '
+                    'Audio convolution channels reduce to eight while retaining all three stride-two stages '
+                    'and depthwise groups. Keep 448-pixel crops and author-example image geometry. Synthetic '
+                    '4008-frame audio crosses the 500-frame encoder chunk boundary. Both modalities generate '
+                    'four tokens and compare logits and final cache; vision source semantics remain under review.'),
             },
         },
     },

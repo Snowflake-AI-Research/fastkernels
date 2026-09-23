@@ -1,7 +1,7 @@
 """Phi4's image and single-clip speech generation with the active modality LoRA.
 
 The two author examples are separate workloads of this common model. The
-reference adapter loader supplies the selected trained adapter in common state.
+reference adapter loader supplies the selected active adapter in common state.
 Padded multi-audio is excluded: pinned native and author masking disagree there.
 """
 
