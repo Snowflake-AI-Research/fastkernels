@@ -1,448 +1,448 @@
-model,owner,historical_evidence,next_action
-afmoe,reviewer,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
-aimv2,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-albert,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-align,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-altclip,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-apertus,reviewer,full workload selected; complete run missing,Supply --input-dict or implement valid shared synthetic input preparation. Check readiness and scaled scope; run common random weights/inputs and investigate.
-arcee,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-aria,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-audio_spectrogram_transformer,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-audioflamingo3,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-autoformer,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-aya_vision,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-bamba,reviewer,full-size numerical pass,Review construction and retained full numerical followup plus smaller random-weight pass; old full timing is withheld.
-bark,us,registered; full workload review unfinished,Supply --input-dict or implement valid shared synthetic input preparation. Review default computation; approve scaled values and complete missing behavior.
-bart,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-beit,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-bert,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-bert_generation,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-big_bird,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-bigbird_pegasus,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-biogpt,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-bit,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-bitnet,reviewer,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
-blenderbot,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-blenderbot_small,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-blip,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-blip_2,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-blip_text,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-bloom,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-blt,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-bridgetower,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-bros,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-camembert,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-canine,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-chameleon,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-chinese_clip,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-chmv2,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-clap,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-clip,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-clipseg,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-clvp,us,no registered runnable implementation,Complete existing speech-code and contrastive implementation review; resolve conditioning-mask interpretation before registration.
-codegen,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-cohere,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-cohere2,reviewer,full workload selected; complete run missing,Review scaled local/global attention pattern and inputs; obtain paired GPU evidence.
-cohere2_vision,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-cohere_asr,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-colmodernvbert,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-colpali,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-colqwen2,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-conditional_detr,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-convbert,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-convnext,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-convnextv2,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-cpmant,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-csm,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-ctrl,reviewer,full workload selected; complete run missing,Reproduce native mixed-dtype error and candidate cache-kernel compilation failure; CPU fixes exist but no complete GPU rerun.
-cvt,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-cwm,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-d_fine,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-dab_detr,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-dac,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-data2vec_audio,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-data2vec_text,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-data2vec_vision,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-dbrx,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-deberta,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-deberta_v2,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-decision_transformer,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-deepseek_v2,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-deepseek_v3,us,registered; full workload review unfinished,Prepare correctly packed common weights for --state-dict; ordinary random initialization is insufficient. Review default computation; approve scaled values and complete missing behavior.
-deepseek_v4,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-deepseek_vl,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-deepseek_vl_hybrid,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-deformable_detr,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-deimv2,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-deit,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-depth_anything,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-depth_pro,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-detr,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-dia,us,registered; full workload review unfinished,Supply --input-dict or implement valid shared synthetic input preparation. Review default computation; approve scaled values and complete missing behavior.
-diffllama,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-dinat,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-dinov2,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-dinov2_with_registers,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-dinov3_convnext,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-dinov3_vit,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-distilbert,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-doge,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-donut_swin,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-dots1,reviewer,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
-dpr,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-dpt,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-edgetam,reviewer,full workload selected; complete run missing,Supply --input-dict or implement valid shared synthetic input preparation. Check readiness and scaled scope; run common random weights/inputs and investigate.
-edgetam_video,reviewer,full-size numerical pass,Supply --input-dict or implement valid shared synthetic input preparation. Review construction and outputs; validate the approved scaled case when changed.
-efficientloftr,reviewer,full-size numerical pass,Investigate 5.43x forward time: two-value predicates use expensive Top1 reductions; review construction and patch implementation; see REVIEW.md.
-efficientnet,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-electra,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-emu3,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-encodec,reviewer,full-size numerical pass,Review recurrence patches and measured per-step launch overhead (up to 5.09x forward time); retain existing weight scope; see REVIEW.md.
-encoder_decoder,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-eomt,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-eomt_dinov3,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-ernie,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-ernie4_5,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-ernie4_5_moe,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-ernie4_5_vl_moe,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-esm,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-esmfold,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-eurobert,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-evolla,us,registered; full workload review unfinished,Supply --input-dict or implement valid shared synthetic input preparation. Review default computation; approve scaled values and complete missing behavior.
-exaone4,reviewer,full workload selected; complete run missing,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
-exaone4_5,reviewer,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
-exaone_moe,reviewer,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
-falcon,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-falcon_h1,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-falcon_mamba,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-fast_vlm,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-fastspeech2_conformer,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-flaubert,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-flava,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-flex_olmo,us,registered; full workload review unfinished,Primary logits pass but key caches fail (worst 98.17% within tolerance). CPU FP32 controls are not full GPU acceptance; remaining cause unresolved.
-florence2,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-fnet,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-focalnet,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-fsmt,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-funnel,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-fuyu,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-gemma,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-gemma2,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-gemma3,reviewer,full workload selected; complete run missing,Zero multimodal projection hides visual contribution under native random initialization; establish informative shared-weight testing and paired GPU evidence.
-gemma3n,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-gemma4,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-gemma4_assistant,us,no registered runnable implementation,Complete assisted-generation integration with the main model; existing components and gemma4_bernoulli patch do not establish the full task.
-git,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-glm,reviewer,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
-glm4,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-glm46v,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-glm4_moe,us,registered; full workload review unfinished,Primary logits pass but deeper key caches fail (worst 96.58% within tolerance). Native rotary reuse repaired a component; rerun still failed caches. Continue from downstream divergence.
-glm4_moe_lite,reviewer,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
-glm4v,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-glm4v_moe,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-glm_image,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-glm_moe_dsa,reviewer,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
-glm_ocr,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-glmasr,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-glpn,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-got_ocr2,reviewer,full-size numerical pass,"Supply --input-dict or implement valid shared synthetic input preparation. Review construction and outputs; full numerical pass retained, but saved timing is withheld because of GPU thermal throttling."
-gpt2,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-gpt_bigcode,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-gpt_neo,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-gpt_neox,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-gpt_neox_japanese,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-gpt_oss,reviewer,registered; full workload review unfinished,Prepare correctly packed common weights for --state-dict; ordinary random initialization is insufficient. Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
-gptj,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-granite,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-granite4_vision,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-granite_speech,us,registered; full workload review unfinished,Prepare common state including adapter weights for --state-dict. Review default computation; approve scaled values and complete missing behavior.
-granite_speech_plus,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-granitemoe,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-granitemoehybrid,reviewer,full workload selected; complete run missing,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
-granitemoeshared,reviewer,full workload selected; complete run missing,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
-grounding_dino,reviewer,full workload selected; complete run missing,Current case uses FP32; CPU outputs matched after GroupNorm epsilon fix. Resolve intentional-infinity comparison policy and obtain GPU evidence.
-groupvit,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-helium,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-hgnet_v2,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-hiera,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-higgs_audio_v2,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-higgs_audio_v2_tokenizer,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-hubert,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-hunyuan_v1_dense,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-hunyuan_v1_moe,us,registered; full workload review unfinished,Primary logits pass but deeper key/value caches fail (worst 90.44% within tolerance). Router/expert controls and FP32 diagnostics exist; remaining BF16 cause is unresolved.
-hy_v3,reviewer,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
-ibert,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-idefics,reviewer,full workload selected; complete run missing,Check whether zero cross-attention gates hide the visual branch under random initialization.
-idefics2,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-idefics3,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-ijepa,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-imagegpt,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-informer,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-instructblip,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-instructblipvideo,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-internvl,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-jais2,reviewer,full workload selected; complete run missing,CPU comparison passed; review scaled case and obtain paired GPU evidence.
-jamba,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-janus,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-jetmoe,reviewer,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
-jina_embeddings_v3,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-kosmos2,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-kosmos2_5,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-kyutai_speech_to_text,us,registered; full workload review unfinished,Supply --input-dict or implement valid shared synthetic input preparation. Review default computation; approve scaled values and complete missing behavior.
-laguna,reviewer,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
-lasr,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-layoutlm,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-layoutlmv2,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-layoutlmv3,reviewer,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-led,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-levit,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-lfm2,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-lfm2_moe,reviewer,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
-lfm2_vl,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-lightglue,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-lighton_ocr,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-lilt,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-llama,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-llama4,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-llava,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-llava_next,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-llava_next_video,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-llava_onevision,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-longcat_flash,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-longformer,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-longt5,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-luke,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-lw_detr,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-lxmert,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-m2m_100,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-mamba,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-mamba2,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-marian,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-markuplm,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-mask2former,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-maskformer,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-maskformer_swin,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-mbart,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-megatron_bert,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-metaclip_2,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-mgp_str,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-mimi,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-minicpmv4_6,reviewer,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
-minimax,us,registered; full workload review unfinished,"Primary logits pass but linear-attention state fails (worst 96.08% within tolerance). Decay-table controls explain an FP32 diagnostic discrepancy, not the remaining BF16 failure."
-minimax_m2,us,registered; full workload review unfinished,Prepare correctly packed common weights for --state-dict; ordinary random initialization is insufficient. Review default computation; approve scaled values and complete missing behavior.
-ministral,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-ministral3,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-mistral,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-mistral3,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-mistral4,us,registered; full workload review unfinished,Prepare correctly packed common weights for --state-dict; ordinary random initialization is insufficient. Review default computation; approve scaled values and complete missing behavior.
-mixtral,reviewer,full workload selected; complete run missing,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
-mlcd,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-mllama,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-mm_grounding_dino,reviewer,full workload selected; complete run missing,Current case uses FP32; CPU outputs matched after GroupNorm epsilon fix. Resolve intentional-infinity comparison policy and obtain GPU evidence.
-mobilebert,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-mobilenet_v1,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-mobilenet_v2,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-mobilevit,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-mobilevitv2,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-modernbert,reviewer,full-size numerical pass,Rerun current source or prove changes irrelevant to saved evidence; see REVIEW.md.
-modernbert_decoder,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-modernvbert,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-moonshine,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-moonshine_streaming,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-moshi,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-mpnet,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-mpt,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-mra,us,no registered runnable implementation,"Review existing coarse/fine attention implementation, numerical behavior and composition rules before registration."
-mt5,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-musicflamingo,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-musicgen,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-musicgen_melody,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-mvp,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-nanochat,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-nemotron,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-nemotron_h,reviewer,full workload selected; complete run missing,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
-nllb_moe,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-nomic_bert,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-nystromformer,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-olmo,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-olmo2,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-olmo3,reviewer,full workload selected; complete run missing,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
-olmo_hybrid,reviewer,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
-olmoe,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-omdet_turbo,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-oneformer,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-openai,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-openai_privacy_filter,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-opt,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-ovis2,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-owlv2,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-owlvit,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-paddleocr_vl,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-paligemma,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-parakeet,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-patchtsmixer,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-patchtst,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-pe_audio,reviewer,full workload selected; complete run missing,Supply --input-dict or implement valid shared synthetic input preparation. Zero contrastive scales/biases hide logit computation; inspect embeddings and establish informative shared-weight testing.
-pe_audio_video,reviewer,full workload selected; complete run missing,Supply --input-dict or implement valid shared synthetic input preparation. Zero contrastive scales/biases hide logit computation; inspect all modalities and establish informative shared-weight testing.
-pe_video,reviewer,full workload selected; complete run missing,Supply --input-dict or implement valid shared synthetic input preparation. Zero contrastive scales/biases hide logit computation; inspect video features and establish informative shared-weight testing.
-pegasus,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-pegasus_x,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-perceiver,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-perception_lm,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-persimmon,reviewer,full workload selected; complete run missing,Primary logits pass but layer-1 key caches fail (worst 95.43% within tolerance). Native rotary improves but does not resolve; isolate layer-0 attention/MLP and layer-1 Q/K normalization on common inputs.
-phi,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-phi3,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-phi4_multimodal,us,registered; full workload review unfinished,Supply --input-dict or implement valid shared synthetic input preparation. Prepare common state including adapter weights for --state-dict. Review default computation; approve scaled values and complete missing behavior.
-phimoe,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-pi0,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-pix2struct,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-pixio,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-pixtral,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-plbart,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-poolformer,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-pop2piano,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-pp_doclayout_v2,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-pp_doclayout_v3,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-pp_formulanet,reviewer,full workload selected; complete run missing,Tiny vision initialization produced zero cross-attention keys/values; establish informative shared-weight testing before accepting numerical agreement.
-pp_lcnet,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-pp_lcnet_v3,reviewer,full workload selected; complete run missing,Earlier CPU signal shrank to about 1e-14 at final stage; establish informative shared-weight testing and paired GPU evidence.
-pp_ocrv5_mobile_det,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-pp_ocrv5_mobile_rec,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-pp_ocrv5_server_det,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-pp_ocrv5_server_rec,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-prompt_depth_anything,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-prophetnet,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-pvt,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-pvt_v2,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-qianfan_ocr,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-qwen2,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-qwen2_5_omni,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-qwen2_5_vl,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-qwen2_audio,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-qwen2_moe,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-qwen2_vl,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-qwen3,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-qwen3_5,reviewer,full workload selected; complete run missing,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located. Newer development tests also fail across continuation outputs/state.
-qwen3_5_moe,reviewer,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
-qwen3_moe,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-qwen3_next,reviewer,full workload selected; complete run missing,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located. Newer development tests also fail across continuation outputs/state.
-qwen3_omni_moe,reviewer,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
-qwen3_vl,reviewer,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
-qwen3_vl_moe,reviewer,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
-rag,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-recurrent_gemma,reviewer,full workload selected; complete run missing,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
-reformer,us,registered; full workload review unfinished,BF16 reference runtime error from mixed precision; FP32 upcast diagnostic passes but does not approve BF16 or workload scope.
-regnet,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-rembert,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-resnet,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-roberta,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-roberta_prelayernorm,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-roc_bert,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-roformer,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-rt_detr,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-rt_detr_resnet,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-rt_detr_v2,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-rwkv,reviewer,full-size numerical mismatch,Investigate saved numerical mismatch and 84.65x prefill time; current recurrence changed since that run; see REVIEW.md.
-sam,us,full-size numerical pass,Supply --input-dict or implement valid shared synthetic input preparation. Review construction and outputs; validate the approved scaled case when changed.
-sam2,us,full-size numerical pass,Supply --input-dict or implement valid shared synthetic input preparation. Review construction and outputs; validate the approved scaled case when changed.
-sam2_video,us,full-size numerical pass,"Supply --input-dict or implement valid shared synthetic input preparation. Review construction and outputs; full numerical pass retained, but saved timing is withheld because of GPU thermal throttling."
-sam3,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-sam3_lite_text,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-sam3_tracker,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-sam3_tracker_video,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-sam3_video,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-sam_hq,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-seamless_m4t,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-seamless_m4t_v2,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-seed_oss,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-segformer,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-seggpt,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-sew,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-sew_d,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-shieldgemma2,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-siglip,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-siglip2,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-slanet,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-slanext,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-smollm3,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-smolvlm,reviewer,full-size numerical mismatch,Supply --input-dict or implement valid shared synthetic input preparation. Verify vision fix; isolate remaining text-layer difference on identical inputs; see REVIEW.md.
-solar_open,us,registered; full workload review unfinished,Primary logits pass but key caches fail (worst 98.43% within tolerance). Common-input expert checks pass; isolate remaining accumulated error.
-speech_encoder_decoder,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-speech_to_text,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-speecht5,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-splinter,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-squeezebert,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-stablelm,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-starcoder2,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-superglue,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-superpoint,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-swiftformer,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-swin,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-swin2sr,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-swinv2,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-switch_transformers,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-t5,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-t5gemma,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-t5gemma2,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-table_transformer,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-tapas,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-textnet,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-time_series_transformer,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-timesfm,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-timesfm2_5,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-timesformer,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-timm_backbone,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-timm_wrapper,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-trocr,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-tvp,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-udop,reviewer,full-size numerical pass,Verify coordinate units and visual-token selection before numerical acceptance; see REVIEW.md.
-umt5,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-unispeech,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-unispeech_sat,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-univnet,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-upernet,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-uvdoc,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-vaultgemma,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-vibevoice_acoustic_tokenizer,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-vibevoice_asr,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-video_llama_3,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-video_llava,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-videomae,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-videomt,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-vilt,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-vipllava,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-vision_encoder_decoder,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-vision_text_dual_encoder,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-visual_bert,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-vit,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-vit_mae,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-vit_msn,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-vitdet,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-vitmatte,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-vitpose,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-vitpose_backbone,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-vits,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-vivit,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-vjepa2,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-voxtral,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-voxtral_realtime,us,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-wav2vec2,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-wav2vec2_bert,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-wav2vec2_conformer,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-wavlm,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-whisper,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-x_clip,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-xcodec,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-xglm,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-xlm,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-xlm_roberta,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-xlm_roberta_xl,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-xlnet,us,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-xlstm,reviewer,full-size numerical mismatch,"Investigate numerical mismatch and 47.20x prefill time; check recurrence, normalization and nonzero gate activity; see REVIEW.md."
-xmod,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-yolos,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-yoso,us,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-youtu,reviewer,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
-zamba,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-zamba2,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-zoedepth,reviewer,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+model,owner,review_priority,historical_evidence,next_action
+afmoe,reviewer,investigate,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
+aimv2,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+albert,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+align,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+altclip,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+apertus,reviewer,optional,full workload selected; complete run missing,Supply --input-dict or implement valid shared synthetic input preparation. Check readiness and scaled scope; run common random weights/inputs and investigate.
+arcee,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+aria,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+audio_spectrogram_transformer,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+audioflamingo3,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+autoformer,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+aya_vision,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+bamba,reviewer,optional,full-size numerical pass,Review construction and retained full numerical followup plus smaller random-weight pass; old full timing is withheld.
+bark,us,,registered; full workload review unfinished,Supply --input-dict or implement valid shared synthetic input preparation. Review default computation; approve scaled values and complete missing behavior.
+bart,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+beit,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+bert,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+bert_generation,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+big_bird,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+bigbird_pegasus,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+biogpt,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+bit,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+bitnet,reviewer,investigate,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
+blenderbot,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+blenderbot_small,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+blip,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+blip_2,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+blip_text,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+bloom,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+blt,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+bridgetower,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+bros,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+camembert,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+canine,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+chameleon,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+chinese_clip,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+chmv2,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+clap,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+clip,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+clipseg,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+clvp,us,,no registered runnable implementation,Complete existing speech-code and contrastive implementation review; resolve conditioning-mask interpretation before registration.
+codegen,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+cohere,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+cohere2,reviewer,optional,full workload selected; complete run missing,Earlier paired GPU comparison passes; independently review the local/global attention pattern and inputs if time permits.
+cohere2_vision,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+cohere_asr,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+colmodernvbert,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+colpali,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+colqwen2,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+conditional_detr,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+convbert,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+convnext,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+convnextv2,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+cpmant,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+csm,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+ctrl,reviewer,complete_execution,full workload selected; complete run missing,Reproduce native mixed-dtype error and candidate cache-kernel compilation failure; CPU fixes exist but no complete GPU rerun.
+cvt,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+cwm,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+d_fine,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+dab_detr,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+dac,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+data2vec_audio,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+data2vec_text,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+data2vec_vision,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+dbrx,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+deberta,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+deberta_v2,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+decision_transformer,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+deepseek_v2,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+deepseek_v3,us,,registered; full workload review unfinished,Prepare correctly packed common weights for --state-dict; ordinary random initialization is insufficient. Review default computation; approve scaled values and complete missing behavior.
+deepseek_v4,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+deepseek_vl,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+deepseek_vl_hybrid,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+deformable_detr,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+deimv2,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+deit,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+depth_anything,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+depth_pro,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+detr,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+dia,us,,registered; full workload review unfinished,Supply --input-dict or implement valid shared synthetic input preparation. Review default computation; approve scaled values and complete missing behavior.
+diffllama,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+dinat,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+dinov2,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+dinov2_with_registers,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+dinov3_convnext,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+dinov3_vit,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+distilbert,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+doge,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+donut_swin,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+dots1,reviewer,investigate,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
+dpr,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+dpt,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+edgetam,reviewer,optional,full workload selected; complete run missing,Supply --input-dict or implement valid shared synthetic input preparation. Check readiness and scaled scope; run common random weights/inputs and investigate.
+edgetam_video,reviewer,optional,full-size numerical pass,Supply --input-dict or implement valid shared synthetic input preparation. Review construction and outputs; validate the approved scaled case when changed.
+efficientloftr,reviewer,investigate,full-size numerical pass,Investigate 5.43x forward time: two-value predicates use expensive Top1 reductions; review construction and patch implementation; see REVIEW.md.
+efficientnet,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+electra,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+emu3,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+encodec,reviewer,investigate,full-size numerical pass,Review recurrence patches and measured per-step launch overhead (up to 5.09x forward time); retain existing weight scope; see REVIEW.md.
+encoder_decoder,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+eomt,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+eomt_dinov3,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+ernie,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+ernie4_5,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+ernie4_5_moe,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+ernie4_5_vl_moe,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+esm,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+esmfold,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+eurobert,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+evolla,us,,registered; full workload review unfinished,Supply --input-dict or implement valid shared synthetic input preparation. Review default computation; approve scaled values and complete missing behavior.
+exaone4,reviewer,investigate,full workload selected; complete run missing,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
+exaone4_5,reviewer,investigate,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
+exaone_moe,reviewer,investigate,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
+falcon,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+falcon_h1,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+falcon_mamba,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+fast_vlm,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+fastspeech2_conformer,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+flaubert,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+flava,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+flex_olmo,us,,registered; full workload review unfinished,Primary logits pass but key caches fail (worst 98.17% within tolerance). CPU FP32 controls are not full GPU acceptance; remaining cause unresolved.
+florence2,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+fnet,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+focalnet,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+fsmt,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+funnel,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+fuyu,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+gemma,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+gemma2,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+gemma3,reviewer,complete_execution,full workload selected; complete run missing,Zero multimodal projection hides visual contribution under native random initialization; establish informative shared-weight testing and paired GPU evidence.
+gemma3n,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+gemma4,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+gemma4_assistant,us,,no registered runnable implementation,Complete assisted-generation integration with the main model; existing components and gemma4_bernoulli patch do not establish the full task.
+git,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+glm,reviewer,investigate,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
+glm4,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+glm46v,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+glm4_moe,us,,registered; full workload review unfinished,Primary logits pass but deeper key caches fail (worst 96.58% within tolerance). Native rotary reuse repaired a component; rerun still failed caches. Continue from downstream divergence.
+glm4_moe_lite,reviewer,investigate,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
+glm4v,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+glm4v_moe,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+glm_image,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+glm_moe_dsa,reviewer,investigate,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
+glm_ocr,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+glmasr,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+glpn,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+got_ocr2,reviewer,optional,full-size numerical pass,"Supply --input-dict or implement valid shared synthetic input preparation. Review construction and outputs; full numerical pass retained, but saved timing is withheld because of GPU thermal throttling."
+gpt2,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+gpt_bigcode,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+gpt_neo,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+gpt_neox,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+gpt_neox_japanese,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+gpt_oss,reviewer,investigate,registered; full workload review unfinished,Prepare correctly packed common weights for --state-dict; ordinary random initialization is insufficient. Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
+gptj,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+granite,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+granite4_vision,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+granite_speech,us,,registered; full workload review unfinished,Prepare common state including adapter weights for --state-dict. Review default computation; approve scaled values and complete missing behavior.
+granite_speech_plus,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+granitemoe,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+granitemoehybrid,reviewer,investigate,full workload selected; complete run missing,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
+granitemoeshared,reviewer,investigate,full workload selected; complete run missing,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
+grounding_dino,reviewer,investigate,full workload selected; complete run missing,Current case uses FP32; CPU outputs matched after GroupNorm epsilon fix. Resolve intentional-infinity comparison policy and obtain GPU evidence.
+groupvit,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+helium,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+hgnet_v2,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+hiera,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+higgs_audio_v2,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+higgs_audio_v2_tokenizer,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+hubert,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+hunyuan_v1_dense,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+hunyuan_v1_moe,us,,registered; full workload review unfinished,Primary logits pass but deeper key/value caches fail (worst 90.44% within tolerance). Router/expert controls and FP32 diagnostics exist; remaining BF16 cause is unresolved.
+hy_v3,reviewer,investigate,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
+ibert,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+idefics,reviewer,investigate,full workload selected; complete run missing,Check whether zero cross-attention gates hide the visual branch under random initialization.
+idefics2,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+idefics3,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+ijepa,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+imagegpt,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+informer,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+instructblip,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+instructblipvideo,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+internvl,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+jais2,reviewer,complete_execution,full workload selected; complete run missing,CPU comparison passed; review scaled case and obtain paired GPU evidence.
+jamba,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+janus,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+jetmoe,reviewer,investigate,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
+jina_embeddings_v3,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+kosmos2,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+kosmos2_5,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+kyutai_speech_to_text,us,,registered; full workload review unfinished,Supply --input-dict or implement valid shared synthetic input preparation. Review default computation; approve scaled values and complete missing behavior.
+laguna,reviewer,investigate,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
+lasr,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+layoutlm,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+layoutlmv2,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+layoutlmv3,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+led,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+levit,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+lfm2,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+lfm2_moe,reviewer,investigate,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
+lfm2_vl,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+lightglue,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+lighton_ocr,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+lilt,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+llama,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+llama4,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+llava,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+llava_next,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+llava_next_video,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+llava_onevision,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+longcat_flash,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+longformer,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+longt5,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+luke,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+lw_detr,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+lxmert,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+m2m_100,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+mamba,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+mamba2,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+marian,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+markuplm,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+mask2former,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+maskformer,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+maskformer_swin,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+mbart,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+megatron_bert,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+metaclip_2,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+mgp_str,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+mimi,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+minicpmv4_6,reviewer,investigate,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
+minimax,us,,registered; full workload review unfinished,"Primary logits pass but linear-attention state fails (worst 96.08% within tolerance). Decay-table controls explain an FP32 diagnostic discrepancy, not the remaining BF16 failure."
+minimax_m2,us,,registered; full workload review unfinished,Prepare correctly packed common weights for --state-dict; ordinary random initialization is insufficient. Review default computation; approve scaled values and complete missing behavior.
+ministral,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+ministral3,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+mistral,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+mistral3,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+mistral4,us,,registered; full workload review unfinished,Prepare correctly packed common weights for --state-dict; ordinary random initialization is insufficient. Review default computation; approve scaled values and complete missing behavior.
+mixtral,reviewer,investigate,full workload selected; complete run missing,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
+mlcd,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+mllama,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+mm_grounding_dino,reviewer,investigate,full workload selected; complete run missing,Current case uses FP32; CPU outputs matched after GroupNorm epsilon fix. Resolve intentional-infinity comparison policy and obtain GPU evidence.
+mobilebert,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+mobilenet_v1,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+mobilenet_v2,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+mobilevit,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+mobilevitv2,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+modernbert,reviewer,investigate,full-size numerical pass,Rerun current source or prove changes irrelevant to saved evidence; see REVIEW.md.
+modernbert_decoder,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+modernvbert,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+moonshine,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+moonshine_streaming,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+moshi,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+mpnet,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+mpt,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+mra,us,,no registered runnable implementation,"Review existing coarse/fine attention implementation, numerical behavior and composition rules before registration."
+mt5,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+musicflamingo,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+musicgen,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+musicgen_melody,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+mvp,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+nanochat,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+nemotron,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+nemotron_h,reviewer,investigate,full workload selected; complete run missing,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
+nllb_moe,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+nomic_bert,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+nystromformer,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+olmo,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+olmo2,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+olmo3,reviewer,investigate,full workload selected; complete run missing,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
+olmo_hybrid,reviewer,investigate,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
+olmoe,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+omdet_turbo,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+oneformer,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+openai,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+openai_privacy_filter,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+opt,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+ovis2,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+owlv2,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+owlvit,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+paddleocr_vl,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+paligemma,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+parakeet,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+patchtsmixer,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+patchtst,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+pe_audio,reviewer,investigate,full workload selected; complete run missing,Supply --input-dict or implement valid shared synthetic input preparation. Zero contrastive scales/biases hide logit computation; inspect embeddings and establish informative shared-weight testing.
+pe_audio_video,reviewer,investigate,full workload selected; complete run missing,Supply --input-dict or implement valid shared synthetic input preparation. Zero contrastive scales/biases hide logit computation; inspect all modalities and establish informative shared-weight testing.
+pe_video,reviewer,investigate,full workload selected; complete run missing,Supply --input-dict or implement valid shared synthetic input preparation. Zero contrastive scales/biases hide logit computation; inspect video features and establish informative shared-weight testing.
+pegasus,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+pegasus_x,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+perceiver,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+perception_lm,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+persimmon,reviewer,investigate,full workload selected; complete run missing,Primary logits pass but layer-1 key caches fail (worst 95.43% within tolerance). Native rotary improves but does not resolve; isolate layer-0 attention/MLP and layer-1 Q/K normalization on common inputs.
+phi,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+phi3,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+phi4_multimodal,us,,registered; full workload review unfinished,Supply --input-dict or implement valid shared synthetic input preparation. Prepare common state including adapter weights for --state-dict. Review default computation; approve scaled values and complete missing behavior.
+phimoe,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+pi0,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+pix2struct,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+pixio,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+pixtral,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+plbart,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+poolformer,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+pop2piano,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+pp_doclayout_v2,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+pp_doclayout_v3,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+pp_formulanet,reviewer,investigate,full workload selected; complete run missing,Tiny vision initialization produced zero cross-attention keys/values; establish informative shared-weight testing before accepting numerical agreement.
+pp_lcnet,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+pp_lcnet_v3,reviewer,complete_execution,full workload selected; complete run missing,Earlier CPU signal shrank to about 1e-14 at final stage; establish informative shared-weight testing and paired GPU evidence.
+pp_ocrv5_mobile_det,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+pp_ocrv5_mobile_rec,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+pp_ocrv5_server_det,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+pp_ocrv5_server_rec,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+prompt_depth_anything,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+prophetnet,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+pvt,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+pvt_v2,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+qianfan_ocr,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+qwen2,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+qwen2_5_omni,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+qwen2_5_vl,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+qwen2_audio,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+qwen2_moe,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+qwen2_vl,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+qwen3,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+qwen3_5,reviewer,investigate,full workload selected; complete run missing,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located. Newer development tests also fail across continuation outputs/state.
+qwen3_5_moe,reviewer,investigate,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
+qwen3_moe,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+qwen3_next,reviewer,investigate,full workload selected; complete run missing,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located. Newer development tests also fail across continuation outputs/state.
+qwen3_omni_moe,reviewer,investigate,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
+qwen3_vl,reviewer,investigate,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
+qwen3_vl_moe,reviewer,investigate,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
+rag,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+recurrent_gemma,reviewer,investigate,full workload selected; complete run missing,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
+reformer,us,,registered; full workload review unfinished,BF16 reference runtime error from mixed precision; FP32 upcast diagnostic passes but does not approve BF16 or workload scope.
+regnet,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+rembert,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+resnet,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+roberta,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+roberta_prelayernorm,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+roc_bert,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+roformer,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+rt_detr,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+rt_detr_resnet,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+rt_detr_v2,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+rwkv,reviewer,investigate,full-size numerical mismatch,Investigate saved numerical mismatch and 84.65x prefill time; current recurrence changed since that run; see REVIEW.md.
+sam,us,,full-size numerical pass,Supply --input-dict or implement valid shared synthetic input preparation. Review construction and outputs; validate the approved scaled case when changed.
+sam2,us,,full-size numerical pass,Supply --input-dict or implement valid shared synthetic input preparation. Review construction and outputs; validate the approved scaled case when changed.
+sam2_video,us,,full-size numerical pass,"Supply --input-dict or implement valid shared synthetic input preparation. Review construction and outputs; full numerical pass retained, but saved timing is withheld because of GPU thermal throttling."
+sam3,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+sam3_lite_text,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+sam3_tracker,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+sam3_tracker_video,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+sam3_video,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+sam_hq,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+seamless_m4t,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+seamless_m4t_v2,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+seed_oss,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+segformer,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+seggpt,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+sew,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+sew_d,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+shieldgemma2,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+siglip,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+siglip2,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+slanet,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+slanext,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+smollm3,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+smolvlm,reviewer,investigate,full-size numerical mismatch,Supply --input-dict or implement valid shared synthetic input preparation. Verify vision fix; isolate remaining text-layer difference on identical inputs; see REVIEW.md.
+solar_open,us,,registered; full workload review unfinished,Primary logits pass but key caches fail (worst 98.43% within tolerance). Common-input expert checks pass; isolate remaining accumulated error.
+speech_encoder_decoder,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+speech_to_text,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+speecht5,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+splinter,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+squeezebert,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+stablelm,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+starcoder2,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+superglue,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+superpoint,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+swiftformer,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+swin,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+swin2sr,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+swinv2,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+switch_transformers,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+t5,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+t5gemma,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+t5gemma2,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+table_transformer,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+tapas,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+textnet,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+time_series_transformer,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+timesfm,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+timesfm2_5,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+timesformer,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+timm_backbone,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+timm_wrapper,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+trocr,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+tvp,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+udop,reviewer,investigate,full-size numerical pass,Verify coordinate units and visual-token selection before numerical acceptance; see REVIEW.md.
+umt5,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+unispeech,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+unispeech_sat,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+univnet,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+upernet,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+uvdoc,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+vaultgemma,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+vibevoice_acoustic_tokenizer,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+vibevoice_asr,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+video_llama_3,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+video_llava,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+videomae,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+videomt,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+vilt,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+vipllava,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+vision_encoder_decoder,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+vision_text_dual_encoder,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+visual_bert,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+vit,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+vit_mae,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+vit_msn,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+vitdet,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+vitmatte,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+vitpose,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+vitpose_backbone,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+vits,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+vivit,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+vjepa2,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+voxtral,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+voxtral_realtime,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+wav2vec2,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+wav2vec2_bert,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+wav2vec2_conformer,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+wavlm,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+whisper,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+x_clip,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+xcodec,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+xglm,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+xlm,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+xlm_roberta,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+xlm_roberta_xl,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+xlnet,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
+xlstm,reviewer,investigate,full-size numerical mismatch,"Investigate numerical mismatch and 47.20x prefill time; check recurrence, normalization and nonzero gate activity; see REVIEW.md."
+xmod,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+yolos,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+yoso,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+youtu,reviewer,investigate,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
+zamba,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+zamba2,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
+zoedepth,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.

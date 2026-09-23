@@ -7,27 +7,35 @@ workload. `next_action` identifies the open issue or next check.
 
 ## Assignment and priorities
 
-You own **221 registered implementations**:
+You own **221 registered implementations**. Filter `review_priority` in
+`review.csv` and work in this order:
 
-| Work | Models | Focus |
+| Priority | Models | Work |
 |---|---:|---|
-| Known numerical issues | 35 | Investigate failed main-run, cache, or FP32 diagnostic comparisons. |
-| Incomplete execution evidence | 4 | Resolve CTRL's runtime errors; obtain paired GPU evidence for Gemma3, Jais2, and PPLCNetV3. |
-| Earlier passing main results | 182 | Review construction and supporting evidence; prioritize any specific warning in `review.csv`. |
+| `investigate` | 44 | Resolve numerical failures, large slowdowns, or specific evidence concerns. |
+| `complete_execution` | 4 | Resolve CTRL's runtime errors; obtain paired GPU evidence for Gemma3, Jais2, and PPLCNetV3. |
+| `optional` | 173 | Independently review previously passing GPU-tested workloads only if time permits. |
 
-The 182 comprise 77 full-size passes and 105 development passes. Both can supply
-acceptable evidence under the README's policy. Review adequate passing results
-after unresolved failures and suspicious results; rerun only for a concrete gap.
-A passing main result does not override a failed supplemental cache check.
-The CSV's `historical_evidence` column records earlier milestones, not current
-acceptance requirements or final classifications.
+The first group contains 35 numerical investigations and four recorded slowdowns
+of at least 3x HF time; two models appear in both, giving 37 distinct models.
+Seven more have specific evidence concerns: zeroed branches in Idefics, the three
+PE modality models, and PPFormulaNet; UDOP's coordinate units; and ModernBERT's
+source mismatch. These are not routine optional reviews.
 
-Prioritize numerical failures and the four large slowdowns below. Performance
-investigation overlaps the groups above. You may complete missing behavior,
-repair bugs, and optimize your models within the agreed rules. Coordinate
-shared-helper edits and discuss methodology changes. We own the other 226
-entries, including all 38 without registered implementations, and coordinate
-shared infrastructure and integration.
+All 182 entries outside the numerical/execution groups have saved passing primary
+GPU comparisons and timing measurements. Two are slow and seven have the concerns
+above, leaving 173 optional reviews. Their timing records vary in quality; a
+recorded time is not a cleared performance result. Reuse adequate evidence for
+its tested workload. Do not rerun solely for model size or a second review.
+Optional independent checks may be omitted under time pressure; known failures
+and evidence gaps remain unresolved until addressed. The CSV's
+`historical_evidence` records earlier milestones, not current acceptance policy.
+
+You may complete missing behavior, repair bugs, and optimize your models within
+the agreed rules. Coordinate shared-helper edits and discuss methodology changes.
+We own the other 226 entries, including all 38 without registered implementations,
+and coordinate shared infrastructure and integration. `review_priority` is left
+blank for our entries because this prioritization covers the reviewer assignment.
 
 ## Completing a model review
 
