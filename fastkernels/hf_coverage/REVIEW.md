@@ -33,7 +33,7 @@ and evidence gaps remain unresolved until addressed. The CSV's
 
 You may complete missing behavior, repair bugs, and optimize your models within
 the agreed rules. Coordinate shared-helper edits and discuss methodology changes.
-We own the other 226 entries, including all 38 without registered implementations,
+We own the other 226 entries, including all 34 without registered implementations,
 and coordinate shared infrastructure and integration. `review_priority` is left
 blank for our entries because this prioritization covers the reviewer assignment.
 

@@ -28,7 +28,7 @@ class RetrievalBackbone(nn.Module):
 
     def forward(self, ids, positions):
         embeddings = self.text.embed_tokens(ids)
-        if get_context().is_prefill:
+        if get_context().is_prefill and self.inputs.get("pixel_values") is not None:
             inputs = self.inputs
             grids = inputs["image_grid_thw"]
             valid = torch.arange(inputs["pixel_values"].shape[1], device=ids.device)[

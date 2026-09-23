@@ -562,6 +562,8 @@ def prepare(job: dict, directory: Path) -> dict:
                 ) * 10).to(input_dtype("prompt_depth"))
             if "input_points" in spec:
                 inputs["input_points"] = torch.tensor(spec["input_points"], dtype=input_dtype("input_points"))
+            if "input_labels" in spec:
+                inputs["input_labels"] = torch.tensor(spec["input_labels"], dtype=torch.long)
             if "noise_shape" in spec:
                 inputs["noise"] = torch.rand(*spec["noise_shape"], generator=generator)
             if "noise_sequence_shape" in spec:
@@ -680,9 +682,11 @@ def reference_workloads(model, inputs, case) -> dict[str, Workload]:
                 flatten(key, value)
         return selected
 
-    if case["workload"] in ("sam2_video", "edgetam_video"):
+    if case["workload"] in ("sam2_video", "edgetam_video", "sam3_tracker_video"):
         if case["workload"] == "edgetam_video":
             from transformers.models.edgetam_video.modeling_edgetam_video import EdgeTamVideoInferenceSession as VideoSession
+        elif case["workload"] == "sam3_tracker_video":
+            from transformers.models.sam3_tracker_video.modeling_sam3_tracker_video import Sam3TrackerVideoInferenceSession as VideoSession
         else:
             from transformers.models.sam2_video.modeling_sam2_video import Sam2VideoInferenceSession as VideoSession
 
@@ -714,7 +718,7 @@ def reference_workloads(model, inputs, case) -> dict[str, Workload]:
                 frame_state = session.output_dict_per_obj[0][bucket][index]
                 state_names = ["pred_masks", "object_pointer", "object_score_logits",
                                "maskmem_features", "maskmem_pos_enc"]
-                if case["workload"] == "sam2_video":
+                if case["workload"] in ("sam2_video", "sam3_tracker_video"):
                     state_names.append("high_res_masks")
                 for name in state_names:
                     outputs[f"frame{index}.state.{name}"] = frame_state[name]

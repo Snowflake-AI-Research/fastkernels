@@ -44,10 +44,10 @@ codegen,reviewer,optional,full-size numerical pass,Review construction and outpu
 cohere,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 cohere2,reviewer,optional,full workload selected; complete run missing,Earlier paired GPU comparison passes; independently review the local/global attention pattern and inputs if time permits.
 cohere2_vision,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-cohere_asr,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+cohere_asr,us,,no registered runnable implementation,Constructor-derived scaled implementation added; FP32/BF16 CPU outputs and self/cross caches pass. GPU correctness and diagnostic timing pending.
 colmodernvbert,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
 colpali,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-colqwen2,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+colqwen2,us,,registered; full workload review unfinished,Unpadded text query now skips absent image inputs; CPU routing check passes. Preserve existing document evidence. Query GPU comparison and default-scope review pending; padded query attention remains unsupported.
 conditional_detr,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 convbert,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 convnext,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
@@ -203,7 +203,7 @@ lightglue,us,,full-size numerical pass,Review construction and outputs; validate
 lighton_ocr,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
 lilt,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 llama,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-llama4,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+llama4,us,,no registered runnable implementation,Constructor-derived text-only implementation added; CPU prefill and two continuations pass with cache checks. GPU attempt stopped for contention; GPU correctness and timing pending. Image path is outside selected scope.
 llava,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 llava_next,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 llava_next_video,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
@@ -278,7 +278,7 @@ ovis2,us,,registered; full workload review unfinished,Review default computation
 owlv2,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 owlvit,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 paddleocr_vl,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-paligemma,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+paligemma,us,,no registered runnable implementation,Bare-constructor Gemma-v1 plus SigLIP implementation added; FP32/BF16 CPU outputs and caches pass using existing native CPU callables. GPU correctness and timing pending; not PaliGemma2 coverage.
 parakeet,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 patchtsmixer,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 patchtst,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
@@ -349,7 +349,7 @@ sam2_video,us,,full-size numerical pass,"Supply --input-dict or implement valid 
 sam3,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 sam3_lite_text,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 sam3_tracker,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-sam3_tracker_video,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
+sam3_tracker_video,us,,no registered runnable implementation,"Constructor-derived tracker implementation added; CPU masks and state match, with spatial and 18-frame history checks tested separately. Full registered 18-frame GPU correctness and timing pending."
 sam3_video,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
 sam_hq,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
 seamless_m4t,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.

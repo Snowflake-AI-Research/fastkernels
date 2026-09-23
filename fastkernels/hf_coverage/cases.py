@@ -1128,6 +1128,44 @@ CASES = {
         'reference_backend': None,
     },
 
+    'cohere_asr': {'reference': {'config_class': 'transformers:CohereAsrConfig',
+                   'model_class': 'transformers:CohereAsrForConditionalGeneration',
+                   'source': {'kind': 'constructor_defaults',
+                              'revision': 'da6c53e431f7c9ef0691239d4ce89b0f711ecad7',
+                              'url': 'https://github.com/huggingface/transformers/blob/da6c53e431f7c9ef0691239d4ce89b0f711ecad7/src/transformers/models/cohere_asr/configuration_cohere_asr.py#L27-L35',
+                              'description': 'Explicit independent CohereAsrConfig() '
+                                             'conditional-generation constructor example. This is not '
+                                             'asserted equivalent to the gated checkpoint. Preserve '
+                                             'Parakeet/Conformer audio encoding, learned-position ReLU '
+                                             'decoder, encoder projection, untied full vocabulary '
+                                             'logits and self/cross cache.'},
+                   'encoder_input_names': ['input_features', 'attention_mask']},
+     'dimension_overrides': {'encoder_config': {'hidden_size': 320,
+                                                'num_attention_heads': 2,
+                                                'intermediate_size': 1280,
+                                                'num_hidden_layers': 2},
+                             'hidden_size': 256,
+                             'num_attention_heads': 2,
+                             'num_key_value_heads': 2,
+                             'intermediate_size': 1024,
+                             'num_hidden_layers': 2},
+     'dimension_purpose': 'Two homogeneous encoder and decoder layers retain encoder head width 160, decoder '
+                          'head width 128, ordinary multihead grouping and 4x feed-forward ratios. Preserve '
+                          '128 mel bands, factor-8 subsampling, 256 frontend channels, kernel-9 convolution and '
+                          'the full 16,384-token vocabulary. 129 frames cross all subsampling stages with odd '
+                          'boundaries; a 7-token prefix plus two continuations tests state growth. CPU '
+                          'controls also cover a padded 105-frame sample and decoder key padding.',
+     'input': {'kind': 'spectrogram',
+               'name': 'input_features',
+               'batch_size': 2,
+               'shape': [129, 128],
+               'attention_mask_length': 129,
+               'decoder_sequence_length': 9,
+               'decoder_start_token_id': 4},
+     'workload': 'seq2seq_continuation',
+     'outputs': ['logits', 'encoder_last_hidden_state', 'past_key_values'],
+     'reference_backend': 'sdpa'},
+
     'colmodernvbert': {
         'reference': {
             'config_class': 'transformers:ColModernVBertConfig',
@@ -5505,6 +5543,37 @@ CASES = {
         'outputs': ['logits', 'past_key_values'],
     },
 
+    'llama4': {'reference': {'config_class': 'transformers:Llama4TextConfig',
+                   'model_class': 'transformers:Llama4ForCausalLM',
+                   'source': {'kind': 'constructor_defaults',
+                              'description': 'Text component of the documented Llama4Config() '
+                                             'defaults, selecting the ordinary text-only task in '
+                                             'model_doc/llama4.md. This does not claim Scout '
+                                             'checkpoint or image-path coverage.',
+                              'revision': 'da6c53e431f7c9ef0691239d4ce89b0f711ecad7',
+                              'url': 'https://github.com/huggingface/transformers/blob/da6c53e431f7c9ef0691239d4ce89b0f711ecad7/src/transformers/models/llama4/configuration_llama4.py#L208-L255'}},
+     'reference_backend': None,
+     'dimension_overrides': {'hidden_size': 640,
+                             'intermediate_size': 1024,
+                             'intermediate_size_mlp': 2048,
+                             'num_hidden_layers': 4,
+                             'num_attention_heads': 5,
+                             'num_key_value_heads': 1,
+                             'vocab_size': 256,
+                             'max_position_embeddings': 128,
+                             'attention_chunk_size': 64,
+                             'floor_scale': 64},
+     'dimension_purpose': 'Retain native 128-wide heads, 5:1 query/KV grouping, 1.6:1 expert FF ratio, '
+                          '16 experts, top-one routing plus a shared expert, RMS Q/K normalization, and complete '
+                          'three-RoPE/one-NoPE cycle with four MoE layers. Width scales by 1/8; depth '
+                          'preserves every block kind. Reduce chunk length and NoPE temperature '
+                          'threshold together from 8192 to 64 to exercise both boundaries in the 65-token '
+                          'prefix; two continuation calls verify retained 63-token chunk caches and '
+                          'growing full cache. Vocabulary 256 and 128 positions reduce storage only.',
+     'input': {'kind': 'tokens', 'batch_size': 1, 'sequence_length': 67},
+     'workload': 'causal_lm_continuation',
+     'outputs': ['logits', 'past_key_values']},
+
     'llava': {
         'reference': {
             'continuation_outputs': ['logits', 'past_key_values'],
@@ -7239,6 +7308,55 @@ CASES = {
             ' projected width1024/residual512 and8:1GQA. Vision nativehead72, tanhGELU, bilinear position '
             'resize4x4to6x4, merge2 projector with exactGELU. Full vocabulary/special IDs.'),
     },
+
+    'paligemma': {'reference': {'config_class': 'transformers:PaliGemmaConfig',
+                   'model_class': 'transformers:PaliGemmaForConditionalGeneration',
+                   'source': {'kind': 'constructor_defaults',
+                              'description': 'Pinned PaliGemmaConfig() bare defaults select coherent '
+                                             'Gemma-v1 and unpooled SigLIP. This explicitly differs '
+                                             'from the unusable stock-component doc example and gated '
+                                             'PaliGemma2 task checkpoint.',
+                              'revision': 'da6c53e431f7c9ef0691239d4ce89b0f711ecad7',
+                              'url': 'https://github.com/huggingface/transformers/blob/da6c53e431f7c9ef0691239d4ce89b0f711ecad7/src/transformers/models/paligemma/configuration_paligemma.py'},
+                   'native_position_ids': True,
+                   'native_cache_defaults': True,
+                   'prefill_sequence_input_names': ['token_type_ids'],
+                   'continuation_outputs': ['logits', 'past_key_values']},
+     'config_overrides': {'vision_config': {'patch_size': 14,
+                                            'vision_use_head': False,
+                                            'vocab_size': 257152}},
+     'dimension_overrides': {'projection_dim': 512,
+                             'hidden_size': 512,
+                             'vocab_size': 1024,
+                             'vision_config': {'hidden_size': 144,
+                                               'intermediate_size': 512,
+                                               'num_attention_heads': 2,
+                                               'num_hidden_layers': 2},
+                             'text_config': {'hidden_size': 512,
+                                             'intermediate_size': 4096,
+                                             'num_attention_heads': 8,
+                                             'num_key_value_heads': 1,
+                                             'head_dim': 64,
+                                             'num_hidden_layers': 2,
+                                             'vocab_size': 1024}},
+     'dimension_purpose': 'Retain native 224-pixel images, 14-pixel patches and 256 image tokens. Two repeated '
+                          'vision/text blocks; vision width 144 with 2 heads preserves head width 72 and the 32:9 feed-forward ratio; '
+                          'text widths 512/4096 preserve the 8:1 feed-forward ratio and 8:1 query/KV grouping, reducing ordinary '
+                          'rotary head width from 256 to 64 for bounded validation. Vocabulary 1024 retains native '
+                          'out-of-vocabulary image ID 256000 and corresponding embedding replacement. Explicit nested '
+                          'vision fields restate bare constructor defaults because partial child '
+                          'dictionaries otherwise select stock SigLIP defaults.',
+     'input': {'kind': 'text_image',
+               'shape': [3, 224, 224],
+               'text_batch_size': 1,
+               'image_batch_size': 1,
+               'batch_size': 1,
+               'sequence_length': 514,
+               'image_token_positions': list(range(256)),
+               'token_type_id': 0},
+     'workload': 'causal_lm_continuation',
+     'reference_backend': None,
+     'outputs': ['logits', 'image_hidden_states', 'past_key_values']},
 
     'parakeet': {
         'reference': {
@@ -9148,6 +9266,35 @@ CASES = {
         'workload': 'forward',
         'outputs': ['pred_masks', 'iou_scores', 'object_score_logits', 'image_embeddings'],
     },
+
+    'sam3_tracker_video': {'reference': {'config_class': 'transformers:Sam3TrackerVideoConfig',
+                   'model_class': 'transformers:Sam3TrackerVideoModel',
+                   'source': {'kind': 'constructor_defaults',
+                              'revision': 'da6c53e431f7c9ef0691239d4ce89b0f711ecad7',
+                              'url': 'https://github.com/huggingface/transformers/blob/da6c53e431f7c9ef0691239d4ce89b0f711ecad7/src/transformers/models/sam3_tracker_video/configuration_sam3_tracker_video.py#L175-L201',
+                              'description': 'Pinned HF full-model constructor example, selected '
+                                             'independently of the gated facebook/sam3 checkpoint; '
+                                             'point-initialized video propagation.'}},
+     'dimension_overrides': {'image_size': 448,
+                             'vision_config': {'backbone_config': {'hidden_size': 128,
+                                                                   'intermediate_size': 592,
+                                                                   'num_hidden_layers': 2,
+                                                                   'num_attention_heads': 2,
+                                                                   'global_attn_indexes': [1]}}},
+     'dimension_purpose': 'Two vision layers retain local/global attention, head width 64 and feed-forward '
+                          'ratio 592/128. Patch size 14 and image size 448 produce a 32x32 grid crossing the '
+                          'default 24-token window. All pyramid, decoder and memory features retain '
+                          'their defaults; 18 frames cross seven memory slots and 16 object pointers.',
+     'input': {'kind': 'video',
+               'name': 'video',
+               'batch_size': 18,
+               'shape': [3, 448, 448],
+               'input_points': [[[[224.0, 224.0]]]],
+               'input_labels': [[[1]]],
+               'dtypes': {'input_points': 'float32', 'input_labels': 'int64'}},
+     'outputs': ['pred_masks', 'object_score_logits'],
+     'workload': 'sam3_tracker_video',
+     'reference_backend': None},
 
     'seed_oss': {
         'workload': 'causal_lm',
