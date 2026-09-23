@@ -735,6 +735,11 @@ def reference_workloads(model, inputs, case) -> dict[str, Workload]:
                             for name, tensor in (("key", layer.keys), ("value", layer.values)):
                                 if tensor is not None:
                                     selected[f"{key}.{index}.{name}"] = tensor
+                    # MiniMax stores recurrent matrices beside its K/V layers.
+                    # Empty list entries mark layers without recurrent state.
+                    for index, state in enumerate(getattr(value, "linear_cache", ())):
+                        if isinstance(state, torch.Tensor):
+                            selected[f"{key}.{index}.recurrent_states"] = state
                 else:
                     raise TypeError("cache selection requires a dynamic, static, or encoder-decoder K/V cache")
             else:

@@ -758,6 +758,8 @@ CASES = {
 
     'blip_2': {
         'reference': {
+            'fan_in_normal_modules': ['vision_model'],
+            'randomize_zero_parameters': ['query_tokens'],
             'config_class': 'transformers:Blip2Config',
             'model_class': 'transformers:Blip2ForConditionalGeneration',
             'source': {
@@ -788,6 +790,10 @@ CASES = {
             'kind': 'text_image', 'text_batch_size': 2, 'image_batch_size': 2, 'sequence_length': 43,
             'shape': [3, 56, 56], 'image_token_positions': list(range(0, 32)),
         },
+        'initialization_reason': (
+            'Native vision weights make residual updates negligible; zero query tokens hide Qformer self-attention. '
+            'Shared fan-in vision matrices and nonzero random query tokens activate these paths while preserving '
+            'biases, normalization, dimensions and inputs.'),
         'workload': 'forward',
         'outputs': [
             'logits', 'language_model_outputs.logits', 'vision_outputs.last_hidden_state',
@@ -3432,11 +3438,12 @@ CASES = {
             'n_routed_experts': 16, 'vocab_size': 512, 'max_position_embeddings': 128, 'pad_token_id': 0,
             'eos_token_id': 2,
         },
-        'input': {'kind': 'tokens', 'batch_size': 2, 'sequence_length': 17},
-        'outputs': ['logits'],
-        'workload': 'causal_lm',
+        'input': {'kind': 'tokens', 'batch_size': 2, 'sequence_length': 18},
+        'outputs': ['logits', 'past_key_values'],
+        'workload': 'causal_lm_continuation',
         'dimension_purpose': ('Preserve3initialdense+1routedlayer,12:1GQA,QKVbias,QKnorm,halfheadRoPE,sharedexpert '
-            'andtop8of16routing; reduceotherdimensions.'),
+            'andtop8of16routing; reduceotherdimensions.'
+            ' Keep the prompt and first continuation; add a second continuation and compare all logical caches.'),
     },
 
     'glm4_moe_lite': {
@@ -4312,13 +4319,15 @@ CASES = {
             'moe_intermediate_size': [128, 128, 128], 'num_shared_experts': [1, 1, 1], 'pad_token_id': 1020,
             'eos_token_id': 1021, 'eod_token_id': 1022, 'sep_token_id': 1023,
         },
-        'input': {'kind': 'tokens', 'batch_size': 2, 'sequence_length': 270},
-        'workload': 'causal_lm',
+        'input': {'kind': 'tokens', 'batch_size': 2, 'sequence_length': 271},
+        'workload': 'causal_lm_continuation',
+        'outputs': ['logits', 'past_key_values'],
         'reference_backend': 'sdpa',
         'dimension_purpose': ('Retain4:1 GQA, attention width equal hidden width, all64 experts/top8, shared expert and '
             'post-RoPE Q/K norms. Reduce head/model width/depth/vocabulary; retain fixed-alpha dynamic '
             'RoPE. Remap special-token IDs into reduced vocabulary, retaining distinct padding/EOS/EOD/SEP '
-            'identities.'),
+            'identities.'
+            ' Keep the prompt and first continuation; add a second continuation and compare all logical caches.'),
     },
 
     'hy_v3': {
@@ -6296,8 +6305,9 @@ CASES = {
             'bos_token_id': 1022,
             'eos_token_id': 1023,
         },
-        'input': {'kind': 'tokens', 'batch_size': 2, 'sequence_length': 270},
-        'workload': 'causal_lm',
+        'input': {'kind': 'tokens', 'batch_size': 2, 'sequence_length': 271},
+        'workload': 'causal_lm_continuation',
+        'outputs': ['logits', 'past_key_values'],
         'reference_backend': 'sdpa',
         'dimension_purpose': ('Retain seven linear blocks then full attention then linear, attention width4/3 hidden,8:1 '
             'GQA,32 experts/top2 and unchanged residual factors/block256.270 tokens exercise two recurrence'
@@ -10105,12 +10115,14 @@ CASES = {
             'num_hidden_layers': 3, 'num_attention_heads': 8, 'num_key_value_heads': 1, 'head_dim': 64,
             'vocab_size': 1024,
         },
-        'input': {'kind': 'tokens', 'batch_size': 2, 'sequence_length': 270},
-        'workload': 'causal_lm',
+        'input': {'kind': 'tokens', 'batch_size': 2, 'sequence_length': 271},
+        'workload': 'causal_lm_continuation',
+        'outputs': ['logits', 'past_key_values'],
         'reference_backend': 'sdpa',
         'dimension_purpose': ('Retain attention width2x hidden/8:1 GQA, every layer routed with128 experts/top8/shared1; '
             'full-head YaRN factor2 and native context boundaries. Reduce layer/model/expert intermediate '
-            'widths.'),
+            'widths.'
+            ' Keep the prompt and first continuation; add a second continuation and compare all logical caches.'),
     },
 
     'speech_encoder_decoder': {

@@ -124,15 +124,39 @@ def load_state_dict_into(model, state_dict, config):
             attn.log_decay = -attn.slope_rate.float().reshape(1, 1, attn.heads, 1)
 
 
-def make_workloads(model, inputs, config):
-    linear = [layer.self_attn for layer in model.model.layers if isinstance(layer.self_attn, LightningAttention)]
-    attention = [layer.self_attn.attn for layer in model.model.layers if not isinstance(layer.self_attn, LightningAttention)]
-    for layer in linear:
+def make_workloads(model, inputs, config, *, case=None):
+    linear = [(index, layer.self_attn) for index, layer in enumerate(model.model.layers)
+              if isinstance(layer.self_attn, LightningAttention)]
+    full = [(index, layer.self_attn.attn) for index, layer in enumerate(model.model.layers)
+            if not isinstance(layer.self_attn, LightningAttention)]
+    for _, layer in linear:
         layer.batch_size = inputs["input_ids"].shape[0]
-    workloads = decoder_workloads(model, inputs, config, attentions=attention)
+    workloads = decoder_workloads(model, inputs, config,
+                                  attentions=[attention for _, attention in full], case=case)
+    continuation = case is not None and case.get("workload") == "causal_lm_continuation"
+
     def prepare(original):
-        for layer in linear:
+        for _, layer in linear:
             layer.state = None
-        original()
-    return {name: Workload(run=work.run, prepare=lambda work=work: prepare(work.prepare))
+        if original is not None:
+            original()
+
+    def collect(output, original):
+        output = original(output) if original is not None else output
+        # The shared helper numbers only full-attention layers. Restore native
+        # layer indices before adding each linear layer's carried K-transpose-V.
+        remapped = {}
+        for key, value in output.items():
+            if key.startswith("past_key_values."):
+                _, index, field = key.split(".", 2)
+                key = f"past_key_values.{full[int(index)][0]}.{field}"
+            remapped[key] = value
+        for index, layer in linear:
+            remapped[f"past_key_values.{index}.recurrent_states"] = layer.state
+        return remapped
+
+    return {name: Workload(run=work.run,
+                           prepare=lambda work=work: prepare(work.prepare),
+                           collect=(lambda output, work=work: collect(output, work.collect))
+                                   if continuation else work.collect)
             for name, work in workloads.items()}
