@@ -1,6 +1,8 @@
 """GLM-4.5's biased grouped-query attention, head norms and routed experts."""
 import torch
 from fastkernels.hf_coverage.models.dots1 import NormalizedExperts
+from fastkernels.hf_coverage.models.git import GitAttention
+from fastkernels.hf_coverage.models.qwen2_precision import DenseCachedAttention
 from fastkernels.hf_coverage.models.llama import make_workloads
 from fastkernels.hf_coverage.models.olmo2 import decoder_config
 from fastkernels.hf_coverage.models.stablelm import PartialRotary
@@ -8,6 +10,23 @@ from fastkernels.hf_coverage.patches.grouped_topk_normalization import GroupedTo
 from fastkernels.tasks.baseline.L1.rms_norm import RMSNorm
 from fastkernels.tasks.baseline.L1.rotary_emb import RotaryEmbedding
 from fastkernels.tasks.baseline.L4.llama import LlamaForCausalLM
+
+
+class GroupedEagerAttention(GitAttention):
+    """Reuse score-rounded BMM/softmax attention with HF's grouped KV expansion.
+
+    The existing vision variant multiplies BF16 scores by the attention scale,
+    evaluates softmax in FP32, then stores probabilities in BF16 before BMM.
+    GLM4's eager reference uses that same order; fused attention does not.
+    """
+
+    def __init__(self):
+        super().__init__(vision=True)
+
+    def forward(self, query, key, value, causal=False):
+        repeats = query.shape[2] // key.shape[2]
+        key, value = (tensor.repeat_interleave(repeats, dim=2) for tensor in (key, value))
+        return super().forward(query, key, value, causal=causal)
 
 
 class NativeRotary(RotaryEmbedding):
@@ -27,6 +46,10 @@ def build_from_config(config, device, dtype):
     model.model.rotary_emb = rotary
     for i, layer in enumerate(model.model.layers):
         layer.self_attn.rotary_emb = rotary
+        layer.self_attn.attn = DenseCachedAttention(
+            config.num_attention_heads, config.num_key_value_heads, config.head_dim,
+        )
+        layer.self_attn.attn.attention = GroupedEagerAttention()
         layer.self_attn.q_norm = RMSNorm(config.head_dim, config.rms_norm_eps)
         layer.self_attn.k_norm = RMSNorm(config.head_dim, config.rms_norm_eps)
         if i >= config.first_k_dense_replace:

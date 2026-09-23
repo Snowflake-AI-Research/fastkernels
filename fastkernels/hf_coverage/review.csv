@@ -136,7 +136,7 @@ git,reviewer,optional,full-size numerical pass,Review construction and outputs; 
 glm,reviewer,investigate,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
 glm4,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 glm46v,us,,registered; full workload review unfinished,"Extended BF16 GPU prefill+two continuations and selected cache/state outputs pass 18 tensor checks. Existing construction retained; reviewed scaling/default computation. Diagnostic ours/HF ratios: prefill=0.75x, decode_1=1.07x, decode_2=1.06x."
-glm4_moe,us,investigate,registered; full workload review unfinished,Current GPU comparison checks logits and complete state through two continuations; numerical failure persists (minimum matched fraction 0.965820). Stage and common-input root-cause investigation pending; historical logit passes do not close it.
+glm4_moe,us,optional,registered; full workload review unfinished,"Current declared workload passed paired GPU checks on common weights and inputs; 27 tensors, minimum matched fraction 1.000000. Diagnostic timing measured; final construction review remains."
 glm4_moe_lite,reviewer,investigate,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
 glm4v,us,,registered; full workload review unfinished,"Current BF16 GPU prefill+two continuations and all selected cache outputs pass 18 checks; diagnostic ours/HF 0.80x,1.12x,1.14x."
 glm4v_moe,us,,registered; full workload review unfinished,"Current BF16 GPU prefill+two continuations and all selected cache outputs pass 18 checks; diagnostic ours/HF 0.66x,0.68x,0.66x."
@@ -180,7 +180,7 @@ imagegpt,reviewer,optional,full-size numerical pass,Review construction and outp
 informer,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
 instructblip,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
 instructblipvideo,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
-internvl,us,,registered; full workload review unfinished,Extended to two supplied-token continuations and all logical caches. Native CPU state/history checks and strict candidate weight loading pass; candidate GPU comparison pending. Historical one-step evidence retained.
+internvl,us,optional,registered; full workload review unfinished,"Current declared workload passed paired GPU checks on common weights and inputs; 16 tensors, minimum matched fraction 1.000000. Diagnostic timing measured; final construction review remains."
 jais2,reviewer,complete_execution,full workload selected; complete run missing,CPU comparison passed; review scaled case and obtain paired GPU evidence.
 jamba,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 janus,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
@@ -200,7 +200,7 @@ lfm2,reviewer,optional,full workload selected; complete run missing,Check readin
 lfm2_moe,reviewer,investigate,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
 lfm2_vl,us,optional,registered; full workload review unfinished,"Current declared workload passed paired GPU checks on common weights and inputs; 19 tensors, minimum matched fraction 1.000000. Diagnostic timing measured; final construction review remains."
 lightglue,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-lighton_ocr,us,,registered; full workload review unfinished,Extended to two supplied-token continuations and all logical caches. Native CPU state/history checks and strict candidate weight loading pass; candidate GPU comparison pending. Historical one-step evidence retained.
+lighton_ocr,us,optional,registered; full workload review unfinished,"Current declared workload passed paired GPU checks on common weights and inputs; 16 tensors, minimum matched fraction 1.000000. Diagnostic timing measured; final construction review remains."
 lilt,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 llama,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 llama4,us,,no registered runnable implementation,Registered constructor-derived text-only case passes GPU outputs and caches over prefill plus two continuations (27 tensors). Diagnostic latency is 2.63x HF prefill and 1.74-1.89x decode. Image path is outside this selected scope.
@@ -208,7 +208,7 @@ llava,reviewer,optional,full workload selected; complete run missing,Check readi
 llava_next,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 llava_next_video,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 llava_onevision,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-longcat_flash,us,,registered; full workload review unfinished,Extended to two supplied-token continuations and all logical caches. Native CPU state/history checks and strict candidate weight loading pass; candidate GPU comparison pending. Historical one-step evidence retained.
+longcat_flash,us,optional,registered; full workload review unfinished,"Current declared workload passed paired GPU checks on common weights and inputs; 27 tensors, minimum matched fraction 1.000000. Diagnostic timing measured; final construction review remains."
 longformer,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 longt5,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 luke,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
@@ -231,9 +231,9 @@ minicpmv4_6,reviewer,investigate,registered; full workload review unfinished,Inv
 minimax,us,investigate,registered; full workload review unfinished,Current GPU comparison checks logits and complete state through two continuations; numerical failure persists (minimum matched fraction 0.959885). Stage and common-input root-cause investigation pending; historical logit passes do not close it.
 minimax_m2,us,,registered; full workload review unfinished,Prepare correctly packed common weights for --state-dict; ordinary random initialization is insufficient. Review default computation; approve scaled values and complete missing behavior.
 ministral,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-ministral3,us,,registered; full workload review unfinished,Extended to two supplied-token continuations and all logical caches. Native CPU state/history checks and strict candidate weight loading pass; candidate GPU comparison pending. Historical one-step evidence retained.
+ministral3,us,optional,registered; full workload review unfinished,"Current declared workload passed paired GPU checks on common weights and inputs; 21 tensors, minimum matched fraction 0.999899. Diagnostic timing measured; final construction review remains."
 mistral,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-mistral3,us,,registered; full workload review unfinished,Extended to two supplied-token continuations and all logical caches. Native CPU state/history checks and strict candidate weight loading pass; candidate GPU comparison pending. Historical one-step evidence retained.
+mistral3,us,optional,registered; full workload review unfinished,"Current declared workload passed paired GPU checks on common weights and inputs; 244 tensors, minimum matched fraction 1.000000. Diagnostic timing measured; final construction review remains."
 mistral4,us,,registered; full workload review unfinished,Prepare correctly packed common weights for --state-dict; ordinary random initialization is insufficient. Review default computation; approve scaled values and complete missing behavior.
 mixtral,reviewer,investigate,full workload selected; complete run missing,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
 mlcd,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
