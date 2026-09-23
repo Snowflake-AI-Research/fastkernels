@@ -379,8 +379,12 @@ class Model(nn.Module):
         c, rope = self.config, self.config.rope_parameters
         dim = int((c.hidden_size // c.num_attention_heads) * rope['partial_rotary_factor'])
         original = rope['original_max_position_embeddings']
-        factors = torch.tensor(rope['long_factor' if length > original else 'short_factor'], dtype=torch.float32, device=device)
-        inverse = 1.0 / (factors * rope['rope_theta'] ** (torch.arange(0, dim, 2, device=device).float() / dim))
+        # HF loads short frequencies on CPU, then creates long frequencies on
+        # the execution device only after crossing the original context length.
+        frequency_device = device if length > original else torch.device('cpu')
+        factors = torch.tensor(rope['long_factor' if length > original else 'short_factor'], dtype=torch.float32, device=frequency_device)
+        inverse = 1.0 / (factors * rope['rope_theta'] ** (torch.arange(0, dim, 2, device=frequency_device).float() / dim))
+        inverse = inverse.to(device)
         ratio = rope.get('factor', c.max_position_embeddings / original)
         scale = rope.get('attention_factor', 1.0 if ratio <= 1 else math.sqrt(1 + math.log(ratio) / math.log(original)))
         phase = torch.arange(length, device=device).float()[:, None] * inverse[None]
