@@ -345,7 +345,7 @@ rt_detr_v2,reviewer,optional,full workload selected; complete run missing,Check 
 rwkv,reviewer,investigate,full-size numerical mismatch,Investigate saved numerical mismatch and 84.65x prefill time; current recurrence changed since that run; see REVIEW.md.
 sam,us,,full-size numerical pass,Supply --input-dict or implement valid shared synthetic input preparation. Review construction and outputs; validate the approved scaled case when changed.
 sam2,us,,full-size numerical pass,Supply --input-dict or implement valid shared synthetic input preparation. Review construction and outputs; validate the approved scaled case when changed.
-sam2_video,us,,full-size numerical pass,"Supply --input-dict or implement valid shared synthetic input preparation. Review construction and outputs; full numerical pass retained, but saved timing is withheld because of GPU thermal throttling."
+sam2_video,us,,full-size numerical pass,Shared synthetic video and point prompts now prepare successfully without --input-dict; native session setup checked on CPU. Historical full numerical pass retained for its original inputs; new-input GPU comparison pending. Saved timing remains withheld for thermal throttling.
 sam3,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 sam3_lite_text,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 sam3_tracker,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.

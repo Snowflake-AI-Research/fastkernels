@@ -9188,7 +9188,11 @@ CASES = {
                 'description': 'Pinned model documentation video tracking example.',
             },
         },
-        'input': {'kind': 'external', 'name': 'video', 'shape': [18, 3, 1024, 1024], 'batch_size': 1},
+        'input': {
+            'kind': 'video', 'name': 'video', 'shape': [3, 1024, 1024], 'batch_size': 18,
+            'input_points': [[[[512.0, 512.0]]]], 'input_labels': [[[1]]],
+            'dtypes': {'input_points': 'float32', 'input_labels': 'int64'},
+        },
         'outputs': ['pred_masks', 'object_score_logits'],
         'workload': 'sam2_video',
         'reference_backend': None,
