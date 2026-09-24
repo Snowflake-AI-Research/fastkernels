@@ -43,19 +43,39 @@ _NCCL_BASE = int(os.environ.get("FASTKERNELS_NCCL_PORT_BASE", "29500"))
 # GPU pool
 # ---------------------------------------------------------------------------
 class GPUPool:
-    def __init__(self, gpus: list[str]):
+    """GPU leasing with backfill: smaller requests may use free GPUs while a larger one
+    waits, but once the oldest waiting request has waited ``starve_s`` everyone queues
+    behind it (so e.g. a tp=4 model is never starved by a stream of tp=1 runs)."""
+
+    def __init__(self, gpus: list[str], starve_s: float = 900.0):
         self.free = list(gpus)
         self.total = len(gpus)
         self.cv = threading.Condition()
         self._port = 0
+        self.starve_s = starve_s
+        self.waiting: list[tuple[float, int]] = []  # (since, ticket)
+        self._ticket = 0
 
     def lease(self, n: int) -> tuple[list[str], int]:
         if n > self.total:
             raise RuntimeError(f"needs {n} GPUs, pool has {self.total}")
         with self.cv:
-            self.cv.wait_for(lambda: len(self.free) >= n)
+            self._ticket += 1
+            me = (time.time(), self._ticket)
+            self.waiting.append(me)
+
+            def ready() -> bool:
+                if len(self.free) < n:
+                    return False
+                oldest = min(self.waiting)
+                return oldest == me or time.time() - oldest[0] < self.starve_s
+
+            while not ready():
+                self.cv.wait(timeout=30)
+            self.waiting.remove(me)
             got, self.free = self.free[:n], self.free[n:]
             self._port += 1
+            self.cv.notify_all()
             return got, _NCCL_BASE + (self._port % 500)
 
     def release(self, gpus: list[str]) -> None:
