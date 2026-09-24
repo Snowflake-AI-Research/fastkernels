@@ -15,6 +15,7 @@ import importlib
 import importlib.abc
 import importlib.machinery
 import importlib.util
+import os
 import re
 import sys
 import textwrap
@@ -455,6 +456,17 @@ _candidate_finder: _CandidateFinder | None = None
 _standalone = False
 _keep: frozenset[str] = frozenset()
 
+# Optional kernel filters (comma-separated ``L<n>:<stem>``), used by ``fastkernels e2e``:
+# ONLY limits which candidates are swapped in (and hence imported/JIT-built);
+# EXCLUDE drops candidates entirely -- they are neither swapped in nor resolved by
+# other candidates' ``from ..L<n>.<stem> import`` (those alias the baseline instead).
+_ONLY_ENV = "FASTKERNELS_CANDIDATE_ONLY"
+_EXCLUDE_ENV = "FASTKERNELS_CANDIDATE_EXCLUDE"
+
+
+def _env_kernel_set(var: str) -> frozenset[str]:
+    return frozenset(k.strip() for k in os.environ.get(var, "").split(",") if k.strip())
+
 
 def install_candidate_finder(*, standalone: bool | None = None, keep: Iterable[str] | None = None) -> None:
     """Register the candidate import finder (idempotent). Pass *standalone*/*keep* to set policy."""
@@ -490,7 +502,8 @@ class _CandidateFinder(importlib.abc.MetaPathFinder):
             return None
         level, stem = parts
         cand = __import__("fastkernels").CANDIDATE_DIR / level / f"{stem}.py"
-        use_file = cand.is_file() and not (_standalone and fullname not in _keep)
+        use_file = (cand.is_file() and not (_standalone and fullname not in _keep)
+                    and f"{level}:{stem}" not in _env_kernel_set(_EXCLUDE_ENV))
         if use_file:
             return importlib.util.spec_from_file_location(fullname, cand)
         baseline = f"fastkernels.tasks.baseline.{level}.{stem}"
@@ -523,10 +536,14 @@ def discover_candidate_impls() -> list[tuple]:
     """
     import importlib
 
+    only, exclude = _env_kernel_set(_ONLY_ENV), _env_kernel_set(_EXCLUDE_ENV)
     pairs: list[tuple] = []
     for target in discover_operator_targets():
         cand_file = CANDIDATE_DIR / f"L{target.level}" / f"{target.name}.py"
         if not cand_file.is_file():
+            continue
+        key = f"L{target.level}:{target.name}"
+        if (only and key not in only) or key in exclude:
             continue
         try:
             base_mod = importlib.import_module(
