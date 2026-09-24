@@ -8,11 +8,11 @@ apertus,reviewer,optional,full workload selected; complete run missing,Supply --
 arcee,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 aria,us,,registered; full workload review unfinished,"Extended BF16 GPU check passes selected outputs and KV across prefill+two continuations (15 tensors),10warmups50samples; ours faster in measured case."
 audio_spectrogram_transformer,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-audioflamingo3,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+audioflamingo3,us,optional,registered; full workload review unfinished,Retain historical GPU pass. Changed optional precision/cache paths are inactive; current masked-attention CPU controls are exact. No demonstrated active incompatibility; exact historical shared-helper bodies remain unavailable.
 autoformer,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
 aya_vision,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
 bamba,reviewer,optional,full-size numerical pass,Review construction and retained full numerical followup plus smaller random-weight pass; old full timing is withheld.
-bark,us,,registered; full workload review unfinished,Supply --input-dict or implement valid shared synthetic input preparation. Review default computation; approve scaled values and complete missing behavior.
+bark,us,optional,registered; full workload review unfinished,Retain historical waveform pass with independently GPU-validated shared decoder repair and current full decoder CPU comparison at Bark dimensions. No demonstrated unresolved decoder defect; this is not a fresh current end-to-end GPU result.
 bart,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 beit,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 bert,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
@@ -35,7 +35,7 @@ camembert,reviewer,optional,full-size numerical pass,Review construction and out
 canine,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 chameleon,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
 chinese_clip,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-chmv2,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+chmv2,us,optional,registered; full workload review unfinished,Retain historical GPU pass. Documented shared-file embedding edits are outside this model path; current fusion/transpose helper checks pass. No new whole-model GPU run claimed.
 clap,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 clip,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 clipseg,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
@@ -125,7 +125,7 @@ fnet,reviewer,optional,full-size numerical pass,Review construction and outputs;
 focalnet,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 fsmt,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 funnel,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-fuyu,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+fuyu,us,optional,registered; full workload review unfinished,Retain historical 73-output GPU pass. Active partial rotary arithmetic is supported by existing all-layer GPU controls and current CPU checks. Unrelated shared-helper changes do not require rerunning this case.
 gemma,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 gemma2,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
 gemma3,reviewer,complete_execution,full workload selected; complete run missing,Zero multimodal projection hides visual contribution under native random initialization; establish informative shared-weight testing and paired GPU evidence.
@@ -143,7 +143,7 @@ glm4v_moe,us,,registered; full workload review unfinished,"Current BF16 GPU pref
 glm_image,us,,registered; full workload review unfinished,"Current BF16 GPU prefill+two continuations and all selected cache outputs pass 18 checks; diagnostic ours/HF 0.72x,1.34x,1.50x."
 glm_moe_dsa,reviewer,investigate,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
 glm_ocr,us,,registered; full workload review unfinished,"Current BF16 GPU prefill+two continuations and all selected cache outputs pass 18 checks; diagnostic ours/HF 0.93x,1.12x,1.09x."
-glmasr,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+glmasr,us,optional,registered; full workload review unfinished,Retain historical eight-output GPU pass including two continuation updates. Later GPU evidence supports current shared cache/norm/loader paths; no concrete active incompatibility found. Exact historical helper identity remains qualified.
 glpn,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 got_ocr2,reviewer,optional,full-size numerical pass,"Supply --input-dict or implement valid shared synthetic input preparation. Review construction and outputs; full numerical pass retained, but saved timing is withheld because of GPU thermal throttling."
 gpt2,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
@@ -155,8 +155,8 @@ gpt_oss,reviewer,investigate,registered; full workload review unfinished,Prepare
 gptj,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 granite,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 granite4_vision,us,,no registered runnable implementation,Implement or justify the exact missing capability or scope exclusion.
-granite_speech,us,,registered; full workload review unfinished,Prepare common state including adapter weights for --state-dict. Review default computation; approve scaled values and complete missing behavior.
-granite_speech_plus,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
+granite_speech,us,optional,registered; full workload review unfinished,Retain historical eight-output GPU pass and supplied-adapter sensitivity evidence. Recovered attention-helper change only adds an unused optional return; other changed branches are inactive. No demonstrated defect; some historical shared-helper bodies remain unavailable.
+granite_speech_plus,us,optional,registered; full workload review unfinished,Retain historical eight-output GPU pass. Recovered attention-helper change only adds an unused optional return; current shared components have independent evidence. No demonstrated defect; exact identity of other historical helpers remains qualified.
 granitemoe,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 granitemoehybrid,reviewer,investigate,full workload selected; complete run missing,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
 granitemoeshared,reviewer,investigate,full workload selected; complete run missing,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
