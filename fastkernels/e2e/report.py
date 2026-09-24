@@ -52,7 +52,9 @@ def print_table(rows: list[dict]) -> None:
               f"{_fmt(r['speedup']):>8} {_fmt(r['mean_d']):>7}  {extra[:90]}")
 
 
-def check_preflight(rows: list[dict], expected: int | None) -> bool:
+def check_preflight(rows: list[dict], expected: int | None, only: set[int] | None = None) -> bool:
+    if only:
+        rows = [r for r in rows if r["scenario"][:2].isdigit() and int(r["scenario"][:2]) in only]
     ok = True
     scen = {r["scenario"] for r in rows}
     if expected is not None and len(scen) < expected:
@@ -89,6 +91,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("out", nargs="?", type=Path)
     ap.add_argument("--check-preflight", action="store_true")
     ap.add_argument("--expected-scenarios", type=int, default=None)
+    ap.add_argument("--only-indices", default=None, help="check only these scenario indices, e.g. 6,4,7")
     ap.add_argument("--verify-sets", type=Path, default=None)
     args = ap.parse_args(argv)
     if args.verify_sets:
@@ -96,7 +99,8 @@ def main(argv: list[str] | None = None) -> int:
     rows = summarize(args.out)
     print_table(rows)
     if args.check_preflight:
-        return 0 if check_preflight(rows, args.expected_scenarios) else 1
+        only = {int(i) for i in args.only_indices.split(",")} if args.only_indices else None
+        return 0 if check_preflight(rows, args.expected_scenarios, only) else 1
     return 0
 
 

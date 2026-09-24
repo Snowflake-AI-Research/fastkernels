@@ -14,11 +14,21 @@ OUT=${OUT:-$HOME/fk-paper-e2e}
 CANDIDATES_REPO=${CANDIDATES_REPO:-git@github.com:sfc-gh-goliaro/fastkernels-results.git}
 CANDIDATES_REF=${CANDIDATES_REF:-paper-e2e-v1}   # tag pinning the frozen candidate sets
 SETS="drkernel-ind drkernel-seq claude-ind claude-seq kda-ind kda-seq ako-ind ako-seq"
+# Optional: run only some models (indices into fastkernels/scenarios/default.yaml), e.g. to
+# split the work across two nodes -- see docs/paper-e2e-handoff.md.
+SCENARIOS=${SCENARIOS:-}
+if [ -n "$SCENARIOS" ]; then
+  SUBSET=(--scenario-indices "$SCENARIOS")
+  N_EXPECTED=$(echo "$SCENARIOS" | tr ',' '\n' | grep -c .)
+else
+  SUBSET=()
+  N_EXPECTED=11
+fi
 
 cd "$(dirname "$0")/.."
 mkdir -p "$OUT"
 exec > >(tee -a "$OUT/run.log") 2>&1
-echo "[paper-e2e] $(date) fastkernels=$(git rev-parse --short HEAD) out=$OUT"
+echo "[paper-e2e] $(date) fastkernels=$(git rev-parse --short HEAD) out=$OUT scenarios=${SCENARIOS:-all}"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader
 
 pack() {  # always leave a small tarball to email back, even on failure
@@ -36,15 +46,16 @@ C="$OUT/candidates/agent-candidates"
 python -m fastkernels.e2e.report --verify-sets "$C"
 
 # 2. Preflight (~30-60 min): every model with tiny workloads and a do-nothing candidate set.
-python -m fastkernels e2e default --sets "$C/selftest" --out "$OUT/preflight" \
+python -m fastkernels e2e default --sets "$C/selftest" --out "$OUT/preflight" ${SUBSET[@]+"${SUBSET[@]}"} \
   --max-requests 2 --probe-requests 2 --correctness-samples 2 || true
-if ! python -m fastkernels.e2e.report "$OUT/preflight" --check-preflight --expected-scenarios 11; then
+if ! python -m fastkernels.e2e.report "$OUT/preflight" --check-preflight --expected-scenarios "$N_EXPECTED" \
+     ${SCENARIOS:+--only-indices "$SCENARIOS"}; then
   echo "[paper-e2e] PREFLIGHT FAILED -- please email back the results file below"
   exit 1
 fi
 
 # 3. Full run (~1-2 days): pre-build each set's kernels once, then every model x set.
 SET_DIRS=$(for s in $SETS; do printf "%s," "$C/$s"; done)
-python -m fastkernels e2e default --sets "${SET_DIRS%,}" --out "$OUT/e2e" --prebuild
+python -m fastkernels e2e default --sets "${SET_DIRS%,}" --out "$OUT/e2e" ${SUBSET[@]+"${SUBSET[@]}"} --prebuild
 python -m fastkernels.e2e.report "$OUT/e2e"
 echo "[paper-e2e] DONE -- please email back the results file below"

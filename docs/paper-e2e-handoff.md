@@ -15,6 +15,20 @@ When it prints `DONE` (or `PREFLIGHT FAILED`), email back the `paper_e2e_results
 (a few MB). Needs a Hugging Face login with access to the default models (Llama-3.1, FLUX.1-dev,
 ...) and git access to `sfc-gh-goliaro/fastkernels-results` (candidate sets, cloned by the script).
 
+**Two 8-GPU nodes (about half the wall time):** split the models, one command per node (same
+repo/branch on both). Each node emails back its own results file; the two merge trivially
+(results are per model).
+
+```bash
+SCENARIOS=6,4,7 bash scripts/paper_e2e.sh               # node A: Qwen3-VL-235B (tp=4), GLA, YOLOv10
+SCENARIOS=0,1,2,3,5,8,9,10 bash scripts/paper_e2e.sh    # node B: the other 8 models
+```
+
+Indices refer to `fastkernels/scenarios/default.yaml`. The split balances estimated GPU time
+(Qwen3-VL-235B alone is ~40 of ~85 GPU-hours). If a run was already started on one node
+without `SCENARIOS`, stop it, `git pull`, and restart it with its subset: finished work is
+kept. Run inside `tmux`/`screen` so a dropped SSH session does not kill it.
+
 What it does: verifies the candidate sets' checksums; a ~30-60 min preflight (every model, tiny
 workloads, a do-nothing candidate set) that stops early with a clear message if anything is
 broken; then the full run (~1-2 days): per model a baseline, a noise run (fresh-compile baseline,
