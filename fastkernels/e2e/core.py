@@ -422,7 +422,8 @@ def main(argv: list[str] | None = None) -> int:
                          "workloads run once on the surviving subset (0 = always full runs)")
     ap.add_argument("--broken-threshold", type=float, default=0.5,
                     help="mean per-sample discrepancy above which a running candidate counts as broken")
-    ap.add_argument("--run-timeout", type=int, default=5400)
+    ap.add_argument("--run-timeout", type=int, default=10800,
+                    help="per-run safety timeout in seconds (catches hangs)")
     ap.add_argument("--warmup-passes", type=int, default=1,
                     help="untimed passes over each throughput workload before timing it "
                          "(keeps lazy JIT compiles out of the timed region)")
