@@ -88,6 +88,19 @@ def _fuse_qkv_keys(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     return passthrough
 
 
+def _drop_aliased(model: torch.nn.Module, missing: list[str]) -> list[str]:
+    """Drop "missing" keys that are aliases of a loaded entry.
+
+    A module may register the same Parameter under a second name (e.g. a kernel that
+    caches ``self._src_w = self.weight``). ``load_state_dict`` reports the alias as
+    missing although it is the very tensor that was loaded under the other name.
+    """
+    state = model.state_dict(keep_vars=True)
+    missing_set = set(missing)
+    loaded = {id(v) for k, v in state.items() if k not in missing_set}
+    return [k for k in missing if k not in state or id(state[k]) not in loaded]
+
+
 def _remap_encoder_embedding_keys(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     remapped: dict[str, torch.Tensor] = {}
     for key, value in state.items():
@@ -117,6 +130,7 @@ def load_bge_m3_weights(model: BgeM3EmbeddingModel, model_path: str) -> None:
         ),
     )
     missing, unexpected = model.load_state_dict(backbone_state, strict=False)
+    missing = _drop_aliased(model, missing)
 
     sparse_path = os.path.join(model_path, "sparse_linear.pt")
     if not os.path.exists(sparse_path):
@@ -184,6 +198,7 @@ def load_colbertv2_weights(model: ColBERTModel, model_path: str) -> None:
     if "model.colbert_linear.weight" in state:
         state["colbert_linear.weight"] = state.pop("model.colbert_linear.weight")
     missing, unexpected = model.load_state_dict(state, strict=False)
+    missing = _drop_aliased(model, missing)
 
     missing = [
         key for key in missing
