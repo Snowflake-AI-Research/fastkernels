@@ -119,6 +119,9 @@ class LLMAdapter(Adapter):
             # tokens and the forced re-decode share one batch regime (batch size changes
             # kernel configs, and near-tie argmaxes would flip systematically otherwise).
             out_lens = tput[0]["output_lens"][:n]
+            # Same decode path as the forced re-decode below (run_forced_decode sets this
+            # too): hybrid models route it through their per-step host path.
+            os.environ["FASTKERNELS_FORCE_SYNC_DECODE"] = "1"
             engine.block_manager.reset()
             outs = engine.generate(prompts, [SamplingParams(temperature=0.0, top_p=1.0, max_tokens=ol,
                                                             ignore_eos=True) for ol in out_lens],

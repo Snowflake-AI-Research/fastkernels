@@ -7807,6 +7807,7 @@ class LlamaEngine:
             sp = sp_list[i]
             ids = prompt if isinstance(prompt, list) else self.tokenizer.encode(prompt)
             seq = Sequence(ids, max_tokens=sp.max_tokens, ignore_eos=sp.ignore_eos)
+            seq._req_idx = i  # request index, as in generate() (used by forced decoding)
             all_seqs.append(seq)
             seq_sp[id(seq)] = sp
 
@@ -7820,6 +7821,10 @@ class LlamaEngine:
             not collect_logits
             and all(sp.temperature == 0.0 for sp in sp_list)
         )
+        if os.environ.get("FASTKERNELS_FORCE_SYNC_DECODE", "0") != "0":
+            # Forced-decode diagnostics: take the per-step host path (tokens appended
+            # to each Sequence feed the next step), not the device-side async fast path.
+            all_greedy = False
 
         def _ensure_decode_blocks(seqs: list[Sequence]) -> bool:
             block_size = mr.mamba_state_manager.block_size
@@ -8173,6 +8178,7 @@ class LlamaEngine:
             sp = sp_list[i]
             ids = prompt if isinstance(prompt, list) else self.tokenizer.encode(prompt)
             seq = Sequence(ids, max_tokens=sp.max_tokens, ignore_eos=sp.ignore_eos)
+            seq._req_idx = i  # request index, as in generate() (used by forced decoding)
             all_seqs.append(seq)
             seq_sp[id(seq)] = sp
 
@@ -8200,6 +8206,10 @@ class LlamaEngine:
             not collect_logits
             and all(sp.temperature == 0.0 for sp in sp_list)
         )
+        if os.environ.get("FASTKERNELS_FORCE_SYNC_DECODE", "0") != "0":
+            # Forced-decode diagnostics: take the per-step host path (tokens appended
+            # to each Sequence feed the next step), not the device-side async fast path.
+            all_greedy = False
 
         def _admit():
             """Move waiting seqs into ``prefilling`` (allocating one Mamba state
