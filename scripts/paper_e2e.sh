@@ -12,7 +12,7 @@ set -euo pipefail
 
 OUT=${OUT:-$HOME/fk-paper-e2e}
 CANDIDATES_REPO=${CANDIDATES_REPO:-git@github.com:sfc-gh-goliaro/fastkernels-results.git}
-CANDIDATES_REF=${CANDIDATES_REF:-agent-candidates}
+CANDIDATES_REF=${CANDIDATES_REF:-paper-e2e-v1}   # tag pinning the frozen candidate sets
 SETS="drkernel-ind drkernel-seq claude-ind claude-seq kda-ind kda-seq ako-ind ako-seq"
 
 cd "$(dirname "$0")/.."
