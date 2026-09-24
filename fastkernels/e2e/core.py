@@ -131,6 +131,11 @@ class E2E:
                        FASTKERNELS_CANDIDATE_ONLY=",".join(only or []),
                        FASTKERNELS_CANDIDATE_EXCLUDE=",".join(exclude or []),
                        TORCH_EXTENSIONS_DIR=str(self.out / "work" / "torch_extensions" / set_dir.name))
+        if name == "noise":
+            # A fresh compile (no Inductor/FX cache) re-makes autotuning choices, as a
+            # candidate run does; a warm cache would reproduce the baseline bit-for-bit and
+            # understate the run-to-run nondeterminism floor.
+            env["TORCHINDUCTOR_FORCE_DISABLE_CACHES"] = "1"
         gpus, port = self.pool.lease(max(1, scenario.tp))
         env.update(CUDA_VISIBLE_DEVICES=",".join(gpus), FASTKERNELS_NCCL_PORT=str(port))
         t0 = time.time()

@@ -73,7 +73,9 @@ def main(argv: list[str] | None = None) -> int:
     ref = str(Path(results["baseline"]["_dir"]) / "outputs.pt")
     if not args.skip_noise:
         results["noise"] = run_one(args.out, "noise", args.scenarios, args.index,
-                                   {**run, "reference": ref}, base_env, False, args.timeout)
+                                   {**run, "reference": ref},
+                                   {**base_env, "TORCHINDUCTOR_FORCE_DISABLE_CACHES": "1"},
+                                   False, args.timeout)
     if args.candidates_dir:
         set_dir = prepare_set(Path(args.candidates_dir), args.out / "sets")
         only = args.only or ",".join(kernels_for(set_dir, scenario.hf_name))
