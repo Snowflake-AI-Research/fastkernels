@@ -152,7 +152,7 @@ def _checkpoint() -> tuple[str, str]:
 
 
 def _load_weights(model, path: str) -> None:
-    """``load_openfold3_checkpoint`` (strict load), plus the two layout changes of the released
+    """``load_openfold3_checkpoint``, plus the two layout changes of the released
     ``of3_ft3_v1`` checkpoint vs the harness's ``of3-p2-155k``, remapped exactly:
 
     * atom transformers carry one z LayerNorm (weight only) per block instead of one shared
@@ -175,7 +175,23 @@ def _load_weights(model, path: str) -> None:
         sd[f"{prefix}.layer_norm_z.weight"] = torch.ones_like(w)
     for k in [k for k in sd if k.endswith("fourier_emb.w") and sd[k].dim() == 2]:
         sd[k] = sd[k].reshape(-1)
-    model.load_state_dict(sd, strict=True)
+    # Every model *parameter* must be loaded (strict, as in the harness), but candidate
+    # modules may legitimately (a) drop dead submodules -- e.g. AuxiliaryHeads' unused
+    # ``pairformer_embedding`` -> unexpected checkpoint keys; (b) alias a parameter under a
+    # second name (``self._src_w = self.weight``) -> missing keys that share storage with a
+    # loaded one; (c) register their own buffers (caches, tables) -> missing buffer keys.
+    # These are tolerated; a dropped *live* module fails correctness instead.
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    msd = model.state_dict(keep_vars=True)
+    loaded = {msd[k].data_ptr() for k in msd if k in sd}
+    bad = [k for k in missing
+           if isinstance(msd[k], torch.nn.Parameter) and msd[k].data_ptr() not in loaded]
+    if bad:
+        raise RuntimeError(f"checkpoint lacks {len(bad)} model parameters, e.g. {bad[:8]}")
+    for what, keys in (("unused checkpoint", unexpected), ("aliased/buffer model", missing)):
+        if keys:
+            roots = sorted({k.rsplit(".", 1)[-1] for k in keys})
+            print(f"[openfold3] tolerated {len(keys)} {what} tensors ({roots[:6]})", flush=True)
 
 
 def provision(seed: int = 42, all_chains: bool = False) -> None:
