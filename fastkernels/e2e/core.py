@@ -110,7 +110,7 @@ class E2E:
     # -- one run ------------------------------------------------------------
     def run(self, index: int, scen_slug: str, name: str, *, reference: str | None,
             set_dir: Path | None = None, only: list[str] | None = None,
-            exclude: list[str] | None = None) -> dict:
+            exclude: list[str] | None = None, max_requests: int | None = -1) -> dict:
         scenario = self.scenarios[index]
         d = self.run_dir(scen_slug, name)
         if (d / "result.json").is_file():  # resume
@@ -121,7 +121,8 @@ class E2E:
         a = self.args
         spec = {"scenarios": a.scenarios, "index": index, "candidates": set_dir is not None,
                 "result": str(d / "result.json"),
-                "run": {"out_dir": str(d), "seed": a.seed, "max_requests": a.max_requests,
+                "run": {"out_dir": str(d), "seed": a.seed,
+                        "max_requests": a.max_requests if max_requests == -1 else max_requests,
                         "correctness_samples": a.correctness_samples, "enforce_eager": a.eager,
                         "reference": reference, "workloads": a.workloads.split(",") if a.workloads else None}}
         (d / "spec.json").write_text(json.dumps(spec, indent=1))
@@ -241,15 +242,19 @@ class E2E:
         attempts: list[dict] = []
         n = 0
 
-        def attempt(only: list[str], purpose: str) -> tuple[dict, dict]:
+        def attempt(only: list[str], purpose: str, full: bool) -> tuple[dict, dict]:
+            """``full``: the scenario's real workloads; otherwise a cheap probe (few
+            requests) that is enough to catch crashes and grossly broken outputs."""
             nonlocal n
             n += 1
             excl = [x["kernel"] for x in dropped]
+            mr = -1 if full or not a.probe_requests else a.probe_requests
             res = self.run(index, slug, f"{set_dir.name}/attempt_{n:02d}", reference=ref,
-                           set_dir=set_dir, only=only, exclude=excl)
+                           set_dir=set_dir, only=only, exclude=excl, max_requests=mr)
             log = (Path(res["_dir"]) / "log.txt").read_text(errors="replace") \
                 if (Path(res["_dir"]) / "log.txt").is_file() else ""
-            info = {"n": n, "purpose": purpose, "only": only, "exclude": excl, "status": res["status"],
+            info = {"n": n, "purpose": purpose, "full": full or not a.probe_requests,
+                    "only": only, "exclude": excl, "status": res["status"],
                     "error": (res.get("error") or "")[:1500], "swapped": res.get("swapped"),
                     "not_swapped": res.get("not_swapped"), "t_import_s": res.get("t_import_s"),
                     "t_total_s": res.get("t_total_s")}
@@ -267,35 +272,42 @@ class E2E:
             return info["status"] == "ok" and info.get("mean_d") is not None \
                 and info["mean_d"] > a.broken_threshold
 
-        def bisect(active: list[str], bad) -> str | None:
+        def bisect(active: list[str], bad, full: bool) -> str | None:
             """Find one kernel whose presence alone makes ``bad`` true (else None)."""
             suspects = list(active)
             while len(suspects) > 1 and n < a.max_attempts:
                 half = suspects[: len(suspects) // 2]
-                _, info = attempt(half, "bisect")
+                _, info = attempt(half, "bisect", full)
                 if bad(info):
                     suspects = half
                     continue
                 rest = suspects[len(half):]
                 if n >= a.max_attempts:
                     return None
-                _, info = attempt(rest, "bisect")
+                _, info = attempt(rest, "bisect", full)
                 if bad(info):
                     suspects = rest
                     continue
                 return None  # interaction between halves: give up bisecting
             return suspects[0] if len(suspects) == 1 else None
 
+        def record_import_failures(info: dict) -> None:
+            for k in info.get("not_swapped") or []:
+                if k not in {x["kernel"] for x in dropped}:
+                    dropped.append({"kernel": k, "category": "import", "attempt": info["n"],
+                                    "reason": "candidate failed to import / define its class"})
+
         final = None
         while n < a.max_attempts:
             active = [k for k in requested if k not in {x["kernel"] for x in dropped}]
             if not active:
                 break
-            res, info = attempt(active, "full")
-            for k in info.get("not_swapped") or []:
-                if k not in {x["kernel"] for x in dropped}:
-                    dropped.append({"kernel": k, "category": "import", "attempt": info["n"],
-                                    "reason": "candidate failed to import / define its class"})
+            res, info = attempt(active, "probe" if a.probe_requests else "full", False)
+            record_import_failures(info)
+            if info["status"] == "ok" and not broken(info) and not info["full"]:
+                # The probe passed: run the real workloads once on the same subset.
+                res, info = attempt(active, "full", True)
+                record_import_failures(info)
             if info["status"] == "ok" and not broken(info):
                 final = (res, info)
                 break
@@ -305,18 +317,24 @@ class E2E:
                     dropped.append({"kernel": named[0], "category": info["category"],
                                     "attempt": info["n"], "reason": info["error"][:500]})
                     continue
-                culprit = bisect(active, lambda i: i["status"] != "ok")
+                culprit = bisect(active, lambda i: i["status"] != "ok", info["full"])
                 category = info["category"]
             else:
-                culprit = bisect(active, broken)
+                culprit = bisect(active, broken, info["full"])
                 category = "incorrect"
             if culprit is None:
                 break
             dropped.append({"kernel": culprit, "category": category, "attempt": n,
                             "reason": f"found by bisection ({category})"})
 
+        # All winners = the first attempt, or -- if that was a passing probe -- the full run
+        # of the same kernels that followed it (its speedups are the meaningful ones).
+        all_winners = attempts[0] if attempts else None
+        if (all_winners and not all_winners["full"] and len(attempts) > 1
+                and attempts[1]["full"] and attempts[1]["only"] == all_winners["only"]):
+            all_winners = attempts[1]
         summary = {"kernels_requested": requested, "dropped": dropped, "attempts": attempts,
-                   "all_winners": attempts[0] if attempts else None}
+                   "all_winners": all_winners}
         if final is not None:
             res, info = final
             summary.update(status="ok", kernels_final=info["only"], timings=res.get("timings"),
@@ -395,6 +413,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--correctness-samples", type=int, default=64)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--max-attempts", type=int, default=16)
+    ap.add_argument("--probe-requests", type=int, default=8,
+                    help="requests per workload for the cheap drop-and-retry probes; the real "
+                         "workloads run once on the surviving subset (0 = always full runs)")
     ap.add_argument("--broken-threshold", type=float, default=0.5,
                     help="mean per-sample discrepancy above which a running candidate counts as broken")
     ap.add_argument("--run-timeout", type=int, default=5400)
