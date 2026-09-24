@@ -14,7 +14,9 @@ In-process port of the fastkernels side of ``validate/bench_detection.py``:
   --prepare`` builds it ahead of time (CPU only);
 * timing (as the harness): one bs=1 warmup forward; throughput workloads tile
   ``num_images`` over the unique images in batches (host gather + H2D copy inside the
-  timed loop), 3 warmup + 3 measured passes, images/s from the median pass; latency
+  timed loop), 3 measured passes, images/s from the median pass. Warmup before them: one
+  batch of every distinct shape plus ``spec.extra["warmup_passes"]`` untimed full passes
+  (default 1; the harness uses 3), so lazy JIT/autotuning never lands in a timed pass; latency
   workloads time ``num_iters`` forwards of the first ``batch_size`` images after
   ``num_warmup``, median seconds. ``spec.max_requests`` caps the throughput image count
   (and so the unique images loaded); latency probes keep their iteration counts.
@@ -277,6 +279,7 @@ class DetectionAdapter(Adapter):
             return run_ours_detector(model, model_name, batch, image_size,
                                      max_detections=_MAX_DETECTIONS)
 
+        warmup_passes = int(spec.extra.get("warmup_passes", 1))
         timings: dict[str, Timing] = {}
         with torch.no_grad():
             predict(images[:1].to(device=device))
@@ -290,7 +293,12 @@ class DetectionAdapter(Adapter):
                     for s in range(0, num, bs):
                         predict(images[cycle[s:s + bs]].to(device=device))
 
-                for _ in range(3):
+                # Untimed warmup so lazy JIT / autotuning never lands in a timed pass: one
+                # batch of every distinct shape (full + remainder), then ``warmup_passes``
+                # full passes (default 1; the orchestrator sets 0 for cheap probes).
+                for s in sorted({0, (num - 1) // bs * bs}):
+                    predict(images[cycle[s:s + bs]].to(device=device))
+                for _ in range(warmup_passes):
                     one_pass()
                 torch.cuda.synchronize()
                 runs = []
