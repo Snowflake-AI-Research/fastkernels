@@ -13,7 +13,9 @@ Workloads (``StructurePrediction``):
 
 * ``short`` / ``medium`` / ``long`` / ``extra-long`` (throughput): ``num_queries`` chains
   drawn from the workload's own length bucket of ``CHAIN_CATALOG`` (seeded permutation;
-  ``max_requests`` keeps a prefix). Timed like the harness -- sync, then per query H2D ->
+  ``max_requests`` keeps a prefix). After ``extra["warmup_passes"]`` (default 1) untimed
+  forwards over every distinct input shape of the workload (so lazily compiled / autotuned
+  kernels never compile inside the timer), timed like the harness -- sync, then per query H2D ->
   ``manual_seed(seed + qi)`` -> forward -> pull the (compact) outputs to CPU, sync; value =
   residues (tokens) / wall second (``tok/s``) -- except that featurization (MSA parsing +
   synthetic atom features on CPU) happens before the timer: in the harness loop it is
@@ -26,7 +28,10 @@ Workloads (``StructurePrediction``):
 Correctness (``outputs.pt``, ``kind="structures"``): the first ``correctness_samples``
 throughput queries in workload order (then one per latency workload if room), keyed by
 ``workload/qi/chain``; per sample the predicted positions of the real (masked-in) atoms,
-their pLDDT logits and the PAE logits strided down to <= 64 x 64 tokens (fp16).
+their pLDDT logits, the PAE logits strided down to <= 64 x 64 tokens (fp16) and the trunk
+single representation (bf16). ``compare``'s per-query d uses the quantities that are stable
+under benign numerics (trunk single rep, pLDDT, structure size); see ``_TOL`` for why the
+harness's structure/PAE criteria are reported but not used.
 
 Data (provision once on CPU: ``python -m fastkernels.e2e.adapters.openfold3 --provision``):
 MSAs from the public OpenProteinSet bucket (``s3://openfold/pdb/<pdb>_<chain>/a3m``) under
@@ -52,8 +57,13 @@ S3_HTTP = "https://openfold.s3.amazonaws.com"
 PUBLIC_CKPT_KEY = "openfold3_params/of3_ft3_v1.pt"
 PLDDT_BINS = 50
 
-# Per-criterion tolerances = the harness's per-query pass thresholds (``_query_passes``).
-_TOL = {"atom_cos": 0.10, "rmsd": 0.5, "plddt_pearson": 0.01, "pae_cos": 0.05}
+# Tolerances of the per-query discrepancy terms (see ``OpenFold3Adapter.metric``), set from a
+# B200 sensitivity probe: benign numerics (cuBLAS bf16 reduced-precision reduction off, 0.1%
+# weight noise, an fp32 model) give 1-cos(s_trunk) 0.7e-5..1.4e-4, pLDDT MAE 0.1..0.6
+# points and |ln Rg ratio| <= 0.26 -- but Kabsch RMSD 4..17 A and PAE-logit cosine 0.5..0.8:
+# on the harness's synthetic features the trunk pair track and the diffusion trajectory are
+# chaotic, so the harness criteria (reported in the summary) only pass bitwise-equal runs.
+_TOL = {"s_trunk": 1e-3, "plddt_mae": 2.0, "log_rg": 1.0}
 
 
 def _data_dir() -> Path:
@@ -219,7 +229,7 @@ def _chain_seed(key: str) -> int:
     return int(hashlib.sha256(key.encode()).hexdigest(), 16) % (2 ** 31)
 
 
-def _compact(outputs: dict, batch: dict) -> dict:
+def _compact(outputs: dict, aux: dict, batch: dict) -> dict:
     """CPU copies of what ``compare`` needs, restricted to the real (unmasked) atoms."""
     import torch
     mask = batch["atom_mask"][0] > 0.5
@@ -229,16 +239,17 @@ def _compact(outputs: dict, batch: dict) -> dict:
     stride = -(-pae.shape[0] // 64)  # <= 64 x 64 (the harness uses n // 64: up to 127 x 127)
     pae = pae[::stride, ::stride, :]
     return {"atom_positions": pos.float().cpu(), "plddt_logits": plddt.to(torch.float16).cpu(),
-            "pae_logits": pae.to(torch.float16).cpu()}
+            "pae_logits": pae.to(torch.float16).cpu(),
+            "s_trunk": aux["s_trunk"][0].to(torch.bfloat16).cpu()}  # bf16 = model dtype, lossless
 
 
 class OpenFold3Adapter(Adapter):
     name = "openfold3"
-    metric = ("per query: d = max over the harness pass criteria of e/(e+tol) with "
-              "e = 1-cos(atom positions) [tol 0.10], Kabsch RMSD in A [tol 0.5], "
-              "1-Pearson(per-atom pLDDT) [tol 0.01], 1-cos(PAE logits) [tol 0.05] "
-              "(real atoms only); d < 0.5 <=> the query passes the harness criteria; "
-              "d = 1 if missing or non-finite")
+    metric = ("per query: d = max_k e_k/(e_k+tol_k) over e = 1-cos(trunk single rep s) "
+              "[tol 1e-3], mean |delta per-atom pLDDT| in points [tol 2], |ln(Rg_cand/Rg_ref)| of "
+              "the predicted structure [tol 1]; d = 1 if missing/non-finite. Structure/PAE "
+              "agreement is not in d: it is chaotic under benign numerics (see _TOL); the harness "
+              "criteria are reported as harness_pass_rate")
 
     @classmethod
     def handles(cls, scenario) -> bool:
@@ -305,6 +316,7 @@ class OpenFold3Adapter(Adapter):
         timings: dict[str, Timing] = {}
         samples: list[dict] = []
         want = spec.correctness_samples
+        warmup_passes = int(spec.extra.get("warmup_passes", 1))
 
         for p in (p for p in plan if p["kind"] == "throughput"):
             name, total_tok = p["name"], 0
@@ -314,7 +326,16 @@ class OpenFold3Adapter(Adapter):
             tf = time.perf_counter()
             queries = [(key, *feats(key)) for key in p["chains"]]
             t_feat = time.perf_counter() - tf
+            # Untimed pass(es) over every distinct input shape, so lazily JIT-compiled /
+            # autotuned kernels (Triton, candidates) never compile inside the timed loop.
+            shapes = {(n, tuple(cb["msa"].shape)): cb for _, cb, n in queries}
+            tw = time.perf_counter()
+            for _ in range(warmup_passes):
+                for cb in shapes.values():
+                    with torch.no_grad():
+                        model(to_device(cb, device, dtype))
             torch.cuda.synchronize()
+            t_warm = time.perf_counter() - tw
             start = time.perf_counter()
             for qi, (key, cpu_batch, n_tok) in enumerate(queries):
                 batch = to_device(cpu_batch, device, dtype)
@@ -322,19 +343,19 @@ class OpenFold3Adapter(Adapter):
                 torch.manual_seed(seed + qi)
                 torch.cuda.manual_seed_all(seed + qi)
                 with torch.no_grad():
-                    outputs, _ = model(batch)
-                out = _compact(outputs, batch)  # D2H (syncs), as the harness extracts per query
+                    outputs, aux = model(batch)
+                out = _compact(outputs, aux, batch)  # D2H (syncs), as the harness extracts per query
                 if len(samples) < want:
                     samples.append({"key": f"{name}/{qi}/{key}", "n_tokens": n_tok,
                                     "seed": seed + qi, **out})
-                del outputs, batch, out
+                del outputs, aux, batch, out
             torch.cuda.synchronize()
             elapsed = time.perf_counter() - start
             del queries
             timings[name] = {"kind": "throughput", "value": total_tok / elapsed, "unit": "tok/s"}
             print(f"[openfold3] {name}: {len(p['chains'])} queries, {total_tok} tokens, "
-                  f"{elapsed:.2f}s (+{t_feat:.2f}s featurize, untimed), {total_tok / elapsed:.1f} tok/s",
-                  flush=True)
+                  f"{elapsed:.2f}s, {total_tok / elapsed:.1f} tok/s (untimed: {t_feat:.1f}s featurize, "
+                  f"{t_warm:.1f}s warmup over {len(shapes)} shapes x {warmup_passes})", flush=True)
 
         for p in (p for p in plan if p["kind"] == "latency"):
             name, key = p["name"], p["chains"][0]
@@ -351,13 +372,13 @@ class OpenFold3Adapter(Adapter):
                 torch.cuda.synchronize()
                 t0 = time.perf_counter()
                 with torch.no_grad():
-                    outputs, _ = model(copy.deepcopy(batch))
+                    outputs, aux = model(copy.deepcopy(batch))
                 torch.cuda.synchronize()
                 lats.append(time.perf_counter() - t0)
                 if it == 0 and len(samples) < want:
                     samples.append({"key": f"{name}/0/{key}", "n_tokens": n_tok, "seed": seed,
-                                    **_compact(outputs, batch)})
-                del outputs
+                                    **_compact(outputs, aux, batch)})
+                del outputs, aux
             med = float(np.median(lats))
             timings[name] = {"kind": "latency", "value": med, "unit": "s"}
             print(f"[openfold3] {name}: {key} ({n_tok} tok), median {med:.4f}s over "
@@ -384,19 +405,33 @@ class OpenFold3Adapter(Adapter):
             p /= p.sum(-1, keepdims=True)
             return p @ ((np.arange(l.shape[-1]) + 0.5) / l.shape[-1])
 
+        def cos(x, y):
+            x, y = x.ravel(), y.ravel()
+            den = np.linalg.norm(x) * np.linalg.norm(y)
+            return float(x @ y / den) if den > 0 else (0.0 if den == 0 else float("nan"))
+
+        def rg(x):
+            return float(np.sqrt(((x - x.mean(0)) ** 2).sum(-1).mean()))
+
         by_key = {s["key"]: s for s in cand.get("samples", [])}
         per, rows = [], []
+        np_err = np.seterr(all="ignore")
         for r in ref.get("samples", []):
             c = by_key.get(r["key"])
             row = None
             try:
-                if c is not None and c["atom_positions"].shape == r["atom_positions"].shape:
-                    pr, pc = arr(r["atom_positions"]), arr(c["atom_positions"])
-                    row = {"atom_cos": b.cosine_sim(pc, pr), "rmsd": b.kabsch_rmsd(pc, pr),
-                           "plddt_pearson": b.pearson_corr(plddt(c["plddt_logits"]),
-                                                           plddt(r["plddt_logits"])),
+                pc = arr(c["atom_positions"]) if c is not None else None
+                if pc is not None and pc.shape == tuple(r["atom_positions"].shape) \
+                        and np.isfinite(pc).all():
+                    pr = arr(r["atom_positions"])
+                    lr, lc = plddt(r["plddt_logits"]), plddt(c["plddt_logits"])
+                    row = {"s_cos": cos(arr(c["s_trunk"]), arr(r["s_trunk"])),
+                           "plddt_mae": float(np.abs(lc - lr).mean() * 100),
+                           "log_rg": abs(float(np.log(rg(pc) / rg(pr)))),
+                           "atom_cos": b.cosine_sim(pc, pr), "rmsd": b.kabsch_rmsd(pc, pr),
+                           "plddt_pearson": b.pearson_corr(lc, lr),
                            "pae_cos": b.cosine_sim(arr(c["pae_logits"]), arr(r["pae_logits"]))}
-                    if not all(np.isfinite(v) for v in row.values()) or not np.isfinite(pc).all():
+                    if not all(np.isfinite(v) for v in row.values()):
                         row = None
             except Exception:  # noqa: BLE001 -- malformed candidate output = maximal discrepancy
                 row = None
@@ -404,28 +439,35 @@ class OpenFold3Adapter(Adapter):
                 per.append(1.0)
                 rows.append(None)
                 continue
-            err = {"atom_cos": 1 - row["atom_cos"], "rmsd": row["rmsd"],
-                   "plddt_pearson": 1 - row["plddt_pearson"], "pae_cos": 1 - row["pae_cos"]}
-            per.append(float(max(max(e, 0.0) / (max(e, 0.0) + _TOL[k]) for k, e in err.items())))
-            row["pass"] = (row["atom_cos"] >= b.TARGETS["atom_pos_cosine_min"]
-                           and row["rmsd"] < b.TARGETS["atom_rmsd_kabsch_mean"]
-                           and row["plddt_pearson"] >= b.TARGETS["plddt_pearson_mean"]
-                           and row["pae_cos"] >= b.TARGETS["pae_cosine_mean"])
+            err = {"s_trunk": max(1 - row["s_cos"], 0.0), "plddt_mae": row["plddt_mae"],
+                   "log_rg": row["log_rg"]}
+            per.append(float(max(e / (e + _TOL[k]) for k, e in err.items())))
+            row["harness_pass"] = (row["atom_cos"] >= b.TARGETS["atom_pos_cosine_min"]
+                                   and row["rmsd"] < b.TARGETS["atom_rmsd_kabsch_mean"]
+                                   and row["plddt_pearson"] >= b.TARGETS["plddt_pearson_mean"]
+                                   and row["pae_cos"] >= b.TARGETS["pae_cosine_mean"])
             rows.append(row)
 
+        np.seterr(**np_err)
         ok = [r for r in rows if r is not None]
         mean = lambda k: float(np.mean([r[k] for r in ok])) if ok else None  # noqa: E731
+        worst = lambda k, f: float(f(r[k] for r in ok)) if ok else None  # noqa: E731
         summary = {
             "n": len(per),
             "invalid": len(per) - len(ok),
-            "pass_rate": (sum(bool(r["pass"]) for r in ok) / len(per)) if per else None,
+            "mean_d": float(np.mean(per)) if per else None,
+            "frac_d_below_0.5": float(np.mean([d < 0.5 for d in per])) if per else None,
+            "mean_s_trunk_cosine": mean("s_cos"),
+            "min_s_trunk_cosine": worst("s_cos", min),
+            "mean_plddt_mae": mean("plddt_mae"),
+            "max_abs_log_rg": worst("log_rg", max),
+            # validate/bench_openfold3 per-query criteria (met only by bitwise-equal numerics)
+            "harness_pass_rate": (sum(bool(r["harness_pass"]) for r in ok) / len(per)) if per else None,
             "mean_atom_cosine": mean("atom_cos"),
             "mean_rmsd": mean("rmsd"),
-            "max_rmsd": float(max(r["rmsd"] for r in ok)) if ok else None,
+            "max_rmsd": worst("rmsd", max),
             "mean_plddt_pearson": mean("plddt_pearson"),
-            "min_plddt_pearson": float(min(r["plddt_pearson"] for r in ok)) if ok else None,
             "mean_pae_cosine": mean("pae_cos"),
-            "mean_d": float(np.mean(per)) if per else None,
         }
         if ref.get("checkpoint") != cand.get("checkpoint"):
             summary["checkpoint_mismatch"] = [ref.get("checkpoint"), cand.get("checkpoint")]
