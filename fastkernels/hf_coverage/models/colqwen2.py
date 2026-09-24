@@ -7,7 +7,8 @@ from torch import nn
 
 from fastkernels.infra.context import get_context
 from fastkernels.tasks.baseline.L1.l2_norm import L2Norm
-from fastkernels.tasks.baseline.L1.linear import Linear
+from fastkernels.tasks.baseline.L1.linear import Linear, Matmul
+from fastkernels.tasks.baseline.L1.dense_attention import DenseAttention
 from . import llama, qwen2, qwen2_vl
 from ..runner import Workload
 
@@ -52,9 +53,75 @@ class ColQwen2(nn.Module):
             config.vlm_config.text_config.hidden_size, config.embedding_dim
         )
         self.normalize = L2Norm(eps=0.0)
+        self.retrieval_attention = DenseAttention(backend="sdpa")
+        self.matmul = Matmul()
 
     def project(self, hidden):
         return {"embeddings": self.normalize(self.projection(hidden))}
+
+    def retrieval_forward(self, input_ids, attention_mask=None, pixel_values=None,
+                          image_grid_thw=None):
+        """Document/query retrieval, including processor-supplied padding.
+
+        Use the same loaded backbone weights and unchanged native norm/RoPE/
+        SwiGLU callables. Dense SDPA accepts the supplied padding mask; the
+        historical paged continuation workload has no such mask interface.
+        """
+        text = self.model.text
+        batch, length = input_ids.shape
+        hidden = text.embed_tokens(input_ids)
+        if pixel_values is not None:
+            if image_grid_thw is None:
+                raise ValueError("Image retrieval requires its patch grid")
+            patches = torch.arange(pixel_values.shape[1], device=input_ids.device)[None]
+            valid = patches < (image_grid_thw[:, 1] * image_grid_thw[:, 2])[:, None]
+            features = self.model.vision(pixel_values[valid], image_grid_thw.detach().cpu())
+            hidden[input_ids == self.model.image_token_id] = features.to(hidden.dtype)
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+        if attention_mask.shape != input_ids.shape:
+            raise ValueError("Retrieval attention mask must match token IDs")
+        # The native wrapper passes inputs_embeds, so each example uses ordinary
+        # sequential positions on all three axes, including padded positions.
+        sequence = torch.arange(length, device=input_ids.device)
+        positions = sequence.repeat(batch)[None].expand(3, -1)
+        allowed = (sequence[None, :] <= sequence[:, None])[None, None]
+        allowed = allowed & attention_mask[:, None, None, :].bool()
+        # Native SDPA uses a Boolean mask: fully masked leading padding rows
+        # produce zero context rather than a uniform finite-min softmax.
+        mask = allowed
+        caches = {}
+
+        def normalize(module, values):
+            return module.forward_native(values, module.weight, module.eps, module.hidden_size)
+
+        for index, layer in enumerate(text.layers):
+            normalized = normalize(layer.input_layernorm, hidden)
+            attention = layer.self_attn
+            sizes = [attention.num_heads * attention.head_dim] + [attention.num_kv_heads * attention.head_dim] * 2
+            weights = attention.qkv_proj.weight.split(sizes)
+            biases = attention.qkv_proj.bias.split(sizes)
+            query, key, value = (self.matmul(normalized, weight, bias)
+                                 for weight, bias in zip(weights, biases))
+            query, key = text.rotary_emb.forward_native_2d(
+                positions, query.reshape(batch * length, -1), key.reshape(batch * length, -1))
+            query = query.reshape(batch, length, attention.num_heads, attention.head_dim)
+            key, value = (tensor.reshape(batch, length, attention.num_kv_heads, attention.head_dim)
+                          for tensor in (key, value))
+            caches[f"past_key_values.{index}.key"] = key.transpose(1, 2)
+            caches[f"past_key_values.{index}.value"] = value.transpose(1, 2)
+            groups = attention.num_heads // attention.num_kv_heads
+            output = self.retrieval_attention(
+                query, key.repeat_interleave(groups, 2), value.repeat_interleave(groups, 2),
+                attn_mask=mask)
+            hidden = hidden + attention.o_proj(output.reshape(batch, length, -1))
+            normalized = normalize(layer.post_attention_layernorm, hidden)
+            gate, up = (self.matmul(normalized, weight) for weight in layer.mlp.gate_up_proj.weight.chunk(2))
+            activated = layer.mlp.act_fn.forward_native(torch.cat((gate, up), -1))
+            hidden = hidden + layer.mlp.down_proj(activated)
+        embeddings = self.project(normalize(text.norm, hidden))["embeddings"]
+        embeddings = embeddings.masked_fill(~attention_mask[..., None].bool(), 0)
+        return dict(embeddings=embeddings, **caches)
 
 
 def build_from_config(config, device, dtype):
@@ -101,6 +168,10 @@ def load_state_dict_into(model, state, config):
 
 
 def make_workloads(model, inputs, config):
+    if inputs.get("pixel_values") is None:
+        return {"forward": Workload(run=lambda: model.retrieval_forward(**inputs))}
+    if inputs.get("attention_mask") is not None:
+        raise ValueError("Padded ColQwen2 retrieval requires the ordinary forward workload")
     if inputs["input_ids"].shape[0] != 1:
         raise ValueError("The ColQwen2 development workload uses one document")
     model.model.inputs = inputs

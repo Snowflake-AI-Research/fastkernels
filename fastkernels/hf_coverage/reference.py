@@ -373,6 +373,11 @@ def prepare(job: dict, directory: Path) -> dict:
             else:
                 ids = torch.randint(vocabulary_size, shape, generator=generator)
             inputs = {"input_ids": ids}
+            if "attention_mask_values" in spec:
+                mask = torch.tensor(spec["attention_mask_values"], dtype=torch.long)
+                if tuple(mask.shape) != shape or not torch.all((mask == 0) | (mask == 1)):
+                    raise ValueError("declared attention mask must be binary and match the token shape")
+                inputs["attention_mask"] = mask
             if "visual_region_count" in spec:
                 regions = spec["visual_region_count"]
                 inputs["visual_feats"] = torch.randn(

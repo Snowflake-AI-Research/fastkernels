@@ -1355,37 +1355,107 @@ CASES = {
     },
 
     'colqwen2': {
-        'reference': {
-            'config_class': 'transformers:ColQwen2Config',
-            'model_class': 'transformers:ColQwen2ForRetrieval',
-            'source': {
-                'kind': 'example_checkpoint', 'checkpoint': 'vidore/colqwen2-v1.0-hf',
-                'revision': 'ddc07d2317c80f75fc742b7362ee9ad1912908f9',
-                'url': 'https://huggingface.co/vidore/colqwen2-v1.0-hf/blob/ddc07d2317c80f75fc742b7362ee9ad1912908f9/config.json',
-                'description': 'Pinned HF documented configuration checkpoint; image retrieval with native sequential positions.',
-            },
-            'prefill_input_names': ['pixel_values', 'image_grid_thw'],
-        },
-        'dimension_overrides': {
-            'vlm_config': {
-                'image_token_id': 900,
-                'video_token_id': 901,
-                'vision_config': {'depth': 2, 'embed_dim': 128, 'hidden_size': 768, 'num_heads': 2},
-                'text_config': {
-                    'vocab_size': 1024, 'hidden_size': 768, 'intermediate_size': 1536, 'num_hidden_layers': 2,
-                    'num_attention_heads': 6, 'num_key_value_heads': 1, 'max_position_embeddings': 2048,
+        'variants': {
+            'document': {
+                'reference': {
+                    'config_class': 'transformers:ColQwen2Config',
+                    'model_class': 'transformers:ColQwen2ForRetrieval',
+                    'source': {
+                        'kind': 'example_checkpoint',
+                        'checkpoint': 'vidore/colqwen2-v1.0-hf',
+                        'revision': 'ddc07d2317c80f75fc742b7362ee9ad1912908f9',
+                        'url': 'https://huggingface.co/vidore/colqwen2-v1.0-hf/blob/ddc07d2317c80f75fc742b7362ee9ad1912908f9/config.json',
+                        'description': ('Pinned HF documented configuration checkpoint; image retrieval with native '
+                         'sequential positions.'),
+                    },
+                    'prefill_input_names': ['pixel_values', 'image_grid_thw'],
                 },
+                'dimension_overrides': {
+                    'vlm_config': {
+                        'image_token_id': 900,
+                        'video_token_id': 901,
+                        'vision_config': {'depth': 2, 'embed_dim': 128, 'hidden_size': 768, 'num_heads': 2},
+                        'text_config': {
+                            'vocab_size': 1024,
+                            'hidden_size': 768,
+                            'intermediate_size': 1536,
+                            'num_hidden_layers': 2,
+                            'num_attention_heads': 6,
+                            'num_key_value_heads': 1,
+                            'max_position_embeddings': 2048,
+                        },
+                    },
+                },
+                'input': {
+                    'kind': 'text_image',
+                    'text_batch_size': 1,
+                    'sequence_length': 24,
+                    'image_batch_size': 1,
+                    'shape': [20, 1176],
+                    'image_grid_thw': [
+                        [1, 4, 4],
+                    ],
+                    'image_token_positions': [4, 5, 6, 7],
+                },
+                'workload': 'causal_lm',
+                'outputs': ['embeddings', 'past_key_values'],
+                'reference_backend': 'sdpa',
+                'dimension_purpose': ('Image retrieval head128dims;quickGELU vision;6:1 GQA and128head width;native MRoPE sections. '
+                 'Padded patch container exercises unpadding. Two layers,prefill/decode,all returned caches.'),
+            },
+            'query': {
+                'reference': {
+                    'config_class': 'transformers:ColQwen2Config',
+                    'model_class': 'transformers:ColQwen2ForRetrieval',
+                    'source': {
+                        'kind': 'example_checkpoint',
+                        'checkpoint': 'vidore/colqwen2-v1.0-hf',
+                        'revision': 'ddc07d2317c80f75fc742b7362ee9ad1912908f9',
+                        'url': 'https://huggingface.co/vidore/colqwen2-v1.0-hf/blob/ddc07d2317c80f75fc742b7362ee9ad1912908f9/config.json',
+                        'description': ('Pinned HF retrieval checkpoint; the public task encodes both image documents and '
+                         'text queries.'),
+                    },
+                },
+                'dimension_overrides': {
+                    'vlm_config': {
+                        'image_token_id': 900,
+                        'video_token_id': 901,
+                        'vision_config': {'depth': 2, 'embed_dim': 128, 'hidden_size': 768, 'num_heads': 2},
+                        'text_config': {
+                            'vocab_size': 1024,
+                            'hidden_size': 768,
+                            'intermediate_size': 1536,
+                            'num_hidden_layers': 2,
+                            'num_attention_heads': 6,
+                            'num_key_value_heads': 1,
+                            'max_position_embeddings': 2048,
+                        },
+                    },
+                },
+                'input': {
+                    'kind': 'tokens',
+                    'batch_size': 2,
+                    'sequence_length': 16,
+                    'vocab_size': 1024,
+                    'input_ids': [
+                        [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25],
+                        [26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 0, 0, 0, 0, 0, 0],
+                    ],
+                    'attention_mask_values': [
+                        [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+                        [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0],
+                    ],
+                },
+                'workload': 'forward',
+                'outputs': ['embeddings', 'past_key_values'],
+                'reference_backend': 'sdpa',
+                'dimension_purpose': ('Text-query retrieval with the same reduced backbone as the document case: two layers, 6:1 '
+                 'grouped attention, 128-wide heads, native rotary sections and 128-wide retrieval output. Two '
+                 'synthetic queries contain 16 and 10 valid tokens; padding exercises attention masking and '
+                 'zeroed retrieval embeddings. Compare embeddings and all returned key/value caches. The '
+                 'document variant exercises vision separately.'),
             },
         },
-        'input': {
-            'kind': 'text_image', 'text_batch_size': 1, 'sequence_length': 24, 'image_batch_size': 1,
-            'shape': [20, 1176], 'image_grid_thw': [[1, 4, 4]], 'image_token_positions': [4, 5, 6, 7],
-        },
-        'workload': 'causal_lm',
-        'outputs': ['embeddings', 'past_key_values'],
-        'reference_backend': 'sdpa',
-        'dimension_purpose': ('Image retrieval head128dims;quickGELU vision;6:1 GQA and128head width;native MRoPE sections. '
-            'Padded patch container exercises unpadding. Two layers,prefill/decode,all returned caches.'),
     },
 
     'conditional_detr': {

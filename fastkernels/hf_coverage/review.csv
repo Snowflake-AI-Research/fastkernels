@@ -47,7 +47,7 @@ cohere2_vision,us,,no registered runnable implementation,Implementation and all2
 cohere_asr,us,,no registered runnable implementation,Registered constructor-derived case passes GPU outputs and all self/cross caches over prefill plus two continuations (30 tensors). Diagnostic latency measured with 10 warmups/50 samples; construction uses existing operations and patches.
 colmodernvbert,us,,registered; full workload review unfinished,"Existing document/query GPU evidence reviewed and retained: selected retrieval task, outputs and meaningful computation covered. No generation continuation requirement for this task."
 colpali,us,,registered; full workload review unfinished,"Existing document/query GPU evidence reviewed and retained: selected retrieval task, outputs and meaningful computation covered. No generation continuation requirement for this task."
-colqwen2,us,optional,registered; full workload review unfinished,"Current declared workload passed paired GPU checks on common weights and inputs; 10 tensors, minimum matched fraction 0.993490. Diagnostic timing measured; final construction review remains."
+colqwen2,us,optional,registered; full workload review unfinished,Both --variant document and --variant query pass BF16 GPU output/cache checks; timings measured. Query batching and padding now use an existing-op composition. Original document inputs and weights retained.
 conditional_detr,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 convbert,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 convnext,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
@@ -316,7 +316,7 @@ pvt,us,,full-size numerical pass,Review construction and outputs; validate the a
 pvt_v2,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 qianfan_ocr,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
 qwen2,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-qwen2_5_omni,us,,registered; full workload review unfinished,Native random talker can emit codes outside codec embedding range; saved invalid code reproduced and no collapsed-weight cause found. Resolve valid shared preparation without seed search or suppression; separately isolate differing speech samples. No full-waveform acceptance.
+qwen2_5_omni,us,,registered; full workload review unfinished,Native random generation emits code8337 outside8194-row waveform embedding. Shared-logit sampling agrees; CPU/GPU position-table and convolution/matmul rounding explain two feature differences. Video attention suboperation remains unisolated. Resolve valid shared preparation without seed search or suppression; no full-waveform acceptance.
 qwen2_5_vl,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
 qwen2_audio,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
 qwen2_moe,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
