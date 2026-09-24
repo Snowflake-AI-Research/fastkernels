@@ -6,11 +6,26 @@ from torch import nn
 from fastkernels.tasks.baseline.L1.dense_attention import DenseAttention
 from fastkernels.tasks.baseline.L1.layer_norm import LayerNorm
 from fastkernels.tasks.baseline.L1.linear import Linear
+from fastkernels.tasks.baseline.L1.rms_norm_gated import _layer_norm_fn_impl
 from fastkernels.tasks.baseline.L1.silu_and_mul import SiluAndMul
 
 from . import cohere2
 from .modernvbert import VisionTower, base_source
 from ..runner import Workload
+
+
+class TritonLayerNorm(LayerNorm):
+    """Reuse the existing centered-variance kernel; retain the CPU development path."""
+
+    def __init__(self, source):
+        super().__init__(source.normalized_shape[0], eps=source.eps, create_offset=False)
+        self.weight = source.weight
+
+    def forward(self, hidden):
+        if not hidden.is_cuda:
+            return super().forward(hidden)
+        # Internal library reuse: this LayerNorm mode is not a standalone task.
+        return _layer_norm_fn_impl(hidden, self.weight, None, eps=self.eps, is_rms_norm=False)
 
 
 class Cohere2VisionForConditionalGeneration(nn.Module):
@@ -26,6 +41,9 @@ class Cohere2VisionForConditionalGeneration(nn.Module):
         self.linear_2 = Linear(config.alignment_intermediate_size // 2,
                                config.text_config.hidden_size).to(device=device, dtype=dtype)
         self.language_model = cohere2.build_from_config(config.text_config, device, dtype)
+        for layer in self.language_model.layers:
+            layer.input_layernorm = TritonLayerNorm(layer.input_layernorm)
+        self.language_model.norm = TritonLayerNorm(self.language_model.norm)
 
     def forward(self, input_ids, pixel_values=None, past_key_values=None):
         if self.training:
