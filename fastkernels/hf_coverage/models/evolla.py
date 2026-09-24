@@ -157,12 +157,11 @@ class ProteinModel(nn.Module):
             x = x.masked_fill((ids == self.config.mask_token_id)[..., None], 0.)
             # Scaling coefficients depend only on discrete token/padding metadata.
             ratio = (ids == self.config.mask_token_id).sum(-1).float() / mask.sum(-1)
-            # Per-example metadata scalar division preserves native FP32
-            # rounding. The .item() synchronization stays in measured forward;
-            # this does not admit division by learned activation tensors.
+            # Keep the metadata divisor on device: CUDA scalar division rounds
+            # differently before the final BF16 cast. The numerator retains
+            # native multiply/store ordering; no learned denominator is used.
             denominator = 1. - ratio
-            x = torch.stack([(row * .88).float() / denominator[i].item()
-                             for i, row in enumerate(x)]).to(x.dtype)
+            x = ((x * .88).float() / denominator[:, None, None]).to(x.dtype)
         if self.embeddings.layer_norm is not None:
             x = self.embeddings.layer_norm(x)
         x = x.masked_fill(~mask.bool()[..., None], 0.)
