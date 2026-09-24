@@ -46,6 +46,18 @@ def resolve_generation_config(reference):
     return json.loads(path.read_text()), {**source, "sha256": digest(path)}
 
 
+def cohere2_vision_config_from_mlx(raw):
+    """Read the original HF architecture from its public MLX conversion.
+
+    MLX adds these weight-format fields; the original checkpoint is unquantized.
+    The audit uses shared random weights, not the converted four-bit weights.
+    """
+    values = dict(raw)
+    for field in ("quantization", "quantization_config"):
+        values.pop(field, None)
+    return symbol("transformers:Cohere2VisionConfig")(**values)
+
+
 def fix_dinat_reference_layout():
     """Correct the pinned DiNAT caller's Q/K/V axes at its NATTEN boundary.
 

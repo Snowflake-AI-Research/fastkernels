@@ -1234,6 +1234,60 @@ CASES = {
         'reference_backend': None,
     },
 
+    'cohere2_vision': {
+        'reference': {
+            'config_class': 'transformers:Cohere2VisionConfig',
+            'model_class': 'transformers:Cohere2VisionForConditionalGeneration',
+            'native_position_ids': True,
+            'native_cache_defaults': True,
+            'continuation_outputs': ['logits', 'past_key_values'],
+            'source': {
+                'kind': 'example_checkpoint',
+                'checkpoint': 'mlx-community/command-a-vision-07-2025-4bit',
+                'revision': '8864bb543540a9db3433293a3bf91baa8140d310',
+                'url': 'https://huggingface.co/mlx-community/command-a-vision-07-2025-4bit/blob/8864bb543540a9db3433293a3bf91baa8140d310/config.json',
+                'config_converter': 'fastkernels.hf_coverage.reference:cohere2_vision_config_from_mlx',
+                'description': ('HF selects CohereLabs/command-a-vision-07-2025, whose configuration is gated. '
+                    'Use the architecture settings published by its documented MLX conversion. The converter '
+                    'removes only the added four-bit storage metadata; the original checkpoint has floating-point '
+                    'weights, and this audit uses shared random weights. This is a disclosed public derivative, '
+                    'not verified original configuration bytes or constructor defaults.'),
+            },
+        },
+        'config_overrides': {},
+        'dimension_overrides': {
+            'image_token_id': 1023,
+            'alignment_intermediate_size': 4608,
+            'vision_config': {
+                'hidden_size': 144, 'intermediate_size': 538,
+                'num_attention_heads': 2, 'num_hidden_layers': 2,
+            },
+            'text_config': {
+                'hidden_size': 1536, 'intermediate_size': 4608,
+                'num_attention_heads': 12, 'num_key_value_heads': 1,
+                'num_hidden_layers': 4, 'vocab_size': 1024, 'eos_token_id': 2,
+                'max_position_embeddings': 8192,
+                'layer_types': ['sliding_attention', 'sliding_attention', 'sliding_attention', 'full_attention'],
+            },
+        },
+        'dimension_purpose': ('Scale both tower widths and the projector width by 1/8. Preserve head widths '
+            '(text 128, vision 72), attention grouping (12 query heads per KV head), both feed-forward ratios, '
+            'and the projector expansion and input/output ratios. Two vision layers and four text layers retain '
+            'every block type, including the complete local/full attention cycle. Keep image size 512, patch '
+            'size 16, the factor-2 shuffle and the 4096-token window. A 4097-token prefill and two continuations '
+            'exercise cache truncation. Reduce the fixed-RoPE table to 8192 positions; all used positions are '
+            'below 4099. Remap image/EOS IDs within a 1024-token vocabulary. Test one synthetic image tile '
+            'with unpadded text; pretrained weights and tokenizer behavior are not evaluated.'),
+        'input': {
+            'kind': 'text_image', 'shape': [3, 512, 512],
+            'text_batch_size': 1, 'image_batch_size': 1, 'batch_size': 1,
+            'sequence_length': 4099, 'image_token_positions': list(range(256)),
+        },
+        'workload': 'causal_lm_continuation',
+        'reference_backend': None,
+        'outputs': ['logits', 'image_hidden_states', 'past_key_values'],
+    },
+
     'cohere_asr': {'reference': {'config_class': 'transformers:CohereAsrConfig',
                    'model_class': 'transformers:CohereAsrForConditionalGeneration',
                    'source': {'kind': 'constructor_defaults',
