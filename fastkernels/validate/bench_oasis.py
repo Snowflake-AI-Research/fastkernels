@@ -57,7 +57,11 @@ def _bootstrap_local_package() -> None:
     spec.loader.exec_module(module)
 
 
-_bootstrap_local_package()
+# Only when run as a standalone script: imported as ``fastkernels.validate.bench_oasis``
+# (e.g. by the e2e oasis adapter) the package is already loaded -- possibly with
+# candidate kernels patched in -- and must not be replaced by a fresh copy.
+if __package__ != "fastkernels.validate":
+    _bootstrap_local_package()
 
 from fastkernels.tasks.baseline.L4.oasis import (  # noqa: E402
     OasisConfig,
