@@ -43,3 +43,25 @@ agent's kernels runs.
 `fastkernels/e2e/core.py`), `<out>/e2e/runs/...` (per-run logs and outputs, stays on the node),
 `<out>/e2e/progress.jsonl` (event log). `python -m fastkernels.e2e.report <out>/e2e` prints a
 status table.
+
+## Operating notes / known issues
+
+- **Disk:** the 11 default models need ~1.1 TB of Hugging Face weights (Qwen3-VL-235B-FP8
+  ~240 GB, Qwen3-Next-80B ~160 GB, Kimi-Linear-48B ~100 GB, GPT-OSS-120B ~65 GB, ...);
+  downloaded on first use if not cached. Host RAM peaks ~20 GB per run (VLM video, BGE-M3).
+- **OpenFold3 weights:** the harness checkpoint (`OpenFold/OpenFold3`, gated) is not
+  required; the adapter downloads the public `openfold3_params/of3_ft3_v1.pt` (same
+  architecture) plus MSA folders automatically. Set `FASTKERNELS_OF3_CHECKPOINT` to use
+  another checkpoint.
+- **Timing is host-sensitive** for small, launch-bound workloads (GLA, YOLOv10, OpenFold3
+  short chains, Oasis/BGE-M3 latency): speedups are only meaningful between runs on the same
+  node -- which is what the script does. Each throughput workload gets one untimed pass
+  first (lazy JIT compiles excluded from timings).
+- **Nondeterminism:** multi-GPU (tp>1) runs are not bit-deterministic (Qwen3-VL-235B tp=4:
+  ~97% teacher-forced agreement between two baseline runs); the per-model noise run
+  measures this floor and MacroEval calibrates correctness against it.
+- **Kimi-Linear:** a partial swap (L1 kernels without the L2 attention) once crashed in
+  Dynamo inside `RMSNormGated` (`torch.accelerator.device_index`); the full sets are fine.
+  If a real set hits it, drop-and-retry records it as a compile failure.
+- **Candidate JIT compile** can take 10-20 min per set on first import (`--prebuild` does it
+  once per set before the timed runs).
