@@ -24,7 +24,12 @@ latency workload. ``spec.workloads`` selects workloads by name (``1024x1024``,
 Correctness: ``spec.correctness_samples`` parti prompts (the first N of the shuffled
 list), generated at 1024x1024 in batches of 4 with the workload's sampling config, image
 ``i`` seeded with ``manual_seed(seed + i)``. Decoded RGB is stored area-downsampled to
-512x512 as uint8 (~0.75 MB/image), plus the final packed latents as bf16 (~0.5 MB/image).
+512x512 as uint8 (~0.75 MB/image), plus the final packed latents as bf16 (~0.5 MB/image);
+64 samples -> ~84 MB. ``compare`` centres both images on the REFERENCE image's per-channel
+mean before the cosine: a raw pixel cosine is dominated by the mean colour (a structureless
+candidate of the right tone scored cos ~0.65), whereas the centred cosine is ~0 for such
+outputs and for unrelated images (|cos| < 0.35), ~0.999 for 2% pixel noise, and still
+penalises global colour shifts (unlike a Pearson correlation).
 
 Smoke-only knob: ``spec.extra["num_inference_steps"]`` or env ``FK_E2E_FLUX_STEPS``
 overrides the step count of every generation (never set it for real runs).
@@ -60,9 +65,9 @@ def _torch_dtype(name: str):
 
 class FluxAdapter(Adapter):
     name = "flux"
-    metric = ("per image: d = clamp(1 - cos(ref, cand), 0, 1), cosine over the decoded RGB "
-              "image (1024x1024 generation, stored area-downsampled to 512x512 uint8) mapped "
-              "to [-1, 1]; non-finite or missing outputs score d = 1")
+    metric = ("per image: d = clamp(1 - cos(ref - mu, cand - mu), 0, 1) over the decoded RGB "
+              "image (1024x1024 generation, stored area-downsampled to 512x512 uint8), mu = "
+              "the reference image's per-channel mean; non-finite or missing outputs score d = 1")
 
     @classmethod
     def handles(cls, scenario) -> bool:
@@ -253,10 +258,12 @@ class FluxAdapter(Adapter):
                 bad += 1
                 continue
             same = torch.equal(r_img[i], c_img[i])
-            a = r_img[i].double().flatten() / 127.5 - 1.0
-            b = c_img[i].double().flatten() / 127.5 - 1.0
-            cos = 1.0 if same else float(torch.dot(a, b) / (a.norm() * b.norm()).clamp_min(1e-12))
-            mse = float(((a - b) / 2).pow(2).mean())   # on the [0, 1] pixel scale
+            a = r_img[i].double() / 255.0          # [C, H, W] in [0, 1]
+            b = c_img[i].double() / 255.0
+            mu = a.mean(dim=(1, 2), keepdim=True)
+            ac, bc = (a - mu).flatten(), (b - mu).flatten()
+            cos = 1.0 if same else float(torch.dot(ac, bc) / (ac.norm() * bc.norm()).clamp_min(1e-12))
+            mse = float((a - b).pow(2).mean())
             per_sample.append(min(1.0, max(0.0, 1.0 - cos)))
             cosines.append(cos)
             mses.append(mse)
