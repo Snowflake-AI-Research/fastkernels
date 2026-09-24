@@ -218,12 +218,6 @@ class E2E:
         slug = f"{index:02d}_{_slug(scenario.hf_name)}"
         res_dir = self.out / "results" / slug
         res_dir.mkdir(parents=True, exist_ok=True)
-        if max(1, scenario.tp) > self.pool.total:
-            note = f"needs {scenario.tp} GPUs, this node has {self.pool.total}"
-            self.event(scenario=slug, run="skipped", error=note)
-            (res_dir / "baseline.json").write_text(json.dumps(
-                {"model": scenario.hf_name, "tp": scenario.tp, "status": "skipped", "error": note}, indent=1))
-            return
         base = self.run(index, slug, "baseline", reference=None)
         (res_dir / "baseline.json").write_text(json.dumps(
             {"model": scenario.hf_name, "tp": scenario.tp, **{k: v for k, v in base.items() if k != "traceback"}},
@@ -414,16 +408,10 @@ class E2E:
         (self.out / "results").mkdir(parents=True, exist_ok=True)
         self.event(event="start", scenarios=idx, sets=[s.name for s in self.sets], gpus=self.pool.total)
         # One thread per scenario; GPU leasing inside ``run`` does the actual packing.
-        failed = []
         with ThreadPoolExecutor(max_workers=max(1, len(idx))) as ex:
-            futs = {i: ex.submit(self.scenario_chain, i) for i in idx}
-            for i, f in futs.items():
-                try:
-                    f.result()
-                except Exception:  # noqa: BLE001 -- one model's failure must not abort the rest
-                    failed.append(i)
-                    self.event(scenario=i, event="scenario_error", error=traceback.format_exc()[-2000:])
-        self.event(event="done", failed_scenarios=failed)
+            for f in [ex.submit(self.scenario_chain, i) for i in idx]:
+                f.result()
+        self.event(event="done")
         return 0
 
 
