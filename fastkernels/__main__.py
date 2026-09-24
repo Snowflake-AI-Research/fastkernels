@@ -11,6 +11,10 @@ def main() -> None:
         from .capture import main as capture_main
         raise SystemExit(capture_main(sys.argv[2:]))
 
+    if len(sys.argv) > 1 and sys.argv[1] == "e2e":
+        from .e2e.core import main as e2e_main
+        raise SystemExit(e2e_main(sys.argv[2:]))
+
     if len(sys.argv) > 1 and sys.argv[1] == "eval":
         from .eval import main as eval_main
         raise SystemExit(eval_main(sys.argv[2:]))
