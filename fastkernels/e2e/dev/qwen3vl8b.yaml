@@ -1,0 +1,15 @@
+# Dev scenario for the e2e "vlm" adapter: the same VLM workloads as the
+# Qwen/Qwen3-VL-235B-A22B-Instruct-FP8 row of scenarios/default.yaml, on the small
+# same-family dense model. Index 0: tp=1 (one GPU).
+scenarios:
+  - model: Qwen/Qwen3-VL-8B-Instruct
+    tp: 1
+    dtype: bfloat16
+    workloads: [VLM.text_only, VLM.image, VLM.video, VLM.single_image, VLM.single_video]
+  # Same model at tp=4: exercises the tensor-parallel paths (spawned ranks, NCCL port,
+  # candidate re-application in the ranks, forced decode through the rank-0 scheduler)
+  # cheaply before touching the 235B model.
+  - model: Qwen/Qwen3-VL-8B-Instruct
+    tp: 4
+    dtype: bfloat16
+    workloads: [VLM.text_only, VLM.image, VLM.video, VLM.single_image, VLM.single_video]

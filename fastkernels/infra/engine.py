@@ -348,16 +348,21 @@ class Sequence:
 
     def __getstate__(self):
         """Minimal pickling for shared memory transfer to non-rank-0 workers."""
+        # mrope_position_delta: the ranks' ``prepare_decode`` needs it for M-RoPE
+        # (Qwen-VL) decode positions on the generic ``call("run", seqs, False)`` path
+        # (non-greedy / FASTKERNELS_FORCE_SYNC_DECODE decode steps at tp>1).
         return (len(self), len(self.prompt_ids), self.block_table,
                 self.sliding_block_tables,
                 self.num_computed_tokens,
                 self.state_slot,
+                getattr(self, "mrope_position_delta", 0),
                 self.token_ids if not self.generated_ids else self.last_token)
 
     def __setstate__(self, state):
         (self._num_tokens, num_prompt, self.block_table,
          sliding_tables,
-         self.num_computed_tokens, self.state_slot) = state[:-1]
+         self.num_computed_tokens, self.state_slot,
+         self.mrope_position_delta) = state[:-1]
         self.sliding_block_tables = list(sliding_tables or [])
         if isinstance(state[-1], list):
             self.token_ids = state[-1]
