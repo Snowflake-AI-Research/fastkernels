@@ -5,10 +5,11 @@ runs them (real WildChat / LongBench prompts, greedy, ``ignore_eos``), on the pr
 path (torch.compile + CUDA graphs).
 
 Correctness: free-running greedy decoding diverges between two *correct* runs (a fresh
-compile alone changes greedy outputs), so correctness is teacher-forced. The baseline run
-saves the free-running tokens of the first ``correctness_samples`` requests of the first
-throughput workload; every other run (noise, candidate) re-decodes those prompts forced
-along the baseline tokens and records, per step, whether its own argmax agreed.
+compile alone changes greedy outputs), so correctness is teacher-forced. Every run greedily
+decodes the first ``correctness_samples`` requests of the first throughput workload as one
+batch; the baseline saves those tokens, and every other run (noise, candidate) re-decodes
+the same prompts forced along the baseline tokens, recording per step whether its own
+argmax agreed.
 """
 
 from __future__ import annotations
@@ -81,8 +82,7 @@ class LLMAdapter(Adapter):
         prompts = tput[0]["prompt_token_ids"][:n]
         try:
             engine.generate(["warmup"], SamplingParams(temperature=0.0, max_tokens=16))
-            free_tokens: list[list[int]] = []
-            for i, r in enumerate(tput):
+            for r in tput:
                 sp = [SamplingParams(temperature=0.0, top_p=1.0, max_tokens=ol, ignore_eos=True)
                       for ol in r["output_lens"]]
                 engine.block_manager.reset()
@@ -93,8 +93,6 @@ class LLMAdapter(Adapter):
                 elapsed = time.perf_counter() - t0
                 ntok = sum(len(o.token_ids) for o in outs)
                 timings[r["name"]] = {"kind": "throughput", "value": ntok / elapsed, "unit": "tok/s"}
-                if i == 0:
-                    free_tokens = [list(o.token_ids) for o in outs[:n]]
             for r in lat:
                 sp = SamplingParams(temperature=0.0, ignore_eos=True, max_tokens=r["output_len"])
                 for _ in range(r["num_warmup"]):
@@ -111,6 +109,15 @@ class LLMAdapter(Adapter):
                 timings[r["name"]] = {"kind": "latency", "value": float(np.median(ts)), "unit": "s",
                                       "samples": ts}
 
+            # Correctness subset, decoded as its own batch in every run, so the reference
+            # tokens and the forced re-decode share one batch regime (batch size changes
+            # kernel configs, and near-tie argmaxes would flip systematically otherwise).
+            out_lens = tput[0]["output_lens"][:n]
+            engine.block_manager.reset()
+            outs = engine.generate(prompts, [SamplingParams(temperature=0.0, top_p=1.0, max_tokens=ol,
+                                                            ignore_eos=True) for ol in out_lens],
+                                   use_tqdm=False, decode_text=False)
+            free_tokens = [list(o.token_ids) for o in outs]
             outputs: dict = {"kind": "tokens", "workload": tput[0]["name"], "tokens": free_tokens}
             if spec.reference:
                 from fastkernels.validate.forced_decode import run_forced_decode
