@@ -325,7 +325,37 @@ class E2E:
                            note=f"stopped after {n} attempts without a deployable subset")
         return summary
 
+    def prebuild(self) -> None:
+        """Import (and so JIT-build) every kernel of every set once, one process per set, in
+        parallel across GPUs, before any timed run -- so scenario runs never compile the
+        same extensions concurrently or on the clock."""
+        def one(set_dir: Path) -> None:
+            d = self.out / "work" / "prebuild"
+            d.mkdir(parents=True, exist_ok=True)
+            env = {k: v for k, v in os.environ.items() if not k.startswith("FASTKERNELS_CANDIDATE")}
+            env.update(FASTKERNELS_CANDIDATE_DIR=str(set_dir),
+                       TORCH_EXTENSIONS_DIR=str(self.out / "work" / "torch_extensions" / set_dir.name))
+            gpus, _ = self.pool.lease(1)
+            env["CUDA_VISIBLE_DEVICES"] = ",".join(gpus)
+            t0 = time.time()
+            code = ("from fastkernels.list import discover_candidate_impls as d; "
+                    "p = d(); print('PREBUILT', len(p))")
+            try:
+                with open(d / f"{set_dir.name}.log", "w") as log:
+                    r = subprocess.run([sys.executable, "-c", code], env=env, stdout=log,
+                                       stderr=subprocess.STDOUT, timeout=self.args.run_timeout)
+                rc = r.returncode
+            except subprocess.TimeoutExpired:
+                rc = "timeout"
+            finally:
+                self.pool.release(gpus)
+            self.event(event="prebuild", set=set_dir.name, rc=rc, wall_s=round(time.time() - t0))
+        with ThreadPoolExecutor(max_workers=max(1, len(self.sets))) as ex:
+            list(ex.map(one, self.sets))
+
     def main(self) -> int:
+        if self.args.prebuild:
+            self.prebuild()
         idx = ([int(i) for i in self.args.scenario_indices.split(",")] if self.args.scenario_indices
                else list(range(len(self.scenarios))))
         (self.out / "results").mkdir(parents=True, exist_ok=True)
@@ -364,6 +394,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="mean per-sample discrepancy above which a running candidate counts as broken")
     ap.add_argument("--run-timeout", type=int, default=5400)
     ap.add_argument("--skip-noise", action="store_true")
+    ap.add_argument("--prebuild", action="store_true",
+                    help="JIT-build every set's kernels once (one GPU per set) before the runs")
     ap.add_argument("--eager", action="store_true", help="diagnostics only: disable torch.compile/graphs")
     args = ap.parse_args(argv)
     return E2E(args).main()

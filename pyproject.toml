@@ -38,7 +38,8 @@ dependencies = [
     "deep-gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@a6b593d2826719dcf4892609af7b84ee23aaf32a",
     "decord",
     "mlflow>=2.10",
-    "datasets",
+    # uv otherwise resolves this unpinned dep to datasets 1.1.1, which breaks on pyarrow>=21.
+    "datasets>=3",
     "diffusers>=0.37",
     "peft>=0.17.0",
     "sam3 @ git+https://github.com/sfc-gh-goliaro/sam3.git",
