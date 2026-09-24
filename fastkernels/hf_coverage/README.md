@@ -99,8 +99,15 @@ invalid, `reference.fan_in_normal_modules` names modules whose matrix weights
 use random values scaled by their number of input terms (seed plus three).
 Convolutions account for filter size and groups; transposed convolutions also
 account for stride. Embeddings, biases, normalization weights, and tied output
-heads are preserved. Preparation records the affected weight names and standard
-deviations. Each use needs a demonstrated reason.
+heads are preserved unless an explicit exception is described below. Preparation
+records the affected weight names and standard deviations. Each use needs a demonstrated reason.
+
+PPDocLayoutV2 additionally initializes BatchNorm scales to one in the declared
+feature-extractor modules. HF's small random scales repeatedly suppress image
+features and leave proposal scores nearly tied. Both implementations receive
+identical modified weights; biases and running statistics stay unchanged.
+Preparation records every affected scale. This is a test initialization exception,
+not a change to model computation or to supplied weights.
 
 CSM's declared random preparation also follows the official converter's
 identical-value copy between its two audio embedding tables and randomizes zero

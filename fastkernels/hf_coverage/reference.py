@@ -264,6 +264,15 @@ def prepare(job: dict, directory: Path) -> dict:
                     fan_in_stds[key] = std
             if fan_in_stds:
                 initialization += "; matrix fan-in normal, seed+3: " + json.dumps(fan_in_stds, sort_keys=True)
+            batch_norm_scales = []
+            for prefix in ref.get("unit_batch_norm_modules", []):
+                for name, layer in model.get_submodule(prefix).named_modules():
+                    if isinstance(layer, torch.nn.BatchNorm2d) and layer.affine:
+                        key = ".".join(part for part in (prefix, name, "weight") if part)
+                        weights[key].fill_(1)
+                        batch_norm_scales.append(key)
+            if batch_norm_scales:
+                initialization += "; shared unit BatchNorm scales: " + ", ".join(batch_norm_scales)
             del model
             # Some HF constructors zero gates and hide otherwise enabled branches.
             # Randomize only explicitly named zero parameters, identically on both sides.

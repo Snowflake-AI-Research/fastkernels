@@ -8585,6 +8585,58 @@ CASES = {
         'outputs': ['sequences', 'logits', 'past_key_values'],
     },
 
+    'pp_doclayout_v2': {
+        'reference': {
+            'config_class': 'transformers:PPDocLayoutV2Config',
+            'model_class': 'transformers:PPDocLayoutV2ForObjectDetection',
+            'source': {
+                'kind': 'example_checkpoint',
+                'checkpoint': 'PaddlePaddle/PP-DocLayoutV2_safetensors',
+                'revision': '880e8971b88938518611c54fc0f59ad57849c9d4',
+                'description': 'Pinned public detection example, including reading-order outputs.',
+                'url': 'https://github.com/huggingface/transformers/blob/da6c53e431f7c9ef0691239d4ce89b0f711ecad7/src/transformers/models/pp_doclayout_v2/modeling_pp_doclayout_v2.py',
+            },
+            'randomize_zero_parameters': [
+                'model.decoder.bbox_embed.0.layers.2.weight',
+                'model.decoder.bbox_embed.1.layers.2.weight',
+            ],
+            'fan_in_normal_modules': [
+                'model.backbone.model', 'model.encoder_input_proj',
+                'model.encoder', 'model.decoder_input_proj',
+            ],
+            'unit_batch_norm_modules': [
+                'model.backbone.model', 'model.encoder_input_proj',
+                'model.encoder', 'model.decoder_input_proj',
+            ],
+        },
+        'dimension_overrides': {
+            'decoder_layers': 2,
+            'reading_order_config': {
+                'hidden_size': 128, 'num_attention_heads': 2,
+                'intermediate_size': 512, 'num_hidden_layers': 2,
+            },
+        },
+        'input': {'kind': 'image', 'batch_size': 1, 'shape': [3, 192, 192]},
+        'reference_backend': {'': 'sdpa', 'backbone_config': 'eager', 'reading_order_config': 'eager'},
+        'workload': 'forward',
+        'outputs': [
+            'logits', 'pred_boxes', 'order_logits', 'last_hidden_state',
+            'intermediate_hidden_states', 'intermediate_logits', 'intermediate_reference_points',
+            'encoder_last_hidden_state', 'init_reference_points', 'enc_topk_logits',
+            'enc_topk_bboxes', 'enc_outputs_class', 'enc_outputs_coord_logits',
+        ],
+        'dimension_purpose': (
+            'Keep 300 queries, the full HGNet backbone, all three feature scales, and native detector '
+            'width 256 with 32-wide heads. Use two detector and reading-order layers; reading width '
+            '128 preserves 64-wide heads and the 4:1 feed-forward ratio. Spatial embeddings, relation '
+            'bias and pointer dimensions remain unchanged. A 192-square image provides 756 proposals. '
+            'Shared fan-in matrix initialization and unit BatchNorm scales prevent image features '
+            'and proposal scores from collapsing. Randomize the two zero box-refinement matrices '
+            'so both updates are exercised. Preserve biases, running statistics, embeddings, class '
+            'thresholds and the seed; supplied weights are not modified.'
+        ),
+    },
+
     'pp_doclayout_v3': {
         'reference': {
             'config_class': 'transformers:PPDocLayoutV3Config',
