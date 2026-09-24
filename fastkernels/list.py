@@ -510,7 +510,7 @@ class _CandidateFinder(importlib.abc.MetaPathFinder):
         return importlib.machinery.ModuleSpec(fullname, _AliasLoader(baseline), origin=baseline)
 
 
-def _load_candidate_class(path: Path, class_name: str):
+def _load_candidate_class(path: Path, class_name: str, strict: bool = False):
     """Import a candidate file and return its operator class (prefers the class
     named like the baseline op; falls back to the last ``nn.Module`` defined)."""
     import torch.nn as nn
@@ -519,7 +519,7 @@ def _load_candidate_class(path: Path, class_name: str):
     dotted = f"fastkernels.tasks.candidate.{path.parent.name}.{path.stem}"
     mod = importlib.import_module(dotted)
     cls = getattr(mod, class_name, None)
-    if cls is None:
+    if cls is None and not strict:
         for value in vars(mod).values():
             if (isinstance(value, type) and issubclass(value, nn.Module)
                     and value is not nn.Module):
@@ -537,8 +537,12 @@ def discover_candidate_impls() -> list[tuple]:
     import importlib
 
     only, exclude = _env_kernel_set(_ONLY_ENV), _env_kernel_set(_EXCLUDE_ENV)
+    targets = discover_operator_targets()
+    classes_per_file: dict[tuple[int, str], int] = {}
+    for t in targets:
+        classes_per_file[(t.level, t.name)] = classes_per_file.get((t.level, t.name), 0) + 1
     pairs: list[tuple] = []
-    for target in discover_operator_targets():
+    for target in targets:
         cand_file = CANDIDATE_DIR / f"L{target.level}" / f"{target.name}.py"
         if not cand_file.is_file():
             continue
@@ -556,7 +560,12 @@ def discover_candidate_impls() -> list[tuple]:
         if not isinstance(base_cls, type):
             continue
         try:
-            cand_cls = _load_candidate_class(cand_file, target.class_name)
+            # A file with several target classes (e.g. rms_norm_gated: RMSNormGated and
+            # FusedRMSNormGated) must name each class it replaces: the "last nn.Module in
+            # the file" fallback would swap a class for a different operator.
+            cand_cls = _load_candidate_class(
+                cand_file, target.class_name,
+                strict=classes_per_file[(target.level, target.name)] > 1)
         except Exception as exc:  # noqa: BLE001
             print(f"  (skip candidate {target.name}: {type(exc).__name__}: {exc})")
             continue
