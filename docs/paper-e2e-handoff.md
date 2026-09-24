@@ -60,8 +60,10 @@ status table.
 - **Nondeterminism:** multi-GPU (tp>1) runs are not bit-deterministic (Qwen3-VL-235B tp=4:
   ~97% teacher-forced agreement between two baseline runs); the per-model noise run
   measures this floor and MacroEval calibrates correctness against it.
-- **Kimi-Linear:** a partial swap (L1 kernels without the L2 attention) once crashed in
-  Dynamo inside `RMSNormGated` (`torch.accelerator.device_index`); the full sets are fine.
-  If a real set hits it, drop-and-retry records it as a compile failure.
+- **Verified on Modal B200s (2026-09-24), final code:** the preflight (baseline, noise run,
+  do-nothing `selftest` set) passes on all 11 default models, including Qwen3-Next and
+  Kimi-Linear (tp=2), GPT-OSS-120B (tp=2) and Qwen3-VL-235B (tp=4); drop-and-retry was
+  exercised with a real agent set (kda-seq) on Llama, Qwen3-Next, Kimi-Linear, GPT-OSS,
+  GLA, FLUX, YOLOv10 and Oasis.
 - **Candidate JIT compile** can take 10-20 min per set on first import (`--prebuild` does it
   once per set before the timed runs).
