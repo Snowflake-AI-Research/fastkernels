@@ -59,8 +59,8 @@ def check_preflight(rows: list[dict], expected: int | None) -> bool:
         print(f"PREFLIGHT: only {len(scen)}/{expected} scenarios produced results")
         ok = False
     for r in rows:
-        if r["item"] == "baseline" and r["status"] != "ok":
-            print(f"PREFLIGHT FAIL {r['scenario']}: baseline {r['status']} {r['error']}")
+        if r["item"] in ("baseline", "noise") and r["status"] != "ok":
+            print(f"PREFLIGHT FAIL {r['scenario']}: {r['item']} {r['status']} {r['error']}")
             ok = False
         if r["item"] == "selftest" and (r["status"] != "ok" or r["dropped"]
                                          or (r["mean_d"] is not None and r["mean_d"] > 0.2)):

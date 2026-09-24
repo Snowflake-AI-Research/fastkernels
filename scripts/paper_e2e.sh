@@ -37,7 +37,7 @@ python -m fastkernels.e2e.report --verify-sets "$C"
 
 # 2. Preflight (~30-60 min): every model with tiny workloads and a do-nothing candidate set.
 python -m fastkernels e2e default --sets "$C/selftest" --out "$OUT/preflight" \
-  --max-requests 2 --correctness-samples 2 --skip-noise || true
+  --max-requests 2 --probe-requests 2 --correctness-samples 2 || true
 if ! python -m fastkernels.e2e.report "$OUT/preflight" --check-preflight --expected-scenarios 11; then
   echo "[paper-e2e] PREFLIGHT FAILED -- please email back the results file below"
   exit 1
