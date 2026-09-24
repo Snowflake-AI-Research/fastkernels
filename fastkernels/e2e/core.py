@@ -124,7 +124,11 @@ class E2E:
                 "run": {"out_dir": str(d), "seed": a.seed,
                         "max_requests": a.max_requests if max_requests == -1 else max_requests,
                         "correctness_samples": a.correctness_samples, "enforce_eager": a.eager,
-                        "reference": reference, "workloads": a.workloads.split(",") if a.workloads else None}}
+                        "reference": reference, "workloads": a.workloads.split(",") if a.workloads else None,
+                        # Probes (capped requests) only check crashes/correctness: no warmup pass.
+                        "extra": {"warmup_passes": 0 if (max_requests not in (-1, None)
+                                                         and max_requests == a.probe_requests)
+                                  else a.warmup_passes}}}
         (d / "spec.json").write_text(json.dumps(spec, indent=1))
         env = {k: v for k, v in os.environ.items() if not k.startswith("FASTKERNELS_CANDIDATE")}
         if set_dir is not None:
@@ -419,6 +423,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--broken-threshold", type=float, default=0.5,
                     help="mean per-sample discrepancy above which a running candidate counts as broken")
     ap.add_argument("--run-timeout", type=int, default=5400)
+    ap.add_argument("--warmup-passes", type=int, default=1,
+                    help="untimed passes over each throughput workload before timing it "
+                         "(keeps lazy JIT compiles out of the timed region)")
     ap.add_argument("--skip-noise", action="store_true")
     ap.add_argument("--prebuild", action="store_true",
                     help="JIT-build every set's kernels once (one GPU per set) before the runs")

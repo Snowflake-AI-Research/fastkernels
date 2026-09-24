@@ -235,8 +235,11 @@ class FLAAdapter(Adapter):
 
         for run in throughput_runs:
             prompts, out_lens = run["prompts"], run["output_lens"]
-            # Prefill + one decode step at this workload's real shapes (Triton autotune).
+            # Prefill + one decode step at this workload's real shapes (Triton autotune), then
+            # full untimed pass(es) so no lazily compiled kernel lands in the timed region.
             engine.generate(prompts, _sp(2))
+            for _ in range(int(spec.extra.get("warmup_passes", 1))):
+                engine.generate(prompts, [_sp(ol) for ol in out_lens])
             torch.cuda.synchronize()
             t0 = time.perf_counter()
             outs = engine.generate(prompts, [_sp(ol) for ol in out_lens])

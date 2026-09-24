@@ -85,6 +85,12 @@ class LLMAdapter(Adapter):
             for r in tput:
                 sp = [SamplingParams(temperature=0.0, top_p=1.0, max_tokens=ol, ignore_eos=True)
                       for ol in r["output_lens"]]
+                # Untimed pass(es) at the real shapes, so lazily JIT-compiled kernels
+                # (FlashInfer, DeepGEMM, Triton autotune -- baseline and candidate alike)
+                # are not compiled inside the timed region.
+                for _ in range(int(spec.extra.get("warmup_passes", 1))):
+                    engine.block_manager.reset()
+                    engine.generate(r["prompt_token_ids"], sp, use_tqdm=False, decode_text=False)
                 engine.block_manager.reset()
                 torch.cuda.synchronize()
                 t0 = time.perf_counter()
