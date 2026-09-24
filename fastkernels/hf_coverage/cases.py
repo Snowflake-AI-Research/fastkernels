@@ -272,6 +272,52 @@ CASES = {
             'Keep the checkpoint default that disables language caching.'),
     },
 
+    'aya_vision': {'reference': {'config_class': 'transformers:AyaVisionConfig',
+                   'model_class': 'transformers:AyaVisionForConditionalGeneration',
+                   'continuation_outputs': ['logits', 'past_key_values'],
+                   'source': {'kind': 'example_checkpoint',
+                              'checkpoint': 'unsloth/aya-vision-8b',
+                              'revision': '1904accecafa6a9d5c5c9a475d92a40c0b4694cc',
+                              'url': 'https://huggingface.co/unsloth/aya-vision-8b/blob/1904accecafa6a9d5c5c9a475d92a40c0b4694cc/config.json',
+                              'description': 'User-approved published nonquantized BF16 alternative to '
+                                             'gated CohereForAI source; Unsloth marks unsloth_fixed, not '
+                                             'byte-verified official equality. Pinned Aya wrapper retains '
+                                             'text logit_scale configuration but does not apply it: calls '
+                                             'Cohere2Model and direct tied head.'}},
+     'reference_backend': None,
+     'dimension_overrides': {'image_token_index': 1023,
+                             'eos_token_id': 2,
+                             'alignment_intermediate_size': 3584,
+                             'text_config': {'vocab_size': 1024,
+                                             'eos_token_id': 2,
+                                             'hidden_size': 512,
+                                             'intermediate_size': 1792,
+                                             'num_attention_heads': 4,
+                                             'num_key_value_heads': 1,
+                                             'num_hidden_layers': 4,
+                                             'sliding_window': 8},
+                             'vision_config': {'hidden_size': 144,
+                                               'intermediate_size': 538,
+                                               'num_hidden_layers': 2,
+                                               'num_attention_heads': 2,
+                                               'image_size': 84}},
+     'dimension_purpose': 'Retains text head128,GQA4,MLP3.5:1, projector intermediate7x text width, all '
+                          'three local plus fourth global layers and cache. Window4096->8 exercised '
+                          'by23-token prefill and two continuations. Vision head72/exact MLP ratio, 14px '
+                          'patches, nondegenerate6x6 grid shuffled2x2 to3x3 image tokens. Reduced '
+                          'vocabulary has relocated image/EOS IDs; full tied vocabulary head still '
+                          'computed. One synthetic image/text example; no claims about actual prompt '
+                          'tokenization.',
+     'input': {'kind': 'text_image',
+               'text_batch_size': 1,
+               'image_batch_size': 1,
+               'sequence_length': 25,
+               'shape': [3, 84, 84],
+               'image_token_positions': [2, 3, 4, 5, 6, 7, 8, 9, 10],
+               'fixed_token_ids': {'0': 5}},
+     'workload': 'causal_lm_continuation',
+     'outputs': ['logits', 'image_hidden_states', 'past_key_values']},
+
     'bamba': {
         'reference': {
             'config_class': 'transformers:BambaConfig',
@@ -942,6 +988,60 @@ CASES = {
         'reference_backend': None,
     },
 
+    'chameleon': {'reference': {'config_class': 'transformers:ChameleonConfig',
+                   'model_class': 'transformers:ChameleonForConditionalGeneration',
+                   'source': {'kind': 'example_checkpoint',
+                              'checkpoint': 'nopperl/chameleon-7b-hf',
+                              'revision': 'c2c0e05d1495f70ce43bcb6007671f9caa7734b6',
+                              'url': 'https://huggingface.co/nopperl/chameleon-7b-hf/blob/c2c0e05d1495f70ce43bcb6007671f9caa7734b6/config.json',
+                              'description': 'Explicit public conversion of the Meta 7B example selected by '
+                                             'pinned HF ChameleonForConditionalGeneration.forward. Its full '
+                                             'vocabulary agrees with independently hosted original-format '
+                                             'ZeroWw/chameleon-7b@0db4738a58301a83b684b93da3bfd24c1e6766af '
+                                             'after official converter reserved-token rename; VQ canonical '
+                                             'metadata agrees with original vqgan.yaml. The gated official '
+                                             'checkpoint was not accessed, so bytewise official identity is '
+                                             'not claimed.'},
+                   'native_position_ids': True,
+                   'native_cache_defaults': True,
+                   'continuation_outputs': ['logits', 'past_key_values']},
+     'reference_backend': None,
+     'config_overrides': {'vq_config': {'num_embeddings': 8192,
+                                        'double_latent': False,
+                                        'channel_multiplier': [1, 1, 2, 2, 4],
+                                        'attn_type': 'vanilla'}},
+     'dimension_overrides': {'hidden_size': 256,
+                             'intermediate_size': 688,
+                             'num_attention_heads': 2,
+                             'num_key_value_heads': 2,
+                             'num_hidden_layers': 2,
+                             'vq_config': {'resolution': 128,
+                                           'base_channels': 32,
+                                           'latent_channels': 64,
+                                           'embed_dim': 64}},
+     'dimension_purpose': 'Text width256/two heads preserves native head128, MHA and exact FFN ratio43:16; '
+                          'two repeated layers retain per-head Q/K LayerNorm, pre-RMSNorm, SiLU MLP, '
+                          'default RoPE and cache updates. VQ retains all five channel stages [1,1,2,2,4], '
+                          'two residual blocks per stage, four downsamplers, vanilla middle attention, '
+                          'all8192 codes and complete65536-token mapping. Widths scale by1/4; image128 '
+                          'yields8x8=64 image tokens and nontrivial spatial attention. Prefill128 tokens '
+                          'includes64 image placeholders and64 ordinary tokens, followed by two '
+                          'supplied-token continuations. VQ canonical fields explicitly restate verified '
+                          'values obscured by older serialized aliases.',
+     'input': {'kind': 'text_image',
+               'text_batch_size': 1,
+               'image_batch_size': 1,
+               'shape': [3, 128, 128],
+               'sequence_length': 130,
+               'image_token_positions': [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+                                         20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36,
+                                         37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53,
+                                         54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64],
+               'fixed_token_ids': {'0': 1}},
+     'workload': 'causal_lm_continuation',
+     'outputs': ['logits', 'past_key_values'],
+     'decode_outputs': ['logits', 'past_key_values']},
+
     'chinese_clip': {
         'reference': {
             'config_class': 'transformers.models.chinese_clip.configuration_chinese_clip:ChineseCLIPConfig',
@@ -1381,6 +1481,64 @@ CASES = {
         'reference_backend': None,
         'outputs': ['logits', 'past_key_values'],
     },
+
+    'csm': {'cudnn_deterministic': True,
+         'reference': {'config_class': 'transformers:CsmConfig',
+                   'model_class': 'transformers:CsmForConditionalGeneration',
+                   'source': {'kind': 'constructor_defaults',
+                              'revision': 'da6c53e431f7c9ef0691239d4ce89b0f711ecad7',
+                              'url': 'https://github.com/huggingface/transformers/blob/da6c53e431f7c9ef0691239d4ce89b0f711ecad7/src/transformers/models/csm/configuration_csm.py#L107-L118',
+                              'description': 'Explicit CsmConfig constructor example selects constructor '
+                                             'greedy defaults; text-only speech modality from '
+                                             'docs/source/en/model_doc/csm.md:40-65. Checkpoint conversion '
+                                             'supplies the equal-value codebook embedding relationship, '
+                                             'without importing checkpoint sampling settings.'},
+                   'csm_equal_codebook_embeddings': True,
+                   'randomize_zero_buffers': {'suffix': '.embed_sum',
+                                              'prefix': 'codec_model.',
+                                              'std': 0.1,
+                                              'seed_offset': 4}},
+     'dimension_overrides': {'hidden_size': 256,
+                             'intermediate_size': 1024,
+                             'num_hidden_layers': 2,
+                             'num_attention_heads': 4,
+                             'num_key_value_heads': 1,
+                             'depth_decoder_config': {'hidden_size': 512,
+                                                      'intermediate_size': 4096,
+                                                      'num_hidden_layers': 2,
+                                                      'num_attention_heads': 4,
+                                                      'num_key_value_heads': 1,
+                                                      'backbone_hidden_size': 256},
+                             'codec_config': {'model_type': 'mimi',
+                                              'hidden_size': 64,
+                                              'num_filters': 8,
+                                              'num_hidden_layers': 2,
+                                              'num_attention_heads': 1,
+                                              'num_key_value_heads': 1,
+                                              'intermediate_size': 256,
+                                              'vector_quantization_hidden_dimension': 32,
+                                              'codebook_dim': 32,
+                                              'upsample_groups': 64,
+                                              'sliding_window': 4}},
+     'reference_backend': 'eager',
+     'input': {'kind': 'tokens',
+               'batch_size': 1,
+               'sequence_length': 8,
+               'vocab_size': 128256,
+               'input_ids': [[128000, 123, 117, 80, 93, 124, 10, 128003]]},
+     'workload': 'generate',
+     'generation_kwargs': {'max_new_tokens': 3, 'output_audio': True},
+     'outputs': ['sequences', 'logits', 'depth_logits', 'audio_values', 'past_key_values'],
+     'dimension_purpose': 'Retain complete text-to-waveform generation: temporal prefill plus two cached '
+                          'continuations, all32codebooks and93depth steps, full2051audio/128256text '
+                          'vocabularies. Temporal2layers,width256,GQA4:1,head64,FF4:1; '
+                          'depth2layers,width512,GQA4:1,head128,FF8:1. '
+                          'Mimi2layers,width64,head64,FF4:1,filter8,vector/codebook32,all32quantizers(1semantic+31acoustic),all4convolution '
+                          'ratios[8,6,5,4]. Reduce codec window250to4; three codec frames '
+                          'produce6transformer positions and cross the window. Native constructor zero '
+                          'centroid buffers would collapse code dependence, so declare shared random '
+                          'nonzero centroids. Equal backbone/depth embedding values follow official '
+                          'convert_csm.py195-197; no numerical reference monkeypatch.'},
 
     'ctrl': {
         'reference': {
@@ -1944,6 +2102,30 @@ CASES = {
         'reference_backend': None,
         'outputs': ['logits', 'past_key_values'],
     },
+
+    'dinat': {'reference': {'config_class': 'transformers:DinatConfig',
+                   'model_class': 'transformers:DinatModel',
+                   'source': {'kind': 'constructor_defaults',
+                              'url': 'https://github.com/huggingface/transformers/blob/da6c53e431f7c9ef0691239d4ce89b0f711ecad7/src/transformers/models/dinat/configuration_dinat.py',
+                              'description': 'Pinned DinatConfig documentation explicitly constructs '
+                                             'DinatConfig() then DinatModel(configuration). Retain default '
+                                             'K7, dilation8/4/2/1, headwidth32, MLP3, all four hierarchy '
+                                             'stages and no active layer scale. Existing authorized '
+                                             'reference-only QKV-axis correction is required.'}},
+     'dimension_overrides': {'embed_dim': 32,
+                             'depths': [2, 2, 2, 2],
+                             'num_heads': [1, 2, 4, 8],
+                             'dilations': [[1, 8], [1, 4], [1, 2], [1, 1]]},
+     'input': {'kind': 'image', 'batch_size': 1, 'shape': [3, 224, 224]},
+     'workload': 'forward',
+     'outputs': ['last_hidden_state', 'pooler_output'],
+     'reference_backend': 'eager',
+     'dimension_purpose': 'Reduce channel/head count together, preserving32-wide heads, all four stages, '
+                          'both local and dilated blocks per relevant stage and repeat stage4.224px '
+                          'yields56/28/14/7 feature grids, retaining full K7*dilation spatial extent. '
+                          'Candidate uses bounded64-query real-neighborhood gather and existing '
+                          'BMM/Softmax; no dense all-pairs simulation. CPU NATTEN installed; GPU reference '
+                          'build remains pending.'},
 
     'dinov2': {
         'reference': {
@@ -3086,6 +3268,38 @@ CASES = {
         'input': {'kind': 'tokens', 'batch_size': 1, 'sequence_length': 514},
         'outputs': ['logits', 'past_key_values'],
     },
+
+    'gemma2': {'reference': {'config_class': 'transformers:Gemma2Config',
+                   'model_class': 'transformers:Gemma2ForCausalLM',
+                   'forward_kwargs': {'logits_to_keep': 0},
+                   'source': {'kind': 'constructor_defaults',
+                              'revision': 'da6c53e431f7c9ef0691239d4ce89b0f711ecad7',
+                              'url': 'https://github.com/huggingface/transformers/blob/da6c53e431f7c9ef0691239d4ce89b0f711ecad7/src/transformers/models/gemma2/configuration_gemma2.py',
+                              'description': 'Explicit constructor-derived Gemma2 computation selected by '
+                                             'the pinned Config() example, evaluated through its causal-LM '
+                                             'head. This is not recovered checkpoint metadata. '
+                                             'Configuration example calls its defaults gemma2-7b style, '
+                                             'although numerical defaults are '
+                                             'hidden2304/26layers/Q8/KV4/head256. Selected HF SDPA ignores '
+                                             'attention-score cap50; the executed final-logit cap30 is '
+                                             'retained. No eager/FlashAttention equivalence claimed.',
+                              'source_locations': ['src/transformers/models/gemma2/configuration_gemma2.py:Gemma2Config',
+                                                   'src/transformers/models/gemma2/modeling_gemma2.py:Gemma2ForCausalLM']}},
+     'dimension_overrides': {'hidden_size': 576,
+                             'intermediate_size': 2304,
+                             'num_hidden_layers': 2,
+                             'num_attention_heads': 2,
+                             'num_key_value_heads': 1,
+                             'vocab_size': 256},
+     'dimension_purpose': 'Two layers retain one sliding/full pair; preserve head256, Q:KV2:1, attention '
+                          'width:hidden8:9, FF:hidden4:1, native window4096 and context8192. 4097-token '
+                          'prefill crosses the real window, then two supplied tokens exercise retained '
+                          'sliding state. Only model widths, vocabulary and repeated depth shrink.',
+     'reference_backend': 'sdpa',
+     'input': {'kind': 'tokens', 'batch_size': 1, 'sequence_length': 4099},
+     'workload': 'causal_lm_continuation',
+     'outputs': ['logits', 'past_key_values'],
+     'decode_outputs': ['logits', 'past_key_values']},
 
     'gemma3': {
         'reference': {
@@ -5456,6 +5670,41 @@ CASES = {
         'reference_backend': None,
     },
 
+    'layoutlmv2': {'reference': {'config_class': 'transformers:LayoutLMv2Config',
+                   'model_class': 'transformers:LayoutLMv2Model',
+                   'source': {'kind': 'example_checkpoint',
+                              'checkpoint': 'microsoft/layoutlmv2-base-uncased',
+                              'revision': 'ae6f4350c668f88ec580046e35c670df6ec616c1',
+                              'url': 'https://huggingface.co/microsoft/layoutlmv2-base-uncased/blob/ae6f4350c668f88ec580046e35c670df6ec616c1/config.json',
+                              'description': 'Pinned public LayoutLMv2Model forward example loads this '
+                                             'checkpoint with paired document text, boxes and processor '
+                                             'image. Retain full ResNeXt10132x8d/FrozenBN/FPN,7x7 pooled '
+                                             'visual tokens,fastQKV,both1D/2Drelative biases and pooler; no '
+                                             'detection heads are executed by the native public model.'}},
+     'dimension_overrides': {'vocab_size': 1024,
+                             'hidden_size': 192,
+                             'num_hidden_layers': 2,
+                             'num_attention_heads': 3,
+                             'intermediate_size': 768,
+                             'coordinate_size': 32,
+                             'shape_size': 32},
+     'input': {'kind': 'document',
+               'batch_size': 1,
+               'sequence_length': 32,
+               'image_shape': [3, 224, 224],
+               'image_input_name': 'image',
+               'image_value_range': [0, 255],
+               'attention_mask': True},
+     'workload': 'forward',
+     'outputs': ['last_hidden_state', 'pooler_output'],
+     'reference_backend': 'eager',
+     'dimension_purpose': 'Reduce text encoder depth,width and vocabulary, retaining64-wide heads,4:1MLP '
+                          'and six equally sized spatial-embedding segments. Keep entire '
+                          'CNN101-layer32-group8-width visual backbone and FPNchannels256; every native '
+                          'FPNp2–p6 output computes before p2selection.224px BGR-channel-order synthetic '
+                          'values in0–255 match unrescaled processor domain; native performs fixed mean/std '
+                          'normalization.49visual tokens concatenate with32text tokens.'},
+
     'layoutlmv3': {
         'reference': {
             'config_class': 'transformers:LayoutLMv3Config',
@@ -6480,14 +6729,16 @@ CASES = {
             'kv_lora_rank': 64, 'n_routed_experts': 8, 'intermediate_size': 256, 'moe_intermediate_size': 128,
             'num_hidden_layers': 2, 'vocab_size': 256, 'max_position_embeddings': 128,
         },
-        'input': {'kind': 'tokens', 'batch_size': 2, 'sequence_length': 17},
-        'outputs': ['logits'],
-        'workload': 'causal_lm',
+        'input': {'kind': 'tokens', 'batch_size': 2, 'sequence_length': 18},
+        'outputs': ['logits', 'past_key_values'],
+        'workload': 'causal_lm_continuation',
         'dimension_purpose': ('Retain two all-MoE layers, MLA query/KV ranks, native 128-wide Q/K/V heads with64rotary '
             'dimensions, top4of8experts/sharedexpert, YaRN128 and static per-tensor FP8 at each projection.'
             ' Reduced context means Llama4 long-position scale is implemented but unity for primary test '
             'positions.'),
         'reference_backend': 'eager',
+        # Native grouped experts reject static activation FP8; eager retains its quantization.
+        'reference_experts_backend': 'eager',
     },
 
     'mixtral': {
@@ -6814,6 +7065,38 @@ CASES = {
         'outputs': ['logits', 'encoder_last_hidden_state', 'past_key_values'],
         'reference_backend': None,
     },
+
+    'moonshine_streaming': {'reference': {'config_class': 'transformers:MoonshineStreamingConfig',
+                   'model_class': 'transformers:MoonshineStreamingForConditionalGeneration',
+                   'source': {'kind': 'example_checkpoint',
+                              'checkpoint': 'UsefulSensors/moonshine-streaming-tiny',
+                              'revision': 'f8e9dfd8c562c257c151a907b7b7f2fe8ff8511a',
+                              'url': 'https://huggingface.co/UsefulSensors/moonshine-streaming-tiny/blob/f8e9dfd8c562c257c151a907b7b7f2fe8ff8511a/config.json',
+                              'description': 'Pinned model documentation selects this hyphenated '
+                                             'checkpoint; the forward docstring has an underscore typo. '
+                                             'Public task is waveform-to-transcript greedy generate.'}},
+     'dimension_overrides': {'hidden_size': 80,
+                             'intermediate_size': 320,
+                             'num_attention_heads': 2,
+                             'num_key_value_heads': 2,
+                             'num_hidden_layers': 2,
+                             'encoder_hidden_size': 80,
+                             'encoder_config': {'hidden_size': 80,
+                                                'intermediate_size': 320,
+                                                'num_attention_heads': 2,
+                                                'num_key_value_heads': 2}},
+     'dimension_purpose': 'Width80/two heads preserve head40, full MHA, FF4:1, decoder partial rotary32, '
+                          'all six encoder layers and native [16,4]/[16,0] window schedule. Two repeated '
+                          'decoder layers; full32768 vocabulary, native80-sample frames and both causal '
+                          'stride2 convs. Audio10240 becomes32 encoder positions and crosses left16 '
+                          'windows. Three generated tokens exercise prefill plus two cache updates. Caller '
+                          'supplies audio padding metadata; returned mutated encoder tensor is outside '
+                          'public transcription outputs. No native computation is repaired or overridden.',
+     'input': {'kind': 'waveform', 'shape': [10240], 'batch_size': 1, 'attention_mask_length': 10240},
+     'workload': 'generate',
+     'generation_kwargs': {'max_new_tokens': 3},
+     'outputs': ['sequences', 'logits', 'past_key_values'],
+     'reference_backend': None},
 
     'moshi': {
         'reference': {
@@ -9969,6 +10252,85 @@ CASES = {
         'reference_backend': None,
     },
 
+    'shieldgemma2': {'reference': {'config_class': 'transformers:ShieldGemma2Config',
+                   'model_class': 'transformers:ShieldGemma2ForImageClassification',
+                   'source': {'kind': 'pinned_recipe',
+                              'revision': 'da6c53e431f7c9ef0691239d4ce89b0f711ecad7',
+                              'url': 'https://github.com/huggingface/transformers/blob/da6c53e431f7c9ef0691239d4ce89b0f711ecad7/src/transformers/models/shieldgemma2/convert_shieldgemma2_weights_orbax_to_hf.py#L397-L435',
+                              'description': 'Official pinned converter recipe; Yes/No IDs10784/3771 are '
+                                             'pinned wrapper defaults, not tokenizer claims. Synthetic '
+                                             'image/text policy rows use random weights, not actual policy '
+                                             'prompt tokenization. Retains recipe flat factor8 rotary '
+                                             'settings exactly: pinned config resolves layer frequencies to '
+                                             'defaults, so this does not claim nested factor8 or equality '
+                                             'to inaccessible checkpoint bytes.',
+                              'parameters': {'text_config': {'vocab_size': 262208,
+                                                             'hidden_size': 2560,
+                                                             'intermediate_size': 10240,
+                                                             'num_attention_heads': 8,
+                                                             'head_dim': 256,
+                                                             'num_hidden_layers': 34,
+                                                             'num_key_value_heads': 4,
+                                                             'sliding_window': 1024,
+                                                             'rope_parameters': {'rope_type': 'linear',
+                                                                                 'factor': 8.0},
+                                                             'rope_theta': 1000000,
+                                                             'rope_local_base_freq': 10000,
+                                                             'attn_logit_softcapping': None,
+                                                             'query_pre_attn_scalar': 256,
+                                                             'max_position_embeddings': 8192},
+                                             'vision_config': {'hidden_size': 1152,
+                                                               'intermediate_size': 4304,
+                                                               'num_hidden_layers': 27,
+                                                               'num_attention_heads': 16,
+                                                               'num_channels': 3,
+                                                               'image_size': 896,
+                                                               'patch_size': 14,
+                                                               'hidden_act': 'gelu_pytorch_tanh',
+                                                               'layer_norm_eps': 1e-06,
+                                                               'attention_dropout': 0.0,
+                                                               'vision_use_head': False},
+                                             'yes_token_index': 10784,
+                                             'no_token_index': 3771}},
+                   'randomize_zero_parameters': ['model.model.multi_modal_projector.mm_input_projection_weight']},
+     'reference_backend': None,
+     'input': {'kind': 'text_image',
+               'text_batch_size': 3,
+               'image_batch_size': 3,
+               'sequence_length': 19,
+               'shape': [3, 112, 112],
+               'image_token_positions': [2, 3, 4, 5],
+               'fixed_token_ids': {'0': 2, '1': 16381, '6': 16382},
+               'image_token_type_ids': True,
+               'attention_mask': True},
+     'workload': 'forward',
+     'outputs': ['logits', 'probabilities'],
+     'dimension_overrides': {'text_config': {'vocab_size': 16384,
+                                             'hidden_size': 640,
+                                             'intermediate_size': 2560,
+                                             'num_attention_heads': 2,
+                                             'num_key_value_heads': 1,
+                                             'num_hidden_layers': 6,
+                                             'sliding_window': 8},
+                             'vision_config': {'hidden_size': 144,
+                                               'intermediate_size': 538,
+                                               'num_hidden_layers': 2,
+                                               'num_attention_heads': 2,
+                                               'image_size': 112},
+                             'mm_tokens_per_image': 4,
+                             'image_token_index': 16383,
+                             'boi_token_index': 16381,
+                             'eoi_token_index': 16382},
+     'dimension_purpose': 'CPU-manageable/GPU development case preserves text head256,GQA2,MLP4:1 and '
+                          'attention projected-width/hidden ratio0.8 and all five local plus one global '
+                          'layer; vision head72 and exact MLP4304/1152 ratio, 14px patches, 8x8 grid pooled '
+                          'with original kernel4 to2x2 tokens. Window1024->8 is exercised by19-token '
+                          'sequences. Vocabulary16384 retains native Yes/No IDs and complete head. Three '
+                          'synthetic rows represent processor policy expansion count, without actual text '
+                          'tokenization; image rows independently random. Native HF explicitly zeros the '
+                          'image projection and makes image perturbation invisible; randomize only that '
+                          'matrix with the shared seed+2 N(0,0.2^2) protocol.'},
+
     'siglip': {
         'reference': {
             'config_class': 'transformers:SiglipConfig',
@@ -10429,6 +10791,212 @@ CASES = {
         'outputs': ['logits', 'encoder_last_hidden_state', 'past_key_values'],
     },
 
+    't5gemma': {'reference': {'config_class': 'transformers:T5GemmaConfig',
+                   'model_class': 'transformers:T5GemmaForConditionalGeneration',
+                   'forward_kwargs': {},
+                   'native_cache_defaults': True,
+                   'source': {'kind': 'pinned_recipe',
+                              'revision': '0513283af5afffa27390b6ede2facc35d0f16e08',
+                              'url': 'https://github.com/google-deepmind/gemma/blob/0513283af5afffa27390b6ede2facc35d0f16e08/gemma/research/t5gemma/config.py',
+                              'parameters': {'encoder': {'vocab_size': 256128,
+                                                         'hidden_size': 2304,
+                                                         'intermediate_size': 9216,
+                                                         'num_hidden_layers': 26,
+                                                         'num_attention_heads': 8,
+                                                         'num_key_value_heads': 4,
+                                                         'head_dim': 256,
+                                                         'query_pre_attn_scalar': 256,
+                                                         'sliding_window': 4096,
+                                                         'final_logit_softcapping': 30.0,
+                                                         'attn_logit_softcapping': 50.0,
+                                                         'layer_types': ['sliding_attention',
+                                                                         'full_attention',
+                                                                         'sliding_attention',
+                                                                         'full_attention',
+                                                                         'sliding_attention',
+                                                                         'full_attention',
+                                                                         'sliding_attention',
+                                                                         'full_attention',
+                                                                         'sliding_attention',
+                                                                         'full_attention',
+                                                                         'sliding_attention',
+                                                                         'full_attention',
+                                                                         'sliding_attention',
+                                                                         'full_attention',
+                                                                         'sliding_attention',
+                                                                         'full_attention',
+                                                                         'sliding_attention',
+                                                                         'full_attention',
+                                                                         'sliding_attention',
+                                                                         'full_attention',
+                                                                         'sliding_attention',
+                                                                         'full_attention',
+                                                                         'sliding_attention',
+                                                                         'full_attention',
+                                                                         'sliding_attention',
+                                                                         'full_attention'],
+                                                         'rope_parameters': {'rope_type': 'default',
+                                                                             'rope_theta': 10000.0}},
+                                             'decoder': {'vocab_size': 256128,
+                                                         'hidden_size': 2304,
+                                                         'intermediate_size': 9216,
+                                                         'num_hidden_layers': 26,
+                                                         'num_attention_heads': 8,
+                                                         'num_key_value_heads': 4,
+                                                         'head_dim': 256,
+                                                         'query_pre_attn_scalar': 256,
+                                                         'sliding_window': 4096,
+                                                         'final_logit_softcapping': 30.0,
+                                                         'attn_logit_softcapping': 50.0,
+                                                         'layer_types': ['sliding_attention',
+                                                                         'full_attention',
+                                                                         'sliding_attention',
+                                                                         'full_attention',
+                                                                         'sliding_attention',
+                                                                         'full_attention',
+                                                                         'sliding_attention',
+                                                                         'full_attention',
+                                                                         'sliding_attention',
+                                                                         'full_attention',
+                                                                         'sliding_attention',
+                                                                         'full_attention',
+                                                                         'sliding_attention',
+                                                                         'full_attention',
+                                                                         'sliding_attention',
+                                                                         'full_attention',
+                                                                         'sliding_attention',
+                                                                         'full_attention',
+                                                                         'sliding_attention',
+                                                                         'full_attention',
+                                                                         'sliding_attention',
+                                                                         'full_attention',
+                                                                         'sliding_attention',
+                                                                         'full_attention',
+                                                                         'sliding_attention',
+                                                                         'full_attention'],
+                                                         'rope_parameters': {'rope_type': 'default',
+                                                                             'rope_theta': 10000.0}},
+                                             'vocab_size': 256128,
+                                             'tie_word_embeddings': True},
+                              'description': 'Explicit author-recipe fallback: T5GemmaPreset.GEMMA2_2B_2B, '
+                                             'the PREFIXLM IT example in the same pinned author README. '
+                                             'Pinned HF docs select google/t5gemma-2b-2b-prefixlm-it, whose '
+                                             'config returned HTTP401 on ordinary access. This is not '
+                                             'byte-verified identity with that gated checkpoint. Map the '
+                                             'author dimensions, alternating local/global attention, '
+                                             'caps50/30, default RoPE10000 and tied decoder embedder decode '
+                                             'into pinned HF T5Gemma; unspecified HF '
+                                             'inference/token/default settings remain pinned HF defaults. '
+                                             'Author vocabulary 256128 differs from HF module '
+                                             'constructor256000. Evaluate automatic HF SDPA, which omits '
+                                             'attention-score cap but executes final output-logit cap; no '
+                                             'JAX execution equivalence claimed.'}},
+     'config_overrides': {},
+     'dimension_overrides': {'encoder': {'vocab_size': 512,
+                                         'hidden_size': 576,
+                                         'intermediate_size': 2304,
+                                         'num_hidden_layers': 2,
+                                         'num_attention_heads': 2,
+                                         'num_key_value_heads': 1,
+                                         'sliding_window': 32,
+                                         'layer_types': ['sliding_attention', 'full_attention']},
+                             'decoder': {'vocab_size': 512,
+                                         'hidden_size': 576,
+                                         'intermediate_size': 2304,
+                                         'num_hidden_layers': 2,
+                                         'num_attention_heads': 2,
+                                         'num_key_value_heads': 1,
+                                         'sliding_window': 32,
+                                         'layer_types': ['sliding_attention', 'full_attention']},
+                             'vocab_size': 512},
+     'dimension_purpose': 'Reduce each tower26->2 layers while retaining one local and one full block; '
+                          'hidden2304->576, FF9216->2304, Q8->2/KV4->1 preserve256-wide heads,2:1 query '
+                          'grouping,4:1 FF ratio, and8/9 attention/model width. Vocabulary256128->512 '
+                          'reduces embedding storage. Window4096->32 bounds CPU/GPU development workload '
+                          'while encoder41 and decoder35-token prefill exceed it; two continuations '
+                          'exercise31-token sliding retention and full/cross cache reuse. Keep rotary8192 '
+                          'context bound,query scalar256,all norms,cross attention,final cap and tied '
+                          'decoder head.',
+     'input': {'kind': 'seq2seq_tokens',
+               'batch_size': 1,
+               'encoder_sequence_length': 41,
+               'decoder_sequence_length': 37,
+               'decoder_start_token_id': 2},
+     'workload': 'seq2seq_continuation',
+     'reference_backend': None,
+     'outputs': ['logits', 'encoder_last_hidden_state', 'decoder_hidden_states', 'past_key_values']},
+
+    't5gemma2': {'workload': 'seq2seq_continuation',
+     'reference_backend': 'eager',
+     'config_overrides': {},
+     'dimension_overrides': {'vocab_size': 512,
+                             'image_token_index': 510,
+                             'eoi_token_index': 509,
+                             'encoder': {'vocab_size': 512,
+                                         'mm_tokens_per_image': 4,
+                                         'boi_token_index': 508,
+                                         'eoi_token_index': 509,
+                                         'image_token_index': 510,
+                                         'text_config': {'hidden_size': 640,
+                                                         'intermediate_size': 2048,
+                                                         'num_hidden_layers': 6,
+                                                         'vocab_size': 512,
+                                                         'sliding_window': 16,
+                                                         'layer_types': ['sliding_attention',
+                                                                         'sliding_attention',
+                                                                         'sliding_attention',
+                                                                         'sliding_attention',
+                                                                         'sliding_attention',
+                                                                         'full_attention']},
+                                         'vision_config': {'hidden_size': 144,
+                                                           'intermediate_size': 538,
+                                                           'num_hidden_layers': 2,
+                                                           'num_attention_heads': 2,
+                                                           'image_size': 112}},
+                             'decoder': {'hidden_size': 640,
+                                         'intermediate_size': 2048,
+                                         'num_hidden_layers': 6,
+                                         'vocab_size': 512,
+                                         'sliding_window': 16,
+                                         'layer_types': ['sliding_attention', 'sliding_attention',
+                                                         'sliding_attention', 'sliding_attention',
+                                                         'sliding_attention', 'full_attention']}},
+     'dimension_purpose': 'Retain native text hidden640, FFN2048, Q projection1024, four 256-wide query '
+                          'heads and one KV head: GQA4:1 is already at minimum KV count and reducing hidden '
+                          'alone would change the attention-to-residual width ratio. Six layers preserve5 '
+                          'local+1 global pattern and both original RoPE laws. Window512->16 crossed by '
+                          'encoder25 and decoder19-token prefix plus two continuations. Vision '
+                          'independently scales width1152->144 and FFN4304->538, keeping72-wide heads; two '
+                          'layers and image112 retain8x8 patches pooled by native kernel4 to2x2 tokens. '
+                          'Adapter input/output ratio changes1152:640 to144:640 through the existing '
+                          'learned linear projection; no claim that cross-modality width ratio is '
+                          'preserved. Vocabulary512 uses explicit remapped BOI/EOI/image IDs, tied '
+                          'embeddings, image replacement and padding.',
+     'reference': {'config_class': 'transformers:T5Gemma2Config',
+                   'model_class': 'transformers:T5Gemma2ForConditionalGeneration',
+                   'forward_kwargs': {},
+                   'source': {'kind': 'example_checkpoint',
+                              'checkpoint': 'jordimas/t5gemma-2-270m-270m',
+                              'revision': 'dfb6d0d619d8e6d42f279a6197abb90dec0137c1',
+                              'description': 'User-approved same-name published mirror; effective config '
+                                             'equals independently checked Pieces mirror under HF da6c53e4; '
+                                             'no claim of byte identity with gated Google original.'},
+                   'randomize_zero_parameters': ['model.encoder.multi_modal_projector.mm_input_projection_weight',
+                                                 'model.encoder.text_model.embed_tokens.eoi_embedding']},
+     'input': {'kind': 'seq2seq_tokens',
+               'batch_size': 1,
+               'encoder_sequence_length': 25,
+               'decoder_sequence_length': 21,
+               'decoder_start_token_id': 0,
+               'encoder_prefix_token_ids': [2],
+               'encoder_suffix_token_ids': [1],
+               'image_shape': [3, 112, 112],
+               'image_token_positions': [2, 3, 4, 5],
+               'fixed_token_ids': {'1': 508, '6': 509, '24': 0},
+               'decoder_fixed_token_ids': {'4': 509},
+               'attention_mask': True},
+     'outputs': ['logits', 'encoder_last_hidden_state', 'past_key_values']},
+
     'table_transformer': {
         'reference': {
             'config_class': 'transformers:TableTransformerConfig',
@@ -10753,6 +11321,39 @@ CASES = {
         'outputs': ['last_hidden_state'],
         'reference_backend': None,
     },
+
+    'vaultgemma': {'reference': {'config_class': 'transformers:VaultGemmaConfig',
+                   'model_class': 'transformers:VaultGemmaForCausalLM',
+                   'forward_kwargs': {'logits_to_keep': 0},
+                   'source': {'kind': 'constructor_defaults',
+                              'revision': 'da6c53e431f7c9ef0691239d4ce89b0f711ecad7',
+                              'url': 'https://github.com/huggingface/transformers/blob/da6c53e431f7c9ef0691239d4ce89b0f711ecad7/src/transformers/models/vaultgemma/configuration_vaultgemma.py',
+                              'description': 'Explicit constructor-derived VaultGemma computation selected '
+                                             'by the pinned Config() example, evaluated through its '
+                                             'causal-LM head. This is not recovered checkpoint metadata. '
+                                             'VaultGemma constructor alternates sliding/full attention, '
+                                             'window4096/context8192; model documentation describes '
+                                             'all-full attention/context1024 for google/vaultgemma-1b, '
+                                             'which is a different scope. Selected HF SDPA ignores '
+                                             'attention-score cap50; the executed final-logit cap30 is '
+                                             'retained. No eager/FlashAttention equivalence claimed.',
+                              'source_locations': ['src/transformers/models/vaultgemma/configuration_vaultgemma.py:VaultGemmaConfig',
+                                                   'src/transformers/models/vaultgemma/modeling_vaultgemma.py:VaultGemmaForCausalLM']}},
+     'dimension_overrides': {'hidden_size': 576,
+                             'intermediate_size': 2304,
+                             'num_hidden_layers': 2,
+                             'num_attention_heads': 2,
+                             'num_key_value_heads': 1,
+                             'vocab_size': 256},
+     'dimension_purpose': 'Two layers retain one sliding/full pair; preserve head256, Q:KV2:1, attention '
+                          'width:hidden8:9, FF:hidden4:1, native window4096 and context8192. 4097-token '
+                          'prefill crosses the real window, then two supplied tokens exercise retained '
+                          'sliding state. Only model widths, vocabulary and repeated depth shrink.',
+     'reference_backend': 'sdpa',
+     'input': {'kind': 'tokens', 'batch_size': 1, 'sequence_length': 4099},
+     'workload': 'causal_lm_continuation',
+     'outputs': ['logits', 'past_key_values'],
+     'decode_outputs': ['logits', 'past_key_values']},
 
     'vibevoice_acoustic_tokenizer': {
         'reference': {

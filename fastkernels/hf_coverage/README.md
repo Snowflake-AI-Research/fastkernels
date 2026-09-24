@@ -102,6 +102,15 @@ account for stride. Embeddings, biases, normalization weights, and tied output
 heads are preserved. Preparation records the affected weight names and standard
 deviations. Each use needs a demonstrated reason.
 
+CSM's declared random preparation also follows the official converter's
+identical-value copy between its two audio embedding tables and randomizes zero
+codec centroids so generated codes affect the waveform. Supplied weights are
+preserved, and the preparation record names every changed buffer.
+
+CSM also requests deterministic cuDNN convolutions on both sides: repeated native
+waveform decoding otherwise exceeded the numerical tolerance. The run records
+this setting; it does not change the comparison rule.
+
 These checks test numerical computation, not audio or tracking quality. Cases
 requiring supplied inputs, packed weights, or adapter weights are
 flagged in `review.csv`: `--input-dict` and `--state-dict` load common tensors but
@@ -129,6 +138,10 @@ cover the reviewed implementation, required outputs, and meaningful computation.
 Run again to address a specific evidence gap or evaluate a changed workload,
 not solely to change model size. Preserve the configuration, weights, inputs,
 and source version associated with each result.
+
+DiNAT uses one explicit reference correction: its query/key/value axes are
+reordered to match NATTEN. Saved loading information records `dinat_qkv_layout`;
+the pinned HF checkout is unchanged. This is not a candidate patch.
 
 ## Construction rules
 
@@ -210,6 +223,8 @@ In `cases.py`, `reference` identifies the HF class and configuration source;
 common inputs; `workload` selects execution; and `outputs`/`decode_outputs`
 select comparisons. Backend, dtype, generation, and cache options appear where
 needed. `reference_backend=None` lets HF choose, while omission selects `eager`.
+`reference_experts_backend` separately selects HF's mixture-of-experts backend
+when its automatic choice cannot execute the declared quantization format.
 Descriptions explain choices; each run saves its fully resolved configuration.
 
 Keep large tensors, profiles, and investigation history outside Git. Record enough

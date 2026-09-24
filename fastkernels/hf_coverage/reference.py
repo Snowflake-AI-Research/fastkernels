@@ -46,6 +46,32 @@ def resolve_generation_config(reference):
     return json.loads(path.read_text()), {**source, "sha256": digest(path)}
 
 
+def fix_dinat_reference_layout():
+    """Correct the pinned DiNAT caller's Q/K/V axes at its NATTEN boundary.
+
+    HF passes [batch, width, height, heads, dim]; NATTEN requires
+    [batch, heads, height, width, dim]. This authorized reference-only repair
+    preserves native attention arithmetic and leaves the pinned checkout intact.
+    """
+    from transformers.models.dinat import modeling_dinat
+
+    if getattr(modeling_dinat, "_hf_coverage_layout_fixed", False):
+        return
+    native_qk = modeling_dinat.natten2dqkrpb
+    native_av = modeling_dinat.natten2dav
+
+    def qk(query, key, bias, kernel_size, dilation):
+        return native_qk(query.permute(0, 3, 2, 1, 4),
+                         key.permute(0, 3, 2, 1, 4), bias, kernel_size, dilation)
+
+    def av(attention, value, kernel_size, dilation):
+        return native_av(attention, value.permute(0, 3, 2, 1, 4), kernel_size, dilation)
+
+    modeling_dinat.natten2dqkrpb = qk
+    modeling_dinat.natten2dav = av
+    modeling_dinat._hf_coverage_layout_fixed = True
+
+
 def load_reference_model(model_class, config, weights, dtype, *, load_with_base_class=False,
                          reference_backend=None, load_device="cpu", generation_config=None,
                          adapter_config=None):
@@ -90,6 +116,9 @@ def load_reference_model(model_class, config, weights, dtype, *, load_with_base_
         if model.state_dict().keys() != weights.keys():
             raise RuntimeError("reference adapter state does not match the supplied common state")
         info["adapter_loading"] = {"missing_keys": [], "unexpected_keys": []}
+    if config.model_type == "dinat":
+        fix_dinat_reference_layout()
+        info["reference_corrections"] = ["dinat_qkv_layout"]
     return model.eval(), {key: sorted(value) if isinstance(value, set) else value
                           for key, value in info.items()}
 
@@ -234,6 +263,26 @@ def prepare(job: dict, directory: Path) -> dict:
                 weights[name].normal_(mean=0.0, std=0.2, generator=gate_generator)
             if names:
                 initialization += "; named zero parameters use shared N(0, 0.2^2), seed+2: " + ", ".join(names)
+            if ref.get("csm_equal_codebook_embeddings"):
+                # Official CSM conversion copies equal audio embeddings into
+                # separate tables. Inference requires equal values, not aliasing.
+                source = "backbone_model.embed_tokens.embed_audio_tokens.weight"
+                target = "depth_decoder.model.embed_tokens.weight"
+                weights[target].copy_(weights[source])
+                spec = ref["randomize_zero_buffers"]
+                buffer_names = [name for name in weights
+                                if name.startswith(spec["prefix"]) and name.endswith(spec["suffix"])]
+                if len(buffer_names) != config.num_codebooks:
+                    raise ValueError("CSM preparation requires every codec centroid buffer")
+                buffer_generator = torch.Generator().manual_seed(job["seed"] + spec["seed_offset"])
+                for name in buffer_names:
+                    if torch.count_nonzero(weights[name]).item():
+                        raise ValueError(f"Expected zero-initialized codec buffer: {name}")
+                    weights[name].normal_(std=spec["std"], generator=buffer_generator)
+                initialization += "; CSM converter equal-value audio embedding copy; codec buffers: " + json.dumps({
+                    "names": buffer_names, "normal_std": spec["std"],
+                    "seed": job["seed"] + spec["seed_offset"],
+                }, sort_keys=True)
         generation_config, generation_record = resolve_generation_config(ref)
         model, loading_info = load_reference_model(
             model_class, config, weights, dtype,
@@ -317,7 +366,13 @@ def prepare(job: dict, directory: Path) -> dict:
         elif spec["kind"] == "tokens":
             shape = (spec.get("batch_size", 1), spec["sequence_length"])
             vocabulary_size = spec["vocab_size"] if "vocab_size" in spec else config.vocab_size
-            inputs = {"input_ids": torch.randint(vocabulary_size, shape, generator=generator)}
+            if "input_ids" in spec:
+                ids = torch.tensor(spec["input_ids"], dtype=torch.long)
+                if tuple(ids.shape) != shape:
+                    raise ValueError("declared token IDs do not match the input shape")
+            else:
+                ids = torch.randint(vocabulary_size, shape, generator=generator)
+            inputs = {"input_ids": ids}
             if "visual_region_count" in spec:
                 regions = spec["visual_region_count"]
                 inputs["visual_feats"] = torch.randn(
@@ -400,9 +455,14 @@ def prepare(job: dict, directory: Path) -> dict:
             if spec.get("normalized_bbox"):
                 inputs["bbox"] = (inputs["bbox"].float() / 1000).to(input_dtype("bbox"))
             if spec.get("image_shape"):
-                inputs[spec.get("image_input_name", "pixel_values")] = torch.randn(
-                    (spec["batch_size"], *spec["image_shape"]), generator=generator,
-                ).to(input_dtype(spec.get("image_input_name", "pixel_values")))
+                image_shape = (spec["batch_size"], *spec["image_shape"])
+                if "image_value_range" in spec:
+                    low, high = spec["image_value_range"]
+                    pixels = torch.rand(image_shape, generator=generator) * (high - low) + low
+                else:
+                    pixels = torch.randn(image_shape, generator=generator)
+                image_name = spec.get("image_input_name", "pixel_values")
+                inputs[image_name] = pixels.to(input_dtype(image_name))
             if spec.get("decoder_length"):
                 start = spec.get("decoder_start_token_id", config.decoder_start_token_id)
                 decoder_ids = torch.randint(
@@ -419,6 +479,10 @@ def prepare(job: dict, directory: Path) -> dict:
             suffix = spec.get("encoder_suffix_token_ids", [] if config.eos_token_id is None else [config.eos_token_id])
             special_ids = {config.pad_token_id, bos_token_id,
                            config.eos_token_id, decoder_start, *prefix, *suffix}
+            special_ids.update(spec.get("fixed_token_ids", {}).values())
+            special_ids.update(spec.get("decoder_fixed_token_ids", {}).values())
+            if "image_token_positions" in spec:
+                special_ids.add(config.image_token_index)
             inputs = {}
             for name, length, tower in (("input_ids", "encoder_sequence_length", "encoder"),
                                         ("decoder_input_ids", "decoder_sequence_length", "decoder")):
@@ -445,6 +509,17 @@ def prepare(job: dict, directory: Path) -> dict:
             if suffix:
                 inputs["input_ids"][:, -len(suffix):] = torch.tensor(suffix)
             inputs["decoder_input_ids"][:, 0] = decoder_start
+            for field, name in (("fixed_token_ids", "input_ids"),
+                                ("decoder_fixed_token_ids", "decoder_input_ids")):
+                for position, token in spec.get(field, {}).items():
+                    inputs[name][:, int(position)] = token
+            if "image_shape" in spec:
+                inputs["pixel_values"] = torch.randn(
+                    spec["batch_size"], *spec["image_shape"], generator=generator,
+                ).to(input_dtype("pixel_values"))
+                inputs["input_ids"][:, spec["image_token_positions"]] = config.image_token_index
+            if spec.get("attention_mask"):
+                inputs["attention_mask"] = (inputs["input_ids"] != config.pad_token_id).long()
             if spec.get("global_first_token"):
                 inputs["global_attention_mask"] = torch.zeros_like(inputs["input_ids"])
                 inputs["global_attention_mask"][:, 0] = 1
@@ -792,6 +867,33 @@ def reference_workloads(model, inputs, case) -> dict[str, Workload]:
     if case["workload"] == "sample_actions":
         return {"sample_actions": Workload(run=lambda: {"actions": model.sample_actions(**inputs)})}
     if case["workload"] == "generate":
+        if model.config.model_type == "csm":
+            def generate_csm():
+                depth_logits = []
+                handle = model.depth_decoder.register_forward_hook(
+                    lambda module, args, output: depth_logits.append(output.logits))
+                try:
+                    output = model.generate(**inputs, **case["generation_kwargs"],
+                                            return_dict_in_generate=True, output_logits=True)
+                finally:
+                    handle.remove()
+                codebooks = model.config.num_codebooks - 1
+                if len(depth_logits) != output.sequences.shape[1] * codebooks:
+                    raise ValueError("CSM depth decoder did not execute every codebook step")
+                result = {
+                    "sequences": output.sequences,
+                    "logits": torch.stack(output.logits, dim=1),
+                    "depth_logits": torch.stack([
+                        torch.cat(depth_logits[start:start + codebooks], dim=1)
+                        for start in range(0, len(depth_logits), codebooks)
+                    ], dim=1),
+                    "audio_values": output.audio[0][None, None],
+                }
+                for index, layer in enumerate(output.past_key_values.layers):
+                    result[f"past_key_values.{index}.key"] = layer.keys
+                    result[f"past_key_values.{index}.value"] = layer.values
+                return result
+            return {"generate": Workload(run=generate_csm)}
         output_names = case["reference"].get("generation_output_names")
         if output_names is not None:
             def generate_tuple():
@@ -1049,7 +1151,8 @@ def execute(job: dict, directory: Path) -> dict:
     import torch
 
     pin = verify_reference_pin(job["transformers_revision"])
-    configure_torch(job["seed"], "float32", gpu=True)
+    configure_torch(job["seed"], "float32", gpu=True,
+                    cudnn_deterministic=job["case"].get("cudnn_deterministic", False))
     prepared = torch.load(directory / "prepared.pt", map_location="cpu", weights_only=True)
     ref = job["case"]["reference"]
     config = symbol(ref["config_class"]).from_dict(prepared["config"])
@@ -1064,6 +1167,8 @@ def execute(job: dict, directory: Path) -> dict:
                                                adapter_config=ref.get("adapter_config"))
     if generation_record is not None:
         loading_info["generation_config_source"] = generation_record
+    if job["case"].get("reference_experts_backend") is not None:
+        model.set_experts_implementation(job["case"]["reference_experts_backend"])
     model.to(device="cuda:0")
     speakers_record = None
     if "speakers" in ref:

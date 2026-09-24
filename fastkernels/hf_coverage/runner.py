@@ -175,12 +175,14 @@ def versions() -> dict:
     return result
 
 
-def configure_torch(seed: int, dtype: str, *, gpu: bool) -> None:
+def configure_torch(seed: int, dtype: str, *, gpu: bool, cudnn_deterministic: bool = False) -> None:
     import torch
 
     torch.manual_seed(seed)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cudnn.deterministic = cudnn_deterministic
+    torch.backends.cudnn.benchmark = False
     torch.set_float32_matmul_precision("highest")
     torch.set_default_dtype(getattr(torch, dtype))
     if gpu:
@@ -341,6 +343,8 @@ def worker_metadata() -> dict:
             "torch_cuda": torch.version.cuda,
             "torch_matmul_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
             "torch_cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
+            "torch_cudnn_deterministic": torch.backends.cudnn.deterministic,
+            "torch_cudnn_benchmark": torch.backends.cudnn.benchmark,
             "sdpa_enabled_backends": {
                 "cudnn": torch.backends.cuda.cudnn_sdp_enabled(),
                 "flash": torch.backends.cuda.flash_sdp_enabled(),
@@ -387,7 +391,8 @@ def implementation_worker(job: dict, directory: Path) -> dict:
     import torch
     import torch.distributed as dist
 
-    configure_torch(job["seed"], "float32", gpu=True)
+    configure_torch(job["seed"], "float32", gpu=True,
+                    cudnn_deterministic=job["case"].get("cudnn_deterministic", False))
     prepared = torch.load(directory / "prepared.pt", map_location="cpu", weights_only=True)
     config = config_values(prepared["config"])
     dist.init_process_group("nccl", init_method=(directory / "distributed.init").as_uri(),

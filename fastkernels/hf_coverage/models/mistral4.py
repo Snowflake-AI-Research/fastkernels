@@ -11,6 +11,8 @@ import torch
 from torch import nn
 
 from fastkernels.hf_coverage.models.llama import make_workloads
+from fastkernels.hf_coverage.models.git import GitAttention
+from fastkernels.hf_coverage.models.qwen2_precision import DenseCachedAttention
 from fastkernels.hf_coverage.models.olmo2 import decoder_config
 from fastkernels.hf_coverage.patches.product_gate import ProductGate
 from fastkernels.tasks.baseline.L1.flashinfer_mla_sparse import QuantFp8MLAQuery
@@ -21,7 +23,6 @@ from fastkernels.tasks.baseline.L1.rms_norm import RMSNorm
 from fastkernels.tasks.baseline.L1.rotary_emb import RotaryEmbedding
 from fastkernels.tasks.baseline.L1.silu_and_mul import SiluAndMul
 from fastkernels.tasks.baseline.L1.yarn_rotary_emb import YarnRotaryEmbedding
-from fastkernels.tasks.baseline.L2.attention_impl import Attention
 from fastkernels.tasks.baseline.L4.llama import LlamaForCausalLM
 
 
@@ -116,8 +117,10 @@ class ExpandedStaticAttention(nn.Module):
         self.kv_a_layernorm = RMSNorm(self.rank, 1e-6)
         self.kv_b_proj = StaticFP8Linear(self.rank, self.heads * (self.nope + self.value))
         self.o_proj = StaticFP8Linear(self.heads * self.value, config.hidden_size)
-        self.attn = Attention(self.heads, config.qk_head_dim, config.qk_head_dim ** -0.5,
-                              num_kv_heads=self.heads, prefer_triton=True)
+        # Eager HF materializes BF16 scores/probabilities. Their rounding
+        # changes the next static FP8 projection, so retain those boundaries.
+        self.attn = DenseCachedAttention(self.heads, self.heads, config.qk_head_dim)
+        self.attn.attention = GitAttention(vision=True)
         self.product = ProductGate()
         # These are fixed position values, not hidden-state computations.
         positions = torch.arange(config.max_position_embeddings, dtype=torch.float32)
