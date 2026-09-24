@@ -7,8 +7,10 @@ one ``LlamaEngine`` (TP workers spawned by the engine):
   ``image`` / ``video`` / ``audio``): the bench's datasets, seeds and loaders
   (``_preload_mm_data`` + ``_filter_and_prepare`` are executed from the bench's own
   source, so filters and prompt construction are identical), one 16-token engine
-  warmup, a per-workload prefill warmup at the real shapes (``max_tokens=1``), then one
-  timed ``generate`` of all requests (greedy, ``ignore_eos``) -> output tok/s;
+  warmup, then per workload ``spec.extra["warmup_passes"]`` (default 1) full untimed
+  passes over the same requests (so lazily JIT-compiled / autotuned kernels never compile
+  inside the timed region; with 0, the bench's prefill-only warmup at the real shapes),
+  then one timed ``generate`` of all requests (greedy, ``ignore_eos``) -> output tok/s;
 * latency workloads (``single-image`` / ``single-video`` / ...): the first usable item,
   ``num_warmup`` untimed + ``num_iters`` timed batch-1 generates -> median seconds.
 
@@ -29,8 +31,9 @@ modality), so the reference tokens and the forced re-decode share one batch regi
 ``compare``: per-sample ``d = 1 - mean(agree)``; summary = top-1 agreement overall and
 per modality, first-step agreement, and free-running exact-match / prefix fractions.
 
-``spec.extra`` knobs (all optional): ``max_correctness_tokens`` (cap on the decoded
-length per correctness sample; default: the workload's own output length), ``latency_iters`` / ``latency_warmup`` (override the
+``spec.extra`` knobs (all optional): ``warmup_passes`` (default 1),
+``max_correctness_tokens`` (cap on the decoded length per correctness sample; default:
+the workload's own output length), ``latency_iters`` / ``latency_warmup`` (override the
 workload spec), ``max_layers`` (debug only), ``gpu_memory_utilization``.
 """
 
@@ -160,6 +163,7 @@ class VLMAdapter(Adapter):
         extra = spec.extra or {}
         model = scenario.hf_name
         max_corr_tokens = int(extra.get("max_correctness_tokens") or 0)  # 0 = no cap
+        warmup_passes = int(extra.get("warmup_passes", 1))
         wls = [w for w in scenario.workloads if _wl_selected(w, spec.workloads)]
         if not wls:
             raise ValueError(f"workloads {spec.workloads} match none of "
@@ -295,11 +299,20 @@ class VLMAdapter(Adapter):
                     images, videos, audios = _media_args(items)
                     sp_list = [SamplingParams(temperature=0.0, top_p=1.0, max_tokens=p.output_len,
                                               ignore_eos=True)] * len(items)
-                # Prefill warmup at this workload's real shapes (vision encoder included).
-                engine.generate(prompts, SamplingParams(temperature=0.0, top_p=1.0, max_tokens=1,
-                                                        ignore_eos=True),
-                                images=images, videos=videos, audio_features=audios,
-                                use_tqdm=False, decode_text=False)
+                if warmup_passes > 0:
+                    # Full untimed pass(es) over the same inputs, so lazily JIT-compiled
+                    # kernels (FlashInfer, DeepGEMM, Triton autotune, candidates) are not
+                    # compiled inside the timed region.
+                    for _ in range(warmup_passes):
+                        engine.block_manager.reset()
+                        engine.generate(prompts, sp_list, images=images, videos=videos,
+                                        audio_features=audios, use_tqdm=False, decode_text=False)
+                else:
+                    # bench_vllm's prefill warmup at the real shapes (vision encoder included).
+                    engine.generate(prompts, SamplingParams(temperature=0.0, top_p=1.0,
+                                                            max_tokens=1, ignore_eos=True),
+                                    images=images, videos=videos, audio_features=audios,
+                                    use_tqdm=False, decode_text=False)
                 engine.block_manager.reset()
                 torch.cuda.synchronize()
                 start = time.perf_counter()
