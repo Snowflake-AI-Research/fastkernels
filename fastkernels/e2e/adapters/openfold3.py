@@ -273,6 +273,8 @@ class OpenFold3Adapter(Adapter):
         torch.backends.cudnn.benchmark = False
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
         torch.use_deterministic_algorithms(True, warn_only=True)
+        if os.environ.get("FASTKERNELS_PERTURB"):  # e2e/perturb.py calibration: benign numerics
+            torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
 
         ns: dict = {}
         exec(compile(b._FEATURIZE_FN, "bench_openfold3._FEATURIZE_FN", "exec"), ns)
