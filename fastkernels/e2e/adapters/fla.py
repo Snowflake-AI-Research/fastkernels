@@ -323,7 +323,11 @@ class FLAAdapter(Adapter):
     def compare(cls, ref: dict, cand: dict) -> dict:
         ref_tokens = [list(t) for t in ref.get("tokens") or []]
         cand_free = [list(t) for t in cand.get("tokens") or []]
-        n = len(ref_tokens)
+        # Probe runs decode fewer samples than the baseline: compare the samples the candidate
+        # produced (a candidate that produced none still scores as missing).
+        n_cand = max(len(cand_free), len(cand.get("agree") or []))
+        n = min(len(ref_tokens), n_cand) if n_cand else len(ref_tokens)
+        ref_tokens = ref_tokens[:n]
         exact, prefix = [], []
         for i, r in enumerate(ref_tokens):
             c = cand_free[i] if i < len(cand_free) else []

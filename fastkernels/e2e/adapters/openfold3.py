@@ -418,6 +418,8 @@ class OpenFold3Adapter(Adapter):
         np_err = np.seterr(all="ignore")
         for r in ref.get("samples", []):
             c = by_key.get(r["key"])
+            if c is None and by_key:  # probe runs produce fewer samples: compare what ran
+                continue
             row = None
             try:
                 pc = arr(c["atom_positions"]) if c is not None else None

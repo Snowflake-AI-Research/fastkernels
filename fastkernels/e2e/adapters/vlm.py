@@ -483,6 +483,8 @@ class VLMAdapter(Adapter):
         for i in range(n):
             r = [int(t) for t in rt[i]]
             j = cidx.get(ref_keys[i])
+            if j is None and cidx:  # probe runs produce fewer samples: compare what ran
+                continue
             c = [int(t) for t in ct[j]] if j is not None and j < len(ct) else None
             pre = 0
             for a, b in zip(r, c or []):

@@ -175,6 +175,10 @@ class E2E:
                     timed_out = True
                     os.killpg(proc.pid, signal.SIGKILL)
                     proc.wait()
+                try:  # reap orphans (e.g. TP workers of a crashed run) still holding the GPUs
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
         finally:
             self.pool.release(gpus)
         if (d / "result.json").is_file():
