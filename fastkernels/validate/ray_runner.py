@@ -327,9 +327,19 @@ def _ray_resource_options(
 ) -> dict:
     total_cpus = int(cluster_resources.get("CPU") or os.cpu_count() or 1)
     alloc_cpus = max(1, total_cpus - _reserved_cpus(total_cpus))
+    # Benchmark mode: reserve the whole node per job so nothing else is
+    # running while a number is being measured. Concurrent jobs never share a
+    # GPU, but they do share host CPU, memory bandwidth, the NVLink fabric and
+    # the chassis power budget -- and which neighbours a job has depends on
+    # which *other* models failed in that version, so the interference is
+    # correlated with the version under test.
+    serial = bool(os.environ.get("FASTKERNELS_VALIDATE_SERIAL"))
     fraction = tp / max(1, total_gpus)
+    # num_cpus stays tp-proportional even in serial mode: the job derives its
+    # per-rank OMP/Inductor thread budget from it, and handing a tp=1 job every
+    # core would change the measurement rather than just isolate it.
     options = {
-        "num_gpus": tp,
+        "num_gpus": total_gpus if serial else tp,
         "num_cpus": max(1, floor(alloc_cpus * fraction)),
     }
     total_memory = int(cluster_resources.get("memory") or _total_memory_bytes())

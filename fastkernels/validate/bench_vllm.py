@@ -284,8 +284,13 @@ if namespace:
     except Exception:
         pass
     else:
-        if not getattr(mnnvl.IpcSocket, "_fastkernels_namespaced", False):
-            original_init = mnnvl.IpcSocket.__init__
+        # Newer flashinfer (vLLM 0.29) dropped IpcSocket for a per-PID fd
+        # exchange that cannot collide, so there is nothing to namespace there.
+        _ipc_socket = getattr(mnnvl, "IpcSocket", None)
+        if _ipc_socket is not None and not getattr(
+            _ipc_socket, "_fastkernels_namespaced", False
+        ):
+            original_init = _ipc_socket.__init__
             namespace_bits = int.from_bytes(
                 hashlib.blake2b(namespace.encode(), digest_size=8).digest(),
                 "little",
@@ -296,8 +301,8 @@ if namespace:
                     op_id = (op_id ^ namespace_bits) & ((1 << 64) - 1)
                 original_init(self, rank, op_id, use_abstract)
 
-            mnnvl.IpcSocket.__init__ = namespaced_init
-            mnnvl.IpcSocket._fastkernels_namespaced = True
+            _ipc_socket.__init__ = namespaced_init
+            _ipc_socket._fastkernels_namespaced = True
 
 _max_layers_env = os.environ.get("FASTKERNELS_MAX_LAYERS")
 if _max_layers_env:
@@ -956,10 +961,14 @@ def _configure_parallel_safe_flashinfer():
         from flashinfer.comm import mnnvl
     except Exception:
         return
-    if getattr(mnnvl.IpcSocket, "_fastkernels_namespaced", False):
+    # Newer flashinfer (vLLM 0.29) dropped IpcSocket for a per-PID fd exchange
+    # that cannot collide, so there is nothing to namespace there. Guard the
+    # lookup like the import: an AttributeError here kills the whole preamble.
+    ipc_socket = getattr(mnnvl, "IpcSocket", None)
+    if ipc_socket is None or getattr(ipc_socket, "_fastkernels_namespaced", False):
         return
 
-    original_init = mnnvl.IpcSocket.__init__
+    original_init = ipc_socket.__init__
     namespace_bits = int.from_bytes(
         hashlib.blake2b(namespace.encode(), digest_size=8).digest(),
         "little",
@@ -970,8 +979,8 @@ def _configure_parallel_safe_flashinfer():
             op_id = (op_id ^ namespace_bits) & ((1 << 64) - 1)
         original_init(self, rank, op_id, use_abstract)
 
-    mnnvl.IpcSocket.__init__ = namespaced_init
-    mnnvl.IpcSocket._fastkernels_namespaced = True
+    ipc_socket.__init__ = namespaced_init
+    ipc_socket._fastkernels_namespaced = True
 
 _configure_parallel_safe_flashinfer()
 
@@ -1041,6 +1050,8 @@ def main():
         llm_kwargs["load_format"] = cfg["load_format"]
     if cfg.get("kv_cache_dtype"):
         llm_kwargs["kv_cache_dtype"] = cfg["kv_cache_dtype"]
+    if cfg.get("moe_backend"):
+        llm_kwargs["moe_backend"] = cfg["moe_backend"]
     if cfg.get("max_num_seqs") is not None:
         llm_kwargs["max_num_seqs"] = cfg["max_num_seqs"]
     if cfg.get("max_layers") is not None:
@@ -1195,6 +1206,8 @@ def main():
             engine_kwargs["max_layers"] = cfg["max_layers"]
         if cfg.get("kv_cache_dtype"):
             engine_kwargs["kv_cache_dtype"] = cfg["kv_cache_dtype"]
+        if cfg.get("moe_backend"):
+            engine_kwargs["moe_backend"] = cfg["moe_backend"]
         if "max_num_seqs" in cfg:
             engine_kwargs["max_num_seqs"] = cfg["max_num_seqs"]
         engine = Engine(**engine_kwargs)
@@ -1631,10 +1644,14 @@ def _configure_parallel_safe_flashinfer():
         from flashinfer.comm import mnnvl
     except Exception:
         return
-    if getattr(mnnvl.IpcSocket, "_fastkernels_namespaced", False):
+    # Newer flashinfer (vLLM 0.29) dropped IpcSocket for a per-PID fd exchange
+    # that cannot collide, so there is nothing to namespace there. Guard the
+    # lookup like the import: an AttributeError here kills the whole preamble.
+    ipc_socket = getattr(mnnvl, "IpcSocket", None)
+    if ipc_socket is None or getattr(ipc_socket, "_fastkernels_namespaced", False):
         return
 
-    original_init = mnnvl.IpcSocket.__init__
+    original_init = ipc_socket.__init__
     namespace_bits = int.from_bytes(
         hashlib.blake2b(namespace.encode(), digest_size=8).digest(),
         "little",
@@ -1645,8 +1662,8 @@ def _configure_parallel_safe_flashinfer():
             op_id = (op_id ^ namespace_bits) & ((1 << 64) - 1)
         original_init(self, rank, op_id, use_abstract)
 
-    mnnvl.IpcSocket.__init__ = namespaced_init
-    mnnvl.IpcSocket._fastkernels_namespaced = True
+    ipc_socket.__init__ = namespaced_init
+    ipc_socket._fastkernels_namespaced = True
 
 _configure_parallel_safe_flashinfer()
 
@@ -1727,6 +1744,8 @@ def main():
         llm_kwargs["load_format"] = cfg["load_format"]
     if cfg.get("kv_cache_dtype"):
         llm_kwargs["kv_cache_dtype"] = cfg["kv_cache_dtype"]
+    if cfg.get("moe_backend"):
+        llm_kwargs["moe_backend"] = cfg["moe_backend"]
     if cfg.get("limit_mm_per_prompt"):
         llm_kwargs["limit_mm_per_prompt"] = cfg["limit_mm_per_prompt"]
     if cfg.get("max_layers") is not None:
@@ -2159,6 +2178,11 @@ import numpy as np
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 os.environ.setdefault("VLLM_DEEP_GEMM_WARMUP", "skip")
 
+# Whisper's encoder takes a fixed 30s window. Clips are clamped to it before
+# being handed to vLLM -- see the comment at the clamp site for why vLLM 0.29
+# makes this mandatory rather than merely tidy.
+_WHISPER_WINDOW_S = float(os.environ.get("FASTKERNELS_WHISPER_WINDOW_S", "30"))
+
 def _decode_audio_array(audio):
     from io import BytesIO
     if isinstance(audio, dict) and audio.get("array") is not None:
@@ -2202,10 +2226,14 @@ def _configure_parallel_safe_flashinfer():
         from flashinfer.comm import mnnvl
     except Exception:
         return
-    if getattr(mnnvl.IpcSocket, "_fastkernels_namespaced", False):
+    # Newer flashinfer (vLLM 0.29) dropped IpcSocket for a per-PID fd exchange
+    # that cannot collide, so there is nothing to namespace there. Guard the
+    # lookup like the import: an AttributeError here kills the whole preamble.
+    ipc_socket = getattr(mnnvl, "IpcSocket", None)
+    if ipc_socket is None or getattr(ipc_socket, "_fastkernels_namespaced", False):
         return
 
-    original_init = mnnvl.IpcSocket.__init__
+    original_init = ipc_socket.__init__
     namespace_bits = int.from_bytes(
         hashlib.blake2b(namespace.encode(), digest_size=8).digest(),
         "little",
@@ -2216,8 +2244,8 @@ def _configure_parallel_safe_flashinfer():
             op_id = (op_id ^ namespace_bits) & ((1 << 64) - 1)
         original_init(self, rank, op_id, use_abstract)
 
-    mnnvl.IpcSocket.__init__ = namespaced_init
-    mnnvl.IpcSocket._fastkernels_namespaced = True
+    ipc_socket.__init__ = namespaced_init
+    ipc_socket._fastkernels_namespaced = True
 
 _configure_parallel_safe_flashinfer()
 
@@ -2298,6 +2326,8 @@ def main():
         llm_kwargs["load_format"] = cfg["load_format"]
     if cfg.get("kv_cache_dtype"):
         llm_kwargs["kv_cache_dtype"] = cfg["kv_cache_dtype"]
+    if cfg.get("moe_backend"):
+        llm_kwargs["moe_backend"] = cfg["moe_backend"]
     llm = LLM(**_supported_llm_kwargs(llm_kwargs))
 
     from vllm.inputs import ExplicitEncoderDecoderPrompt, TextPrompt
@@ -2333,8 +2363,24 @@ def main():
 
         prompts = []
         total_audio_s = 0.0
+        truncated = 0
         for sample in audio_samples:
             audio, sr = sample["audio"], sample["sampling_rate"]
+            # Whisper's encoder is defined on a fixed 30s window, and vLLM does
+            # its own feature extraction from the raw audio we hand it here.
+            # vLLM 0.29 does not clamp a longer clip to that window: a 30.61s
+            # LibriSpeech utterance yields a 3061-frame mel, and vLLM's own
+            # multimodal batching then refuses to stack it with the 3000-frame
+            # features of every other clip, killing the engine ~500 requests in
+            #   ValueError: input_features contains inconsistent shapes:
+            #               torch.Size([128, 3000]) vs torch.Size([128, 3061])
+            # 0.26 does not hit this. Clamping here keeps the workload identical
+            # and well-defined across versions; it is the same 30s window
+            # WhisperFeatureExtractor would apply (truncation=True by default).
+            window = int(_WHISPER_WINDOW_S * sr)
+            if len(audio) > window:
+                audio = audio[:window]
+                truncated += 1
             total_audio_s += len(audio) / sr
             prompt = ExplicitEncoderDecoderPrompt(
                 encoder_prompt=TextPrompt(
@@ -2346,6 +2392,11 @@ def main():
                 ),
             )
             prompts.append(prompt)
+
+        # Recorded per scenario so the results carry the fact that the workload
+        # was clamped, rather than it living only in this comment.
+        print(f"  Clamped {truncated}/{len(audio_samples)} clips to the "
+              f"{_WHISPER_WINDOW_S}s Whisper window")
 
         sp = SamplingParams(
             temperature=0.0, ignore_eos=True, max_tokens=output_len,
@@ -2743,6 +2794,17 @@ def main():
              "Omit to leave each side on its own default ('auto'). This is "
              "independent of the weight quantization: nvidia/GLM-5.2-NVFP4 has "
              "NVFP4 weights and an fp8 KV cache.",
+    )
+    parser.add_argument(
+        "--moe-backend", default=None,
+        help="Force vLLM's MoE expert-compute backend instead of letting it "
+             "auto-select (e.g. flashinfer_cutlass, flashinfer_trtllm, "
+             "cutlass, triton, deep_gemm). Exists to separate 'this vLLM "
+             "version is slower on this model' from 'this vLLM version "
+             "auto-selects a worse kernel for this model': on "
+             "Qwen3-VL-235B-FP8 both 0.18 and 0.26 pick FLASHINFER_TRTLLM, yet "
+             "0.26 is 0.70x on the image workload. Dropped silently on vLLM "
+             "versions whose LLM() does not accept it.",
     )
     parser.add_argument(
         "--trust-remote-code",
@@ -3204,6 +3266,7 @@ def main():
         max_layers=args.max_layers, max_model_len=global_max_seq_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
         kv_cache_dtype=args.kv_cache_dtype,
+        moe_backend=args.moe_backend,
         max_num_seqs=engine_max_num_seqs,
         engine_env=engine_env,
         scenarios=scenario_data, latency=latency_data,
@@ -3241,6 +3304,8 @@ def main():
         vllm_config["max_layers"] = args.max_layers
     if args.kv_cache_dtype:
         vllm_config["kv_cache_dtype"] = args.kv_cache_dtype
+    if args.moe_backend:
+        vllm_config["moe_backend"] = args.moe_backend
     if is_qwen_omni:
         vllm_config["limit_mm_per_prompt"] = {
             "image": 1,

@@ -1,0 +1,36 @@
+# Daily baseline drift check: when a new vLLM release appears, re-benchmark the pinned
+# production references against it on each GPU type and compute per-family drift
+# coefficients (scripts/baseline_drift.sh). The job fails (exit 2) when a family drifts by
+# more than 10%, i.e. a FastKernels re-release with re-pinned references is due.
+name: baseline-drift
+
+on:
+  schedule:
+    - cron: "0 6 * * *"   # daily; exits in seconds unless a new vLLM release is out
+  workflow_dispatch:
+    inputs:
+      candidate:
+        description: "vLLM version to compare against the pin (default: latest on PyPI)"
+        required: false
+
+jobs:
+  drift:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [[self-hosted, gpu-8xh200], [self-hosted, gpu-8xb200]]  # one per pinned GPU type
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 1440
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install fastkernels
+        run: pip install -e .
+      - name: Re-benchmark references and compute drift
+        env:
+          CANDIDATE: ${{ inputs.candidate }}
+        run: bash scripts/baseline_drift.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: baseline-drift-${{ join(matrix.runner, '-') }}
+          path: drift-report/
