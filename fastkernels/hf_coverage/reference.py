@@ -1181,7 +1181,15 @@ def execute(job: dict, directory: Path) -> dict:
                     cudnn_deterministic=job["case"].get("cudnn_deterministic", False))
     prepared = torch.load(directory / "prepared.pt", map_location="cpu", weights_only=True)
     ref = job["case"]["reference"]
-    config = symbol(ref["config_class"]).from_dict(prepared["config"])
+    config_values = prepared["config"]
+    if config_values.get("model_type") == "dbrx":
+        # DBRX's to_dict adds generic metadata which its strict nested FFN
+        # constructor rejects. Remove only these non-computational fields.
+        config_values = {**config_values, "ffn_config": {
+            key: value for key, value in config_values["ffn_config"].items()
+            if key not in {"_name_or_path", "output_attentions"}
+        }}
+    config = symbol(ref["config_class"]).from_dict(config_values)
     config._attn_implementation = job["case"].get("reference_backend", "eager")
     generation_config, generation_record = resolve_generation_config(ref)
     model, loading_info = load_reference_model(symbol(ref["model_class"]), config,

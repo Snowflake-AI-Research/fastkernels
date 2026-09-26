@@ -1664,22 +1664,21 @@ CASES = {
                           'nonzero centroids. Equal backbone/depth embedding values follow official '
                           'convert_csm.py195-197; no numerical reference monkeypatch.'},
 
-    'ctrl': {
-        'reference': {
-            'config_class': 'transformers:CTRLConfig',
-            'model_class': 'transformers:CTRLLMHeadModel',
-            'source': {
-                'kind': 'example_checkpoint', 'checkpoint': 'Salesforce/ctrl',
-                'revision': '3ff4f697e86bb0b95f7a70e39822af96671727d9',
-                'url': 'https://huggingface.co/Salesforce/ctrl/blob/3ff4f697e86bb0b95f7a70e39822af96671727d9/config.json',
-                'description': 'Pinned HF public forward example checkpoint.',
-            },
-        },
-        'input': {'kind': 'tokens', 'batch_size': 1, 'sequence_length': 514},
-        'workload': 'causal_lm_continuation',
-        'reference_backend': None,
-        'outputs': ['logits', 'past_key_values'],
-    },
+    'ctrl': {'reference': {'config_class': 'transformers:CTRLConfig',
+                   'model_class': 'transformers:CTRLLMHeadModel',
+                   'source': {'kind': 'example_checkpoint',
+                              'checkpoint': 'Salesforce/ctrl',
+                              'revision': '3ff4f697e86bb0b95f7a70e39822af96671727d9',
+                              'url': 'https://huggingface.co/Salesforce/ctrl/blob/3ff4f697e86bb0b95f7a70e39822af96671727d9/config.json',
+                              'description': 'Pinned HF public forward example checkpoint.'},
+                   'transformers_revision': '89b6b17574892ec0770551537a3fe69d6886703e'},
+     'dimension_overrides': {'n_embd': 320, 'n_head': 4, 'n_layer': 2, 'dff': 2048, 'vocab_size': 1024},
+     'input': {'kind': 'tokens', 'batch_size': 2, 'sequence_length': 270},
+     'workload': 'causal_lm_continuation',
+     'reference_backend': 'eager',
+     'dimension_purpose': 'Native head80, sinusoidal positions, sequential biased ReLU blocks and tied '
+                          'biased output head retained.',
+     'outputs': ['logits', 'past_key_values']},
 
     'cvt': {
         'reference': {
@@ -1928,31 +1927,35 @@ CASES = {
             'to128/model/layers. Expanded HF attention caches are larger than compressed MLA.'),
     },
 
-    'deepseek_v3': {
-        'reference': {
-            'config_class': 'transformers:DeepseekV3Config',
-            'model_class': 'transformers:DeepseekV3ForCausalLM',
-            'load_device': 'cuda',
-            'serialized_weight_suffixes': ['weight_scale_inv', 'gate_up_proj_scale_inv', 'down_proj_scale_inv'],
-            'source': {
-                'kind': 'example_checkpoint', 'checkpoint': 'deepseek-ai/DeepSeek-V3',
-                'revision': 'e815299b0bcbac849fa540c768ef21845365c9eb',
-                'url': 'https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/e815299b0bcbac849fa540c768ef21845365c9eb/config.json',
-                'description': 'Root-approved matching author fallback after invalid/mismatched pinned HF documentation. Native block FP8 retained.',
-            },
-        },
-        'dimension_overrides': {
-            'hidden_size': 896, 'intermediate_size': 512, 'moe_intermediate_size': 128,
-            'num_hidden_layers': 5, 'num_attention_heads': 16, 'num_key_value_heads': 16, 'q_lora_rank': 384,
-            'vocab_size': 1024,
-        },
-        'input': {'kind': 'tokens', 'batch_size': 2, 'sequence_length': 129},
-        'workload': 'causal_lm',
-        'reference_backend': 'sdpa',
-        'dimension_purpose': ('Keep native blockFP8 weights/dynamicactivationquantization,256experts/top8, attention head '
-            'dimensions and all enabled layer types; reduce hidden/intermediate widths and layer count for '
-            'development.'),
-    },
+    'deepseek_v3': {'reference': {'config_class': 'transformers:DeepseekV3Config',
+                   'model_class': 'transformers:DeepseekV3ForCausalLM',
+                   'load_device': 'cuda',
+                   'serialized_weight_suffixes': ['weight_scale_inv',
+                                                  'gate_up_proj_scale_inv',
+                                                  'down_proj_scale_inv'],
+                   'source': {'kind': 'example_checkpoint',
+                              'checkpoint': 'deepseek-ai/DeepSeek-V3',
+                              'revision': 'e815299b0bcbac849fa540c768ef21845365c9eb',
+                              'url': 'https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/e815299b0bcbac849fa540c768ef21845365c9eb/config.json',
+                              'description': 'Root-approved matching author fallback after '
+                                             'invalid/mismatched pinned HF documentation. Native block '
+                                             'FP8 retained.'},
+                   'transformers_revision': '89b6b17574892ec0770551537a3fe69d6886703e'},
+     'dimension_overrides': {'hidden_size': 896,
+                             'intermediate_size': 512,
+                             'moe_intermediate_size': 128,
+                             'num_hidden_layers': 5,
+                             'num_attention_heads': 16,
+                             'num_key_value_heads': 16,
+                             'q_lora_rank': 384,
+                             'vocab_size': 1024},
+     'input': {'kind': 'tokens', 'batch_size': 2, 'sequence_length': 129},
+     'workload': 'causal_lm_continuation',
+     'reference_backend': 'sdpa',
+     'dimension_purpose': 'Keep native blockFP8 weights/dynamicactivationquantization,256experts/top8, '
+                          'attention head dimensions and all enabled layer types; reduce '
+                          'hidden/intermediate widths and layer count for development.',
+     'outputs': ['logits', 'past_key_values']},
 
     'deepseek_vl': {
         'reference': {
@@ -2508,40 +2511,32 @@ CASES = {
         'outputs': ['logits'],
     },
 
-    'emu3': {
-        'reference': {
-            'config_class': 'transformers:Emu3Config',
-            'model_class': 'transformers:Emu3ForConditionalGeneration',
-            'source': {
-                'kind': 'example_checkpoint', 'checkpoint': 'BAAI/Emu3-Chat-hf',
-                'revision': '414c0a163edad789827ee473a71b75c7de546347',
-                'description': 'Pinned native public image-conditioned ordinary text generation; PerceptionLM also exercises video inputs.',
-            },
-            'generation_config': {
-                'do_sample': True, 'eos_token_id': 151850, 'max_new_tokens': 50000, 'pad_token_id': 151643,
-                'top_k': 2048, 'transformers_version': '4.47.0.dev0',
-            },
-            'generation_output_name': 'sequences',
-        },
-        'dimension_overrides': {
-            'text_config': {
-                'hidden_size': 512, 'intermediate_size': 1024, 'num_hidden_layers': 2,
-                'num_attention_heads': 4, 'num_key_value_heads': 1, 'max_position_embeddings': 512,
-            },
-            'vq_config': {'base_channels': 32, 'hidden_size': 128},
-        },
-        'input': {
-            'kind': 'external_prepared',
-            'description': 'Explicit common BF16 pixel tensors plus token IDs; full vocabulary and native image placeholder layout.',
-        },
-        'workload': 'generate',
-        'generation_kwargs': {'max_new_tokens': 4, 'do_sample': False},
-        'outputs': ['sequences'],
-        'reference_backend': 'sdpa',
-        'dimension_purpose': ('Shrink depth and widths while retaining native head widths, full vocabulary, image encoding '
-            'branches, all modal inputs, native pooling and connector ratios. Four ordinary autoregressive '
-            'steps.'),
-    },
+    'emu3': {'reference': {'config_class': 'transformers:Emu3Config',
+                   'model_class': 'transformers:Emu3ForConditionalGeneration',
+                   'source': {'kind': 'example_checkpoint',
+                              'checkpoint': 'BAAI/Emu3-Chat-hf',
+                              'revision': '414c0a163edad789827ee473a71b75c7de546347',
+                              'description': 'Official image-chat model, correctly expanded shared '
+                                             'image placeholders.'},
+                   'transformers_revision': '89b6b17574892ec0770551537a3fe69d6886703e'},
+     'reference_backend': 'sdpa',
+     'workload': 'generate',
+     'generation_kwargs': {'max_new_tokens': 4, 'do_sample': False},
+     'outputs': ['sequences', 'logits'],
+     'dimension_overrides': {'text_config': {'hidden_size': 512,
+                                             'intermediate_size': 1792,
+                                             'num_hidden_layers': 2,
+                                             'num_attention_heads': 4,
+                                             'num_key_value_heads': 1,
+                                             'max_position_embeddings': 512},
+                             'vq_config': {'base_channels': 32, 'hidden_size': 128}},
+     'dimension_purpose': 'Preserve text head128,GQA4,FFN3.5; VQ spatial+temporal block schedule, '
+                          'codebook and full visual vocabulary; proportional codec channel '
+                          'narrowing256→32 and1024→128, single image32x32 retains4x4 codes and row '
+                          'markers.',
+     'input': {'kind': 'supplied',
+               'description': 'Shared official image-chat token layout and synthetic32x32pixels; use '
+                              'valid-inputs.pt.'}},
 
     'encodec': {
         'reference': {
@@ -6688,31 +6683,38 @@ CASES = {
             ' metadata and uses full-head RoPE.'),
     },
 
-    'minimax_m2': {
-        'reference': {
-            'config_class': 'transformers:MiniMaxM2Config',
-            'model_class': 'transformers:MiniMaxM2ForCausalLM',
-            'load_device': 'cuda',
-            'serialized_weight_suffixes': ['weight_scale_inv', 'gate_up_proj_scale_inv', 'down_proj_scale_inv'],
-            'source': {
-                'kind': 'example_checkpoint', 'checkpoint': 'MiniMaxAI/MiniMax-M2',
-                'revision': '757303d492a50514c312788b5247a4f696a4c6a3',
-                'url': 'https://huggingface.co/MiniMaxAI/MiniMax-M2/blob/757303d492a50514c312788b5247a4f696a4c6a3/config.json',
-                'description': 'Root-approved matching author fallback after invalid/mismatched pinned HF documentation. Native block FP8 retained.',
-            },
-        },
-        'dimension_overrides': {
-            'hidden_size': 384, 'intermediate_size': 128, 'num_hidden_layers': 3, 'num_attention_heads': 6,
-            'num_key_value_heads': 1, 'head_dim': 128, 'vocab_size': 1024, 'max_position_embeddings': 2048,
-            'bos_token_id': 1, 'eos_token_id': 2, 'pad_token_id': 0,
-        },
-        'input': {'kind': 'tokens', 'batch_size': 2, 'sequence_length': 129},
-        'workload': 'causal_lm',
-        'reference_backend': 'sdpa',
-        'dimension_purpose': ('Keep native blockFP8 weights/dynamicactivationquantization,256experts/top8, attention head '
-            'dimensions and all enabled layer types; reduce hidden/intermediate widths and layer count for '
-            'development.'),
-    },
+    'minimax_m2': {'reference': {'config_class': 'transformers:MiniMaxM2Config',
+                   'model_class': 'transformers:MiniMaxM2ForCausalLM',
+                   'load_device': 'cuda',
+                   'serialized_weight_suffixes': ['weight_scale_inv',
+                                                  'gate_up_proj_scale_inv',
+                                                  'down_proj_scale_inv'],
+                   'source': {'kind': 'example_checkpoint',
+                              'checkpoint': 'MiniMaxAI/MiniMax-M2',
+                              'revision': '757303d492a50514c312788b5247a4f696a4c6a3',
+                              'url': 'https://huggingface.co/MiniMaxAI/MiniMax-M2/blob/757303d492a50514c312788b5247a4f696a4c6a3/config.json',
+                              'description': 'Root-approved matching author fallback after '
+                                             'invalid/mismatched pinned HF documentation. Native block '
+                                             'FP8 retained.'},
+                   'transformers_revision': '89b6b17574892ec0770551537a3fe69d6886703e'},
+     'dimension_overrides': {'hidden_size': 384,
+                             'intermediate_size': 128,
+                             'num_hidden_layers': 3,
+                             'num_attention_heads': 6,
+                             'num_key_value_heads': 1,
+                             'head_dim': 128,
+                             'vocab_size': 1024,
+                             'max_position_embeddings': 2048,
+                             'bos_token_id': 1,
+                             'eos_token_id': 2,
+                             'pad_token_id': 0},
+     'input': {'kind': 'tokens', 'batch_size': 2, 'sequence_length': 129},
+     'workload': 'causal_lm_continuation',
+     'reference_backend': 'sdpa',
+     'dimension_purpose': 'Keep native blockFP8 weights/dynamicactivationquantization,256experts/top8, '
+                          'attention head dimensions and all enabled layer types; reduce '
+                          'hidden/intermediate widths and layer count for development.',
+     'outputs': ['logits', 'past_key_values']},
 
     'ministral': {
         'workload': 'causal_lm_continuation',
@@ -12510,4 +12512,79 @@ CASES = {
         'workload': 'forward',
         'reference_backend': None,
     },
+    'dbrx': {'reference': {'config_class': 'transformers:DbrxConfig',
+                   'model_class': 'transformers:DbrxForCausalLM',
+                   'source': {'kind': 'pinned_recipe',
+                              'description': 'Selected published DBRX mirror checkpoint config; '
+                                             'preserved head128, GQA6, FFN ratio1.75,16experts/top4, '
+                                             'clipping8 and L1 normalized SiLU router;2identical '
+                                             'decoder blocks,768hidden,1344FFN,1024vocab reduced for '
+                                             'correctness. Explicit rope_theta agrees attn_config.',
+                              'parameters': {'architectures': ['DbrxForCausalLM'],
+                                             'attn_config': {'clip_qkv': 8,
+                                                             'kv_n_heads': 8,
+                                                             'model_type': '',
+                                                             'rope_theta': 500000},
+                                             'auto_map': {'AutoConfig': 'configuration_dbrx.DbrxConfig',
+                                                          'AutoModelForCausalLM': 'modeling_dbrx.DbrxForCausalLM'},
+                                             'd_model': 6144,
+                                             'emb_pdrop': 0.0,
+                                             'ffn_config': {'ffn_hidden_size': 10752,
+                                                            'model_type': '',
+                                                            'moe_jitter_eps': 0.0,
+                                                            'moe_loss_weight': 0.05,
+                                                            'moe_num_experts': 16,
+                                                            'moe_top_k': 4},
+                                             'initializer_range': 0.02,
+                                             'max_seq_len': 32768,
+                                             'model_type': 'dbrx',
+                                             'n_heads': 48,
+                                             'n_layers': 40,
+                                             'output_router_logits': False,
+                                             'resid_pdrop': 0.0,
+                                             'router_aux_loss_coef': 0.05,
+                                             'tie_word_embeddings': False,
+                                             'torch_dtype': 'bfloat16',
+                                             'transformers_version': '4.38.2',
+                                             'use_cache': True,
+                                             'vocab_size': 100352},
+                              'revision': '8007650525bf3b67d6a4763caf02230061452d45',
+                              'qualification': 'Published public mirror, not original author source; '
+                                               'use recorded config artifact provenance.'},
+                   'transformers_revision': '89b6b17574892ec0770551537a3fe69d6886703e'},
+     'workload': 'causal_lm_continuation',
+     'outputs': ['logits', 'past_key_values'],
+     'reference_backend': 'sdpa',
+     'input': {'batch_size': 2, 'sequence_length': 259, 'kind': 'tokens'},
+     'dimension_purpose': 'Preserve native head128,GQA6,FFN1.75,all16experts/top4 and two cache '
+                          'continuations; no architecture window.',
+     'dimension_overrides': {'d_model': 768,
+                             'n_heads': 6,
+                             'n_layers': 2,
+                             'vocab_size': 1024,
+                             'attn_config': {'kv_n_heads': 1},
+                             'ffn_config': {'ffn_hidden_size': 1344},
+                             'rope_parameters': {'rope_type': 'default', 'rope_theta': 500000.0}}},
+    'doge': {'reference': {'config_class': 'transformers:DogeConfig',
+                   'model_class': 'transformers:DogeForCausalLM',
+                   'source': {'kind': 'constructor_defaults',
+                              'description': 'Default dense Doge path; preserve '
+                                             'head128,FFN2,2048keep-window;2heads/2layers/1024vocab '
+                                             'reductions. Shared zero-init A randomized Normal(0,.2) '
+                                             'to exercise learned dynamic mask.'},
+                   'transformers_revision': '89b6b17574892ec0770551537a3fe69d6886703e',
+                   'randomize_zero_parameters': ['model.layers.0.self_attn.A',
+                                                 'model.layers.1.self_attn.A']},
+     'workload': 'causal_lm_continuation',
+     'reference_backend': 'sdpa',
+     'outputs': ['logits', 'past_key_values'],
+     'input': {'batch_size': 1, 'sequence_length': 2053, 'kind': 'tokens'},
+     'dimension_purpose': '2051token prefill exceeds default2048keep-window, plus two continued '
+                          'tokens, preserving required sparse-mask branch.',
+     'dimension_overrides': {'hidden_size': 256,
+                             'intermediate_size': 512,
+                             'num_hidden_layers': 2,
+                             'num_attention_heads': 2,
+                             'num_key_value_heads': 2,
+                             'vocab_size': 1024}},
 }

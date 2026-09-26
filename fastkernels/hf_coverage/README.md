@@ -44,6 +44,24 @@ files if needed, not pretrained weights. Some HF models also fetch compiled
 kernels. Bamba requires network access for that lookup even with cached
 configuration; forcing `HF_HUB_OFFLINE=1` can prevent execution. If preparation
 fails, inspect `prepare.log`; do not substitute another HF revision.
+Cases validated against an upstream reference fix declare an exact
+`reference.transformers_revision` in `cases.py`. For those cases, pass a separate
+checkout of that revision with `--hf-source`. The runner still verifies the pin;
+the original corpus and other cases retain their existing revision. Revision
+`89b6b17574892ec0770551537a3fe69d6886703e` (CTRL, DBRX, Doge, Emu3, DeepSeekV3,
+MiniMaxM2) needs newer hub packages than the shared environment. Install them
+into a separate directory and pass it with `--hf-extra-path`, which is prepended
+for the reference workers only:
+
+```bash
+git clone https://github.com/huggingface/transformers "$HF_NEW" && git -C "$HF_NEW" checkout 89b6b17574892ec0770551537a3fe69d6886703e
+pip install --no-deps --target "$HF_NEW_DEPS" huggingface_hub==1.33.0 tokenizers==0.23.1 safetensors==0.8.0 kernels==0.17.0
+python -m fastkernels.hf_coverage ctrl --hf-python "$VIRTUAL_ENV/bin/python" \
+  --hf-source "$HF_NEW" --hf-extra-path "$HF_NEW_DEPS" --output-dir "$HF_COVERAGE_RUNS/ctrl"
+```
+
+Reference-side bugs blocking twelve entries have standalone reproductions in
+[`reference_probes/`](reference_probes/README.md).
 
 Use `--help` for options. `--variant` selects a declared workload when required.
 `--reuse-from RUN_DIRECTORY` reuses common weights and inputs for the same case,
@@ -177,9 +195,23 @@ relevant operations, straightforward compositions, and permitted adaptations.
 
 ## Correctness and diagnostic timing
 
-The runner calls FastKernels' tensor comparator, not the `fastkernels bench` CLI.
-Each floating tensor needs at least 99% of elements within its dtype tolerances;
-integer outputs must match exactly. The exact rule is saved in `result.json`.
+Acceptance uses whole-tensor relative L2 error, `100 * norm(ours - HF) / norm(HF)`
+accumulated in FP64, for every floating output. The threshold follows the run's
+execution precision:
+
+| Precision | FP32 | FP16 | BF16 | FP8 | FP4 |
+|---|---|---|---|---|---|
+| Max relative L2 | 0.01% | 0.5% | 2% | 5% | 10% |
+
+A case declares `l2_compute_dtype` (`"float8"` or `"float4"`) only when its
+arithmetic is lower precision than its stored outputs. Integer outputs must match
+exactly, and shapes and dtypes must match. Every row of `result.json` also records
+the previous elementwise rule (`matched_ratio`, `elementwise_passed`: at least 99%
+of elements within `atol + rtol * abs(HF)` from FastKernels' tensor comparator) and,
+for outputs with a token axis, `max_token_relative_l2_percent`. Report
+localized token errors above the threshold even when the tensor passes.
+`--criterion elementwise` restores the previous acceptance rule, and
+`--rescore RUN_DIRECTORY...` re-compares saved outputs without rerunning.
 BF16 is the default unless the case declares otherwise. OmDet's matching
 intentional infinities have an explicit exception; further exceptions need review.
 A known semantic bug must be fixed even if the numerical threshold passes.
@@ -210,8 +242,8 @@ in separate processes, then compares outputs and saves results:
 | `prepared.pt` | Shared weights and inputs |
 | `reference_outputs.pt`, `implementation_outputs.pt` | Compared tensors |
 
-`passed_provisional` means that run passed the numerical rule, not the whole
-review. `mismatch` means numerical disagreement; `error` means incomplete
+`passed_provisional` means that run passed the selected numerical rule (recorded as
+`policy.criterion`), not the whole review. `mismatch` means numerical disagreement; `error` means incomplete
 execution. Both return exit status 1. `speedups` means **HF time / our time**;
 values below one mean we are slower.
 

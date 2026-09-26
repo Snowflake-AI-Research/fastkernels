@@ -3,13 +3,19 @@
 from dataclasses import fields
 
 import torch
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from fastkernels.hf_coverage.models.llama import make_workloads
+from fastkernels.hf_coverage.runner import Workload
+from fastkernels.hf_coverage.models.qwen2_precision import ResidualRMSNorm
+from fastkernels.hf_coverage.models.exaone4_5 import NativeGate
+from fastkernels.tasks.baseline.L1.rms_norm_native import RMSNormNative
+from fastkernels.tasks.baseline.L1.rotary_emb import RotaryEmbedding
+from fastkernels.tasks.baseline.L1.dense_attention import DenseAttention
+from fastkernels.hf_coverage.patches.plain_scale_fp8 import PlainScaleFP8Linear, PlainScaleQuant, PlainScaleFP8Experts
 from fastkernels.hf_coverage.patches.grouped_topk_normalization import GroupedTopKNormalization
-from fastkernels.tasks.baseline.L1.fp8_linear import Fp8Linear, postprocess_fp8_weights
+from fastkernels.tasks.baseline.L1.fp8_linear import Fp8Linear
 from fastkernels.tasks.baseline.L1.linear import Matmul
 from fastkernels.tasks.baseline.L2.deepseek_moe import DeepSeekMoE
-from fastkernels.tasks.baseline.L2.vllm_fused_experts import VllmFusedExperts
 from fastkernels.tasks.baseline.L4.deepseek import DeepSeekV3Config, DeepSeekV3ForCausalLM
 
 
@@ -21,7 +27,7 @@ class NativeFP8Experts(DeepSeekMoE):
         self.gate_matmul = Matmul()
         self.grouped_topk = GroupedTopKNormalization(scoring_func="sigmoid", epsilon=epsilon,
                                                     scale=self.routed_scaling_factor)
-        self.fused_experts = VllmFusedExperts()
+        self.fused_experts = PlainScaleFP8Experts()
 
     def forward(self, hidden):
         if self.gate_fp32:
@@ -37,11 +43,10 @@ class NativeFP8Experts(DeepSeekMoE):
 
 
 def prepare_linears(model):
-    """Use each existing FP8 linear's required load-time weight preparation."""
+    """Retain original FP8 weights/FP32 scales and select the existing GEMM core."""
     for module in model.modules():
         if isinstance(getattr(module, "linear_op", None), Fp8Linear):
-            weight, scales = postprocess_fp8_weights(module.weight.data, module.weight_scale_inv.data)
-            module.weight.data, module.weight_scale_inv.data = weight, scales
+            module.linear_op = PlainScaleFP8Linear()
 
 
 def build_from_config(config, device, dtype):
@@ -55,6 +60,14 @@ def build_from_config(config, device, dtype):
     for i, layer in enumerate(model.model.layers):
         if i >= config.first_k_dense_replace:
             layer.mlp = NativeFP8Experts(carrier, config.quantization_config)
+    for layer in model.model.layers:
+        layer.self_attn = UnabsorbedMLA(layer.self_attn, config)
+        layer.input_layernorm = ResidualRMSNorm(config.hidden_size, config.rms_norm_eps)
+        layer.post_attention_layernorm = ResidualRMSNorm(config.hidden_size, config.rms_norm_eps)
+        mlp = layer.mlp.shared_expert if isinstance(layer.mlp, NativeFP8Experts) else layer.mlp
+        if mlp is not None:
+            mlp.act_fn = NativeGate()
+    model.model.norm = ResidualRMSNorm(config.hidden_size, config.rms_norm_eps)
     # FP8 weights and FP32 block scales must retain their native dtypes.
     return model.to(device=device).eval()
 
@@ -94,8 +107,6 @@ def load_state_dict_into(model, state_dict, config):
                 packed[stem + name + "." + field] = (getattr(target.gate_up_proj, field), shard)
     load_mapped_state(state_dict, direct, packed)
     prepare_linears(model)
-    for layer in model.model.layers:
-        layer.self_attn.finalize_absorbed_weights()
 
 
 def load_mapped_state(state_dict, direct, packed):
@@ -109,3 +120,75 @@ def load_mapped_state(state_dict, direct, packed):
         if parameter.dtype != state_dict[name].dtype:
             raise ValueError(f"Packed FP8 dtype mismatch: {name}")
         parameter.weight_loader(parameter, state_dict[name], shard)
+
+
+class UnabsorbedMLA(torch.nn.Module):
+    """Reuse projection/norm/rotary/attention ops with native compressed storage.
+
+    The checkpoint's FP8 kv_b projection executes on each compressed prefix.
+    Absorbing this matrix into the attention changes its dynamic quantization
+    points. Keeping the original contraction order preserves that computation.
+    """
+    def __init__(self, source, config):
+        super().__init__()
+        for name in ("fused_qkv_a_proj", "q_b_proj", "kv_b_proj", "o_proj", "rotary_emb"):
+            setattr(self,name,getattr(source,name))
+        for name in ("q_lora_rank", "kv_lora_rank", "qk_rope_head_dim", "qk_nope_head_dim", "qk_head_dim", "v_head_dim", "num_heads", "scaling"):
+            setattr(self,name,getattr(source,name))
+        self.q_a_layernorm=RMSNormNative(self.q_lora_rank,config.rms_norm_eps)
+        self.kv_a_layernorm=RMSNormNative(self.kv_lora_rank,config.rms_norm_eps)
+        self.attention=DenseAttention(backend="sdpa");self.interleave=config.rope_interleave
+        self.latent=self.rotated=None;self.batch=1
+
+    def forward(self,positions,hidden):
+        total=hidden.shape[0];b=self.batch;seq=total//b
+        packed=self.fused_qkv_a_proj(hidden)
+        qc,kvc=packed.split([self.q_lora_rank,self.kv_lora_rank+self.qk_rope_head_dim],-1)
+        q=self.q_b_proj(self.q_a_layernorm(qc)).view(total,self.num_heads,self.qk_head_dim)
+        qpass,qrot=q.split([self.qk_nope_head_dim,self.qk_rope_head_dim],-1)
+        latent,krot=kvc.split([self.kv_lora_rank,self.qk_rope_head_dim],-1)
+        latent=self.kv_a_layernorm(latent).reshape(b,seq,self.kv_lora_rank)
+        krot=krot[:,None,:]
+        if self.interleave:
+            qrot=torch.cat((qrot[...,0::2],qrot[...,1::2]),-1)
+            krot=torch.cat((krot[...,0::2],krot[...,1::2]),-1)
+        qrot,krot=RotaryEmbedding.forward_native(positions,qrot,krot,self.qk_rope_head_dim,self.rotary_emb.cos_sin_cache.to(hidden.dtype))
+        krot=krot.reshape(b,seq,1,self.qk_rope_head_dim)
+        self.latent=latent if self.latent is None else torch.cat((self.latent,latent),1)
+        self.rotated=krot if self.rotated is None else torch.cat((self.rotated,krot),1)
+        n=self.latent.shape[1]
+        kv=self.kv_b_proj(self.latent.reshape(b*n,self.kv_lora_rank)).view(b,n,self.num_heads,self.qk_nope_head_dim+self.v_head_dim)
+        key,value=kv.split([self.qk_nope_head_dim,self.v_head_dim],-1)
+        key=torch.cat((key,self.rotated.expand(b,n,self.num_heads,self.qk_rope_head_dim)),-1)
+        query=torch.cat((qpass,qrot),-1).reshape(b,seq,self.num_heads,self.qk_head_dim)
+        # Native concatenation materializes contiguous B,H,S,D Q/K. Preserve
+        # that attention layout before the following dynamic FP8 quantizer.
+        query=query.transpose(1,2).contiguous().transpose(1,2)
+        key=key.transpose(1,2).contiguous().transpose(1,2)
+        # Baseline imports may disable cuDNN globally. Restore native SDPA
+        # availability only inside this call; keep all native backends eligible.
+        with sdpa_kernel([SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]):
+            result=self.attention(query,key,value,softmax_scale=self.scaling,causal=seq>1)
+        return self.o_proj(result.reshape(total,self.num_heads*self.v_head_dim))
+
+
+def make_workloads(model,inputs,config,*,case=None):
+    ids=inputs["input_ids"];b,length=ids.shape
+    continuation=case is not None and case.get("workload")=="causal_lm_continuation"
+    steps=2 if continuation else 1;prefix=length-steps
+    def reset():
+        for l in model.model.layers:l.self_attn.latent=l.self_attn.rotated=None;l.self_attn.batch=b
+    def call(start,end):
+        pos=torch.arange(start,end,device=ids.device).repeat(b)
+        logits=model.lm_head(model(ids[:,start:end].reshape(-1),pos)).reshape(b,end-start,-1)
+        result={"logits":logits}
+        if continuation:
+            for i,l in enumerate(model.model.layers):
+                result[f"past_key_values.{i}.key"]=l.self_attn.latent[:,None]
+                result[f"past_key_values.{i}.value"]=l.self_attn.rotated.transpose(1,2)
+        return result
+    def initial():reset();return call(0,prefix)
+    def prepare(i):
+        initial()
+        for j in range(i):call(prefix+j,prefix+j+1)
+    return {"prefill":Workload(run=initial),**{(f"decode_{i+1}" if continuation else "decode"):Workload(run=lambda i=i:call(prefix+i,prefix+i+1),prepare=lambda i=i:prepare(i)) for i in range(steps)}}

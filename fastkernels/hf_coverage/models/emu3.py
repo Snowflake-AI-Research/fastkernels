@@ -214,11 +214,12 @@ class Model(nn.Module):
     def image_tokens(self, pixels, image_sizes):
         codes = self.vqmodel(pixels, image_sizes)
         end = self.config.vocabulary_map['<|extra_200|>']
-        return torch.cat([torch.cat((self.image_to_bpe[code], code.new_full((code.shape[0], 1), end)), dim=-1).flatten() for code in codes])
+        return torch.cat([torch.cat((self.image_to_bpe[code], code.new_full((code.shape[0], 1), end)), dim=-1).flatten() for code in codes]).to(torch.int32)
 
-    def generate(self, input_ids, pixel_values, image_sizes, max_new_tokens=4):
+    def generate(self, input_ids, pixel_values, image_sizes, max_new_tokens=4, *, return_logits=False):
         self.text_model.reset()
         ids = input_ids.clone()
+        scores = []
         for step in range(max_new_tokens):
             current = ids if step == 0 else ids[:, -1:]
             hidden = self.text_model.embed_tokens(current)
@@ -227,11 +228,14 @@ class Model(nn.Module):
                 hidden = hidden.masked_scatter((current == self.config.image_token_id)[..., None].expand_as(hidden), image)
             start = 0 if step == 0 else ids.shape[1] - 1
             hidden = self.text_model(hidden, torch.arange(start, ids.shape[1], device=ids.device))
-            token = self.select(self.lm_head(hidden[:, -1:]).float()).reshape(1, 1)
+            logits = self.lm_head(hidden[:, -1:]).float()
+            if return_logits:
+                scores.append(logits[:, -1].clone())
+            token = self.select(logits).reshape(1, 1)
             ids = torch.cat((ids, token), dim=1)
             if int(token[0, 0]) == self.config.text_config.eos_token_id:
                 break
-        return ids
+        return (ids, scores) if return_logits else ids
 
 
 def build_from_config(config, device, dtype):
@@ -262,4 +266,8 @@ def make_workloads(model, inputs, config, case=None):
     options = {} if case is None else dict(case['generation_kwargs'])
     if options.pop('do_sample', False):
         raise ValueError('Selected public workload uses greedy image-conditioned text generation')
-    return {'generate': Workload(run=lambda: {'sequences': model.generate(**inputs, **options)})}
+    def run():
+        sequences, scores = model.generate(**inputs, **options, return_logits=True)
+        return {'sequences': sequences, **{f'logits.{i}': value for i, value in enumerate(scores)}}
+
+    return {'generate': Workload(run=run)}

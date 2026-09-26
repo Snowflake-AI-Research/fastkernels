@@ -267,14 +267,52 @@ def measure(workloads: dict[str, Workload], *, warmup: int, iterations: int,
     return results, outputs
 
 
-def compare_outputs(actual, reference, *, allow_infinite_outputs=()) -> tuple[bool, dict, dict]:
-    """Reuse the current benchmark's numerical comparator; enforce named outputs."""
+CRITERIA = ("relative_l2", "elementwise")
+L2_THRESHOLDS_PERCENT = {"float64": 0.01, "float32": 0.01, "float16": 0.5, "bfloat16": 2.0,
+                         "float8": 5.0, "float4": 10.0}
+
+
+def l2_threshold_percent(dtype, compute_dtype=None) -> float:
+    name = compute_dtype or str(dtype).removeprefix("torch.")
+    if name.startswith("float8"):
+        name = "float8"
+    return L2_THRESHOLDS_PERCENT[name]
+
+
+def relative_l2(out, ref) -> dict:
+    """100 * ||out - ref|| / ||ref||, accumulated in FP64, plus per-token maxima."""
+    import torch
+
+    out, ref = out.double(), ref.double()
+    error, norm = (out - ref).norm(), ref.norm()
+    percent = float(100 * error / norm) if norm > 0 else (0.0 if error == 0 else float("inf"))
+    row = {"relative_l2_percent": percent}
+    if ref.ndim >= 3 and ref.shape[-1] > 1:
+        token_norm = ref.norm(dim=-1)
+        token = torch.where(token_norm > 0, 100 * (out - ref).norm(dim=-1) / token_norm.clamp_min(1e-300),
+                            torch.zeros_like(token_norm))
+        row["max_token_relative_l2_percent"] = float(token.max())
+    return row
+
+
+def compare_outputs(actual, reference, *, allow_infinite_outputs=(), criterion="relative_l2",
+                    l2_compute_dtype=None) -> tuple[bool, dict, dict]:
+    """Score each named output by relative L2 and by the benchmark's elementwise rule.
+
+    ``criterion`` selects which of the two decides acceptance; both are recorded.
+    """
     import torch
     from fastkernels.bench import _compare_tensor, _TOLERANCES, REQUIRED_MATCHED_RATIO
 
     from fastkernels import bench
 
+    if criterion not in CRITERIA:
+        raise ValueError(f"criterion must be one of {CRITERIA}")
     policy = {
+        "criterion": criterion,
+        "relative_l2": {"thresholds_percent": L2_THRESHOLDS_PERCENT,
+                        "threshold_dtype": l2_compute_dtype or "each reference output's dtype",
+                        "formula": "100 * norm(candidate - HF) / norm(HF), FP64 accumulation, whole tensor"},
         "name": "fastkernels.bench._compare_tensor", "provisional": True,
         "source_sha256": digest(Path(bench.__file__)),
         "required_matched_ratio": REQUIRED_MATCHED_RATIO,
@@ -322,7 +360,12 @@ def compare_outputs(actual, reference, *, allow_infinite_outputs=()) -> tuple[bo
                     finite = torch.isfinite(ref)
                     out, ref = out[finite], ref[finite]
                 ok, absolute, relative, matched, detail = _compare_tensor(out, ref)
-                row.update(passed=ok and out.dtype == ref.dtype, max_absolute_error=absolute,
+                threshold = l2_threshold_percent(ref.dtype, l2_compute_dtype)
+                row.update(relative_l2(out, ref), l2_threshold_percent=threshold)
+                row["l2_passed"] = row["relative_l2_percent"] <= threshold
+                row["elementwise_passed"] = ok
+                accepted = row["l2_passed"] if criterion == "relative_l2" else ok
+                row.update(passed=accepted and out.dtype == ref.dtype, max_absolute_error=absolute,
                            max_relative_error=relative, matched_ratio=matched, detail=detail)
                 if out.dtype != ref.dtype:
                     row["error"] = "dtype mismatch"
@@ -333,6 +376,30 @@ def compare_outputs(actual, reference, *, allow_infinite_outputs=()) -> tuple[bo
         results["error"] = "all reference outputs are empty or zero; no acceptance evidence"
         all_ok = False
     return all_ok, results, policy
+
+
+def rescore(directories, criterion="relative_l2") -> int:
+    """Re-apply the comparison to saved outputs without rerunning either model."""
+    import torch
+
+    status = 0
+    for directory in map(Path, directories):
+        job = json.loads((directory / "job.json").read_text())
+        case = job["case"]
+        load = lambda name: torch.load(directory / name, map_location="cpu", weights_only=True)
+        passed, comparison, _ = compare_outputs(
+            load("implementation_outputs.pt"), load("reference_outputs.pt"),
+            allow_infinite_outputs=case.get("allow_infinite_outputs", ()), criterion=criterion,
+            l2_compute_dtype=case.get("l2_compute_dtype", job.get("dtype")))
+        rows = [(f"{workload}.{name}", row) for workload, outputs in comparison.items()
+                if isinstance(outputs, dict) for name, row in outputs.items() if isinstance(row, dict)]
+        worst = max((row.get("relative_l2_percent", 0.0) for _, row in rows), default=0.0)
+        failed = [name for name, row in rows if not row.get("passed", False)]
+        print(json.dumps({"run": str(directory), "criterion": criterion, "passed": passed,
+                          "max_relative_l2_percent": worst, "outputs": len(rows),
+                          "failed_outputs": failed}))
+        status |= not passed
+    return status
 
 
 def worker_metadata() -> dict:
@@ -483,9 +550,11 @@ def run_case(args) -> int:
             raise ValueError("--hf-source must contain transformers/ or src/transformers/")
     job = {"schema_version": 1, "model": args.model, "case": case,
            "case_sha256": hashlib.sha256(json.dumps(case, sort_keys=True).encode()).hexdigest(),
-           "transformers_revision": corpus["transformers_revision"], "dtype": args.dtype,
+           "transformers_revision": case["reference"].get("transformers_revision", corpus["transformers_revision"]),
+           "dtype": args.dtype,
            "seed": args.seed, "warmup": args.warmup, "iterations": args.iterations,
            "reference_source": str(hf_source) if hf_source else None,
+           "reference_extra_path": list(getattr(args, "hf_extra_path", None) or ()),
            "state_dict": str(Path(args.state_dict).expanduser().resolve()) if args.state_dict else None,
            "input_dict": str(Path(args.input_dict).expanduser().resolve()) if getattr(args, "input_dict", None) else None,
            "upcast_from": str(Path(args.upcast_from).expanduser().resolve()) if args.upcast_from else None,
@@ -511,8 +580,10 @@ def run_case(args) -> int:
         for phase, python, module in phases:
             command = [str(python), "-m", module, phase, str(directory / "job.json")]
             worker_env = env.copy()
-            if phase != "implementation" and hf_source:
-                worker_env["PYTHONPATH"] = str(hf_source) + os.pathsep + env["PYTHONPATH"]
+            if phase != "implementation":
+                reference_paths = [*(getattr(args, "hf_extra_path", None) or []),
+                                   *([str(hf_source)] if hf_source else [])]
+                worker_env["PYTHONPATH"] = os.pathsep.join([*reference_paths, env["PYTHONPATH"]])
             with (directory / f"{phase}.log").open("w") as log:
                 try:
                     process = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT,
@@ -538,6 +609,8 @@ def run_case(args) -> int:
         reference = torch.load(directory / "reference_outputs.pt", map_location="cpu", weights_only=True)
         passed, comparison, policy = compare_outputs(
             actual, reference, allow_infinite_outputs=case.get("allow_infinite_outputs", ()),
+            criterion=getattr(args, "criterion", "relative_l2"),
+            l2_compute_dtype=case.get("l2_compute_dtype", args.dtype),
         )
         report.update(status="passed_provisional" if passed else "mismatch", comparison=comparison, policy=policy)
         report["speedups"] = {

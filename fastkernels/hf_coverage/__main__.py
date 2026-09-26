@@ -14,6 +14,10 @@ def main() -> int:
     parser.add_argument("--hf-python", default=os.environ.get("HF_COVERAGE_REFERENCE_PYTHON"))
     parser.add_argument("--hf-source", default=os.environ.get("HF_COVERAGE_REFERENCE_SOURCE"),
                         help="pinned Transformers checkout or source directory, used only by reference workers")
+    parser.add_argument("--hf-extra-path", action="append", metavar="DIRECTORY",
+                        default=[p for p in os.environ.get("HF_COVERAGE_REFERENCE_EXTRA_PATH", "").split(os.pathsep) if p],
+                        help="prepended to PYTHONPATH for reference workers only, e.g. newer dependencies "
+                             "required by a case's declared Transformers revision")
     parser.add_argument("--output-dir", help="new or empty directory under your scratch storage")
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"),
                         help="execution dtype; defaults to the case's declared dtype, otherwise bfloat16")
@@ -27,7 +31,14 @@ def main() -> int:
     reuse.add_argument("--reuse-from", help="prior run with the same case, dtype, and seed; share its prepared file")
     parser.add_argument("--state-dict", help="optional file of common weights in the pinned HF model's state_dict format")
     parser.add_argument("--input-dict", help="optional file of processor-prepared common input tensors")
+    parser.add_argument("--criterion", choices=("relative_l2", "elementwise"), default="relative_l2",
+                        help="acceptance rule; both are always recorded in result.json")
+    parser.add_argument("--rescore", nargs="+", metavar="RUN_DIRECTORY",
+                        help="re-compare saved outputs of completed runs instead of running")
     args = parser.parse_args()
+    if args.rescore:
+        from .runner import rescore
+        return rescore(args.rescore, args.criterion)
     from .cases import CASES
 
     if args.list:

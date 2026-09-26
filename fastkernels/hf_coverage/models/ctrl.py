@@ -13,6 +13,8 @@ from ..runner import Config
 from .gpt_neox import DecoderBackbone, DecoderLM
 from .phi import BiasedHeadProduct
 from .llama import make_workloads as llama_workloads
+from .qwen2_precision import DenseCachedAttention
+from fastkernels.tasks.baseline.L1.dense_attention import DenseAttention
 
 
 def decoder_config(config):
@@ -29,6 +31,11 @@ class CTRLLayer(nn.Module):
         self.self_attn = LlamaAttention(config.hidden_size, config.num_attention_heads,
             config.num_attention_heads, config.hidden_size // config.num_attention_heads,
             bias=True, o_proj_bias=True, nope=True)
+        # CTRL preserves 80-wide heads. The existing NHD cache store pads this
+        # dimension; the HND paged kernel assumes a power-of-two head width.
+        self.self_attn.attn = DenseCachedAttention(config.num_attention_heads, config.num_attention_heads,
+                                                  config.hidden_size // config.num_attention_heads)
+        self.self_attn.attn.attention = DenseAttention(backend="sdpa")
         self.mlp = VitEncoderMlp(config.hidden_size, config.intermediate_size, bias=True)
         self.mlp.act = ReLU()
 
