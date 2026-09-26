@@ -39,7 +39,7 @@ NEW `kernels` 0.17 then refuses its cached versioned kernels, and OLD `kernels`
 
 ```bash
 cd fastkernels/hf_coverage/reference_probes
-export CUDA_VISIBLE_DEVICES=<idle gpu>
+export CUDA_VISIBLE_DEVICES=<idle gpu> RUNS=<output directory outside the repository>
 python run_all.py --hf-source $HF_OLD --out $RUNS/probes-old
 python run_all.py --hf-source $HF_NEW --extra-path $DEPS_NEW --out $RUNS/probes-new
 python probes.py sam_hq --hf-source $HF_NEW --extra-path $DEPS_NEW --out $RUNS/probes-new/sam_hq.json
