@@ -5,6 +5,27 @@ Start with the [README](README.md) for setup and methodology. Filter
 identifier is the CLI argument and filename in `models/`; `cases.py` defines its
 workload. `next_action` identifies the open issue or next check.
 
+## Current status (2026-09-25)
+
+- **Acceptance rule.** Runs are now accepted by whole-tensor relative L2 at the
+  run's precision (BF16 2%, FP32 0.01%; see the README). The previous 99%
+  elementwise result is still recorded per output and selectable with
+  `--criterion elementwise`. Counts and priorities below predate this change.
+- **HF reference blockers.** Twelve entries are blocked by verified bugs in the HF
+  reference itself: DeepSeekV4, MRA, Reformer, Grounding DINO, MM Grounding DINO,
+  CLVP, NLLB-MoE, SAM-HQ, Phi4 vision, Gemma4 assistant, SAM3 video and
+  Granite4 vision. [`reference_probes/`](reference_probes/README.md) reproduces
+  each one standalone against the pinned revision and against `89b6b175`, and
+  records whether that revision fixes it.
+- **Upstream-fixed references.** CTRL, DBRX, Doge, Emu3, DeepSeekV3 and MiniMaxM2
+  pass against Transformers `89b6b175`, which fixes their pinned-revision
+  reference bugs; their cases declare that revision.
+- **Case definitions in flux.** Several recently closed decoder, MoE and hybrid
+  models passed on reduced continuation workloads that are not yet the committed
+  `cases.py` entries; running those committed cases may not reproduce the
+  recorded pass. Check a case against its recorded workload before treating a
+  mismatch as a regression.
+
 ## Assignment and priorities
 
 You own **221 registered implementations**. Filter `review_priority` in
@@ -13,7 +34,7 @@ You own **221 registered implementations**. Filter `review_priority` in
 | Priority | Models | Work |
 |---|---:|---|
 | `investigate` | 44 | Resolve numerical failures, large slowdowns, or specific evidence concerns. |
-| `complete_execution` | 4 | Resolve CTRL's runtime errors; obtain paired GPU evidence for Gemma3, Jais2, and PPLCNetV3. |
+| `complete_execution` | 4 | Obtain paired GPU evidence for Gemma3, Jais2, and PPLCNetV3. CTRL now passes against `89b6b175`. |
 | `optional` | 173 | Independently review previously passing GPU-tested workloads only if time permits. |
 
 The first group contains 35 numerical investigations and four recorded slowdowns
