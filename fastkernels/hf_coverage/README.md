@@ -7,6 +7,8 @@ claim production serving support or pretrained-model quality.
 
 This document defines setup and methodology. [REVIEW.md](REVIEW.md) explains the
 reviewer's work; [review.csv](review.csv) lists assignments and open issues.
+[REFERENCES.md](REFERENCES.md) covers the twelve entries blocked by HF reference
+issues.
 
 ## Setup and first run
 
@@ -60,7 +62,8 @@ python -m fastkernels.hf_coverage ctrl --hf-python "$VIRTUAL_ENV/bin/python" \
   --hf-source "$HF_NEW" --hf-extra-path "$HF_NEW_DEPS" --output-dir "$HF_COVERAGE_RUNS/ctrl"
 ```
 
-Reference-side bugs blocking twelve entries have standalone reproductions in
+Reference-side issues blocking twelve entries are described in
+[REFERENCES.md](REFERENCES.md) and reproduced in
 [`reference_probes/`](reference_probes/README.md).
 
 Use `--help` for options. `--variant` selects a declared workload when required.

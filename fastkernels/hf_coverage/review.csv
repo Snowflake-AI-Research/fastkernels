@@ -39,7 +39,7 @@ chmv2,us,optional,registered; full workload review unfinished,Retain historical 
 clap,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 clip,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 clipseg,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-clvp,us,,no registered runnable implementation,Implementation exists; no registered case. HF reference wrong: pinned masks admit one key per query and conditioning position IDs are wrong; 89b6b175 fixes the masks but not the positions. See reference_probes.
+clvp,us,,no registered runnable implementation,Implementation exists; no registered case. HF reference wrong: pinned masks admit one key per query and conditioning position IDs are wrong; 89b6b175 fixes the masks but not the positions. See REFERENCES.md.
 codegen,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 cohere,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 cohere2,reviewer,optional,full workload selected; complete run missing,Earlier paired GPU comparison passes; independently review the local/global attention pattern and inputs if time permits.
@@ -69,7 +69,7 @@ deberta_v2,reviewer,optional,full-size numerical pass,Review construction and ou
 decision_transformer,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 deepseek_v2,us,,registered; full workload review unfinished,"Extended BF16 GPU check passes logits and logical KV across prefill+two continuations (21 tensors,min99.756% matched). Ours/HF0.727/0.745/0.752 with10warmups50samples. Logical V export excludes constant padding; timed model unchanged."
 deepseek_v3,us,,registered; full workload review unfinished,"Passes against Transformers 89b6b175 (mixed FP8 fixture, 10/50, exact). The pinned FP8 path produces non-finite outputs on SM100; the case declares the fixed revision."
-deepseek_v4,us,,no registered runnable implementation,"No implementation. HF reference broken: the pinned revision leaks future tokens into earlier logits and returns no cache; 89b6b175 fixes that, but its BF16/FP8 workload raises (FP32 norm output into the BF16 router). See reference_probes."
+deepseek_v4,us,,no registered runnable implementation,"No implementation. HF reference broken: the pinned revision leaks future tokens into earlier logits and returns no cache; 89b6b175 fixes that, but its BF16/FP8 workload raises (FP32 norm output into the BF16 router). See REFERENCES.md."
 deepseek_vl,us,,registered; full workload review unfinished,"Extended BF16 GPU prefill+two continuations and selected cache/state outputs pass 16 tensor checks. Existing construction retained; reviewed scaling/default computation. Diagnostic ours/HF ratios: prefill=0.57x, decode_1=0.39x, decode_2=0.37x."
 deepseek_vl_hybrid,us,,registered; full workload review unfinished,"Extended BF16 GPU prefill+two continuations and selected cache/state outputs pass 16 tensor checks. Existing construction retained; reviewed scaling/default computation. Diagnostic ours/HF ratios: prefill=0.99x, decode_1=0.54x, decode_2=0.50x."
 deformable_detr,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
@@ -131,7 +131,7 @@ gemma2,us,,no registered runnable implementation,Scaled BF16 GPU comparison pass
 gemma3,reviewer,complete_execution,full workload selected; complete run missing,Zero multimodal projection hides visual contribution under native random initialization; establish informative shared-weight testing and paired GPU evidence.
 gemma3n,us,,no registered runnable implementation,Default image/audio/text composition: BF16 GPU prefill+2 continuations passes65 tensors bit-exact; ours/HF1.15/1.08/1.09x. Verified fixes preserve native causal SDPA dispatch and CPU-initialized FP32 rotary frequencies. Independent component/construction review complete.
 gemma4,us,,registered; full workload review unfinished,Existing GPU evidence independently recomputed and retained for selected multimodal forward and state scope; current case agrees with recorded configuration.
-gemma4_assistant,us,investigate,no registered runnable implementation,"Pinned sampled reference verifies greedy drafts as softmax-distributed samples (argmax draft accepted 100/100 when p=q), on both revisions. Leave implementation pending; standalone assistant forward is not assisted generation. See reference_probes."
+gemma4_assistant,us,investigate,no registered runnable implementation,"Pinned sampled reference verifies greedy drafts as softmax-distributed samples (argmax draft accepted 100/100 when p=q), on both revisions. Leave implementation pending; standalone assistant forward is not assisted generation. See REFERENCES.md."
 git,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 glm,reviewer,investigate,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
 glm4,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
@@ -154,13 +154,13 @@ gpt_neox_japanese,reviewer,optional,full workload selected; complete run missing
 gpt_oss,reviewer,investigate,registered; full workload review unfinished,Prepare correctly packed common weights for --state-dict; ordinary random initialization is insufficient. Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
 gptj,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 granite,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-granite4_vision,us,,no registered runnable implementation,"No implementation. Reference selection unresolved: IBM's remote code imports HybridMambaAttentionDynamicCache, absent from both revisions, and the built-in class fails with its default config (mlp_bias). See reference_probes."
+granite4_vision,us,,no registered runnable implementation,"No implementation. Reference selection unresolved: IBM's remote code imports HybridMambaAttentionDynamicCache, absent from both revisions, and the built-in class fails with its default config (mlp_bias). See REFERENCES.md."
 granite_speech,us,optional,registered; full workload review unfinished,Retain historical eight-output GPU pass and supplied-adapter sensitivity evidence. Recovered attention-helper change only adds an unused optional return; other changed branches are inactive. No demonstrated defect; some historical shared-helper bodies remain unavailable.
 granite_speech_plus,us,optional,registered; full workload review unfinished,Retain historical eight-output GPU pass. Recovered attention-helper change only adds an unused optional return; current shared components have independent evidence. No demonstrated defect; exact identity of other historical helpers remains qualified.
 granitemoe,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 granitemoehybrid,reviewer,investigate,full workload selected; complete run missing,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
 granitemoeshared,reviewer,investigate,full workload selected; complete run missing,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
-grounding_dino,reviewer,investigate,full workload selected; complete run missing,Pinned BF16 reference raises at the text query projection; 89b6b175 runs but truncates sine/cosine position embeddings to int64. FP32 finite regions matched. See reference_probes.
+grounding_dino,reviewer,investigate,full workload selected; complete run missing,Pinned BF16 reference raises at the text query projection; 89b6b175 runs but truncates sine/cosine position embeddings to int64. FP32 finite regions matched. See REFERENCES.md.
 groupvit,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 helium,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 hgnet_v2,reviewer,optional,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
@@ -238,7 +238,7 @@ mistral4,us,,registered; full workload review unfinished,Scaled BF16 GPU compari
 mixtral,reviewer,investigate,full workload selected; complete run missing,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
 mlcd,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 mllama,us,,no registered runnable implementation,"New BF16 GPU comparison passes all33 logits/state tensors for image/text prefill+two continuations,10warmups50samples. Named zero gates randomized identically; fixed serialized-config property lookup. Ours/HF latency1.004x/1.038x/1.023x for declared scaled workload."
-mm_grounding_dino,reviewer,investigate,full workload selected; complete run missing,Pinned BF16 reference raises at the text query projection; 89b6b175 runs but truncates sine/cosine position embeddings to int64. FP32 finite regions matched. See reference_probes.
+mm_grounding_dino,reviewer,investigate,full workload selected; complete run missing,Pinned BF16 reference raises at the text query projection; 89b6b175 runs but truncates sine/cosine position embeddings to int64. FP32 finite regions matched. See REFERENCES.md.
 mobilebert,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 mobilenet_v1,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 mobilenet_v2,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
@@ -252,7 +252,7 @@ moonshine_streaming,us,,no registered runnable implementation,Scaled BF16 GPU co
 moshi,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
 mpnet,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 mpt,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
-mra,us,,no registered runnable implementation,Implementation exists; no registered case. HF BF16 reference raises on both revisions (FP32 attention output into the BF16 dense layer); FP32 runs. See reference_probes.
+mra,us,,no registered runnable implementation,Implementation exists; no registered case. HF BF16 reference raises on both revisions (FP32 attention output into the BF16 dense layer); FP32 runs. See REFERENCES.md.
 mt5,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 musicflamingo,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
 musicgen,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
@@ -261,7 +261,7 @@ mvp,us,,full-size numerical pass,Review construction and outputs; validate the a
 nanochat,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 nemotron,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 nemotron_h,reviewer,investigate,full workload selected; complete run missing,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
-nllb_moe,us,,no registered runnable implementation,No implementation. HF reference routes tokens to the wrong experts on both revisions (one_hot applied to an already one-hot mask). See reference_probes.
+nllb_moe,us,,no registered runnable implementation,No implementation. HF reference routes tokens to the wrong experts on both revisions (one_hot applied to an already one-hot mask). See REFERENCES.md.
 nomic_bert,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 nystromformer,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 olmo,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
@@ -292,7 +292,7 @@ perception_lm,us,,registered; full workload review unfinished,Review default com
 persimmon,reviewer,investigate,full workload selected; complete run missing,Primary logits pass but layer-1 key caches fail (worst 95.43% within tolerance). Native rotary improves but does not resolve; isolate layer-0 attention/MLP and layer-1 Q/K normalization on common inputs.
 phi,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 phi3,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
-phi4_multimodal,us,,registered; full workload review unfinished,"Speech passes all seven GPU outputs exactly; inputs are reproducible with prepare_phi4.py. Vision pending: the HF BF16 reference computes 64 wrong position indices (FP32 correct) on both revisions, and the candidate shares that formula. See reference_probes."
+phi4_multimodal,us,,registered; full workload review unfinished,"Speech passes all seven GPU outputs exactly; inputs are reproducible with prepare_phi4.py. Vision pending: the HF BF16 reference computes 64 wrong position indices (FP32 correct) on both revisions, and the candidate shares that formula. See REFERENCES.md."
 phimoe,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
 pi0,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.
 pix2struct,reviewer,optional,full workload selected; complete run missing,Check readiness and scaled scope; run common random weights/inputs and investigate.
@@ -331,7 +331,7 @@ qwen3_vl,reviewer,investigate,registered; full workload review unfinished,Invest
 qwen3_vl_moe,reviewer,investigate,registered; full workload review unfinished,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
 rag,us,,no registered runnable implementation,"Practical new_op for selected exact-HNSWSQ retrieval: graph/frontier traversal, visited state, quantized distances and stopping are absent; BMM+TopK changes the algorithm. Freeze recovered dataset/index revision and disclose alternative RAG example scopes. Synthetic native preparation already resolves loader blocker; BART masks remain ordinary integration work. No candidate/GPU acceptance claimed."
 recurrent_gemma,reviewer,investigate,full workload selected; complete run missing,Investigate saved development numerical mismatch; reproduce current approved case and isolate failing computation. No later qualifying pass located.
-reformer,us,,registered; full workload review unfinished,HF BF16 reference raises on both revisions (FP32 axial position parameters); the FP32 upcast diagnostic passes but does not approve BF16. See reference_probes.
+reformer,us,,registered; full workload review unfinished,HF BF16 reference raises on both revisions (FP32 axial position parameters); the FP32 upcast diagnostic passes but does not approve BF16. See REFERENCES.md.
 regnet,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 rembert,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 resnet,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
@@ -350,8 +350,8 @@ sam3,us,,full-size numerical pass,Review construction and outputs; validate the 
 sam3_lite_text,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 sam3_tracker,us,,full-size numerical pass,Review construction and outputs; validate the approved scaled case when changed.
 sam3_tracker_video,us,,no registered runnable implementation,Registered constructor-derived 18-frame case passes GPU masks and all returned memory/pointer state (144 tensors). Diagnostic forward latency is 1.25x HF. Separate informative nonzero-state CPU controls also pass.
-sam3_video,us,,no registered runnable implementation,"HF reference assigns the removed object's mask and score to the surviving object after hotstart removal, on both revisions. No implementation registered. See reference_probes."
-sam_hq,us,,no registered runnable implementation,No implementation. HF reference feeds pre-transformer features to the HQ upscaler on both revisions (overwritten variable). See reference_probes.
+sam3_video,us,,no registered runnable implementation,"HF reference assigns the removed object's mask and score to the surviving object after hotstart removal, on both revisions. No implementation registered. See REFERENCES.md."
+sam_hq,us,,no registered runnable implementation,No implementation. HF reference feeds pre-transformer features to the HQ upscaler on both revisions (overwritten variable). See REFERENCES.md.
 seamless_m4t,us,,no registered runnable implementation,Both text-to-speech and audio-to-speech routes pass GPU waveform and length comparisons exactly in FP32. BF16 random waveform signal remains too weak for acceptance. Keep FP32 evidence separate; initialization and evaluated-dtype disposition remain open.
 seamless_m4t_v2,us,investigate,no registered runnable implementation,Registered text/audio-to-speech implementation. GPU text BF16 and audio FP32 each match waveform and length exactly; diagnostic timing measured. Audio BF16 generates the same invalid vocoder ID on both sides. Keep partial evidence separate; no whole-entry acceptance.
 seed_oss,us,,registered; full workload review unfinished,Review default computation; approve scaled values and complete missing behavior.

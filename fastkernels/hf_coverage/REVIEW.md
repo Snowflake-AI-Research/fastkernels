@@ -11,12 +11,11 @@ workload. `next_action` identifies the open issue or next check.
   run's precision (BF16 2%, FP32 0.01%; see the README). The previous 99%
   elementwise result is still recorded per output and selectable with
   `--criterion elementwise`. Counts and priorities below predate this change.
-- **HF reference blockers.** Twelve entries are blocked by verified bugs in the HF
+- **HF reference blockers.** Twelve entries are blocked by issues in the HF
   reference itself: DeepSeekV4, MRA, Reformer, Grounding DINO, MM Grounding DINO,
   CLVP, NLLB-MoE, SAM-HQ, Phi4 vision, Gemma4 assistant, SAM3 video and
-  Granite4 vision. [`reference_probes/`](reference_probes/README.md) reproduces
-  each one standalone against the pinned revision and against `89b6b175`, and
-  records whether that revision fixes it.
+  Granite4 vision. [REFERENCES.md](REFERENCES.md) describes each issue, its
+  tentative classification and what remains to decide.
 - **Upstream-fixed references.** CTRL, DBRX, Doge, Emu3, DeepSeekV3 and MiniMaxM2
   pass against Transformers `89b6b175`, which fixes their pinned-revision
   reference bugs; their cases declare that revision.
