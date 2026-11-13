@@ -2088,9 +2088,9 @@ def _time_module(module: nn.Module, base_call, warmup: int, iters: int,
     l2 = _l2_flush_buffer(device)
 
     if static_inputs:
-        # Fixed addresses required for CUDA-graph capture/replay. Clone once so
-        # in-place kernels cannot mutate the caller's tensors across iters.
-        static_args, static_kwargs = _clone_tree((args, kwargs))
+        # Fixed addresses: the caller's buffers are the ones the CUDA graphs
+        # were captured on, and a graph replays at its captured addresses.
+        static_args, static_kwargs = args, kwargs
         fwd_ctx = _cudagraph_forward_ctx(static_args, static_kwargs)
 
         def call_once():
@@ -2343,7 +2343,9 @@ def _bench_one_case(op: Operator, baseline_cls, candidate_cls, case: dict,
             worst = (status, max_abs, max_rel, matched, detail)
         res.max_abs_error = max(res.max_abs_error, max_abs)
         res.max_rel_error = max(res.max_rel_error, max_rel)
-        if status != PASSED:
+        # In compiled mode correctness is judged compiled vs compiled (below);
+        # these eager rounds then only validate inputs and reward-hack checks.
+        if status != PASSED and enforce_eager:
             res.status = status
             res.matched_ratio = matched
             res.detail = detail
@@ -2382,12 +2384,12 @@ def _bench_one_case(op: Operator, baseline_cls, candidate_cls, case: dict,
             # First invocation triggers Dynamo/Inductor and the initial
             # CUDAGraphWrapper capture. Do it once up front (under PIECEWISE)
             # so compile workers and capture cost stay outside the timed loop.
-            args0, kwargs0 = _clone_tree(base_call)
+            base_call = _clone_tree(base_call)
+            args0, kwargs0 = base_call
             with torch.no_grad(), _cudagraph_forward_ctx(args0, kwargs0):
                 timed_candidate(*args0, **kwargs0)
                 timed_baseline(*args0, **kwargs0)
                 torch.cuda.synchronize()
-            del args0, kwargs0
         # Thread-injection check is eager-only: Inductor compile workers
         # legitimately spawn (and sometimes grow) across warmups/captures.
         threads_before = threading.active_count() if enforce_eager else None
@@ -2407,6 +2409,31 @@ def _bench_one_case(op: Operator, baseline_cls, candidate_cls, case: dict,
         res.status = RUNTIME_ERROR
         res.detail = f"timing failed: {exc!r}"
         return res
+
+    if not enforce_eager:
+        # Correctness: compiled/CUDA-graph candidate vs compiled/CUDA-graph
+        # baseline on the same input values (restored in between, since the
+        # graphs share the buffers and a kernel may update inputs in place).
+        try:
+            leaves = _tensor_leaves(base_call)
+            snap = [t.clone() for t in leaves]
+            args, kwargs = base_call
+            with torch.no_grad(), _cudagraph_forward_ctx(args, kwargs):
+                out = _clone_tree(timed_candidate(*args, **kwargs))
+                for dst, src in zip(leaves, snap):
+                    dst.copy_(src)
+                ref = _clone_tree(timed_baseline(*args, **kwargs))
+            torch.cuda.synchronize()
+            canon = _OUTPUT_CANON.get(op.qualname)
+            status, max_abs, max_rel, matched, detail = _compare(
+                *((canon(out), canon(ref)) if canon else (out, ref)), check_dtype=True)
+        except Exception as exc:  # noqa: BLE001
+            status, max_abs, max_rel, matched, detail = RUNTIME_ERROR, 0.0, 0.0, 0.0, f"{exc!r}"
+        res.max_abs_error, res.max_rel_error, res.matched_ratio = max_abs, max_rel, matched
+        if status != PASSED:
+            res.status = status
+            res.detail = f"compiled/CUDA-graph: {detail}"
+            return res
 
     if res.candidate_ms > 0:
         res.speedup = res.baseline_ms / res.candidate_ms
