@@ -246,6 +246,18 @@ def test_section_6():
     from fastkernels.bench import _build_arg_parser
     check("--standalone" in _build_arg_parser().format_help(),
           "6e. bench CLI accepts --standalone")
+    help_text = _build_arg_parser().format_help()
+    check("--enforce-eager" in help_text,
+          "6f. bench CLI accepts --enforce-eager")
+    parsed = _build_arg_parser().parse_args([])
+    check(parsed.enforce_eager is False,
+          "6f. --enforce-eager defaults to False (compile_model+cudagraph on)")
+    parsed_eager = _build_arg_parser().parse_args(["--enforce-eager"])
+    check(parsed_eager.enforce_eager is True,
+          "6f. --enforce-eager enables eager timing")
+    check("FastKernelsBackend" in help_text or "compile_model" in help_text
+          or "piecewise" in help_text.lower(),
+          "6f. --enforce-eager help mentions e2e compile stack")
 
     # 6d. Default JSON output path
     with _Timeout(30):

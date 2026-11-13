@@ -157,8 +157,9 @@ candidates; that is the agent's job.)
 ### 4. Benchmark at the kernel level (from the capture) — iterate
 
 ```bash
-fastkernels bench --target moe_grouped_gemm --self-test   # harness sanity (~1.0x)
+fastkernels bench --target moe_grouped_gemm --self-test   # harness sanity (~1.0x; compile_model+cudagraph)
 fastkernels bench --target moe_grouped_gemm               # baseline vs candidate
+fastkernels bench --target moe_grouped_gemm --enforce-eager  # eager timing only
 ```
 
 **Output:**

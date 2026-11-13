@@ -18,9 +18,10 @@ fastkernels create-stubs --architecture llama
 Test isolated correctness (error ratio $\le$ 1.0) and performance (speedup > 1.0) using runtime-captured shapes:
 
 ```bash
-fastkernels bench             # Benchmark all available candidates
+fastkernels bench             # Benchmark all available candidates (compile_model + piecewise CUDA graphs)
 fastkernels bench --level 1   # Benchmark all L1 candidates
 fastkernels bench --target rms_norm  # Benchmark a single operator
+fastkernels bench --enforce-eager    # Eager timing only (disable compile + CUDA graphs)
 ```
 
 ### 3. End-to-End Evaluation

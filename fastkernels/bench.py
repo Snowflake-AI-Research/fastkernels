@@ -25,10 +25,14 @@ Design (adapted from NVIDIA's SOL-ExecBench ``core/bench`` + fastkernels'
   weights (``load_state_dict(..., strict=False)``); the *same* materialized
   inputs are fed to both and their outputs compared with per-dtype tolerances
   over several rounds of fresh inputs.
-* **Performance** -- CUDA-event timing with warmup, an L2-cache flush and a
-  shifting memory pool (distinct ``data_ptr`` per iteration, no in-loop
-  ``cudaMalloc``); the median of many iterations. Baseline is timed too, giving
-  a speedup factor.
+* **Performance** -- CUDA-event timing with warmup, an L2-cache flush, and
+  (by default) the same ``compile_model`` / ``FastKernelsBackend`` stack
+  ``fastkernels eval`` uses end-to-end, with piecewise CUDA-graph capture
+  activated via ``set_forward_context(PIECEWISE)``. Pass ``--enforce-eager``
+  to fall back to eager timing with a shifting memory pool (distinct
+  ``data_ptr`` per iteration, no in-loop ``cudaMalloc``). The median of many
+  iterations; baseline is timed too, giving a speedup factor. Correctness
+  always runs in eager mode (kernel equivalence, not Inductor numerics).
 * **Reward-hack detection** -- the timing primitive's identity, this module's
   own critical functions, background-thread counts and output-tensor types are
   all checked. Any tampering is reported as ``REWARD_HACK``. (Runtime kernel
@@ -43,6 +47,7 @@ Usage::
     fastkernels bench --self-test --level 1        # baselines vs themselves
     fastkernels bench --target rms_norm --gpus 0   # one operator, one GPU
     fastkernels bench --standalone                 # ignore other candidates' files
+    fastkernels bench --enforce-eager              # eager timing (no compile/cudagraph)
 
 Known limitations (honest by design):
 
@@ -137,6 +142,10 @@ DEFAULT_ITERS = 50
 DEFAULT_ROUNDS = 3
 DEFAULT_MAX_SHAPES = 5
 DEFAULT_SEED = 200
+# Extra warmup iters when timing under compile_model + piecewise CUDA graphs so
+# Inductor compile and the first CUDAGraphWrapper capture stay outside the
+# measured window.
+DEFAULT_COMPILE_EXTRA_WARMUP = 5
 
 # 99% of elements must fall within the per-dtype allclose bound (SOL rule).
 REQUIRED_MATCHED_RATIO = 0.99
@@ -1923,7 +1932,7 @@ def _compare(out, ref, check_dtype: bool):
 # Reward-hack detection (ported from SOL-ExecBench core/bench/reward_hack.py).
 # ---------------------------------------------------------------------------
 _CRITICAL_NAMES = [
-    "_time_module", "_compare", "_compare_tensor", "_run_forward",
+    "_time_module", "_compile_module", "_compare", "_compare_tensor", "_run_forward",
     "_check_monkey_patch", "_check_threads", "_check_lazy_outputs",
     "_check_integrity", "_make_call", "_build_call", "_materialize_value",
 ]
@@ -1959,7 +1968,8 @@ def _check_integrity(snapshot: dict[str, int]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Timing (CUDA events + L2 flush + shifting memory pool; adapts SOL timing.py).
+# Timing (CUDA events + L2 flush + shifting pool or compile/CUDA-graph path;
+# adapts SOL timing.py).
 # ---------------------------------------------------------------------------
 def _l2_flush_buffer(device: str) -> torch.Tensor:
     try:
@@ -1983,6 +1993,9 @@ class _ShiftingPool:
     passed through unchanged -- copying them into a contiguous pool slot would
     destroy the layout the kernel requires. These are read-only weights/scales,
     so reusing the same tensor across iterations is correct.
+
+    Only used for ``--enforce-eager`` timing. The default compile + CUDA-graph
+    path needs fixed addresses, so it uses static input buffers instead.
     """
 
     def __init__(self, tensors: list[torch.Tensor], total: int):
@@ -2014,22 +2027,87 @@ class _ShiftingPool:
         return out
 
 
+def _compile_module(module: nn.Module,
+                    dtype: torch.dtype | None = None) -> nn.Module:
+    """Wrap ``module`` with the same ``compile_model`` stack as e2e eval.
+
+    Uses ``FastKernelsBackend`` (piecewise Inductor, ``fullgraph=True``,
+    custom-op registration, vLLM-aligned Inductor config) and installs
+    ``CUDAGraphWrapper`` on compilable subgraphs. Piecewise graph
+    capture/replay is armed later by ``set_forward_context(PIECEWISE)``
+    around timed calls -- without that context the wrappers fall through
+    to compiled-eager.
+    """
+    from fastkernels.infra.compilation import (
+        compile_model,
+        configure_post_grad_passes,
+    )
+    from fastkernels.infra.context import auto_register_no_compile_layers
+
+    configure_post_grad_passes(model_dtype=dtype)
+    auto_register_no_compile_layers(module)
+    return compile_model(module, cudagraph_enabled=True)
+
+
+def _graph_bs_key(args, kwargs) -> int:
+    """Stable CUDAGraphWrapper cache key for a fixed-shape bench call.
+
+    Prefers the leading dim of the first tensor (the usual batch/token axis);
+    falls back to 1 for scalar-only calls.
+    """
+    for t in _tensor_leaves((args, kwargs)):
+        if t.ndim >= 1 and t.shape[0] > 0:
+            return int(t.shape[0])
+    return 1
+
+
+def _cudagraph_forward_ctx(args, kwargs):
+    """Context manager that arms piecewise CUDAGraphWrapper for a call."""
+    from fastkernels.infra.context import CUDAGraphMode, set_forward_context
+    return set_forward_context(
+        is_prefill=False,
+        cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+        batch_size_for_graph=_graph_bs_key(args, kwargs),
+    )
+
+
 def _time_module(module: nn.Module, base_call, warmup: int, iters: int,
-                 device: str) -> float:
-    """Median CUDA-event latency (ms) of ``module(*args, **kwargs)``."""
+                 device: str, *, static_inputs: bool = False) -> float:
+    """Median CUDA-event latency (ms) of ``module(*args, **kwargs)``.
+
+    When ``static_inputs`` is True (default compile + CUDA-graph path), inputs
+    keep fixed addresses across iterations and the whole warmup/timing loop
+    runs under one ``set_forward_context(PIECEWISE)`` so ``CUDAGraphWrapper``
+    can capture/replay without per-iter context-manager overhead inside the
+    CUDA-event window. When False (``--enforce-eager``), a shifting memory
+    pool varies ``data_ptr`` each call with no compile context.
+    """
+    from contextlib import nullcontext
+
     args, kwargs = base_call
-    leaves = _tensor_leaves((args, kwargs))
-    pool = _ShiftingPool(leaves, warmup + iters) if leaves else None
     l2 = _l2_flush_buffer(device)
 
-    def call_once():
-        if pool is None:
-            return module(*args, **kwargs)
-        it = iter(pool.next())
-        a, k = _map_tensors((args, kwargs), it)
-        return module(*a, **k)
+    if static_inputs:
+        # Fixed addresses required for CUDA-graph capture/replay. Clone once so
+        # in-place kernels cannot mutate the caller's tensors across iters.
+        static_args, static_kwargs = _clone_tree((args, kwargs))
+        fwd_ctx = _cudagraph_forward_ctx(static_args, static_kwargs)
 
-    with torch.no_grad():
+        def call_once():
+            return module(*static_args, **static_kwargs)
+    else:
+        leaves = _tensor_leaves((args, kwargs))
+        pool = _ShiftingPool(leaves, warmup + iters) if leaves else None
+        fwd_ctx = nullcontext()
+
+        def call_once():
+            if pool is None:
+                return module(*args, **kwargs)
+            it = iter(pool.next())
+            a, k = _map_tensors((args, kwargs), it)
+            return module(*a, **k)
+
+    with torch.no_grad(), fwd_ctx:
         for _ in range(warmup):
             l2.zero_()
             call_once()
@@ -2085,6 +2163,8 @@ class BenchResult:
     """Every scenario from a run, plus table/JSON rendering."""
     mode: str
     scenarios: list[ScenarioResult] = field(default_factory=list)
+    # "compile_cudagraph" (default) or "eager" (--enforce-eager).
+    timing: str = "compile_cudagraph"
 
     def _count(self, statuses) -> int:
         return sum(1 for s in self.scenarios if s.status in statuses)
@@ -2093,7 +2173,8 @@ class BenchResult:
         return not any(s.status in _FAIL_STATUSES for s in self.scenarios)
 
     def to_dict(self) -> dict:
-        return {"mode": self.mode, "passed": self._count(_PASS_STATUSES),
+        return {"mode": self.mode, "timing": self.timing,
+                "passed": self._count(_PASS_STATUSES),
                 "failed": self._count(_FAIL_STATUSES), "skipped": self._count({SKIPPED}),
                 "all_passed": self.all_passed(),
                 "scenarios": [s.to_dict() for s in self.scenarios]}
@@ -2162,7 +2243,8 @@ def _shape_repr(fwd_args: dict) -> str:
 
 def _bench_one_case(op: Operator, baseline_cls, candidate_cls, case: dict,
                     device: str, warmup: int, iters: int, rounds: int,
-                    seed: int, integrity: dict) -> ScenarioResult:
+                    seed: int, integrity: dict,
+                    *, enforce_eager: bool = False) -> ScenarioResult:
     operators = case["operators"]
     vid = case["vid"]
     fwd_args = case["fwd_args"]
@@ -2278,13 +2360,45 @@ def _bench_one_case(op: Operator, baseline_cls, candidate_cls, case: dict,
         return res
 
     # 4) Timing: candidate (guarded) and baseline (trusted) -> speedup.
+    # By default both modules go through ``compile_model`` (same
+    # FastKernelsBackend + piecewise CUDAGraphWrapper stack as e2e eval) and
+    # are timed with static buffers under ``set_forward_context(PIECEWISE)``.
+    # ``--enforce-eager`` skips compile and uses the shifting-pool path.
     torch.manual_seed(seed)
     try:
         base_call = _make_call(op, baseline_cls, fwd_args, device, init_args)
-        threads_before = threading.active_count()
-        res.candidate_ms = _time_module(candidate, base_call, warmup, iters, device)
-        _check_threads(threads_before, threading.active_count())
-        res.baseline_ms = _time_module(baseline, base_call, warmup, iters, device)
+        timed_candidate, timed_baseline = candidate, baseline
+        time_warmup, static_inputs = warmup, False
+        if not enforce_eager:
+            try:
+                timed_candidate = _compile_module(candidate, dtype=dtype)
+                timed_baseline = _compile_module(baseline, dtype=dtype)
+            except Exception as exc:  # noqa: BLE001
+                res.status = RUNTIME_ERROR
+                res.detail = f"compile_model failed: {exc!r}"
+                return res
+            time_warmup = warmup + DEFAULT_COMPILE_EXTRA_WARMUP
+            static_inputs = True
+            # First invocation triggers Dynamo/Inductor and the initial
+            # CUDAGraphWrapper capture. Do it once up front (under PIECEWISE)
+            # so compile workers and capture cost stay outside the timed loop.
+            args0, kwargs0 = _clone_tree(base_call)
+            with torch.no_grad(), _cudagraph_forward_ctx(args0, kwargs0):
+                timed_candidate(*args0, **kwargs0)
+                timed_baseline(*args0, **kwargs0)
+                torch.cuda.synchronize()
+            del args0, kwargs0
+        # Thread-injection check is eager-only: Inductor compile workers
+        # legitimately spawn (and sometimes grow) across warmups/captures.
+        threads_before = threading.active_count() if enforce_eager else None
+        res.candidate_ms = _time_module(
+            timed_candidate, base_call, time_warmup, iters, device,
+            static_inputs=static_inputs)
+        if threads_before is not None:
+            _check_threads(threads_before, threading.active_count())
+        res.baseline_ms = _time_module(
+            timed_baseline, base_call, time_warmup, iters, device,
+            static_inputs=static_inputs)
     except _RewardHack as exc:
         res.status = REWARD_HACK
         res.detail = str(exc)
@@ -2347,7 +2461,8 @@ def _worker_main(args) -> int:
         try:
             res = _bench_one_case(op, baseline_cls, candidate_cls, case, device,
                                   args.warmup, args.iters, args.rounds, DEFAULT_SEED,
-                                  integrity)
+                                  integrity,
+                                  enforce_eager=bool(args.enforce_eager))
         except _RewardHack as exc:
             res = ScenarioResult(op=op.qualname, level=op.level,
                                  shape=_shape_repr(case["fwd_args"]), dtype="-",
@@ -2425,6 +2540,8 @@ def _worker_command(op: Operator, args) -> list[str]:
         cmd.append("--self-test")
     if args.standalone:
         cmd.append("--standalone")
+    if args.enforce_eager:
+        cmd.append("--enforce-eager")
     return cmd
 
 
@@ -2538,6 +2655,7 @@ def _run_parallel(ops: list[Operator], args, gpu_ids: list[str], mode: str) -> B
 
     return BenchResult(
         mode=mode,
+        timing="eager" if args.enforce_eager else "compile_cudagraph",
         scenarios=[s for op in ops for s in collected.get(op.qualname, [])])
 
 
@@ -2613,7 +2731,9 @@ def _dist_worker_entry(rank, world_size, port, op_qualname, wargs, out_path, gpu
                 try:
                     res = _bench_one_case(op, baseline_cls, candidate_cls, case,
                                           device, wargs["warmup"], wargs["iters"],
-                                          wargs["rounds"], DEFAULT_SEED, integrity)
+                                          wargs["rounds"], DEFAULT_SEED, integrity,
+                                          enforce_eager=bool(
+                                              wargs.get("enforce_eager", False)))
                     d = res.to_dict()
                 except Exception as exc:  # noqa: BLE001 - keep the group alive
                     traceback.print_exc()
@@ -2657,7 +2777,8 @@ def _run_distributed(ops: list[Operator], args, gpu_ids: list[str]) -> list[Scen
         wargs = {"captures": str(args.captures), "max_shapes": args.max_shapes,
                  "warmup": args.warmup, "iters": args.iters,
                  "rounds": args.rounds, "self_test": bool(args.self_test),
-                 "standalone": bool(args.standalone)}
+                 "standalone": bool(args.standalone),
+                 "enforce_eager": bool(args.enforce_eager)}
         print(f"  -> [GPUs {','.join(ranks_gpus)}] {op.qualname} "
               f"(distributed, world_size={world_size}) started")
         try:
@@ -2755,6 +2876,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--iters", type=int, default=DEFAULT_ITERS)
     p.add_argument("--rounds", type=int, default=DEFAULT_ROUNDS,
                    help="Correctness rounds with fresh inputs (default 3).")
+    p.add_argument("--enforce-eager", action="store_true", default=False,
+                   help="Disable compile_model + piecewise CUDA graphs for "
+                        "timing and use eager mode with a shifting memory pool "
+                        "instead. Default matches e2e eval's FastKernelsBackend "
+                        "compile + PIECEWISE CUDAGraphWrapper path. "
+                        "Correctness always runs eager regardless.")
     p.add_argument("--captures", default=str(capture.CAPTURE_DIR),
                    help="Directory of capture reports (default ~/.fastkernels/captures).")
     p.add_argument("--lock-clocks", action="store_true",
@@ -2807,8 +2934,11 @@ def _print_plan(ops: list[Operator], args, gpu_ids: list[str], mode: str) -> int
     without building any module, spawning a worker or touching a GPU."""
     reports = _load_reports(Path(args.captures))
     gpu_disp = ",".join(gpu_ids) if gpu_ids else "none detected"
+    timing = ("eager (shifting pool)" if args.enforce_eager
+              else "compile_model + piecewise CUDA graphs")
     print("DRY RUN -- no modules are built and no kernels are executed.")
     print(f"Mode: {mode}  |  GPUs: {gpu_disp} (one operator per GPU)")
+    print(f"Timing: {timing}")
     print(f"Config: warmup={args.warmup} iters={args.iters} rounds={args.rounds} "
           f"max-shapes={args.max_shapes}")
     print(f"Captures: {args.captures} ({len(reports)} report(s))\n")
@@ -2880,9 +3010,12 @@ def main(argv: list[str] | None = None) -> int:
     # rest run one-per-GPU in parallel.
     dist_ops = [o for o in ops if o.qualname in _DISTRIBUTED_OPS]
     normal_ops = [o for o in ops if o.qualname not in _DISTRIBUTED_OPS]
+    timing = ("eager" if args.enforce_eager
+              else "compile_model+cudagraph")
     print(f"Benchmarking {len(ops)} operator(s) in {mode} mode on GPU(s) "
           f"{','.join(gpu_ids)} ({len(normal_ops)} one-per-GPU"
-          + (f", {len(dist_ops)} distributed" if dist_ops else "") + ").")
+          + (f", {len(dist_ops)} distributed" if dist_ops else "")
+          + f"; timing={timing}).")
 
     locked = _lock_clocks() if args.lock_clocks else False
     try:
