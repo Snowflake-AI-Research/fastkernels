@@ -1806,11 +1806,19 @@ def _canon_moe_align(out):
     num_tokens_post_padded) output. The token order *within* each expert block
     is assigned by atomics, so it is not deterministic run to run -- only the
     multiset of ids is. Sort the ids so a valid-but-reordered alignment compares
-    equal; ``expert_ids`` (block->expert) and the padded length stay exact."""
-    sorted_ids, *rest = out
-    if isinstance(sorted_ids, torch.Tensor):
-        sorted_ids = torch.sort(sorted_ids.flatten()).values
-    return (sorted_ids, *rest)
+    equal; ``expert_ids`` (block->expert) and the padded length stay exact.
+    Entries past ``num_tokens_post_padded`` are never written (uninitialized
+    buffer tail, never read downstream), so only the valid prefix is compared."""
+    if not (isinstance(out, (tuple, list)) and len(out) == 3
+            and all(isinstance(t, torch.Tensor) for t in out)):
+        return out
+    sorted_ids, expert_ids, num_padded = out
+    if expert_ids.numel():
+        n = int(num_padded.flatten()[0])
+        block = -(-sorted_ids.numel() // expert_ids.numel())  # buffers are sized cdiv(len, block)
+        expert_ids = expert_ids[:-(-n // block)]
+        sorted_ids = torch.sort(sorted_ids.flatten()[:n]).values
+    return (sorted_ids, expert_ids, num_padded)
 
 
 # qualname -> fn(output) -> canonical output, applied to BOTH baseline and
@@ -2047,6 +2055,38 @@ def _compile_module(module: nn.Module,
     configure_post_grad_passes(model_dtype=dtype)
     auto_register_no_compile_layers(module)
     return compile_model(module, cudagraph_enabled=True)
+
+
+class _CUDAGraphOnly(nn.Module):
+    """Run ``module`` uncompiled inside one CUDA graph, captured on the first call's
+    buffers and replayed after. Used for ops whose baseline cannot be compiled: e2e
+    never compiles them either (they sit inside opaque custom ops), it graphs them."""
+
+    def __init__(self, module: nn.Module):
+        super().__init__()
+        self.module, self.graph, self.out = module, None, None
+
+    def forward(self, *args, **kwargs):
+        if self.graph is None:
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):  # warm up (lazy init / JIT) outside the graph
+                for _ in range(3):
+                    self.module(*args, **kwargs)
+            torch.cuda.current_stream().wait_stream(side)
+            graph = torch.cuda.CUDAGraph()
+            try:
+                with torch.cuda.graph(graph):
+                    self.out = self.module(*args, **kwargs)
+            except Exception:
+                # A failed capture leaves the CUDA RNG in capture state and breaks
+                # every later case in this worker; a clean capture resets it.
+                with torch.cuda.graph(torch.cuda.CUDAGraph()):
+                    torch.empty(1, device="cuda").uniform_()
+                raise
+            self.graph = graph
+        self.graph.replay()
+        return self.out
 
 
 def _graph_bs_key(args, kwargs) -> int:
@@ -2370,7 +2410,7 @@ def _bench_one_case(op: Operator, baseline_cls, candidate_cls, case: dict,
     try:
         base_call = _make_call(op, baseline_cls, fwd_args, device, init_args)
         timed_candidate, timed_baseline = candidate, baseline
-        time_warmup, static_inputs = warmup, False
+        time_warmup, static_inputs, graph_only = warmup, False, ""
         if not enforce_eager:
             try:
                 timed_candidate = _compile_module(candidate, dtype=dtype)
@@ -2386,6 +2426,20 @@ def _bench_one_case(op: Operator, baseline_cls, candidate_cls, case: dict,
             # so compile workers and capture cost stay outside the timed loop.
             base_call = _clone_tree(base_call)
             args0, kwargs0 = base_call
+            try:  # baseline first: if it cannot be compiled, graph both sides uncompiled
+                with torch.no_grad(), _cudagraph_forward_ctx(args0, kwargs0):
+                    timed_baseline(*args0, **kwargs0)
+            except Exception as exc:  # noqa: BLE001
+                graph_only = f"CUDA graph only (baseline not compilable: {type(exc).__name__})"
+                timed_candidate, timed_baseline = _CUDAGraphOnly(candidate), _CUDAGraphOnly(baseline)
+                try:  # and if the baseline cannot be graphed either (e.g. host sync), run eager as e2e does
+                    with torch.no_grad():
+                        timed_baseline(*args0, **kwargs0)
+                except Exception as exc2:  # noqa: BLE001
+                    graph_only = ("eager (baseline neither compilable nor CUDA-graph capturable: "
+                                  f"{type(exc2).__name__})")
+                    timed_candidate, timed_baseline = candidate, baseline
+                    time_warmup, static_inputs = warmup, False
             with torch.no_grad(), _cudagraph_forward_ctx(args0, kwargs0):
                 timed_candidate(*args0, **kwargs0)
                 timed_baseline(*args0, **kwargs0)
@@ -2432,8 +2486,9 @@ def _bench_one_case(op: Operator, baseline_cls, candidate_cls, case: dict,
         res.max_abs_error, res.max_rel_error, res.matched_ratio = max_abs, max_rel, matched
         if status != PASSED:
             res.status = status
-            res.detail = f"compiled/CUDA-graph: {detail}"
+            res.detail = f"{graph_only or 'compiled/CUDA-graph'}: {detail}"
             return res
+        res.detail = graph_only
 
     if res.candidate_ms > 0:
         res.speedup = res.baseline_ms / res.candidate_ms
