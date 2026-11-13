@@ -17,6 +17,7 @@ empty string to leave ``TORCH_CUDA_ARCH_LIST`` untouched.
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import os
 import site
@@ -132,6 +133,10 @@ def _load_op_at(
     extra_ldflags: list[str] | None = None,
 ):
     src_paths = [os.path.join(base, s) for s in sources]
+    # One build dir per source dir: baseline and candidates reuse op names (e.g.
+    # "silu_and_mul"); a shared dir lets a failed candidate build silently import
+    # the baseline's .so. All sources use PYBIND11_MODULE(TORCH_EXTENSION_NAME, ...).
+    name = f"{name}_{hashlib.sha1(base.encode()).hexdigest()[:8]}"
 
     include_paths = [base]
     if need_cutlass:
