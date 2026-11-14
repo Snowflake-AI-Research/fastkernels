@@ -1634,6 +1634,7 @@ def _build_qwen3_next_attention_inputs(fwd_args, device, init_args):
     kw["rotary_emb"] = rope
     kw["positions"] = torch.arange(N, device=device, dtype=torch.int64)
     kw["state_manager"] = _Qwen3NextKV(layer_idx, kc, vc)
+    get_context().kda_state = kw["state_manager"]  # the custom-op path (compile) reads it here
     return [], kw
 
 
@@ -2057,10 +2058,17 @@ def _compile_module(module: nn.Module,
     return compile_model(module, cudagraph_enabled=True)
 
 
+def _reset_cuda_capture_state():
+    """A failed capture leaves the CUDA RNG in capture state and breaks every later
+    case in this worker; a clean capture resets it."""
+    with torch.cuda.graph(torch.cuda.CUDAGraph()):
+        torch.empty(1, device="cuda").uniform_()
+
+
 class _CUDAGraphOnly(nn.Module):
     """Run ``module`` uncompiled inside one CUDA graph, captured on the first call's
-    buffers and replayed after. Used for ops whose baseline cannot be compiled: e2e
-    never compiles them either (they sit inside opaque custom ops), it graphs them."""
+    buffers and replayed after: how an op that cannot be compiled is deployed under
+    torch.compile (as an opaque custom op; e2e does this for attention/MoE/KV-cache)."""
 
     def __init__(self, module: nn.Module):
         super().__init__()
@@ -2079,10 +2087,7 @@ class _CUDAGraphOnly(nn.Module):
                 with torch.cuda.graph(graph):
                     self.out = self.module(*args, **kwargs)
             except Exception:
-                # A failed capture leaves the CUDA RNG in capture state and breaks
-                # every later case in this worker; a clean capture resets it.
-                with torch.cuda.graph(torch.cuda.CUDAGraph()):
-                    torch.empty(1, device="cuda").uniform_()
+                _reset_cuda_capture_state()
                 raise
             self.graph = graph
         self.graph.replay()
@@ -2102,12 +2107,18 @@ def _graph_bs_key(args, kwargs) -> int:
 
 
 def _cudagraph_forward_ctx(args, kwargs):
-    """Context manager that arms piecewise CUDAGraphWrapper for a call."""
-    from fastkernels.infra.context import CUDAGraphMode, set_forward_context
+    """Context manager that arms piecewise CUDAGraphWrapper for a call. Keeps the
+    inference metadata the op's input builder published (e.g. attention's prefill
+    ``Context``); without it attention derefs ``None`` as it would with no context."""
+    import dataclasses
+    from fastkernels.infra.context import CUDAGraphMode, get_context, set_forward_context
+    ctx = get_context()
+    keep = {f.name: getattr(ctx, f.name) for f in dataclasses.fields(ctx) if f.init and f.name not in
+            ("cudagraph_runtime_mode", "batch_size_for_graph", "no_compile_layers")}
     return set_forward_context(
-        is_prefill=False,
         cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
         batch_size_for_graph=_graph_bs_key(args, kwargs),
+        **keep,
     )
 
 
@@ -2440,6 +2451,14 @@ def _bench_one_case(op: Operator, baseline_cls, candidate_cls, case: dict,
                                   f"{type(exc2).__name__})")
                     timed_candidate, timed_baseline = candidate, baseline
                     time_warmup, static_inputs = warmup, False
+            else:  # baseline compiled; a candidate that cannot be compiled is graphed as an opaque op
+                try:
+                    with torch.no_grad(), _cudagraph_forward_ctx(args0, kwargs0):
+                        timed_candidate(*args0, **kwargs0)
+                except Exception as exc:  # noqa: BLE001
+                    _reset_cuda_capture_state()  # in case it failed mid-capture
+                    graph_only = f"candidate CUDA graph only (not compilable: {type(exc).__name__})"
+                    timed_candidate = _CUDAGraphOnly(candidate)
             with torch.no_grad(), _cudagraph_forward_ctx(args0, kwargs0):
                 timed_candidate(*args0, **kwargs0)
                 timed_baseline(*args0, **kwargs0)
@@ -2481,6 +2500,18 @@ def _bench_one_case(op: Operator, baseline_cls, candidate_cls, case: dict,
             canon = _OUTPUT_CANON.get(op.qualname)
             status, max_abs, max_rel, matched, detail = _compare(
                 *((canon(out), canon(ref)) if canon else (out, ref)), check_dtype=True)
+            if status == INCORRECT_NUMERICAL:
+                # Inductor can round differently from eager (e.g. LlamaMLP: the eager
+                # baseline is only ~98.4% within tolerance of the compiled one), so
+                # matching the eager baseline on the same inputs is also correct.
+                for dst, src in zip(leaves, snap):
+                    dst.copy_(src)
+                with torch.no_grad():
+                    ref = _clone_tree(baseline(*args, **kwargs))
+                eager = _compare(*((canon(out), canon(ref)) if canon else (out, ref)), check_dtype=True)
+                if eager[0] == PASSED:
+                    status, max_abs, max_rel, matched, detail = eager
+                    graph_only = (graph_only + "; " if graph_only else "") + "matches eager baseline"
         except Exception as exc:  # noqa: BLE001
             status, max_abs, max_rel, matched, detail = RUNTIME_ERROR, 0.0, 0.0, 0.0, f"{exc!r}"
         res.max_abs_error, res.max_rel_error, res.matched_ratio = max_abs, max_rel, matched
